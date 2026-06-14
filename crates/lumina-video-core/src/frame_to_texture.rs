@@ -17,9 +17,9 @@
 use std::sync::Arc;
 use wgpu;
 
-use crate::video::{CpuFrame, DecodedFrame, PixelFormat};
 #[cfg(test)]
 use crate::video::Plane;
+use crate::video::{CpuFrame, DecodedFrame, PixelFormat};
 
 // ---------------------------------------------------------------------------
 // GPU frame textures — the output of frame upload (fed to GPUI surface())
@@ -70,9 +70,9 @@ pub fn decoded_frame_to_textures(
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Option<GpuFrameTextures> {
     match frame {
-        DecodedFrame::Cpu(cpu) => {
-            Some(upload_cpu_frame_as_textures(cpu, device, queue, y_cache, cbcr_cache, rgba_cache))
-        }
+        DecodedFrame::Cpu(cpu) => Some(upload_cpu_frame_as_textures(
+            cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
+        )),
 
         // Platform GPU surfaces: use CPU fallback for now.
         // Zero-copy import (IOSurface, DMABuf, etc.) can be added here
@@ -145,9 +145,7 @@ pub fn upload_cpu_frame_as_textures(
     match frame.format {
         PixelFormat::Nv12 => upload_nv12(frame, device, queue, y_cache, cbcr_cache),
         PixelFormat::Yuv420p => upload_yuv420p_as_nv12(frame, device, queue, y_cache, cbcr_cache),
-        PixelFormat::Rgba | PixelFormat::Bgra => {
-            upload_rgba(frame, device, queue, rgba_cache)
-        }
+        PixelFormat::Rgba | PixelFormat::Bgra => upload_rgba(frame, device, queue, rgba_cache),
         PixelFormat::Rgb24 => upload_rgb24(frame, device, queue, rgba_cache),
     }
 }
@@ -194,7 +192,12 @@ pub fn upload_cpu_frame(
     }
 
     let texture = texture_cache.as_ref().unwrap();
-    let bytes_per_row = width * 4;
+    // Compute bytes_per_row from actual RGBA data to be robust against size mismatches
+    let bytes_per_row = if height > 0 {
+        (rgba.len() / height as usize) as u32
+    } else {
+        return texture.clone();
+    };
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -254,7 +257,7 @@ pub fn decoded_frame_to_texture(
             None
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
         DecodedFrame::Windows(surface) => {
             if let Some(ref cpu) = surface.cpu_fallback {
                 return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
@@ -280,8 +283,10 @@ fn upload_nv12(
 
     // Y plane: full resolution, R8Unorm
     let y_texture = get_or_create_texture(
-        device, y_cache,
-        width, height,
+        device,
+        y_cache,
+        width,
+        height,
         wgpu::TextureFormat::R8Unorm,
         "lumina_video_y",
     );
@@ -290,14 +295,40 @@ fn upload_nv12(
     let cbcr_width = width.div_ceil(2);
     let cbcr_height = height.div_ceil(2);
     let cbcr_texture = get_or_create_texture(
-        device, cbcr_cache,
-        cbcr_width.max(1), cbcr_height.max(1),
+        device,
+        cbcr_cache,
+        cbcr_width.max(1),
+        cbcr_height.max(1),
         wgpu::TextureFormat::Rg8Unorm,
         "lumina_video_cbcr",
     );
 
-    // Upload Y plane
+    // Upload Y plane (R8Unorm: 1 byte/pixel)
+    // Compute layout from actual data to be robust against stride mismatches
     if let Some(y_plane) = frame.plane(0) {
+        let y_bytes_per_row = if height > 0 {
+            (y_plane.data.len() / height as usize) as u32
+        } else {
+            0
+        };
+        // For R8Unorm, 1 byte = 1 pixel; extent width ≤ bytes_per_row
+        let y_extent_width = y_bytes_per_row.min(width);
+        if y_bytes_per_row == 0 || y_extent_width == 0 {
+            tracing::warn!("NV12 Y plane: zero size, skipping upload");
+            return GpuFrameTextures::Nv12 {
+                y_texture,
+                cb_cr_texture: cbcr_texture,
+                width,
+                height,
+            };
+        }
+        if y_bytes_per_row != width {
+            tracing::warn!(
+                "NV12 Y plane: computed bpr={y_bytes_per_row} differs from width={width} — stride={}, data_len={}, height={height}",
+                y_plane.stride,
+                y_plane.data.len(),
+            );
+        }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &y_texture,
@@ -308,19 +339,36 @@ fn upload_nv12(
             &y_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(y_plane.stride as u32),
+                bytes_per_row: Some(y_bytes_per_row),
                 rows_per_image: Some(height),
             },
             wgpu::Extent3d {
-                width,
+                width: y_extent_width,
                 height,
                 depth_or_array_layers: 1,
             },
         );
     }
 
-    // Upload interleaved CbCr plane
+    // Upload interleaved CbCr plane (Rg8Unorm: 2 bytes/pixel)
+    // Compute layout from actual data to be robust against stride mismatches
     if let Some(uv_plane) = frame.plane(1) {
+        let uv_bytes_per_row = if cbcr_height > 0 {
+            (uv_plane.data.len() / cbcr_height as usize) as u32
+        } else {
+            0
+        };
+        // For Rg8Unorm, 2 bytes = 1 pixel pair; extent width = bytes_per_row / 2
+        let uv_extent_width = (uv_bytes_per_row / 2).min(cbcr_width.max(1));
+        if uv_bytes_per_row == 0 || uv_extent_width == 0 {
+            tracing::warn!("NV12 CbCr plane: zero size, skipping upload");
+            return GpuFrameTextures::Nv12 {
+                y_texture,
+                cb_cr_texture: cbcr_texture,
+                width,
+                height,
+            };
+        }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &cbcr_texture,
@@ -331,11 +379,11 @@ fn upload_nv12(
             &uv_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(uv_plane.stride as u32),
+                bytes_per_row: Some(uv_bytes_per_row),
                 rows_per_image: Some(cbcr_height),
             },
             wgpu::Extent3d {
-                width: cbcr_width.max(1),
+                width: uv_extent_width,
                 height: cbcr_height.max(1),
                 depth_or_array_layers: 1,
             },
@@ -364,16 +412,47 @@ fn upload_yuv420p_as_nv12(
     let width = frame.width;
     let height = frame.height;
 
+    // CbCr texture: half resolution, Rg8Unorm (create before Y upload for early-return)
+    let cbcr_width = width.div_ceil(2);
+    let cbcr_height = height.div_ceil(2);
+    let cbcr_texture = get_or_create_texture(
+        device,
+        cbcr_cache,
+        cbcr_width.max(1),
+        cbcr_height.max(1),
+        wgpu::TextureFormat::Rg8Unorm,
+        "lumina_video_cbcr",
+    );
+
     // Y texture: full resolution R8Unorm
     let y_texture = get_or_create_texture(
-        device, y_cache,
-        width, height,
+        device,
+        y_cache,
+        width,
+        height,
         wgpu::TextureFormat::R8Unorm,
         "lumina_video_y",
     );
 
-    // Upload Y plane
+    // Upload Y plane (R8Unorm: 1 byte/pixel)
+    // Compute layout from actual data to be robust against stride mismatches
     if let Some(y_plane) = frame.plane(0) {
+        let y_bytes_per_row = if height > 0 {
+            (y_plane.data.len() / height as usize) as u32
+        } else {
+            0
+        };
+        // For R8Unorm, 1 byte = 1 pixel; extent width ≤ bytes_per_row
+        let y_extent_width = y_bytes_per_row.min(width);
+        if y_bytes_per_row == 0 || y_extent_width == 0 {
+            tracing::warn!("YUV420p Y plane: zero size, skipping upload");
+            return GpuFrameTextures::Nv12 {
+                y_texture,
+                cb_cr_texture: cbcr_texture,
+                width,
+                height,
+            };
+        }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &y_texture,
@@ -384,11 +463,11 @@ fn upload_yuv420p_as_nv12(
             &y_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(y_plane.stride as u32),
+                bytes_per_row: Some(y_bytes_per_row),
                 rows_per_image: Some(height),
             },
             wgpu::Extent3d {
-                width,
+                width: y_extent_width,
                 height,
                 depth_or_array_layers: 1,
             },
@@ -396,15 +475,6 @@ fn upload_yuv420p_as_nv12(
     }
 
     // Interleave U and V planes into CbCr (Rg8Unorm)
-    let cbcr_width = width.div_ceil(2);
-    let cbcr_height = height.div_ceil(2);
-    let cbcr_texture = get_or_create_texture(
-        device, cbcr_cache,
-        cbcr_width.max(1), cbcr_height.max(1),
-        wgpu::TextureFormat::Rg8Unorm,
-        "lumina_video_cbcr",
-    );
-
     let u_plane = frame.plane(1);
     let v_plane = frame.plane(2);
 
@@ -476,8 +546,10 @@ fn upload_rgba(
     let height = frame.height;
 
     let texture = get_or_create_texture(
-        device, cache,
-        width, height,
+        device,
+        cache,
+        width,
+        height,
         wgpu::TextureFormat::Rgba8Unorm,
         "lumina_video_rgba",
     );
@@ -508,7 +580,23 @@ fn upload_rgba(
             // Prevent drop reuse warning
             let _ = rgba;
         } else {
-            // RGBA: direct upload
+            // RGBA: direct upload (Rgba8Unorm: 4 bytes/pixel)
+            // Compute layout from actual data to be robust against stride mismatches
+            let rgba_bytes_per_row = if height > 0 {
+                (plane.data.len() / height as usize) as u32
+            } else {
+                0
+            };
+            // For Rgba8Unorm, 4 bytes = 1 pixel; extent width = bytes_per_row / 4
+            let rgba_extent_width = (rgba_bytes_per_row / 4).min(width);
+            if rgba_bytes_per_row == 0 || rgba_extent_width == 0 {
+                tracing::warn!("RGBA upload: zero size, skipping upload");
+                return GpuFrameTextures::Rgba {
+                    texture,
+                    width,
+                    height,
+                };
+            }
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -519,11 +607,11 @@ fn upload_rgba(
                 &plane.data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(plane.stride as u32),
+                    bytes_per_row: Some(rgba_bytes_per_row),
                     rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
-                    width,
+                    width: rgba_extent_width,
                     height,
                     depth_or_array_layers: 1,
                 },
@@ -531,7 +619,11 @@ fn upload_rgba(
         }
     }
 
-    GpuFrameTextures::Rgba { texture, width, height }
+    GpuFrameTextures::Rgba {
+        texture,
+        width,
+        height,
+    }
 }
 
 fn upload_rgb24(
@@ -544,8 +636,10 @@ fn upload_rgb24(
     let height = frame.height;
 
     let texture = get_or_create_texture(
-        device, cache,
-        width, height,
+        device,
+        cache,
+        width,
+        height,
         wgpu::TextureFormat::Rgba8Unorm,
         "lumina_video_rgba",
     );
@@ -572,7 +666,11 @@ fn upload_rgb24(
         },
     );
 
-    GpuFrameTextures::Rgba { texture, width, height }
+    GpuFrameTextures::Rgba {
+        texture,
+        width,
+        height,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -674,10 +772,10 @@ fn rgb24_to_rgba(frame: &CpuFrame) -> Vec<u8> {
         for col in 0..width {
             let idx = row * stride + col * 3;
             if idx + 2 < data.len() {
-                out.push(data[idx]);     // R
+                out.push(data[idx]); // R
                 out.push(data[idx + 1]); // G
                 out.push(data[idx + 2]); // B
-                out.push(255);           // A
+                out.push(255); // A
             } else {
                 out.extend_from_slice(&[0, 0, 0, 255]);
             }
@@ -752,7 +850,10 @@ mod tests {
             format: PixelFormat::Rgb24,
             width: 2,
             height: 1,
-            planes: vec![Plane { data: vec![255, 0, 0, 0, 255, 0], stride: 6 }],
+            planes: vec![Plane {
+                data: vec![255, 0, 0, 0, 255, 0],
+                stride: 6,
+            }],
         };
         let rgba = rgb24_to_rgba(&frame);
         assert_eq!(rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);

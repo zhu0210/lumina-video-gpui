@@ -28,9 +28,9 @@ use gpui_wgpu::wgpu;
 use lumina_video_core::frame_to_texture::{self, GpuFrameTextures};
 use lumina_video_core::player::CorePlayer;
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
-use lumina_video_core::video::{VideoMetadata, VideoState};
 #[cfg(feature = "moq")]
 use lumina_video_core::video::VideoDecoderBackend;
+use lumina_video_core::video::{VideoMetadata, VideoState};
 
 #[cfg(feature = "moq")]
 use super::moq_decoder::MoqDecoder;
@@ -116,7 +116,11 @@ pub struct GpuiVideoPlayer {
     #[cfg(feature = "moq")]
     moq_audio_bound: bool,
     #[cfg(feature = "moq")]
-    moq_init_promise: Option<poll_promise::Promise<Result<Box<dyn VideoDecoderBackend + Send>, lumina_video_core::video::VideoError>>>,
+    moq_init_promise: Option<
+        poll_promise::Promise<
+            Result<Box<dyn VideoDecoderBackend + Send>, lumina_video_core::video::VideoError>,
+        >,
+    >,
     #[cfg(feature = "moq")]
     moq_init_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -387,10 +391,7 @@ impl GpuiVideoPlayer {
         // Poll frames and upload to GPU
         if self.core.is_playback_requested() {
             self.poll_and_upload_frames();
-        } else if matches!(
-            self.state,
-            VideoState::Ready | VideoState::Paused { .. }
-        ) {
+        } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
             // Peek at first frame for preview (don't advance queue)
             if self.frame_textures.is_none() {
                 self.try_preview_frame();
@@ -442,22 +443,16 @@ impl GpuiVideoPlayer {
                     width,
                     height,
                 } => {
-                    let native_size = size(
-                        DevicePixels(*width as i32),
-                        DevicePixels(*height as i32),
-                    );
+                    let native_size =
+                        size(DevicePixels(*width as i32), DevicePixels(*height as i32));
                     div()
                         .size_full()
                         .flex()
                         .items_center()
                         .justify_center()
                         .child(
-                            surface((
-                                y_texture.clone(),
-                                cb_cr_texture.clone(),
-                                native_size,
-                            ))
-                            .object_fit(ObjectFit::Contain),
+                            surface((y_texture.clone(), cb_cr_texture.clone(), native_size))
+                                .object_fit(ObjectFit::Contain),
                         )
                         .into_element()
                 }
@@ -467,10 +462,7 @@ impl GpuiVideoPlayer {
                     height,
                 } => {
                     let desc = GpuTextureDescriptor {
-                        size: size(
-                            DevicePixels(*width as i32),
-                            DevicePixels(*height as i32),
-                        ),
+                        size: size(DevicePixels(*width as i32), DevicePixels(*height as i32)),
                         format: GpuTextureFormat::Rgba8Unorm,
                         color_space: GpuTextureColorSpace::Srgb,
                     };
@@ -479,18 +471,12 @@ impl GpuiVideoPlayer {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(
-                            surface((texture.clone(), desc))
-                                .object_fit(ObjectFit::Contain),
-                        )
+                        .child(surface((texture.clone(), desc)).object_fit(ObjectFit::Contain))
                         .into_element()
                 }
             }
         } else {
-            div()
-                .size_full()
-                .bg(rgb(0x000000))
-                .into_element()
+            div().size_full().bg(rgb(0x000000)).into_element()
         }
     }
 
@@ -511,10 +497,7 @@ impl GpuiVideoPlayer {
             .gap_2()
             .child(
                 // Simple CSS-animated spinner via text
-                div()
-                    .text_xl()
-                    .text_color(rgb(0xcccccc))
-                    .child("⏳"),
+                div().text_xl().text_color(rgb(0xcccccc)).child("⏳"),
             )
             .child(
                 div()
@@ -543,12 +526,7 @@ impl GpuiVideoPlayer {
             .items_center()
             .justify_center()
             .gap_2()
-            .child(
-                div()
-                    .text_2xl()
-                    .text_color(rgb(0xff6464))
-                    .child("✕"),
-            )
+            .child(div().text_2xl().text_color(rgb(0xff6464)).child("✕"))
             .child(
                 div()
                     .text_sm()
@@ -720,9 +698,7 @@ impl GpuiVideoPlayer {
         let complete = self.core.check_init_complete();
         if complete {
             self.initialized = true;
-            if self.config.autoplay
-                && matches!(self.core.state(), VideoState::Ready)
-            {
+            if self.config.autoplay && matches!(self.core.state(), VideoState::Ready) {
                 self.core.play_with_muted(self.config.muted);
             }
         }

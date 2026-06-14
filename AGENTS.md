@@ -16,11 +16,12 @@ grep -rE 'path = "(/|\.\.)' **/Cargo.toml
 For platform-specific changes, also verify relevant features:
 
 ```bash
-cargo check --features macos-native-video
-cargo check --features linux-gstreamer-video
+# Windows: Media Foundation + DXVA2 (opt-in)
 cargo check --features windows-native-video
-cargo check --features ffmpeg
+# MoQ: Media over QUIC live streaming
 cargo check --features moq
+# Vendored GStreamer runtime (Linux only)
+cargo check --features vendored-runtime
 ```
 
 ## NEVER (zero exceptions)
@@ -47,10 +48,12 @@ cargo check --features moq
 
 ## Platform Features
 
+Native hardware decoders are always-on per platform (detected via `cfg(target_os = "...")`).
+No feature flags are needed for macOS (AVFoundation/VideoToolbox), Linux (GStreamer/VA-API),
+or Android (MediaCodec). FFmpeg is included automatically on macOS for MKV/WebM support.
+
 | Feature | Platform | Backend |
 |---|---|---|
-| `macos-native-video` | macOS | AVFoundation + VideoToolbox |
-| `linux-gstreamer-video` | Linux | GStreamer + VA-API |
-| `windows-native-video` | Windows | Media Foundation + DXVA2 |
-| `ffmpeg` | All | FFmpeg fallback |
-| `moq` | All | MoQ live streaming |
+| `windows-native-video` | Windows | Media Foundation + DXVA2/D3D11VA (opt-in) |
+| `moq` | Desktop | MoQ live streaming over QUIC + Nostr discovery |
+| `vendored-runtime` | Linux | Bundle GStreamer libraries with the binary |

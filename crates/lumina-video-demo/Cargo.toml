@@ -10,19 +10,40 @@ name = "lumina-video-demo"
 path = "src/main.rs"
 
 [dependencies]
+gpui = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend",
+  features = ["wgpu"]
+}
+gpui_wgpu = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend"
+}
 lumina-video = { path = "../lumina-video" }
-gpui = { git = "https://github.com/zhu0210/zed.git", branch = "gpui_wgpu_backend", features = ["wgpu"] }
-gpui_wgpu = { git = "https://github.com/zhu0210/zed.git", branch = "gpui_wgpu_backend" }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Platform backends — each OS pulls in its own platform implementation.
 # Linux needs display server features; macOS / Windows use defaults.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-gpui_linux = { git = "https://github.com/zhu0210/zed.git", branch = "gpui_wgpu_backend", features = ["wayland", "x11"] }
+gpui_linux = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend",
+  features = ["wayland", "x11"]
+}
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui_macos = { git = "https://github.com/zhu0210/zed.git", branch = "gpui_wgpu_backend" }
+gpui_macos = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend"
+}
 
 [target.'cfg(target_os = "windows")'.dependencies]
-gpui_windows = { git = "https://github.com/zhu0210/zed.git", branch = "gpui_wgpu_backend" }
+gpui_windows = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend"
+}
+
+[features]
+# Windows still requires explicit feature flag
+windows-native-video = ["lumina-video/windows-native-video"]

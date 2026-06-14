@@ -35,15 +35,17 @@ pub mod media;
 // Re-export core types for convenience
 pub use media::{
     // GPUI video player (replaces the egui VideoPlayer)
-    GpuiVideoPlayer, GpuiVideoPlayerConfig, GpuiVideoPlayerResponse,
+    GpuiVideoPlayer,
+    GpuiVideoPlayerConfig,
+    GpuiVideoPlayerResponse,
 };
 
 // Re-export video core types
 pub use lumina_video_core::{
     audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples, AudioState, AudioSync},
     video::{
-        CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend,
-        VideoError, VideoFrame, VideoMetadata, VideoState,
+        CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
+        VideoFrame, VideoMetadata, VideoState,
     },
 };
 
@@ -60,11 +62,11 @@ pub use lumina_video_core::video_decoder::{FfmpegDecoder, FfmpegDecoderBuilder, 
 
 // Android decoder
 #[cfg(target_os = "android")]
-pub use media::AndroidVideoDecoder;
-#[cfg(target_os = "android")]
 pub use lumina_video_core::android_video::{
     android_zero_copy_snapshot, AndroidZeroCopySnapshot, ZeroCopyStatus,
 };
+#[cfg(target_os = "android")]
+pub use media::AndroidVideoDecoder;
 
 // Web/WASM video player
 #[cfg(target_arch = "wasm32")]

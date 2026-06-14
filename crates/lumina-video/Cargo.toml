@@ -3,20 +3,20 @@ name = "lumina-video"
 version = { workspace = true }
 edition = "2021"
 description = "Cross-platform video playback for GPUI with hardware acceleration"
-license = "MIT OR Apache-2.0"
 repository = "https://github.com/lumina-video/lumina-video"
-keywords = ["gpui", "video", "multimedia", "wgpu", "hardware-acceleration"]
+license = "MIT OR Apache-2.0"
+keywords = ["gpui", "hardware-acceleration", "multimedia", "video", "wgpu"]
 categories = ["gui", "multimedia", "rendering"]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 targets = [
-    "x86_64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-    "aarch64-linux-android",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-linux-android",
 ]
 
 [dependencies]
@@ -25,28 +25,35 @@ lumina-video-core = { path = "../lumina-video-core" }
 
 # GPUI — the UI framework (replaces egui)
 # "wgpu" is opt-in (not in default features) — required for GpuContextHandle, surface(), etc.
-gpui = { git = "https://github.com/zhu0210/zed.git", branch = "gpui_wgpu_backend", features = ["wgpu"] }
+gpui = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend",
+  features = ["wgpu"]
+}
 # gpui_wgpu for wgpu types (single wgpu version shared with core)
-gpui_wgpu = { git = "https://github.com/zhu0210/zed.git", branch = "gpui_wgpu_backend" }
+gpui_wgpu = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend"
+}
 
 # Utilities
 bytemuck = { version = "1.14", features = ["derive"] }
-tracing = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 url = "2.5"
 
 # Native-only dependencies (not available on wasm32)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Threading
-parking_lot = { workspace = true }
 crossbeam-channel = "0.5"
-# Async promises with tokio backend
-poll-promise = { workspace = true }
+http-body-util = { workspace = true }
 # HTTP streaming (browser uses native fetch APIs instead)
 hyper = { workspace = true }
-hyper-util = { workspace = true }
-http-body-util = { workspace = true }
 hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
+# Threading
+parking_lot = { workspace = true }
+# Async promises with tokio backend
+poll-promise = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
 
@@ -85,33 +92,36 @@ optional = true
 
 # Web/WASM video playback using browser APIs
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { version = "0.3" }
 wasm-bindgen = { version = "0.2" }
 wasm-bindgen-futures = { version = "0.4" }
-js-sys = { version = "0.3" }
-web-sys = { version = "0.3", features = [
-    "Window",
+web-sys = {
+  version = "0.3",
+  features = [
+    "CodecState",
+    "CssStyleDeclaration",
     "Document",
     "Element",
-    "HtmlElement",
-    "HtmlVideoElement",
-    "HtmlMediaElement",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
     "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
     "MediaError",
-    "TimeRanges",
-    "CssStyleDeclaration",
     "Node",
-    "console",
+    "TimeRanges",
     # WebCodecs API for MoQ decoder
     "VideoDecoder",
     "VideoDecoderConfig",
     "VideoDecoderInit",
     "VideoDecoderSupport",
     "VideoFrame",
-    "EncodedVideoChunk",
-    "EncodedVideoChunkInit",
-    "EncodedVideoChunkType",
-    "CodecState",
-] }
+    "Window",
+    "console",
+  ]
+}
 # wgpu for WebGPU zero-copy texture operations (must match GPUI's wgpu)
 wgpu = { workspace = true }
 
@@ -119,10 +129,29 @@ wgpu = { workspace = true }
 default = []
 
 # Windows: Native Media Foundation + DXVA2/D3D11VA hardware acceleration
-windows-native-video = []
+windows-native-video = ["lumina-video-core/windows-native-video"]
+
+# Vendored runtime: Bundle GStreamer libraries with the binary (Linux only)
+# This eliminates the need for users to install GStreamer system packages.
+# The vendored libraries are loaded from `vendor/linux-x86_64/lib/` relative to the executable.
+# LGPL compliance: See vendor/README.md for source availability and relinking instructions.
+vendored-runtime = ["lumina-video-core/vendored-runtime"]
 
 # MoQ: Media over QUIC live streaming transport
-moq = ["async-channel", "bytes", "hang", "moq-lite", "moq-native", "nostr-sdk", "quinn"]
+moq = [
+  "async-channel",
+  "bytes",
+  "hang",
+  "moq-lite",
+  "moq-native",
+  "nostr-sdk",
+  "quinn"
+]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"cargo-clippy\", \"windows-native-video\"))"] }
+unexpected_cfgs = {
+  level = "warn",
+  check-cfg = [
+    "cfg(feature, values(\"cargo-clippy\", \"windows-native-video\", \"moq\", \"android-zero-copy\"))"
+  ]
+}

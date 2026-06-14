@@ -46,10 +46,12 @@ use crate::video::{
 };
 use crate::windows_audio::{AudioFormatInfo, AudioFrame};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "zero-copy")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // Media Foundation Lifecycle Guard
@@ -148,9 +150,11 @@ impl ComGuard {
     /// Creates a new COM guard, calling CoInitializeEx.
     fn new(debug: bool) -> Result<Self, VideoError> {
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED).map_err(|e| {
-                VideoError::DecoderInit(format!("COM initialization failed: {}", e))
-            })?;
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(|e| {
+                    VideoError::DecoderInit(format!("COM initialization failed: {}", e))
+                })?;
         }
         if debug {
             debug!("COM initialized for this thread");
@@ -228,7 +232,6 @@ use windows::{
             MF_SOURCE_READER_MEDIASOURCE,
         },
         Security::SECURITY_ATTRIBUTES,
-        System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT},
         System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
     },
 };
@@ -324,6 +327,11 @@ pub struct WindowsVideoDecoder {
     /// remains initialized while other COM objects are being dropped.
     _com_guard: ComGuard,
 }
+
+// SAFETY: COM objects are initialized with COINIT_MULTITHREADED (MTA),
+// which means all COM interfaces in this struct are free-threaded and
+// can be used from any thread.
+unsafe impl Send for WindowsVideoDecoder {}
 
 impl WindowsVideoDecoder {
     /// Creates a new Windows video decoder with debug logging control.
@@ -474,11 +482,15 @@ impl WindowsVideoDecoder {
         }
 
         let mut reset_token: u32 = 0;
-        let manager: IMFDXGIDeviceManager = unsafe {
-            MFCreateDXGIDeviceManager(&mut reset_token).map_err(|e| {
+        let mut manager: Option<IMFDXGIDeviceManager> = None;
+        unsafe {
+            MFCreateDXGIDeviceManager(&mut reset_token, &mut manager).map_err(|e| {
                 VideoError::DecoderInit(format!("MFCreateDXGIDeviceManager failed: {}", e))
-            })?
-        };
+            })?;
+        }
+        let manager = manager.ok_or_else(|| {
+            VideoError::DecoderInit("MFCreateDXGIDeviceManager returned null".to_string())
+        })?;
 
         unsafe {
             manager
@@ -506,10 +518,15 @@ impl WindowsVideoDecoder {
         }
 
         // Create attributes for source reader
-        let attributes: IMFAttributes = unsafe {
-            MFCreateAttributes(4)
-                .map_err(|e| VideoError::DecoderInit(format!("MFCreateAttributes failed: {}", e)))?
-        };
+        let mut attributes: Option<IMFAttributes> = None;
+        unsafe {
+            MFCreateAttributes(&mut attributes, 4).map_err(|e| {
+                VideoError::DecoderInit(format!("MFCreateAttributes failed: {}", e))
+            })?;
+        }
+        let attributes = attributes.ok_or_else(|| {
+            VideoError::DecoderInit("MFCreateAttributes returned null".to_string())
+        })?;
 
         // Enable hardware transforms
         unsafe {
@@ -576,12 +593,7 @@ impl WindowsVideoDecoder {
                 .map_err(|e| VideoError::DecoderInit(format!("GetNativeMediaType failed: {}", e)))?
         };
 
-        let mut frame_size: u64 = 0;
-        unsafe {
-            native_type
-                .GetUINT64(&MF_MT_FRAME_SIZE, &mut frame_size)
-                .ok();
-        }
+        let frame_size: u64 = unsafe { native_type.GetUINT64(&MF_MT_FRAME_SIZE).ok().unwrap_or(0) };
 
         // Try NV12 first (native HW decoder format)
         if Self::try_set_output_format(reader, &MFVideoFormat_NV12, frame_size, debug_logging) {
@@ -681,22 +693,12 @@ impl WindowsVideoDecoder {
         };
 
         // Extract frame size
-        let mut frame_size: u64 = 0;
-        unsafe {
-            media_type
-                .GetUINT64(&MF_MT_FRAME_SIZE, &mut frame_size)
-                .ok();
-        }
+        let frame_size: u64 = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE).ok().unwrap_or(0) };
         let width = (frame_size >> 32) as u32;
         let height = (frame_size & 0xFFFFFFFF) as u32;
 
         // Extract frame rate
-        let mut frame_rate: u64 = 0;
-        unsafe {
-            media_type
-                .GetUINT64(&MF_MT_FRAME_RATE, &mut frame_rate)
-                .ok();
-        }
+        let frame_rate: u64 = unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE).ok().unwrap_or(0) };
         let fps_num = (frame_rate >> 32) as f32;
         let fps_den = (frame_rate & 0xFFFFFFFF) as f32;
         let frame_rate = if fps_den > 0.0 {
@@ -706,12 +708,12 @@ impl WindowsVideoDecoder {
         };
 
         // Extract pixel aspect ratio
-        let mut par: u64 = 0;
-        unsafe {
+        let par: u64 = unsafe {
             media_type
-                .GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, &mut par)
-                .ok();
-        }
+                .GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO)
+                .ok()
+                .unwrap_or(0)
+        };
         let par_num = (par >> 32) as f32;
         let par_den = (par & 0xFFFFFFFF) as f32;
         let pixel_aspect_ratio = if par_den > 0.0 {
@@ -730,6 +732,7 @@ impl WindowsVideoDecoder {
             frame_rate,
             codec: "h264".to_string(), // TODO: Extract actual codec
             pixel_aspect_ratio,
+            start_time: None,
         };
 
         if debug_logging {
@@ -747,20 +750,14 @@ impl WindowsVideoDecoder {
         // MF_PD_DURATION GUID: {6C990D33-BB8E-477A-8598-0D5D96FCD88A}
         let mf_pd_duration = windows::core::GUID::from_u128(0x6c990d33_bb8e_477a_8598_0d5d96fcd88a);
 
-        let mut var = PROPVARIANT::default();
         unsafe {
-            // Use GetPresentationAttribute with MF_SOURCE_READER_MEDIASOURCE to get duration
-            if reader
-                .GetPresentationAttribute(
-                    MF_SOURCE_READER_MEDIASOURCE.0 as u32,
-                    &mf_pd_duration,
-                    &mut var,
-                )
-                .is_ok()
-            {
+            let result = reader
+                .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &mf_pd_duration);
+            if let Ok(prop) = result {
                 // Duration is stored as a 64-bit value in 100-nanosecond units
-                let duration_100ns = var.Anonymous.Anonymous.Anonymous.hVal.max(0) as u64;
-                let _ = PropVariantClear(&mut var);
+                // PROPVARIANT wraps imp::PROPVARIANT via #[repr(transparent)]
+                let raw = prop.as_raw();
+                let duration_100ns = raw.Anonymous.Anonymous.Anonymous.hVal.max(0) as u64;
                 return Some(Duration::from_nanos(duration_100ns * 100));
             }
         }
@@ -788,7 +785,7 @@ impl WindowsVideoDecoder {
         }
 
         // Check for end of stream (use imported constant)
-        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 != 0 {
+        if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             self.eof.store(true, Ordering::SeqCst);
             if self.debug_logging {
                 debug!("End of stream reached");
@@ -797,7 +794,7 @@ impl WindowsVideoDecoder {
         }
 
         // Check for stream tick (no data yet) (use imported constant)
-        if flags & MF_SOURCE_READERF_STREAMTICK.0 != 0 {
+        if flags & (MF_SOURCE_READERF_STREAMTICK.0 as u32) != 0 {
             if self.debug_logging {
                 debug!("Stream tick, no frame yet");
             }
@@ -805,7 +802,7 @@ impl WindowsVideoDecoder {
         }
 
         // Check for media type change (HLS/adaptive streams may change resolution)
-        if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 != 0 {
+        if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
             if self.debug_logging {
                 info!("Media type changed, reconfiguring decoder");
             }
@@ -907,16 +904,14 @@ impl WindowsVideoDecoder {
 
         // Get the D3D11 texture and subresource index from DXGI buffer
         let (texture, subresource_index): (ID3D11Texture2D, u32) = unsafe {
+            let subresource = dxgi_buffer.GetSubresourceIndex().map_err(|e| {
+                VideoError::DecodeFailed(format!("GetSubresourceIndex failed: {}", e))
+            })?;
+
             let mut resource: Option<ID3D11Texture2D> = None;
-            let mut subresource: u32 = 0;
             dxgi_buffer
                 .GetResource(&ID3D11Texture2D::IID, &mut resource as *mut _ as *mut _)
                 .map_err(|e| VideoError::DecodeFailed(format!("GetResource failed: {}", e)))?;
-            dxgi_buffer
-                .GetSubresourceIndex(&mut subresource)
-                .map_err(|e| {
-                    VideoError::DecodeFailed(format!("GetSubresourceIndex failed: {}", e))
-                })?;
 
             let tex = resource.ok_or_else(|| {
                 VideoError::DecodeFailed("DXGI buffer resource is null".to_string())
@@ -1274,9 +1269,9 @@ impl WindowsVideoDecoder {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_STAGING,
-            BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(0),
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ,
-            MiscFlags: windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(0),
+            BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(0).0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(0).0 as u32,
         };
 
         let staging: ID3D11Texture2D = unsafe {
@@ -1598,60 +1593,47 @@ impl WindowsVideoDecoder {
 
         // Read all required audio attributes
         let sample_rate = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, &mut val)
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to get sample rate: {}", e))
-                })?;
-            val
+                .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
+                .map_err(|e| VideoError::DecoderInit(format!("Failed to get sample rate: {}", e)))?
         };
 
         let channels = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get channel count: {}", e))
-                })?;
-            val as u16
+                })? as u16
         };
 
         let bits_per_sample = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get bits per sample: {}", e))
-                })?;
-            val as u16
+                })? as u16
         };
 
         let block_align = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get block alignment: {}", e))
-                })?;
-            val as u16
+                })? as u16
         };
 
         let avg_bytes_per_sec = unsafe {
-            let mut val: u32 = 0;
             resolved_type
-                .GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &mut val)
+                .GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get avg bytes per sec: {}", e))
-                })?;
-            val
+                })?
         };
 
         // Check if the resolved format is float (MFAudioFormat_Float) vs integer PCM.
         // We request PCM, but check the resolved type to be defensive.
         let is_float = unsafe {
-            let mut subtype = windows::core::GUID::default();
-            if resolved_type.GetGUID(&MF_MT_SUBTYPE, &mut subtype).is_ok() {
+            if let Ok(subtype) = resolved_type.GetGUID(&MF_MT_SUBTYPE) {
                 subtype == MFAudioFormat_Float
             } else {
                 false
@@ -1720,7 +1702,7 @@ impl WindowsVideoDecoder {
         }
 
         // Handle MF reader flags
-        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 != 0 {
+        if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             self.audio_eof.store(true, Ordering::SeqCst);
             if self.debug_logging {
                 debug!("Audio end of stream reached");
@@ -1728,19 +1710,19 @@ impl WindowsVideoDecoder {
             return Ok(None);
         }
 
-        if flags & MF_SOURCE_READERF_STREAMTICK.0 != 0 {
+        if flags & (MF_SOURCE_READERF_STREAMTICK.0 as u32) != 0 {
             if self.debug_logging {
                 debug!("Audio stream tick (gap in stream)");
             }
             return Ok(None);
         }
 
-        if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 != 0 {
+        if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
             warn!("Audio media type changed mid-stream");
             // Could re-read format here, but for now just log
         }
 
-        if flags & MF_SOURCE_READERF_NEWSTREAM.0 != 0 {
+        if flags & (MF_SOURCE_READERF_NEWSTREAM.0 as u32) != 0 {
             if self.debug_logging {
                 info!("New audio stream detected");
             }
@@ -2008,24 +1990,13 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
         // Convert Duration to 100ns units for Media Foundation
         let position_100ns = position.as_nanos() as i64 / 100;
 
-        // Create PROPVARIANT for seek position.
-        // Media Foundation expects VT_I8 (64-bit signed integer) in 100ns units.
-        // The PROPVARIANT union layout is:
-        //   - Anonymous.Anonymous.vt: variant type tag (VT_I8 = 20)
-        //   - Anonymous.Anonymous.Anonymous.hVal: i64 value for VT_I8
-        //
-        // We use default() for safe initialization, then set fields explicitly
-        // to avoid UB from uninitialized union fields.
-        let mut prop_variant =
-            windows::Win32::System::Com::StructuredStorage::PROPVARIANT::default();
-
+        // Construct PROPVARIANT with VT_I8 and the position value.
+        // SAFETY: zeroed PROPVARIANT union is valid; we set vt and hVal before use.
+        let prop_variant: windows::core::PROPVARIANT = unsafe { std::mem::zeroed() };
         unsafe {
-            // Access the inner union fields through the Anonymous chain.
-            // This is the documented structure of PROPVARIANT:
-            // PROPVARIANT { Anonymous: PROPVARIANT_0 { Anonymous: PROPVARIANT_0_0 { vt, ..., Anonymous: PROPVARIANT_0_0_0 { hVal, ... } } } }
-            prop_variant.Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_I8;
-            // hVal is the LARGE_INTEGER field for VT_I8, which is equivalent to i64
-            prop_variant.Anonymous.Anonymous.Anonymous.hVal = position_100ns;
+            let raw = prop_variant.as_raw() as *const _ as *mut windows::core::imp::PROPVARIANT;
+            (*raw).Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_I8.0;
+            (*raw).Anonymous.Anonymous.Anonymous.hVal = position_100ns;
         }
 
         unsafe {
@@ -2054,18 +2025,13 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
         self.eof.load(Ordering::SeqCst)
     }
 
-    /// Windows Media Foundation handles audio internally - no separate FFmpeg audio thread needed.
+    /// Windows Media Foundation handles audio internally - no separate audio thread needed.
     fn handles_audio_internally(&self) -> bool {
         true
     }
 
     fn hw_accel_type(&self) -> HwAccelType {
         self.hw_accel
-    }
-
-    /// Windows Media Foundation handles audio internally with its own A/V sync.
-    fn handles_audio_internally(&self) -> bool {
-        true
     }
 }
 
