@@ -5,7 +5,7 @@
 //!
 //! - Core types: [`video`], [`audio`], [`subtitles`]
 //! - Platform decoders: macOS (AVFoundation), Linux (GStreamer), Android (ExoPlayer), Windows (Media Foundation)
-//! - Zero-copy GPU import: `zero_copy`
+//! - Zero-copy GPU import: [`zero_copy`], [`frame_to_texture`]
 //! - Threading primitives: [`frame_queue`], [`triple_buffer`], [`sync_metrics`]
 //! - Network utilities: [`network`]
 //!
@@ -66,15 +66,26 @@ pub mod windows_audio;
 pub mod windows_video;
 
 // === Zero-copy GPU import ===
+//
+// FIXME: zero_copy.rs needs updating for GPUI's wgpu fork (zed-industries/wgpu).
+// The HAL APIs changed significantly: as_hal() takes fewer generic args,
+// create_texture_from_hal() returns Option instead of Result, etc.
+// For now, all platforms use CPU fallback via frame_to_texture.rs.
+// Re-enable once zero_copy.rs is ported to the new HAL API.
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "android",
-    all(target_os = "windows", feature = "windows-native-video")
-))]
-pub mod zero_copy;
+// #[cfg(any(
+//     target_os = "macos",
+//     target_os = "ios",
+//     target_os = "linux",
+//     target_os = "android",
+//     all(target_os = "windows", feature = "windows-native-video")
+// ))]
+// pub mod zero_copy;
+
+// === Frame-to-texture conversion (CPU + zero-copy dispatch) ===
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod frame_to_texture;
 
 // === Vendored runtime (Linux only) ===
 

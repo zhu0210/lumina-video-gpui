@@ -1,0 +1,772 @@
+//! Convert decoded video frames to wgpu textures suitable for GPUI's `surface()`.
+//!
+//! Two rendering paths are supported:
+//!
+//! | Path | Format | Textures | GPUI `surface()` call |
+//! |------|--------|----------|-----------------------|
+//! | **NV12 native** | NV12, YUV420p | Y (R8Unorm) + CbCr (Rg8Unorm) | `surface((y_tex, cbcr_tex, size))` — GPU-side YUV→RGB |
+//! | **RGBA passthrough** | RGBA, BGRA, RGB24 | Single RGBA8Unorm | `surface((tex, desc))` |
+//!
+//! YUV420p frames are cheaply interleaved (U+V → CbCr) to use the NV12 path,
+//! avoiding the expensive CPU YUV→RGB conversion. Only NV12 and YUV420p use
+//! the NV12 path; RGB formats use RGBA passthrough.
+//!
+//! Platform GPU surfaces (IOSurface, DMABuf, etc.) are imported zero-copy
+//! when possible, falling back to the CPU path via `cpu_fallback`.
+
+use std::sync::Arc;
+use wgpu;
+
+use crate::video::{CpuFrame, DecodedFrame, PixelFormat};
+#[cfg(test)]
+use crate::video::Plane;
+
+// ---------------------------------------------------------------------------
+// GPU frame textures — the output of frame upload (fed to GPUI surface())
+// ---------------------------------------------------------------------------
+
+/// GPU representation of a decoded video frame.
+///
+/// Variants map directly to [`gpui::SurfaceSource`] conversions:
+/// - `Nv12` → `surface((y_tex, cbcr_tex, native_size))`
+/// - `Rgba` → `surface((tex, descriptor))`
+#[derive(Clone)]
+pub enum GpuFrameTextures {
+    /// Two-plane NV12: Y (R8Unorm) + interleaved CbCr (Rg8Unorm).
+    /// Use with `surface((y_texture, cb_cr_texture, native_size))`.
+    Nv12 {
+        y_texture: Arc<wgpu::Texture>,
+        cb_cr_texture: Arc<wgpu::Texture>,
+        width: u32,
+        height: u32,
+    },
+    /// Single RGBA8Unorm texture.
+    /// Use with `surface((texture, descriptor))`.
+    Rgba {
+        texture: Arc<wgpu::Texture>,
+        width: u32,
+        height: u32,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Convert any `DecodedFrame` to `GpuFrameTextures` for GPUI's `surface()`.
+///
+/// - NV12/YUV420p CPU frames → NV12 dual-texture (GPU-side YUV→RGB conversion)
+/// - RGBA/BGRA/RGB24 CPU frames → single RGBA8Unorm texture
+/// - Platform GPU surfaces → CPU fallback path (zero-copy import is TODO)
+///
+/// If the decode pipeline produces a GPU surface without a CPU fallback and
+/// zero-copy import hasn't been implemented for this integration, returns `None`.
+pub fn decoded_frame_to_textures(
+    frame: &DecodedFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_cache: &mut Option<Arc<wgpu::Texture>>,
+    cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+    rgba_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> Option<GpuFrameTextures> {
+    match frame {
+        DecodedFrame::Cpu(cpu) => {
+            Some(upload_cpu_frame_as_textures(cpu, device, queue, y_cache, cbcr_cache, rgba_cache))
+        }
+
+        // Platform GPU surfaces: use CPU fallback for now.
+        // Zero-copy import (IOSurface, DMABuf, etc.) can be added here
+        // by importing directly into wgpu textures and wrapping as
+        // GpuFrameTextures::Nv12 or ::Rgba.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        DecodedFrame::MacOS(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                Some(upload_cpu_frame_as_textures(
+                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
+                ))
+            } else {
+                tracing::warn!("MacOS GPU surface without CPU fallback — frame dropped");
+                None
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        DecodedFrame::Linux(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                Some(upload_cpu_frame_as_textures(
+                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
+                ))
+            } else {
+                tracing::warn!("Linux GPU surface without CPU fallback — frame dropped");
+                None
+            }
+        }
+
+        #[cfg(target_os = "android")]
+        DecodedFrame::Android(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                Some(upload_cpu_frame_as_textures(
+                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
+                ))
+            } else {
+                tracing::warn!("Android GPU surface without CPU fallback — frame dropped");
+                None
+            }
+        }
+
+        #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+        DecodedFrame::Windows(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                Some(upload_cpu_frame_as_textures(
+                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
+                ))
+            } else {
+                tracing::warn!("Windows GPU surface without CPU fallback — frame dropped");
+                None
+            }
+        }
+    }
+}
+
+/// Upload a CPU frame to GPU textures, choosing the best path:
+///
+/// - NV12 → NV12 dual-texture (no CPU YUV→RGB conversion)
+/// - YUV420p → interleaved to NV12 dual-texture
+/// - RGBA/BGRA → single RGBA8Unorm texture
+/// - RGB24 → converted to RGBA8Unorm
+pub fn upload_cpu_frame_as_textures(
+    frame: &CpuFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_cache: &mut Option<Arc<wgpu::Texture>>,
+    cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+    rgba_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> GpuFrameTextures {
+    match frame.format {
+        PixelFormat::Nv12 => upload_nv12(frame, device, queue, y_cache, cbcr_cache),
+        PixelFormat::Yuv420p => upload_yuv420p_as_nv12(frame, device, queue, y_cache, cbcr_cache),
+        PixelFormat::Rgba | PixelFormat::Bgra => {
+            upload_rgba(frame, device, queue, rgba_cache)
+        }
+        PixelFormat::Rgb24 => upload_rgb24(frame, device, queue, rgba_cache),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy single-texture path (for backwards compatibility)
+// ---------------------------------------------------------------------------
+
+/// Upload a CPU frame as a single RGBA8Unorm texture (CPU YUV→RGB conversion).
+///
+/// Prefer [`upload_cpu_frame_as_textures`] for the NV12 native path, which
+/// avoids the CPU conversion.
+pub fn upload_cpu_frame(
+    frame: &CpuFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> Arc<wgpu::Texture> {
+    let rgba = cpu_frame_to_rgba(frame);
+    let width = frame.width;
+    let height = frame.height;
+
+    let needs_create = match texture_cache {
+        Some(ref tex) => tex.width() != width || tex.height() != height,
+        None => true,
+    };
+
+    if needs_create {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lumina_video_frame"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        *texture_cache = Some(Arc::new(texture));
+    }
+
+    let texture = texture_cache.as_ref().unwrap();
+    let bytes_per_row = width * 4;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    texture.clone()
+}
+
+/// Convert any DecodedFrame to an Arc<wgpu::Texture> (CPU YUV→RGB conversion).
+///
+/// Prefer [`decoded_frame_to_textures`] for the NV12 native path.
+pub fn decoded_frame_to_texture(
+    frame: &DecodedFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> Option<Arc<wgpu::Texture>> {
+    match frame {
+        DecodedFrame::Cpu(cpu) => Some(upload_cpu_frame(cpu, device, queue, texture_cache)),
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        DecodedFrame::MacOS(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
+            }
+            None
+        }
+
+        #[cfg(target_os = "linux")]
+        DecodedFrame::Linux(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
+            }
+            None
+        }
+
+        #[cfg(target_os = "android")]
+        DecodedFrame::Android(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
+            }
+            None
+        }
+
+        #[cfg(target_os = "windows")]
+        DecodedFrame::Windows(surface) => {
+            if let Some(ref cpu) = surface.cpu_fallback {
+                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
+            }
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NV12 path — upload Y + CbCr as separate textures for GPU-side YUV→RGB
+// ---------------------------------------------------------------------------
+
+fn upload_nv12(
+    frame: &CpuFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_cache: &mut Option<Arc<wgpu::Texture>>,
+    cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> GpuFrameTextures {
+    let width = frame.width;
+    let height = frame.height;
+
+    // Y plane: full resolution, R8Unorm
+    let y_texture = get_or_create_texture(
+        device, y_cache,
+        width, height,
+        wgpu::TextureFormat::R8Unorm,
+        "lumina_video_y",
+    );
+
+    // CbCr plane: half resolution (NV12 chroma subsampling), Rg8Unorm
+    let cbcr_width = width.div_ceil(2);
+    let cbcr_height = height.div_ceil(2);
+    let cbcr_texture = get_or_create_texture(
+        device, cbcr_cache,
+        cbcr_width.max(1), cbcr_height.max(1),
+        wgpu::TextureFormat::Rg8Unorm,
+        "lumina_video_cbcr",
+    );
+
+    // Upload Y plane
+    if let Some(y_plane) = frame.plane(0) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &y_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &y_plane.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(y_plane.stride as u32),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    // Upload interleaved CbCr plane
+    if let Some(uv_plane) = frame.plane(1) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &cbcr_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &uv_plane.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(uv_plane.stride as u32),
+                rows_per_image: Some(cbcr_height),
+            },
+            wgpu::Extent3d {
+                width: cbcr_width.max(1),
+                height: cbcr_height.max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    GpuFrameTextures::Nv12 {
+        y_texture,
+        cb_cr_texture: cbcr_texture,
+        width,
+        height,
+    }
+}
+
+/// Interleave YUV420p's separate U and V planes into a single CbCr plane
+/// (Rg8Unorm) and upload as NV12 dual-texture.
+///
+/// This avoids the expensive CPU YUV→RGB conversion — we just interleave bytes.
+fn upload_yuv420p_as_nv12(
+    frame: &CpuFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_cache: &mut Option<Arc<wgpu::Texture>>,
+    cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> GpuFrameTextures {
+    let width = frame.width;
+    let height = frame.height;
+
+    // Y texture: full resolution R8Unorm
+    let y_texture = get_or_create_texture(
+        device, y_cache,
+        width, height,
+        wgpu::TextureFormat::R8Unorm,
+        "lumina_video_y",
+    );
+
+    // Upload Y plane
+    if let Some(y_plane) = frame.plane(0) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &y_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &y_plane.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(y_plane.stride as u32),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    // Interleave U and V planes into CbCr (Rg8Unorm)
+    let cbcr_width = width.div_ceil(2);
+    let cbcr_height = height.div_ceil(2);
+    let cbcr_texture = get_or_create_texture(
+        device, cbcr_cache,
+        cbcr_width.max(1), cbcr_height.max(1),
+        wgpu::TextureFormat::Rg8Unorm,
+        "lumina_video_cbcr",
+    );
+
+    let u_plane = frame.plane(1);
+    let v_plane = frame.plane(2);
+
+    match (u_plane, v_plane) {
+        (Some(u), Some(v)) => {
+            // Build interleaved CbCr buffer: [Cb, Cr, Cb, Cr, ...] per row
+            let cbcr_stride = (cbcr_width as usize) * 2;
+            let mut cbcr_data = vec![0u8; cbcr_stride * cbcr_height as usize];
+
+            for row in 0..cbcr_height as usize {
+                for col in 0..cbcr_width as usize {
+                    let u_idx = row * u.stride + col;
+                    let v_idx = row * v.stride + col;
+                    let out_idx = row * cbcr_stride + col * 2;
+                    if u_idx < u.data.len() {
+                        cbcr_data[out_idx] = u.data[u_idx]; // Cb (maps to R in RG8)
+                    }
+                    if v_idx < v.data.len() {
+                        cbcr_data[out_idx + 1] = v.data[v_idx]; // Cr (maps to G in RG8)
+                    }
+                }
+            }
+
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cbcr_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &cbcr_data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(cbcr_stride as u32),
+                    rows_per_image: Some(cbcr_height),
+                },
+                wgpu::Extent3d {
+                    width: cbcr_width.max(1),
+                    height: cbcr_height.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        _ => {
+            // Missing U or V plane — this shouldn't happen but don't crash
+            tracing::warn!("YUV420p frame missing U or V plane");
+        }
+    }
+
+    GpuFrameTextures::Nv12 {
+        y_texture,
+        cb_cr_texture: cbcr_texture,
+        width,
+        height,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RGBA passthrough path
+// ---------------------------------------------------------------------------
+
+fn upload_rgba(
+    frame: &CpuFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &mut Option<Arc<wgpu::Texture>>,
+) -> GpuFrameTextures {
+    let width = frame.width;
+    let height = frame.height;
+
+    let texture = get_or_create_texture(
+        device, cache,
+        width, height,
+        wgpu::TextureFormat::Rgba8Unorm,
+        "lumina_video_rgba",
+    );
+
+    if let Some(plane) = frame.plane(0) {
+        if frame.format == PixelFormat::Bgra {
+            // BGRA → RGBA: swizzle in-place
+            let rgba = bgra_to_rgba(&plane.data);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            // Prevent drop reuse warning
+            let _ = rgba;
+        } else {
+            // RGBA: direct upload
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &plane.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(plane.stride as u32),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    GpuFrameTextures::Rgba { texture, width, height }
+}
+
+fn upload_rgb24(
+    frame: &CpuFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cache: &mut Option<Arc<wgpu::Texture>>,
+) -> GpuFrameTextures {
+    let width = frame.width;
+    let height = frame.height;
+
+    let texture = get_or_create_texture(
+        device, cache,
+        width, height,
+        wgpu::TextureFormat::Rgba8Unorm,
+        "lumina_video_rgba",
+    );
+
+    // Convert RGB24 → RGBA (add alpha=255)
+    let rgba = rgb24_to_rgba(frame);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    GpuFrameTextures::Rgba { texture, width, height }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Get an existing texture with matching size, or create a new one.
+fn get_or_create_texture(
+    device: &wgpu::Device,
+    cache: &mut Option<Arc<wgpu::Texture>>,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> Arc<wgpu::Texture> {
+    let needs_create = match cache {
+        Some(ref tex) => tex.width() != width || tex.height() != height || tex.format() != format,
+        None => true,
+    };
+
+    if needs_create {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        *cache = Some(Arc::new(texture));
+    }
+
+    cache.as_ref().unwrap().clone()
+}
+
+// ---------------------------------------------------------------------------
+// CPU YUV→RGB conversion (kept for the legacy single-texture path)
+// ---------------------------------------------------------------------------
+
+/// Convert a CpuFrame to RGBA pixel data (CPU conversion).
+///
+/// Handles YUV420p, NV12, RGB24, BGRA, and RGBA formats.
+/// YUV→RGB uses BT.601 limited-range conversion.
+pub fn cpu_frame_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+    match frame.format {
+        PixelFormat::Rgba => frame.planes[0].data.clone(),
+        PixelFormat::Bgra => bgra_to_rgba(&frame.planes[0].data),
+        PixelFormat::Rgb24 => rgb24_to_rgba(frame),
+        PixelFormat::Yuv420p => yuv420p_to_rgba(frame),
+        PixelFormat::Nv12 => nv12_to_rgba(frame),
+    }
+}
+
+/// BT.601 limited-range YUV→RGB conversion with range expansion.
+///
+/// Y ∈ [16, 235], U/V ∈ [16, 240] → expanded to full range → R,G,B ∈ [0, 255].
+fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
+    // Range expansion: limited → full
+    let y = ((y as f32 - 16.0) * 255.0 / 219.0).max(0.0);
+    let u = (u as f32 - 128.0) * 255.0 / 224.0;
+    let v = (v as f32 - 128.0) * 255.0 / 224.0;
+
+    // BT.601 coefficients (applied to full-range Y'CbCr)
+    let r = y + 1.402 * v;
+    let g = y - 0.344136 * u - 0.714136 * v;
+    let b = y + 1.772 * u;
+
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn bgra_to_rgba(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks_exact(4) {
+        out.push(chunk[2]);
+        out.push(chunk[1]);
+        out.push(chunk[0]);
+        out.push(chunk[3]);
+    }
+    out
+}
+
+fn rgb24_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let data = &frame.planes[0].data;
+    let stride = frame.planes[0].stride;
+    let mut out = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        for col in 0..width {
+            let idx = row * stride + col * 3;
+            if idx + 2 < data.len() {
+                out.push(data[idx]);     // R
+                out.push(data[idx + 1]); // G
+                out.push(data[idx + 2]); // B
+                out.push(255);           // A
+            } else {
+                out.extend_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+    }
+    out
+}
+
+fn yuv420p_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let y_plane = &frame.planes[0].data;
+    let u_plane = &frame.planes[1].data;
+    let v_plane = &frame.planes[2].data;
+
+    let mut rgba = vec![0u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let uv_idx = (y / 2) * (width / 2) + (x / 2);
+            let (r, g, b) = yuv_to_rgb(y_plane[idx], u_plane[uv_idx], v_plane[uv_idx]);
+            let out_idx = idx * 4;
+            rgba[out_idx] = r;
+            rgba[out_idx + 1] = g;
+            rgba[out_idx + 2] = b;
+            rgba[out_idx + 3] = 255;
+        }
+    }
+    rgba
+}
+
+fn nv12_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let y_plane = &frame.planes[0].data;
+    let uv_plane = &frame.planes[1].data;
+
+    let mut rgba = vec![0u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let uv_idx = (y / 2) * (width / 2) * 2 + (x / 2) * 2;
+            let (r, g, b) = yuv_to_rgb(y_plane[idx], uv_plane[uv_idx], uv_plane[uv_idx + 1]);
+            let out_idx = idx * 4;
+            rgba[out_idx] = r;
+            rgba[out_idx + 1] = g;
+            rgba[out_idx + 2] = b;
+            rgba[out_idx + 3] = 255;
+        }
+    }
+    rgba
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bgra_to_rgba() {
+        let bgra = vec![0u8, 128, 255, 255];
+        let rgba = bgra_to_rgba(&bgra);
+        assert_eq!(rgba, vec![255, 128, 0, 255]);
+    }
+
+    #[test]
+    fn test_rgb24_to_rgba() {
+        let frame = CpuFrame {
+            format: PixelFormat::Rgb24,
+            width: 2,
+            height: 1,
+            planes: vec![Plane { data: vec![255, 0, 0, 0, 255, 0], stride: 6 }],
+        };
+        let rgba = rgb24_to_rgba(&frame);
+        assert_eq!(rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn test_yuv_to_rgb_black() {
+        let (r, g, b) = yuv_to_rgb(16, 128, 128);
+        assert_eq!((r, g, b), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_yuv_to_rgb_white() {
+        let (r, g, b) = yuv_to_rgb(235, 128, 128);
+        assert_eq!((r, g, b), (255, 255, 255));
+    }
+}
