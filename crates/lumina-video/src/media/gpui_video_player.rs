@@ -722,7 +722,10 @@ impl GpuiVideoPlayer {
             None => return,
         };
 
-        while let Some(video_frame) = self.core.poll_frame() {
+        // Only poll ONE frame per update cycle. The while-loop approach drained
+        // the entire queue but only kept the last frame's textures, wasting work
+        // and causing constant buffer underruns when decode rate < render rate.
+        if let Some(video_frame) = self.core.poll_frame() {
             self.loop_seek_pending = false;
 
             let textures = frame_to_texture::decoded_frame_to_textures(
@@ -734,7 +737,10 @@ impl GpuiVideoPlayer {
                 &mut self.rgba_cache,
             );
 
-            self.frame_textures = textures;
+            // Only replace textures if we got a valid upload (don't clear on None)
+            if let Some(tex) = textures {
+                self.frame_textures = Some(tex);
+            }
         }
     }
 

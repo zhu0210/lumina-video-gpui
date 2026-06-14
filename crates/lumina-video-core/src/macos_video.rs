@@ -77,7 +77,7 @@ use objc2_core_video::{
     CVPixelBufferUnlockBaseAddress,
 };
 use objc2_foundation::{
-    NSCopying, NSMutableDictionary, NSNumber, NSObjectProtocol, NSString, NSURL,
+    NSCopying, NSDate, NSMutableDictionary, NSNumber, NSObjectProtocol, NSRunLoop, NSString, NSURL,
 };
 
 use crate::video::{
@@ -578,6 +578,36 @@ impl MacOSVideoDecoder {
         tracing::info!(
             "MacOSVideoDecoder: Created player with IOSurface/Metal compatibility (paused, waiting for play)"
         );
+
+        // Pump the run loop until AVPlayer reaches ReadyToPlay or timeout.
+        // GPUI's event loop doesn't pump NSRunLoop frequently enough during
+        // app startup, so AVPlayer may stay in Unknown status indefinitely.
+        // We pump here to give AVFoundation time to load the media.
+        {
+            let run_loop = unsafe { NSRunLoop::currentRunLoop() };
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut interval = NSDate::dateWithTimeIntervalSinceNow(0.01);
+            loop {
+                let status = unsafe { player_item.status() };
+                if status == AVPlayerItemStatus::ReadyToPlay
+                    || status == AVPlayerItemStatus::Failed
+                    || std::time::Instant::now() > deadline
+                {
+                    tracing::debug!(
+                        "MacOSVideoDecoder: player status={:?} after {:?}",
+                        status,
+                        std::time::Instant::now()
+                            .duration_since(deadline - Duration::from_secs(10)),
+                    );
+                    break;
+                }
+                unsafe {
+                    run_loop.runUntilDate(&interval);
+                }
+                // Refresh the interval for next iteration
+                interval = NSDate::dateWithTimeIntervalSinceNow(0.01);
+            }
+        }
 
         Ok(Self {
             player,
@@ -1190,22 +1220,34 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
             let io_surface = unsafe { CVPixelBufferGetIOSurface(pb_ptr) };
 
             if !io_surface.is_null() {
+                // Extract CPU fallback BEFORE wrapping pixel_buffer (which moves it).
+                // Zero-copy IOSurface→wgpu import is not yet implemented, so we need
+                // the CPU data for texture upload.
+                let cpu_fallback =
+                    match extract_cpu_frame_from_pixel_buffer(&pixel_buffer, width, height) {
+                        Ok(cpu) => Some(cpu),
+                        Err(e) => {
+                            tracing::warn!(
+                                "MacOSVideoDecoder: CPU fallback extraction failed: {}",
+                                e
+                            );
+                            None
+                        }
+                    };
+
                 // Wrap the pixel_buffer in a thread-safe wrapper, then Arc it.
                 // The IOSurface is owned by the CVPixelBuffer, so we need to keep the CVPixelBuffer alive.
                 // PixelBufferWrapper implements Send+Sync for thread-safe sharing.
                 let owner: Arc<dyn std::any::Any + Send + Sync> =
                     Arc::new(PixelBufferWrapper(pixel_buffer));
 
-                // Note: cpu_fallback is None to avoid eager CPU copy. If zero-copy
-                // import fails at render time, the rendering code will request
-                // a new frame and hit the CPU fallback path below.
                 let gpu_surface = unsafe {
                     MacOSGpuSurface::new(
                         io_surface,
                         width as u32,
                         height as u32,
                         PixelFormat::Bgra,
-                        None, // No eager CPU fallback - preserves zero-copy benefits
+                        cpu_fallback,
                         owner,
                     )
                 };
