@@ -155,8 +155,15 @@ pub fn decoded_frame_to_textures(
             } else {
                 // No CPU fallback — try zero-copy DMABuf → Vulkan → wgpu import.
                 // DMABuf memory is GPU-only and cannot be CPU-mapped.
+                tracing::debug!(
+                    "Linux DMABuf frame: {}x{} fmt={:?}, {} planes, attempting zero-copy import",
+                    surface.width, surface.height, surface.format, surface.planes.len()
+                );
                 match import_linux_dmabuf_frame(surface, device) {
-                    Ok(textures) => Some(textures),
+                    Ok(textures) => {
+                        tracing::info!("Linux DMABuf zero-copy import succeeded");
+                        Some(textures)
+                    }
                     Err(e) => {
                         tracing::warn!("Linux DMABuf zero-copy import failed: {e}");
                         None

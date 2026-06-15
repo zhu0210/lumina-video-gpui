@@ -410,11 +410,26 @@ impl GpuiVideoPlayer {
 
         // Poll frames and upload to GPU
         if self.core.is_playback_requested() {
+            let qlen = self.core.frame_queue().len();
+            if qlen > 0 {
+                tracing::debug!("update: playback_requested, queue_len={qlen}, state={:?}", self.state);
+            }
             self.poll_and_upload_frames();
         } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
             // Peek at first frame for preview (don't advance queue)
             if self.frame_textures.is_none() {
                 self.try_preview_frame();
+            }
+        } else {
+            // Neither playing nor ready — log why
+            if !self.initialized {
+                // Still initializing — expected
+            } else {
+                tracing::debug!(
+                    "update: skipping poll — not playing/ready, state={:?}, qlen={}",
+                    self.state,
+                    self.core.frame_queue().len()
+                );
             }
         }
 
@@ -754,10 +769,23 @@ impl GpuiVideoPlayer {
         // back-pressure ("QUEUE FULL branch, sleeping 5ms").  Upload only
         // the *last* frame's textures to the GPU — intermediate frames are
         // just popped and dropped so the decoder thread never stalls.
+        let queue_len_before = self.core.frame_queue().len();
         let mut last_frame = None;
+        let mut drained = 0u32;
         while let Some(video_frame) = self.core.poll_frame() {
+            drained += 1;
             self.loop_seek_pending = false;
             last_frame = Some(video_frame);
+        }
+        if drained > 0 {
+            tracing::debug!(
+                "poll_and_upload: drained {drained} frames, queue was {queue_len_before}"
+            );
+        } else if queue_len_before > 0 {
+            tracing::warn!(
+                "poll_and_upload: drained 0 frames but queue has {queue_len_before} — \
+                 scheduler is holding frames back (audio not started?)"
+            );
         }
 
         if let Some(video_frame) = last_frame {
