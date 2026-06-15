@@ -22,6 +22,62 @@ use crate::video::Plane;
 use crate::video::{CpuFrame, DecodedFrame, PixelFormat};
 
 // ---------------------------------------------------------------------------
+// Write-texture guard — prevents GPU validation crashes when frame
+// metadata (width/height/stride) is inconsistent with actual plane data.
+// ---------------------------------------------------------------------------
+
+/// Wrapper around `queue.write_texture` that checks the source buffer is
+/// large enough for the described copy.  Logs a warning and skips the
+/// upload instead of triggering a wgpu validation error / panic.
+fn safe_write_texture(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    data: &[u8],
+    layout: wgpu::TexelCopyBufferLayout,
+    extent: wgpu::Extent3d,
+) {
+    let required = layout.bytes_per_row.unwrap_or(0) as usize
+        * layout.rows_per_image.unwrap_or(1) as usize;
+    if data.len() < required {
+        tracing::warn!(
+            "write_texture skipped: buffer {} bytes < needed {} bytes \
+             (bpr={}, rows={}, extent={}x{}x{})",
+            data.len(),
+            required,
+            layout.bytes_per_row.unwrap_or(0),
+            layout.rows_per_image.unwrap_or(0),
+            extent.width,
+            extent.height,
+            extent.depth_or_array_layers,
+        );
+        return;
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        layout,
+        extent,
+    );
+}
+
+/// Helper: calls safe_write_texture on a cached texture reference.
+/// Avoids repeating the texture dereference pattern.
+fn safe_write_cached(
+    queue: &wgpu::Queue,
+    texture: &Arc<wgpu::Texture>,
+    data: &[u8],
+    layout: wgpu::TexelCopyBufferLayout,
+    extent: wgpu::Extent3d,
+) {
+    safe_write_texture(queue, texture.as_ref(), data, layout, extent)
+}
+
+// ---------------------------------------------------------------------------
 // GPU frame textures — the output of frame upload (fed to GPUI surface())
 // ---------------------------------------------------------------------------
 
@@ -97,8 +153,15 @@ pub fn decoded_frame_to_textures(
                     cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
                 ))
             } else {
-                tracing::warn!("Linux GPU surface without CPU fallback — frame dropped");
-                None
+                // No CPU fallback — try zero-copy DMABuf → Vulkan → wgpu import.
+                // DMABuf memory is GPU-only and cannot be CPU-mapped.
+                match import_linux_dmabuf_frame(surface, device) {
+                    Ok(textures) => Some(textures),
+                    Err(e) => {
+                        tracing::warn!("Linux DMABuf zero-copy import failed: {e}");
+                        None
+                    }
+                }
             }
         }
 
@@ -125,6 +188,68 @@ pub fn decoded_frame_to_textures(
                 None
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux zero-copy DMABuf → wgpu texture import
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn import_linux_dmabuf_frame(
+    surface: &crate::video::LinuxGpuSurface,
+    device: &wgpu::Device,
+) -> Result<GpuFrameTextures, crate::video::VideoError> {
+    use crate::video::PixelFormat;
+    use crate::zero_copy::linux::DmaBufHandle;
+    use crate::zero_copy::linux::DmaBufPlaneHandle;
+
+    let plane_handles: Vec<DmaBufPlaneHandle> = surface
+        .planes
+        .iter()
+        .map(|p| DmaBufPlaneHandle {
+            fd: p.fd,
+            offset: p.offset,
+            stride: p.stride,
+            size: p.size,
+        })
+        .collect();
+
+    let dmabuf_handle = DmaBufHandle::new(plane_handles, surface.modifier);
+
+    let textures = unsafe {
+        crate::zero_copy::linux::import_dmabuf_multi_plane(
+            device,
+            dmabuf_handle,
+            surface.width,
+            surface.height,
+            surface.format,
+        )
+    }
+    .map_err(|e| {
+        crate::video::VideoError::DecodeFailed(format!(
+            "DMABuf zero-copy import failed: {e}"
+        ))
+    })?;
+
+    match surface.format {
+        PixelFormat::Nv12 => {
+            if textures.len() < 2 {
+                return Err(crate::video::VideoError::DecodeFailed(
+                    "NV12 import returned insufficient textures".into(),
+                ));
+            }
+            Ok(GpuFrameTextures::Nv12 {
+                y_texture: std::sync::Arc::new(textures[0].clone()),
+                cb_cr_texture: std::sync::Arc::new(textures[1].clone()),
+                width: surface.width,
+                height: surface.height,
+            })
+        }
+        _ => Err(crate::video::VideoError::UnsupportedFormat(format!(
+            "Zero-copy import not implemented for {:?} on Linux",
+            surface.format
+        ))),
     }
 }
 
@@ -198,13 +323,9 @@ pub fn upload_cpu_frame(
     } else {
         return texture.clone();
     };
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
+    safe_write_texture(
+        queue,
+        texture,
         &rgba,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
@@ -329,13 +450,9 @@ fn upload_nv12(
                 y_plane.data.len(),
             );
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &y_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        safe_write_texture(
+            queue,
+            &y_texture,
             &y_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
@@ -453,13 +570,9 @@ fn upload_yuv420p_as_nv12(
                 height,
             };
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &y_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        safe_write_texture(
+            queue,
+            &y_texture,
             &y_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,

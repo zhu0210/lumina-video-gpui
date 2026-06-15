@@ -18,42 +18,72 @@ lumina-video = { path = "../lumina-video" }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Platform backends — each OS pulls in its own platform implementation.
-# Linux needs display server features; macOS / Windows use defaults.
+# =========================================================================
+# Platform backends — all three must use the wgpu-renderer backend.
+#
+# wgpu  : enables GpuContextHandle, surface(), Window::gpu_context(),
+#         SurfaceSource variants, WgpuTextureNv12 scene primitives.
+#         Required on gpui for ALL platforms.
+#
+# wgpu-renderer : switches the platform crate from its native renderer
+#         (Metal on macOS, DirectX on Windows) to gpui_wgpu::WgpuRenderer.
+#         Required on gpui_macos and gpui_windows.
+#         Linux (gpui_linux) ALWAYS uses WgpuRenderer — no toggle needed.
+# =========================================================================
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
   branch = "gpui_wgpu_backend",
-  features = ["wayland", "x11"]
+  features = [
+    "wgpu",    # GpuContextHandle + surface() element
+    "wayland", # Wayland display server protocol
+    "x11",     # X11 display server protocol
+  ]
 }
 gpui_linux = {
   git = "https://github.com/zhu0210/zed.git",
   branch = "gpui_wgpu_backend",
-  features = ["wayland", "x11"]
+  features = [
+    "wayland", # pulls in gpui_wgpu, wayland-client, etc.
+    "x11",     # pulls in gpui_wgpu, x11rb, etc.
+  ]
 }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
   branch = "gpui_wgpu_backend",
-  features = ["font-kit", "wgpu"]
+  features = [
+    "wgpu",     # GpuContextHandle + surface() element
+    "font-kit", # font-kit text system (macOS default)
+  ]
 }
 gpui_macos = {
   git = "https://github.com/zhu0210/zed.git",
   branch = "gpui_wgpu_backend",
-  features = ["font-kit", "wgpu-renderer"]
+  features = [
+    "wgpu-renderer", # switches from Metal renderer → WgpuRenderer
+    "font-kit",       # font-kit text system
+  ]
 }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
   branch = "gpui_wgpu_backend",
-  features = ["wgpu"]
+  features = [
+    "wgpu", # GpuContextHandle + surface() element
+    # text system: gpui_wgpu::CosmicTextSystem (from wgpu-renderer),
+    # NOT font-kit / DirectWrite
+  ]
 }
 gpui_windows = {
   git = "https://github.com/zhu0210/zed.git",
   branch = "gpui_wgpu_backend",
-  features = ["wgpu-renderer"]
+  features = [
+    "wgpu-renderer", # switches from DirectX renderer → WgpuRenderer
+  ]
 }
 
 [features]

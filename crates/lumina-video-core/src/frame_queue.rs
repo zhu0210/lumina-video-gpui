@@ -1801,8 +1801,23 @@ impl FrameScheduler {
         gap: Duration,
         now: std::time::Instant,
     ) -> Duration {
+        // When audio hasn't started, begin with a generous tolerance and
+        // escalate over time so video can play even without an audio clock.
+        // Without escalation, a static AUDIO_STARTUP_AHEAD_TOLERANCE (500ms)
+        // permanently rejects frames whose PTS is further ahead than the
+        // wall clock's slow advance — the queue fills, the decoder sleeps,
+        // and video never starts.
         if !audio_started {
-            return AUDIO_STARTUP_AHEAD_TOLERANCE;
+            let mut tolerance = AUDIO_STARTUP_AHEAD_TOLERANCE;
+            if let Some(start) = self.rejection_start_time {
+                let stuck_ms = now.duration_since(start).as_millis();
+                // Escalate: +2000ms per second of being stuck, up to 30s max.
+                let extra_ms = (stuck_ms / 500).saturating_mul(180) as u64;
+                tolerance = tolerance
+                    .saturating_add(Duration::from_millis(extra_ms))
+                    .min(Duration::from_secs(30));
+            }
+            return tolerance;
         }
 
         let mut tolerance = LIVE_BASE_AHEAD_TOLERANCE;

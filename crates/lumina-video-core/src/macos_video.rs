@@ -253,16 +253,20 @@ fn extract_cpu_frame_from_pixel_buffer(
         return Err(VideoError::DecodeFailed("Width overflow".to_string()));
     };
 
-    // Copy data, handling potential row padding from CVPixelBuffer
-    const WGPU_ALIGNMENT: usize = 256;
+    // CVPixelBuffer rows may be padded (Metal requires 256-byte alignment).
+    // ALWAYS strip padding so downstream code (upload_rgba / bgra_to_rgba)
+    // receives contiguous pixel data with stride = width * 4.
+    // Keeping padding causes bgra_to_rgba to treat pad bytes as pixels,
+    // and write_texture with stride width*4 then reads garbage for every
+    // row beyond the first.  On the egui main branch this path is never
+    // taken — zero_copy::macos::import_iosurface() handles everything via
+    // Metal zero-copy import.  The GPUI port disabled zero_copy.rs, so
+    // this CPU fallback is the only macOS rendering path.
     let (data, stride) = if bytes_per_row == row_bytes {
         // No padding - direct copy
         (bgra_data.to_vec(), row_bytes)
-    } else if bytes_per_row.is_multiple_of(WGPU_ALIGNMENT) {
-        // CVPixelBuffer padding is already 256-aligned - use directly
-        (bgra_data.to_vec(), bytes_per_row)
     } else {
-        // Has non-aligned padding - strip it
+        // Has padding — strip it unconditionally
         if bytes_per_row < row_bytes {
             unsafe {
                 CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
@@ -272,7 +276,7 @@ fn extract_cpu_frame_from_pixel_buffer(
                 bytes_per_row, row_bytes
             )));
         }
-        let mut data = Vec::with_capacity(row_bytes * height);
+        let mut compact = Vec::with_capacity(row_bytes * height);
         for y in 0..height {
             let row_start = y * bytes_per_row;
             let row_end = row_start + row_bytes;
@@ -282,9 +286,9 @@ fn extract_cpu_frame_from_pixel_buffer(
                 }
                 return Err(VideoError::DecodeFailed("Row data truncated".to_string()));
             }
-            data.extend_from_slice(&bgra_data[row_start..row_end]);
+            compact.extend_from_slice(&bgra_data[row_start..row_end]);
         }
-        (data, row_bytes)
+        (compact, row_bytes)
     };
 
     unsafe {

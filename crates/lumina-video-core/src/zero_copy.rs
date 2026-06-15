@@ -285,9 +285,7 @@ pub mod macos {
     ///
     /// This verifies that the HAL APIs are accessible for zero-copy import.
     pub fn is_metal_backend(device: &wgpu::Device) -> bool {
-        unsafe {
-            device.as_hal::<wgpu::hal::api::Metal, _, bool>(|hal_device| hal_device.is_some())
-        }
+        unsafe { device.as_hal::<wgpu::hal::api::Metal>().is_some() }
     }
 
     /// Gets information about the Metal device for diagnostics.
@@ -295,12 +293,8 @@ pub mod macos {
     /// Returns the device name if Metal backend is available, None otherwise.
     pub fn get_metal_device_info(device: &wgpu::Device) -> Option<String> {
         unsafe {
-            device.as_hal::<wgpu::hal::api::Metal, _, Option<String>>(|hal_device| {
-                hal_device.map(|d| {
-                    let metal_device = d.raw_device();
-                    let guard = metal_device.lock();
-                    guard.name().to_string()
-                })
+            device.as_hal::<wgpu::hal::api::Metal>().map(|d| {
+                d.raw_device().lock().name().to_string()
             })
         }
     }
@@ -340,96 +334,80 @@ pub mod macos {
             ));
         }
 
-        // Access the Metal HAL device and create the texture
-        let hal_texture_result = device
-            .as_hal::<wgpu::hal::api::Metal, _, Result<wgpu::hal::metal::Texture, ZeroCopyError>>(
-                |hal_device| {
-                    let Some(hal_device) = hal_device else {
-                        warn!("Failed to get Metal HAL device");
-                        return Err(ZeroCopyError::HalAccessFailed(
-                            "wgpu not using Metal backend".to_string(),
-                        ));
-                    };
+        // Access the Metal HAL device
+        let hal_device = device
+            .as_hal::<wgpu::hal::api::Metal>()
+            .ok_or_else(|| {
+                ZeroCopyError::HalAccessFailed(
+                    "wgpu not using Metal backend".to_string(),
+                )
+            })?;
 
-                    // Get the raw Metal device
-                    let metal_device = hal_device.raw_device();
-                    let metal_device_guard = metal_device.lock();
+        // Get the raw Metal device
+        let metal_device = hal_device.raw_device();
+        let metal_device_guard = metal_device.lock();
 
-                    debug!(
-                        "Creating Metal texture from IOSurface via objc2 ({}x{} {:?}) on {}",
-                        width,
-                        height,
-                        format,
-                        metal_device_guard.name()
-                    );
+        debug!(
+            "Creating Metal texture from IOSurface ({}x{} {:?}) on {}",
+            width,
+            height,
+            format,
+            metal_device_guard.name()
+        );
 
-                    // Create Metal texture descriptor
-                    let descriptor = metal::TextureDescriptor::new();
-                    descriptor.set_texture_type(metal::MTLTextureType::D2);
-                    let metal_format = wgpu_format_to_metal(format)?;
-                    descriptor.set_pixel_format(metal_format);
-                    descriptor.set_width(width as u64);
-                    descriptor.set_height(height as u64);
-                    descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
-                    // Note: For IOSurface-backed textures created via newTextureWithDescriptor:iosurface:plane:,
-                    // Metal ignores the storage mode in the descriptor - the IOSurface dictates memory layout.
-                    // macOS uses Managed (CPU+GPU); iOS uses Shared (unified memory).
-                    #[cfg(target_os = "macos")]
-                    descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
-                    #[cfg(target_os = "ios")]
-                    descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        // Create Metal texture descriptor
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_texture_type(metal::MTLTextureType::D2);
+        let metal_format = wgpu_format_to_metal(format)?;
+        descriptor.set_pixel_format(metal_format);
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        #[cfg(target_os = "macos")]
+        descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+        #[cfg(target_os = "ios")]
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
 
-                    // Get raw pointers for objc msg_send
-                    let device_ptr = metal_device_guard.as_ptr();
-                    let descriptor_ptr = descriptor.as_ptr();
+        // Get raw pointers for objc msg_send
+        let device_ptr = metal_device_guard.as_ptr();
+        let descriptor_ptr = descriptor.as_ptr();
 
-                    // Call [MTLDevice newTextureWithDescriptor:iosurface:plane:]
-                    // This is the key method that metal-rs doesn't expose
-                    // Using objc crate's msg_send! (same as metal-rs uses internally)
-                    let texture_ptr: *mut Object = msg_send![
-                        device_ptr,
-                        newTextureWithDescriptor: descriptor_ptr
-                        iosurface: io_surface
-                        plane: 0usize  // plane 0 for single-plane formats like BGRA
-                    ];
+        // Call [MTLDevice newTextureWithDescriptor:iosurface:plane:]
+        let texture_ptr: *mut Object = msg_send![
+            device_ptr,
+            newTextureWithDescriptor: descriptor_ptr
+            iosurface: io_surface
+            plane: 0usize
+        ];
 
-                    if texture_ptr.is_null() {
-                        warn!("Metal newTextureWithDescriptor:iosurface:plane: returned null");
-                        return Err(ZeroCopyError::TextureCreationFailed(
-                            "Metal failed to create texture from IOSurface".to_string(),
-                        ));
-                    }
+        if texture_ptr.is_null() {
+            return Err(ZeroCopyError::TextureCreationFailed(
+                "Metal failed to create texture from IOSurface".to_string(),
+            ));
+        }
 
-                    // Wrap the raw pointer as a metal::Texture
-                    // The texture is retained by msg_send (returns +1 retain count)
-                    let metal_texture =
-                        metal::Texture::from_ptr(texture_ptr as *mut metal::MTLTexture);
+        // Wrap the raw pointer as a metal::Texture
+        let metal_texture =
+            metal::Texture::from_ptr(texture_ptr as *mut metal::MTLTexture);
 
-                    info!(
-                        "Created Metal texture from IOSurface: {}x{} {:?}",
-                        width, height, format
-                    );
+        info!(
+            "Created Metal texture from IOSurface: {}x{} {:?}",
+            width, height, format
+        );
 
-                    // Wrap as wgpu_hal::metal::Texture using the existing API
-                    let hal_texture = wgpu::hal::metal::Device::texture_from_raw(
-                        metal_texture,
-                        format,
-                        metal::MTLTextureType::D2,
-                        1, // array_layers
-                        1, // mip_levels
-                        wgpu::hal::CopyExtent {
-                            width,
-                            height,
-                            depth: 1,
-                        },
-                    );
-
-                    Ok(hal_texture)
-                },
-            );
-
-        // Get the HAL texture from the closure result
-        let hal_texture = hal_texture_result?;
+        // Wrap as wgpu_hal::metal::Texture
+        let hal_texture = wgpu::hal::metal::Device::texture_from_raw(
+            metal_texture,
+            format,
+            metal::MTLTextureType::D2,
+            1,
+            1,
+            wgpu::hal::CopyExtent {
+                width,
+                height,
+                depth: 1,
+            },
+        );
 
         // Create wgpu texture descriptor
         let texture_desc = wgpu::TextureDescriptor {
@@ -633,9 +611,7 @@ pub mod linux {
     ///
     /// Returns `false` if using OpenGL, software rendering, or another backend.
     pub fn is_vulkan_backend(device: &wgpu::Device) -> bool {
-        unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan, _, bool>(|hal_device| hal_device.is_some())
-        }
+        unsafe { device.as_hal::<wgpu::hal::api::Vulkan>().is_some() }
     }
 
     /// Gets information about the Vulkan device for diagnostics.
@@ -643,24 +619,22 @@ pub mod linux {
     /// Returns the device name if Vulkan backend is available, None otherwise.
     pub fn get_vulkan_device_info(device: &wgpu::Device) -> Option<String> {
         unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan, _, Option<String>>(|hal_device| {
-                hal_device.map(|d| {
-                    let instance = d.shared_instance();
-                    let raw_instance = instance.raw_instance();
-                    let physical_device = d.raw_physical_device();
+            device.as_hal::<wgpu::hal::api::Vulkan>().map(|d| {
+                let instance = d.shared_instance();
+                let raw_instance = instance.raw_instance();
+                let physical_device = d.raw_physical_device();
 
-                    let properties = raw_instance.get_physical_device_properties(physical_device);
-                    let device_name = CStr::from_ptr(properties.device_name.as_ptr())
-                        .to_string_lossy()
-                        .into_owned();
-                    format!(
-                        "{} (Vulkan {}.{}.{})",
-                        device_name,
-                        vk::api_version_major(properties.api_version),
-                        vk::api_version_minor(properties.api_version),
-                        vk::api_version_patch(properties.api_version)
-                    )
-                })
+                let properties = raw_instance.get_physical_device_properties(physical_device);
+                let device_name = CStr::from_ptr(properties.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
+                format!(
+                    "{} (Vulkan {}.{}.{})",
+                    device_name,
+                    vk::api_version_major(properties.api_version),
+                    vk::api_version_minor(properties.api_version),
+                    vk::api_version_patch(properties.api_version)
+                )
             })
         }
     }
@@ -679,15 +653,10 @@ pub mod linux {
     /// - VK_EXT_image_drm_format_modifier (for tiled formats)
     pub fn is_dmabuf_import_available(device: &wgpu::Device) -> bool {
         unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan, _, bool>(|hal_device| {
-                let Some(hal_device) = hal_device else {
-                    return false;
-                };
-
+            device.as_hal::<wgpu::hal::api::Vulkan>().map_or(false, |hal_device| {
                 let extensions = hal_device.enabled_device_extensions();
                 let has_dma_buf = extensions.contains(&EXT_EXTERNAL_MEMORY_DMA_BUF);
                 let has_fd = extensions.contains(&KHR_EXTERNAL_MEMORY_FD);
-
                 has_dma_buf && has_fd
             })
         }
@@ -956,18 +925,16 @@ pub mod linux {
             ));
         }
 
-        // Access the Vulkan HAL device and create the texture
-        let hal_texture_result = device
-            .as_hal::<wgpu::hal::api::Vulkan, _, Result<wgpu::hal::vulkan::Texture, ZeroCopyError>>(
-                |hal_device| {
-                    let Some(hal_device) = hal_device else {
-                        warn!("Failed to get Vulkan HAL device");
-                        return Err(ZeroCopyError::HalAccessFailed(
-                            "wgpu not using Vulkan backend".to_string(),
-                        ));
-                    };
+        // Access the Vulkan HAL device
+        let hal_device = device
+            .as_hal::<wgpu::hal::api::Vulkan>()
+            .ok_or_else(|| {
+                ZeroCopyError::HalAccessFailed(
+                    "wgpu not using Vulkan backend".to_string(),
+                )
+            })?;
 
-                    // Check for required extensions
+        // Check for required extensions
                     let extensions = hal_device.enabled_device_extensions();
                     let has_dma_buf = extensions.contains(&EXT_EXTERNAL_MEMORY_DMA_BUF);
                     let has_fd = extensions.contains(&KHR_EXTERNAL_MEMORY_FD);
@@ -1180,7 +1147,7 @@ pub mod linux {
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format,
-                        usage: wgpu::hal::TextureUses::RESOURCE,
+                        usage: wgpu::TextureUses::RESOURCE,
                         memory_flags: wgpu::hal::MemoryFlags::empty(),
                         view_formats: vec![],
                     };
@@ -1201,18 +1168,12 @@ pub mod linux {
 
                     // drop_callback is called when wgpu is done with the texture,
                     // allowing us to free the externally managed VkDeviceMemory
-                    let hal_texture = wgpu::hal::vulkan::Device::texture_from_raw(
+                    let hal_texture = hal_device.texture_from_raw(
                         vk_image,
                         &texture_desc,
                         Some(drop_callback),
+                        wgpu::hal::vulkan::TextureMemory::External,
                     );
-
-                    Ok(hal_texture)
-                },
-            );
-
-        // Get the HAL texture from the closure result
-        let hal_texture = hal_texture_result?;
 
         // Create wgpu texture descriptor
         let texture_desc = wgpu::TextureDescriptor {
@@ -1766,9 +1727,7 @@ pub mod android {
     /// (Android 7.0 Nougat) and a compatible GPU. Returns `false` if using
     /// OpenGL ES or software rendering.
     pub fn is_vulkan_backend(device: &wgpu::Device) -> bool {
-        unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan, _, bool>(|hal_device| hal_device.is_some())
-        }
+        unsafe { device.as_hal::<wgpu::hal::api::Vulkan>().is_some() }
     }
 
     /// Checks if Vulkan AHardwareBuffer import extension is available.
@@ -1777,11 +1736,7 @@ pub mod android {
     /// which is required for zero-copy AHardwareBuffer import.
     pub fn is_ahardwarebuffer_import_available(device: &wgpu::Device) -> bool {
         unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan, _, bool>(|hal_device| {
-                let Some(hal_device) = hal_device else {
-                    return false;
-                };
-
+            device.as_hal::<wgpu::hal::api::Vulkan>().map_or(false, |hal_device| {
                 let enabled_extensions = hal_device.enabled_device_extensions();
                 enabled_extensions
                     .contains(&VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME)
@@ -1794,24 +1749,22 @@ pub mod android {
     /// Returns device name and driver version if Vulkan backend is available.
     pub fn get_vulkan_device_info(device: &wgpu::Device) -> Option<String> {
         unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan, _, Option<String>>(|hal_device| {
-                hal_device.map(|d| {
-                    let instance = d.shared_instance();
-                    let raw_instance = instance.raw_instance();
-                    let physical_device = d.raw_physical_device();
+            device.as_hal::<wgpu::hal::api::Vulkan>().map(|d| {
+                let instance = d.shared_instance();
+                let raw_instance = instance.raw_instance();
+                let physical_device = d.raw_physical_device();
 
-                    let properties = raw_instance.get_physical_device_properties(physical_device);
-                    let device_name = CStr::from_ptr(properties.device_name.as_ptr())
-                        .to_string_lossy()
-                        .into_owned();
-                    format!(
-                        "{} (Vulkan {}.{}.{})",
-                        device_name,
-                        vk::api_version_major(properties.api_version),
-                        vk::api_version_minor(properties.api_version),
-                        vk::api_version_patch(properties.api_version)
-                    )
-                })
+                let properties = raw_instance.get_physical_device_properties(physical_device);
+                let device_name = CStr::from_ptr(properties.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
+                format!(
+                    "{} (Vulkan {}.{}.{})",
+                    device_name,
+                    vk::api_version_major(properties.api_version),
+                    vk::api_version_minor(properties.api_version),
+                    vk::api_version_patch(properties.api_version)
+                )
             })
         }
     }
@@ -2147,7 +2100,7 @@ pub mod android {
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format,
-                        usage: wgpu::hal::TextureUses::RESOURCE,
+                        usage: wgpu::TextureUses::RESOURCE,
                         memory_flags: wgpu::hal::MemoryFlags::empty(),
                         view_formats: vec![],
                     };
@@ -2169,10 +2122,11 @@ pub mod android {
 
                     // drop_callback is called when wgpu is done with the texture,
                     // allowing us to free the externally managed VkDeviceMemory
-                    let hal_texture = wgpu::hal::vulkan::Device::texture_from_raw(
+                    let hal_texture = hal_device.texture_from_raw(
                         vk_image,
                         &texture_desc,
                         Some(drop_callback),
+                        wgpu::hal::vulkan::TextureMemory::External,
                     );
 
                     Ok(hal_texture)
@@ -4518,7 +4472,7 @@ pub mod android {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::hal::TextureUses::RESOURCE,
+                usage: wgpu::TextureUses::RESOURCE,
                 memory_flags: wgpu::hal::MemoryFlags::empty(),
                 view_formats: vec![],
             };
@@ -5019,7 +4973,7 @@ pub mod android {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::hal::TextureUses::RESOURCE,
+                usage: wgpu::TextureUses::RESOURCE,
                 memory_flags: wgpu::hal::MemoryFlags::empty(),
                 view_formats: vec![],
             };
@@ -6286,7 +6240,7 @@ pub mod windows {
 
     /// Checks if the current wgpu device supports D3D12 backend.
     pub fn is_d3d12_backend(device: &wgpu::Device) -> bool {
-        unsafe { device.as_hal::<wgpu::hal::api::Dx12, _, bool>(|hal_device| hal_device.is_some()) }
+        unsafe { device.as_hal::<wgpu::hal::api::Dx12>().is_some() }
     }
 
     /// Gets information about the D3D12 device for diagnostics.

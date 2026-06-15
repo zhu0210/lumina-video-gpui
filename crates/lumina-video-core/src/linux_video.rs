@@ -1782,13 +1782,17 @@ impl ZeroCopyGStreamerDecoder {
         // Keep the GStreamer sample alive to ensure DMABuf FDs remain valid
         let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample.clone());
 
+        // DMABuf memory is GPU-only and cannot be CPU-mapped via
+        // map_readable().  The CPU fallback is intentionally None —
+        // decoded_frame_to_textures() will dispatch to zero_copy::linux
+        // for Vulkan DMABuf → wgpu texture import instead.
+
         // Create the LinuxGpuSurface
         // Safety:
         // - All FDs in `planes` are valid DMABuf FDs obtained from gst_dmabuf_memory_get_fd()
         // - `owner` keeps the GStreamer sample alive, ensuring DMABuf FDs remain valid
         // - `width`, `height`, `format`, and `modifier` are validated from GStreamer video_info
         // - `is_single_fd` is correctly determined from buffer memory layout
-        // - No CPU fallback is provided; DMABuf memory cannot be reliably CPU-mapped
         let surface = unsafe {
             LinuxGpuSurface::new(
                 planes,
@@ -1797,7 +1801,7 @@ impl ZeroCopyGStreamerDecoder {
                 format,
                 dmabuf_info.modifier,
                 is_single_fd,
-                None, // No CPU fallback - DMABuf memory cannot be CPU-mapped
+                None, // DMABuf is GPU-only, imports via zero_copy::linux
                 owner,
             )
         };

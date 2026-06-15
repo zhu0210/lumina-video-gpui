@@ -268,11 +268,32 @@ impl CorePlayer {
                 }
             };
 
+            #[cfg(target_os = "windows")]
+            let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
+                #[cfg(feature = "windows-native-video")]
+                {
+                    use crate::windows_video::WindowsVideoDecoder;
+                    tracing::info!("Initializing Windows Media Foundation decoder for {}", url);
+                    WindowsVideoDecoder::new(&url, false)
+                        .map(|d| Box::new(d) as Box<dyn VideoDecoderBackend + Send>)
+                }
+                #[cfg(not(feature = "windows-native-video"))]
+                {
+                    let _ = &url;
+                    Err(VideoError::DecoderInit(
+                        "No video decoder available on Windows — \
+                         enable the \"windows-native-video\" feature for Media Foundation support"
+                            .to_string(),
+                    ))
+                }
+            };
+
             #[cfg(not(any(
                 target_os = "android",
                 target_os = "ios",
                 target_os = "linux",
                 target_os = "macos",
+                target_os = "windows",
             )))]
             let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
                 let _ = &url;

@@ -105,6 +105,9 @@ pub struct GpuiVideoPlayer {
     initialized: bool,
     loop_seek_pending: bool,
 
+    // Diagnostics: avoid log spam when GPU context is repeatedly unavailable
+    gpu_context_missing_logged: bool,
+
     // Subtitles
     subtitle_track: Option<SubtitleTrack>,
     show_subtitles: bool,
@@ -154,6 +157,7 @@ impl GpuiVideoPlayer {
             loading_started: false,
             initialized: false,
             loop_seek_pending: false,
+            gpu_context_missing_logged: false,
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
@@ -363,9 +367,22 @@ impl GpuiVideoPlayer {
     /// Must be called every frame. Polls the decode pipeline, uploads textures,
     /// and syncs playback state from `CorePlayer`.
     pub fn update(&mut self, window: &mut Window, _cx: &mut App) {
-        // Lazy GPU context init
+        // Lazy GPU context init — retry every frame until available.
         if self.gpu_context.is_none() {
             self.gpu_context = window.gpu_context();
+            if self.gpu_context.is_none() {
+                if !self.gpu_context_missing_logged {
+                    tracing::warn!(
+                        "GPU context not available from platform window; \
+                         textures cannot be uploaded. Retrying each frame."
+                    );
+                    self.gpu_context_missing_logged = true;
+                }
+            } else {
+                tracing::info!("GPU context acquired successfully");
+                // Reset the flag so if the context is lost we log again.
+                self.gpu_context_missing_logged = false;
+            }
         }
 
         // Start async decoder init
@@ -377,6 +394,9 @@ impl GpuiVideoPlayer {
         // Check init completion
         if !self.initialized {
             self.check_init_complete();
+            if self.initialized {
+                tracing::info!("Decoder initialization complete, playback ready");
+            }
         }
 
         // Sync metadata from decode thread (lazy metadata like macOS AVPlayer)
@@ -445,13 +465,15 @@ impl GpuiVideoPlayer {
                 } => {
                     let native_size =
                         size(DevicePixels(*width as i32), DevicePixels(*height as i32));
+                    // Surface must request explicit size; otherwise flex containers
+                    // allocate zero bounds to auto-sized children with only aspect_ratio,
+                    // and the resulting paint_bounds cause the scissor rect to clip
+                    // everything (Issue #1).
                     div()
                         .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
                         .child(
                             surface((y_texture.clone(), cb_cr_texture.clone(), native_size))
+                                .size_full()
                                 .object_fit(ObjectFit::Contain),
                         )
                         .into_element()
@@ -466,12 +488,15 @@ impl GpuiVideoPlayer {
                         format: GpuTextureFormat::Rgba8Unorm,
                         color_space: GpuTextureColorSpace::Srgb,
                     };
+                    // Same rationale as NV12 above: explicit size avoids zero
+                    // layout bounds inside flex containers.
                     div()
                         .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(surface((texture.clone(), desc)).object_fit(ObjectFit::Contain))
+                        .child(
+                            surface((texture.clone(), desc))
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        )
                         .into_element()
                 }
             }
@@ -719,15 +744,23 @@ impl GpuiVideoPlayer {
     fn poll_and_upload_frames(&mut self) {
         let gpu = match self.gpu_context.as_ref() {
             Some(g) => g,
-            None => return,
+            None => {
+                tracing::debug!("poll_and_upload_frames: GPU context not yet available");
+                return;
+            }
         };
 
-        // Only poll ONE frame per update cycle. The while-loop approach drained
-        // the entire queue but only kept the last frame's textures, wasting work
-        // and causing constant buffer underruns when decode rate < render rate.
-        if let Some(video_frame) = self.core.poll_frame() {
+        // Drain every available frame from the decode queue to prevent
+        // back-pressure ("QUEUE FULL branch, sleeping 5ms").  Upload only
+        // the *last* frame's textures to the GPU — intermediate frames are
+        // just popped and dropped so the decoder thread never stalls.
+        let mut last_frame = None;
+        while let Some(video_frame) = self.core.poll_frame() {
             self.loop_seek_pending = false;
+            last_frame = Some(video_frame);
+        }
 
+        if let Some(video_frame) = last_frame {
             let textures = frame_to_texture::decoded_frame_to_textures(
                 &video_frame.frame,
                 &gpu.device,
@@ -739,7 +772,15 @@ impl GpuiVideoPlayer {
 
             // Only replace textures if we got a valid upload (don't clear on None)
             if let Some(tex) = textures {
+                if self.frame_textures.is_none() {
+                    tracing::info!("First video frame uploaded to GPU");
+                }
                 self.frame_textures = Some(tex);
+            } else {
+                tracing::warn!(
+                    "Frame upload returned None — decoded frame could not be \
+                     converted to GPU textures (missing CPU fallback?)"
+                );
             }
         }
     }
@@ -767,6 +808,11 @@ impl GpuiVideoPlayer {
             &mut self.rgba_cache,
         );
 
-        self.frame_textures = textures;
+        if let Some(tex) = textures {
+            tracing::debug!("Preview frame uploaded to GPU");
+            self.frame_textures = Some(tex);
+        } else {
+            tracing::warn!("Preview frame upload returned None — missing CPU fallback?");
+        }
     }
 }
