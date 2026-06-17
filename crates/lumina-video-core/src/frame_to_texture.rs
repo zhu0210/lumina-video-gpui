@@ -130,10 +130,6 @@ pub fn decoded_frame_to_textures(
             cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
         )),
 
-        // Platform GPU surfaces: use CPU fallback for now.
-        // Zero-copy import (IOSurface, DMABuf, etc.) can be added here
-        // by importing directly into wgpu textures and wrapping as
-        // GpuFrameTextures::Nv12 or ::Rgba.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         DecodedFrame::MacOS(surface) => {
             if let Some(ref cpu) = surface.cpu_fallback {
@@ -141,8 +137,22 @@ pub fn decoded_frame_to_textures(
                     cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
                 ))
             } else {
-                tracing::warn!("MacOS GPU surface without CPU fallback — frame dropped");
-                None
+                // No CPU fallback — try zero-copy IOSurface → Metal → wgpu import.
+                // IOSurface-backed textures cannot be reliably CPU-mapped.
+                tracing::debug!(
+                    "macOS IOSurface frame: {}x{} fmt={:?}, attempting zero-copy import",
+                    surface.width, surface.height, surface.format
+                );
+                match import_macos_iosurface_frame(surface, device) {
+                    Ok(textures) => {
+                        tracing::info!("macOS IOSurface zero-copy import succeeded");
+                        Some(textures)
+                    }
+                    Err(e) => {
+                        tracing::warn!("macOS IOSurface zero-copy import failed: {e}");
+                        None
+                    }
+                }
             }
         }
 
@@ -196,6 +206,38 @@ pub fn decoded_frame_to_textures(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// macOS zero-copy IOSurface → wgpu texture import
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn import_macos_iosurface_frame(
+    surface: &crate::video::MacOSGpuSurface,
+    device: &wgpu::Device,
+) -> Result<GpuFrameTextures, crate::video::VideoError> {
+    let texture = unsafe {
+        crate::zero_copy::macos::import_iosurface(
+            device,
+            surface.io_surface,
+            surface.width,
+            surface.height,
+            wgpu::TextureFormat::Bgra8Unorm,
+        )
+    }
+    .map_err(|e| {
+        crate::video::VideoError::DecodeFailed(format!(
+            "IOSurface zero-copy import failed: {e}"
+        ))
+    })?;
+
+    // IOSurface textures are always BGRA8Unorm
+    Ok(GpuFrameTextures::Rgba {
+        texture: std::sync::Arc::new(texture),
+        width: surface.width,
+        height: surface.height,
+    })
 }
 
 // ---------------------------------------------------------------------------

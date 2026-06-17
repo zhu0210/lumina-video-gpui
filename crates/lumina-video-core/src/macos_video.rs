@@ -258,10 +258,8 @@ fn extract_cpu_frame_from_pixel_buffer(
     // receives contiguous pixel data with stride = width * 4.
     // Keeping padding causes bgra_to_rgba to treat pad bytes as pixels,
     // and write_texture with stride width*4 then reads garbage for every
-    // row beyond the first.  On the egui main branch this path is never
-    // taken — zero_copy::macos::import_iosurface() handles everything via
-    // Metal zero-copy import.  The GPUI port disabled zero_copy.rs, so
-    // this CPU fallback is the only macOS rendering path.
+    // row beyond the first. This CPU fallback is only taken when IOSurface
+    // is unavailable or the pixel buffer has no IOSurface backing.
     let (data, stride) = if bytes_per_row == row_bytes {
         // No padding - direct copy
         (bgra_data.to_vec(), row_bytes)
@@ -1224,34 +1222,23 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
             let io_surface = unsafe { CVPixelBufferGetIOSurface(pb_ptr) };
 
             if !io_surface.is_null() {
-                // Extract CPU fallback BEFORE wrapping pixel_buffer (which moves it).
-                // Zero-copy IOSurface→wgpu import is not yet implemented, so we need
-                // the CPU data for texture upload.
-                let cpu_fallback =
-                    match extract_cpu_frame_from_pixel_buffer(&pixel_buffer, width, height) {
-                        Ok(cpu) => Some(cpu),
-                        Err(e) => {
-                            tracing::warn!(
-                                "MacOSVideoDecoder: CPU fallback extraction failed: {}",
-                                e
-                            );
-                            None
-                        }
-                    };
-
                 // Wrap the pixel_buffer in a thread-safe wrapper, then Arc it.
                 // The IOSurface is owned by the CVPixelBuffer, so we need to keep the CVPixelBuffer alive.
                 // PixelBufferWrapper implements Send+Sync for thread-safe sharing.
                 let owner: Arc<dyn std::any::Any + Send + Sync> =
                     Arc::new(PixelBufferWrapper(pixel_buffer));
 
+                // IOSurface-backed textures are imported zero-copy via
+                // frame_to_texture::import_macos_iosurface_frame() → zero_copy::macos::import_iosurface().
+                // No CPU fallback is provided — IOSurface memory layout is GPU-optimized
+                // and cannot be reliably CPU-mapped.
                 let gpu_surface = unsafe {
                     MacOSGpuSurface::new(
                         io_surface,
                         width as u32,
                         height as u32,
                         PixelFormat::Bgra,
-                        cpu_fallback,
+                        None, // IOSurface is GPU-only, imports via zero_copy::macos
                         owner,
                     )
                 };

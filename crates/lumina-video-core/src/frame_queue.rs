@@ -1962,6 +1962,10 @@ impl FrameScheduler {
         // If waiting for first frame, accept any frame to start the clock
         if self.waiting_for_first_frame {
             let queue_len = queue.len();
+            tracing::info!(
+                "get_next_frame: waiting_for_first_frame=true, queue_len={queue_len}, playback_requested={}",
+                self.playback_requested
+            );
             let Some(frame) = queue.pop() else {
                 tracing::trace!(
                     "get_next_frame: waiting_for_first_frame=true, queue empty, returning current_frame={:?}",
@@ -1969,6 +1973,26 @@ impl FrameScheduler {
                 );
                 return self.current_frame.clone();
             };
+            // A preroll frame at pts=0 (decoder probe) should not anchor
+            // the playback clock — the next real frame may sit at the GOP
+            // start (e.g. 625ms) and the wall clock, starting from 0,
+            // would never close that permanent offset.  Accept the preroll
+            // but defer clock initialisation to the first frame with a
+            // meaningful PTS.
+            if frame.pts.is_zero() {
+                tracing::debug!(
+                    "get_next_frame: PREROLL (pts=0) accepted, deferring clock start, queue_len={}",
+                    queue_len
+                );
+                self.waiting_for_first_frame = false;
+                self.current_frame = Some(frame.clone());
+                self.current_position = Duration::ZERO;
+                // Keep waiting_for_first_frame semantics — the NEXT
+                // frame with pts>0 will initialise the clock properly.
+                self.waiting_for_first_frame = true;
+                return Some(frame);
+            }
+
             tracing::debug!(
                 "get_next_frame: FIRST FRAME accepted, pts={:?}, queue_len={}",
                 frame.pts,
@@ -1976,10 +2000,39 @@ impl FrameScheduler {
             );
             self.on_frame_received(frame.pts);
             self.current_frame = Some(frame.clone());
+            self.current_position = frame.pts;
             self.stalled = false;
             self.advance_frame_pacing();
-            // Record sync metrics for first frame
             self.record_sync(frame.pts);
+
+            // Check for large PTS gap to next frame (e.g., preroll at ~0ms followed by
+            // real content at 5s). Without a clock jump, the scheduler would reject
+            // every frame until wall-clock catches up.
+            if let Some(next_pts) = queue.peek_pts() {
+                let ahead = next_pts.saturating_sub(frame.pts);
+                tracing::debug!(
+                    "get_next_frame: first frame check: current={:?}, next={:?}, ahead={:?}",
+                    frame.pts,
+                    next_pts,
+                    ahead
+                );
+                if ahead > Duration::from_millis(500) {
+                    let jump_to = next_pts.saturating_sub(Duration::from_millis(42));
+                    tracing::info!(
+                        "get_next_frame: clock jump after first frame {:?} → {:?} \
+                         (next frame ahead by {:?})",
+                        frame.pts,
+                        jump_to,
+                        ahead,
+                    );
+                    self.current_position = jump_to;
+                    self.playback_start_position = jump_to;
+                    self.playback_start_time = Some(std::time::Instant::now());
+                }
+            } else {
+                tracing::debug!("get_next_frame: no next frame to check for clock jump");
+            }
+
             return Some(frame);
         }
 
@@ -2140,6 +2193,28 @@ impl FrameScheduler {
             };
 
             let now = std::time::Instant::now();
+
+            // Clock jump check: if next frame is way ahead (>1s) of our current *position*,
+            // the stream might have a large PTS gap (e.g., sparse keyframes in HTTP stream,
+            // seek recovery). Jump the clock forward to prevent indefinite rejection.
+            // This handles streams with non-contiguous PTS (common with network buffering).
+            let ahead_of_position = next_pts.saturating_sub(current_pos);
+            if ahead_of_position > Duration::from_secs(1) {
+                let jump_to = next_pts.saturating_sub(Duration::from_millis(42));
+                tracing::info!(
+                    "get_next_frame: large PTS gap detected, jumping clock {:?} → {:?} (gap={:?})",
+                    current_pos,
+                    jump_to,
+                    ahead_of_position
+                );
+                self.current_position = jump_to;
+                self.playback_start_position = jump_to;
+                self.playback_start_time = Some(std::time::Instant::now());
+                self.reset_rejection_tracking();
+                // Continue to re-evaluate with the new clock position
+                continue;
+            }
+
             // Accept frame if:
             // 1. It's at or before current position (normal case), OR
             // 2. It's within tolerance AHEAD of current position (adaptive for live jitter), OR
@@ -2396,6 +2471,29 @@ impl FrameScheduler {
             //
             // Until we integrate proper audio position queries from native players,
             // wall-clock timing provides reasonable results.
+
+            // After accepting a frame, check if the next queued frame is
+            // far ahead of the clock.  This happens during startup when the
+            // decoder outputs a preroll (pts≈0) followed by GOP frames at
+            // the content's real PTS (e.g. 625ms).  Without a clock jump
+            // the scheduler rejects every subsequent frame until the wall
+            // clock catches up — which can take seconds.
+            if let Some(next_pts) = queue.peek_pts() {
+                let ahead = next_pts.saturating_sub(self.current_position);
+                if ahead > Duration::from_millis(500) {
+                    let jump_to = next_pts.saturating_sub(Duration::from_millis(42));
+                    tracing::info!(
+                        "get_next_frame: clock jump {:?} → {:?} \
+                         (next frame ahead by {:?})",
+                        self.current_position,
+                        jump_to,
+                        ahead,
+                    );
+                    self.current_position = jump_to;
+                    self.playback_start_position = jump_to;
+                    self.playback_start_time = Some(std::time::Instant::now());
+                }
+            }
 
             // Record sync metrics for displayed frame
             self.record_sync(frame.pts);

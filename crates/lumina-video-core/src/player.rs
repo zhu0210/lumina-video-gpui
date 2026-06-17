@@ -352,10 +352,17 @@ impl CorePlayer {
                 if uses_native_audio {
                     if let Some(ref ah) = decoder_audio_handle {
                         self.audio_handle = ah.clone();
+                        self.scheduler.set_audio_handle(self.audio_handle.clone());
+                        tracing::info!("Native audio enabled (decoder handles audio internally, using audio as master clock)");
+                        self.audio_handle.set_available(true);
+                    } else {
+                        // Decoder handles audio internally (e.g. GStreamer alsasink)
+                        // but doesn't provide an AudioHandle with position tracking.
+                        // Clear the audio handle so the scheduler uses pure wall-clock
+                        // timing without any audio sync checks that would fail.
+                        self.scheduler.clear_audio_handle();
+                        tracing::info!("Native audio enabled (decoder handles audio internally, using wall-clock for frame pacing)");
                     }
-                    self.audio_handle.set_available(true);
-                    self.scheduler.set_audio_handle(self.audio_handle.clone());
-                    tracing::info!("Native audio enabled (decoder handles audio internally)");
                 }
 
                 let frame_queue = Arc::clone(&self.frame_queue);
