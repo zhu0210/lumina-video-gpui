@@ -27,6 +27,18 @@ use crate::macos_video::MacOSVideoDecoder;
 use crate::sync_metrics::{SyncMetrics, SyncMetricsSnapshot};
 use crate::video::{VideoDecoderBackend, VideoError, VideoFrame, VideoMetadata, VideoState};
 
+/// Result of polling the video scheduler once.
+///
+/// Consumers retain the previously presented frame for `Hold`; the frame is
+/// returned only when presentation advances.
+#[derive(Debug, Clone)]
+pub enum FramePollResult {
+    NewFrame(VideoFrame),
+    Hold,
+    Buffering,
+    EndOfStream,
+}
+
 /// Returns true if the URL points to a container format supported by AVFoundation.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 fn is_avfoundation_supported_container(url: &str) -> bool {
@@ -633,27 +645,61 @@ impl CorePlayer {
     // Frame retrieval
     // =========================================================================
 
-    /// Gets the next frame to display from the scheduler.
-    ///
-    /// Returns `None` if no frame is ready. Updates internal position tracking.
-    pub fn poll_frame(&mut self) -> Option<VideoFrame> {
+    /// Polls the scheduler once and distinguishes a new frame from a held one.
+    pub fn poll_frame_result(&mut self) -> FramePollResult {
+        let generation_before = self.scheduler.presentation_generation();
         let frame = self.scheduler.get_next_frame(&self.frame_queue);
-        if let Some(ref f) = frame {
+        let selected_new_frame = self.scheduler.presentation_generation() != generation_before;
+
+        if selected_new_frame {
+            let Some(frame) = frame else {
+                return if self.frame_queue.is_eos() {
+                    FramePollResult::EndOfStream
+                } else {
+                    FramePollResult::Buffering
+                };
+            };
             match self.state {
                 VideoState::Playing { .. } => {
-                    self.state = VideoState::Playing { position: f.pts };
+                    self.state = VideoState::Playing {
+                        position: frame.pts,
+                    };
                 }
                 VideoState::Paused { .. } => {
-                    self.state = VideoState::Paused { position: f.pts };
+                    self.state = VideoState::Paused {
+                        position: frame.pts,
+                    };
                 }
                 VideoState::Ready | VideoState::Buffering { .. } | VideoState::Loading => {
-                    self.state = VideoState::Playing { position: f.pts };
+                    self.state = VideoState::Playing {
+                        position: frame.pts,
+                    };
                 }
                 // Don't override Ended/Error — frame may be stale or spurious
                 VideoState::Ended | VideoState::Error(_) => {}
             }
+            return FramePollResult::NewFrame(frame);
         }
-        frame
+
+        if self.frame_queue.is_eos() && self.frame_queue.is_empty() {
+            FramePollResult::EndOfStream
+        } else if self.frame_queue.is_empty() {
+            FramePollResult::Buffering
+        } else if frame.is_some() {
+            FramePollResult::Hold
+        } else {
+            FramePollResult::Buffering
+        }
+    }
+
+    /// Compatibility helper for integrations that only need newly selected frames.
+    pub fn poll_frame(&mut self) -> Option<VideoFrame> {
+        match self.poll_frame_result() {
+            FramePollResult::NewFrame(frame) => Some(frame),
+            FramePollResult::Hold | FramePollResult::Buffering | FramePollResult::EndOfStream => {
+                None
+            }
+        }
     }
 
     /// Peeks at the next frame without removing it from the queue.
@@ -811,5 +857,54 @@ impl CorePlayer {
 impl Drop for CorePlayer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::video::{CpuFrame, DecodedFrame, PixelFormat, Plane};
+
+    fn frame(pts: Duration) -> VideoFrame {
+        let plane = Plane {
+            data: vec![0; 4],
+            stride: 4,
+        };
+        VideoFrame::new(
+            pts,
+            DecodedFrame::Cpu(CpuFrame::new(PixelFormat::Rgba, 1, 1, vec![plane])),
+        )
+    }
+
+    #[test]
+    fn poll_result_does_not_return_held_frame_as_new() {
+        let mut player = CorePlayer::new("test://scheduler");
+        player.scheduler.start();
+        player.scheduler.set_frame_rate_pacing(1.0);
+        assert!(player.frame_queue.push(frame(Duration::from_millis(1))));
+        assert!(player.frame_queue.push(frame(Duration::from_millis(900))));
+
+        assert!(matches!(
+            player.poll_frame_result(),
+            FramePollResult::NewFrame(_)
+        ));
+        assert!(matches!(player.poll_frame_result(), FramePollResult::Hold));
+        assert_eq!(player.frame_queue.len(), 1);
+    }
+
+    #[test]
+    fn poll_result_distinguishes_buffering_and_eos() {
+        let mut player = CorePlayer::new("test://scheduler");
+        player.scheduler.start();
+
+        assert!(matches!(
+            player.poll_frame_result(),
+            FramePollResult::Buffering
+        ));
+        player.frame_queue.set_eos();
+        assert!(matches!(
+            player.poll_frame_result(),
+            FramePollResult::EndOfStream
+        ));
     }
 }

@@ -1080,6 +1080,8 @@ pub struct FrameScheduler {
     current_position: Duration,
     /// The last frame that was displayed
     current_frame: Option<VideoFrame>,
+    /// Increments whenever a frame is newly selected for presentation.
+    presentation_generation: u64,
     /// Time when playback started (or was resumed) - only set after first frame arrives
     playback_start_time: Option<std::time::Instant>,
     /// Position when playback started (synced to frame PTS)
@@ -1182,6 +1184,7 @@ impl FrameScheduler {
         Self {
             current_position: Duration::ZERO,
             current_frame: None,
+            presentation_generation: 0,
             playback_start_time: None,
             playback_start_position: Duration::ZERO,
             waiting_for_first_frame: false,
@@ -1993,6 +1996,7 @@ impl FrameScheduler {
                 );
                 self.waiting_for_first_frame = false;
                 self.current_frame = Some(frame.clone());
+                self.presentation_generation = self.presentation_generation.wrapping_add(1);
                 self.current_position = Duration::ZERO;
                 // Keep waiting_for_first_frame semantics — the NEXT
                 // frame with pts>0 will initialise the clock properly.
@@ -2008,6 +2012,7 @@ impl FrameScheduler {
             self.waiting_for_first_frame = false;
             self.on_frame_received(frame.pts);
             self.current_frame = Some(frame.clone());
+            self.presentation_generation = self.presentation_generation.wrapping_add(1);
             self.current_position = frame.pts;
             self.stalled = false;
             self.stall_cooldown_until = None;
@@ -2335,6 +2340,8 @@ impl FrameScheduler {
                             );
                             self.current_position = frame.pts;
                             self.current_frame = Some(frame.clone());
+                            self.presentation_generation =
+                                self.presentation_generation.wrapping_add(1);
                             self.playback_start_time = Some(std::time::Instant::now());
                             self.playback_start_position = frame.pts;
                             self.advance_frame_pacing();
@@ -2361,6 +2368,8 @@ impl FrameScheduler {
                         if let Some(frame) = queue.pop() {
                             self.current_position = frame.pts;
                             self.current_frame = Some(frame.clone());
+                            self.presentation_generation =
+                                self.presentation_generation.wrapping_add(1);
                             self.playback_start_time = Some(std::time::Instant::now());
                             self.playback_start_position = frame.pts;
                             self.advance_frame_pacing();
@@ -2449,6 +2458,7 @@ impl FrameScheduler {
 
             self.current_position = frame.pts;
             self.current_frame = Some(frame.clone());
+            self.presentation_generation = self.presentation_generation.wrapping_add(1);
             self.advance_frame_pacing();
 
             // Deferred epoch: enable audio once video reaches the live edge.
@@ -2699,7 +2709,8 @@ impl FrameScheduler {
         // stall/resume storms when the decode thread can't keep up.
         // Use 33ms (roughly one 30fps frame) — long enough to prevent
         // the storm but short enough to maintain sync with wall-clock timing.
-        self.stall_cooldown_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(33));
+        self.stall_cooldown_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(33));
 
         // MoQ wall-clock mode: pause audio during video stalls so they stay in sync.
         // Without this, audio continues playing through the ring buffer while the
@@ -2811,6 +2822,11 @@ impl FrameScheduler {
     /// Returns the current frame without advancing.
     pub fn current_frame(&self) -> Option<&VideoFrame> {
         self.current_frame.as_ref()
+    }
+
+    /// Monotonic identifier for the most recently selected presentation frame.
+    pub fn presentation_generation(&self) -> u64 {
+        self.presentation_generation
     }
 }
 

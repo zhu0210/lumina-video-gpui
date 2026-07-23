@@ -26,7 +26,7 @@ use gpui::*;
 use gpui_wgpu::wgpu;
 
 use lumina_video_core::frame_to_texture::{self, GpuFrameTextures};
-use lumina_video_core::player::CorePlayer;
+use lumina_video_core::player::{CorePlayer, FramePollResult};
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 #[cfg(feature = "moq")]
 use lumina_video_core::video::VideoDecoderBackend;
@@ -107,8 +107,7 @@ pub struct GpuiVideoPlayer {
 
     // Diagnostics: avoid log spam when GPU context is repeatedly unavailable
     gpu_context_missing_logged: bool,
-    // Rate-limit per-frame warnings to once per 5 seconds
-    last_frame_warn: Option<std::time::Instant>,
+    // Rate-limit upload warnings to once per 5 seconds
     last_upload_warn: Option<std::time::Instant>,
 
     // Subtitles
@@ -161,7 +160,6 @@ impl GpuiVideoPlayer {
             initialized: false,
             loop_seek_pending: false,
             gpu_context_missing_logged: false,
-            last_frame_warn: None,
             last_upload_warn: None,
             subtitle_track: None,
             show_subtitles: true,
@@ -778,59 +776,10 @@ impl GpuiVideoPlayer {
             }
         };
 
-        // Drain available frames from the decode queue, uploading only the last.
-        // Cap at 16 iterations: poll_frame() always returns Some(current_frame)
-        // after the first frame (even during stall), so an uncapped loop spins.
-        let queue_len_before = self.core.frame_queue().len();
-        let mut last_frame = None;
-        let mut drained = 0u32;
-        const MAX_DRAIN: u32 = 16;
-        while drained < MAX_DRAIN {
-            let Some(video_frame) = self.core.poll_frame() else {
-                break;
-            };
-            drained += 1;
+        // The scheduler owns late-frame dropping. Polling more than once here can
+        // consume future frames and turns held frames into needless GPU uploads.
+        if let FramePollResult::NewFrame(video_frame) = self.core.poll_frame_result() {
             self.loop_seek_pending = false;
-            last_frame = Some(video_frame);
-        }
-        if drained > 0 {
-            tracing::trace!(
-                "poll_and_upload: drained {drained} frames, queue was {queue_len_before}"
-            );
-        } else if queue_len_before > 0 {
-            // Rate-limit: only log once per 5 seconds
-            let now = std::time::Instant::now();
-            let should_log = self
-                .last_frame_warn
-                .map_or(true, |t| now.duration_since(t).as_secs() >= 5);
-            if should_log {
-                tracing::warn!(
-                    "poll_and_upload: drained 0 frames but queue has {queue_len_before} — \
-                     scheduler is holding frames back (audio not started?)"
-                );
-                self.last_frame_warn = Some(now);
-            }
-        }
-        if drained > 0 {
-            tracing::trace!(
-                "poll_and_upload: drained {drained} frames, queue was {queue_len_before}"
-            );
-        } else if queue_len_before > 0 {
-            // Rate-limit: only log once per 5 seconds to avoid per-frame spam
-            let now = std::time::Instant::now();
-            let should_log = self
-                .last_frame_warn
-                .map_or(true, |t| now.duration_since(t).as_secs() >= 5);
-            if should_log {
-                tracing::warn!(
-                    "poll_and_upload: drained 0 frames but queue has {queue_len_before} — \
-                     scheduler is holding frames back (audio not started?)"
-                );
-                self.last_frame_warn = Some(now);
-            }
-        }
-
-        if let Some(video_frame) = last_frame {
             let textures = frame_to_texture::decoded_frame_to_textures(
                 &video_frame.frame,
                 &gpu.device,
