@@ -684,8 +684,6 @@ impl CorePlayer {
 
         if self.frame_queue.is_eos() && self.frame_queue.is_empty() {
             FramePollResult::EndOfStream
-        } else if self.frame_queue.is_empty() {
-            FramePollResult::Buffering
         } else if frame.is_some() {
             FramePollResult::Hold
         } else {
@@ -891,6 +889,22 @@ mod tests {
         ));
         assert!(matches!(player.poll_frame_result(), FramePollResult::Hold));
         assert_eq!(player.frame_queue.len(), 1);
+    }
+
+    #[test]
+    fn held_frame_with_empty_queue_is_not_an_underrun() {
+        let mut player = CorePlayer::new("test://scheduler");
+        player.scheduler.start();
+        assert!(player.frame_queue.push(frame(Duration::from_millis(1))));
+
+        assert!(matches!(
+            player.poll_frame_result(),
+            FramePollResult::NewFrame(_)
+        ));
+        assert!(player.frame_queue.is_empty());
+        assert!(matches!(player.poll_frame_result(), FramePollResult::Hold));
+        assert_eq!(player.scheduler.sync_metrics().underrun_count(), 0);
+        assert_eq!(player.scheduler.sync_metrics().stall_count(), 0);
     }
 
     #[test]

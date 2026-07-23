@@ -1016,6 +1016,9 @@ const STUCK_TIMEOUT: Duration = Duration::from_secs(3);
 const NEAR_BOUNDARY_FORCE_TIMEOUT: Duration = Duration::from_millis(900);
 /// Startup tolerance while waiting for audio to begin.
 const AUDIO_STARTUP_AHEAD_TOLERANCE: Duration = Duration::from_millis(500);
+/// VOD frames should follow their timestamps closely; live jitter tolerance is
+/// enabled separately through frame-rate pacing.
+const VOD_AHEAD_TOLERANCE: Duration = Duration::from_millis(5);
 /// Base live tolerance once audio is running.
 const LIVE_BASE_AHEAD_TOLERANCE: Duration = Duration::from_millis(2000);
 /// Maximum adaptive live tolerance to avoid unbounded A/V divergence.
@@ -1076,6 +1079,8 @@ enum RejectHandlingState {
 /// The scheduler only advances position when frames are actually being delivered,
 /// preventing the scroll bar from advancing during buffering.
 pub struct FrameScheduler {
+    /// Injectable monotonic clock used by all scheduler timing decisions.
+    clock: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
     /// The current playback position (updated from frame PTS)
     current_position: Duration,
     /// The last frame that was displayed
@@ -1182,6 +1187,7 @@ impl FrameScheduler {
     /// Creates a new frame scheduler.
     pub fn new() -> Self {
         Self {
+            clock: Arc::new(std::time::Instant::now),
             current_position: Duration::ZERO,
             current_frame: None,
             presentation_generation: 0,
@@ -1227,6 +1233,21 @@ impl FrameScheduler {
             deferred_epoch_pts: None,
             last_get_next_frame_time: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_clock(clock: Arc<dyn Fn() -> std::time::Instant + Send + Sync>) -> Self {
+        let mut scheduler = Self::new();
+        scheduler.clock = clock;
+        scheduler
+    }
+
+    fn now(&self) -> std::time::Instant {
+        (self.clock)()
+    }
+
+    fn elapsed_since(&self, instant: std::time::Instant) -> Duration {
+        self.now().saturating_duration_since(instant)
     }
 
     /// Creates a new frame scheduler with audio handle for sync tracking.
@@ -1345,7 +1366,7 @@ impl FrameScheduler {
         if self.frame_pacing_interval.is_zero() {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = self.now();
         self.next_frame_due = Some(match self.next_frame_due {
             Some(due) => {
                 let next = due + self.frame_pacing_interval;
@@ -1415,7 +1436,7 @@ impl FrameScheduler {
                     // This prevents video from racing ahead of audio.
                     let elapsed = self
                         .playback_start_time
-                        .map(|t| t.elapsed())
+                        .map(|t| self.elapsed_since(t))
                         .unwrap_or(Duration::ZERO);
                     if elapsed < Duration::from_millis(500) {
                         // During initial startup, hold at start position
@@ -1466,7 +1487,7 @@ impl FrameScheduler {
         self.smoothed_drift_us = 0.0;
         if let Some(start) = self.playback_start_time.take() {
             // Calculate wall-clock position
-            let wall_clock_pos = self.playback_start_position + start.elapsed();
+            let wall_clock_pos = self.playback_start_position + self.elapsed_since(start);
 
             // Use frame PTS if wall-clock has run away (e.g., after loops)
             if let Some(ref frame) = self.current_frame {
@@ -1540,7 +1561,7 @@ impl FrameScheduler {
         // Use wall-clock for smooth updates, but don't exceed the last frame's PTS
         // This prevents position from running ahead of actual video playback
         let wall_clock_pos = match self.playback_start_time {
-            Some(start) => self.playback_start_position + start.elapsed(),
+            Some(start) => self.playback_start_position + self.elapsed_since(start),
             None => return self.current_position,
         };
 
@@ -1586,7 +1607,7 @@ impl FrameScheduler {
             self.audio_stalled = false;
             self.audio_stall_start = None;
             if self.playback_requested {
-                self.playback_start_time = Some(std::time::Instant::now());
+                self.playback_start_time = Some(self.now());
                 self.playback_start_position = self.current_position;
             }
             self.frames_since_recovery = 0;
@@ -1602,7 +1623,7 @@ impl FrameScheduler {
     fn on_frame_received(&mut self, frame_pts: Duration) {
         if self.waiting_for_first_frame && self.playback_requested {
             // First frame after play/seek - start the clock synced to frame PTS
-            self.playback_start_time = Some(std::time::Instant::now());
+            self.playback_start_time = Some(self.now());
             self.playback_start_position = frame_pts;
             self.waiting_for_first_frame = false;
 
@@ -1641,7 +1662,7 @@ impl FrameScheduler {
                     return true;
                 }
                 self.playback_start_time
-                    .map(|t| t.elapsed() >= AUDIO_CLOCK_START_GRACE)
+                    .map(|t| self.elapsed_since(t) >= AUDIO_CLOCK_START_GRACE)
                     .unwrap_or(false)
             })
             .unwrap_or(true)
@@ -1724,12 +1745,12 @@ impl FrameScheduler {
 
         // Warmup: 5s after audio starts
         match self.audio_start_time {
-            Some(start) if start.elapsed() >= Duration::from_secs(5) => {}
+            Some(start) if self.elapsed_since(start) >= Duration::from_secs(5) => {}
             _ => return,
         }
 
         // Time-based rate limiting: every 200ms, dt capped at 500ms
-        let now = std::time::Instant::now();
+        let now = self.now();
         let dt = match self.last_drift_update {
             Some(last) => {
                 let elapsed = now.duration_since(last);
@@ -1811,6 +1832,10 @@ impl FrameScheduler {
         gap: Duration,
         now: std::time::Instant,
     ) -> Duration {
+        if self.frame_pacing_interval.is_zero() {
+            return VOD_AHEAD_TOLERANCE;
+        }
+
         // When audio hasn't started, begin with a generous tolerance and
         // escalate over time so video can play even without an audio clock.
         // Without escalation, a static AUDIO_STARTUP_AHEAD_TOLERANCE (500ms)
@@ -2009,7 +2034,6 @@ impl FrameScheduler {
                 frame.pts,
                 queue_len
             );
-            self.waiting_for_first_frame = false;
             self.on_frame_received(frame.pts);
             self.current_frame = Some(frame.clone());
             self.presentation_generation = self.presentation_generation.wrapping_add(1);
@@ -2030,7 +2054,7 @@ impl FrameScheduler {
                     next_pts,
                     ahead
                 );
-                if ahead > Duration::from_millis(500) {
+                if ahead > Duration::from_secs(1) {
                     let jump_to = next_pts.saturating_sub(Duration::from_millis(42));
                     tracing::info!(
                         "get_next_frame: clock jump after first frame {:?} → {:?} \
@@ -2041,7 +2065,7 @@ impl FrameScheduler {
                     );
                     self.current_position = jump_to;
                     self.playback_start_position = jump_to;
-                    self.playback_start_time = Some(std::time::Instant::now());
+                    self.playback_start_time = Some(self.now());
                 }
             } else {
                 tracing::debug!("get_next_frame: no next frame to check for clock jump");
@@ -2054,7 +2078,7 @@ impl FrameScheduler {
         // or throttles repainting, but cpal audio continues playing. This creates A/V
         // drift equal to the gap duration. Detect the gap and resync immediately.
         if !self.use_audio_as_sync_master && self.playback_start_time.is_some() {
-            let now = std::time::Instant::now();
+            let now = self.now();
             if let Some(last) = self.last_get_next_frame_time {
                 let gap = now.duration_since(last);
                 if gap > RENDERING_GAP_THRESHOLD {
@@ -2092,7 +2116,7 @@ impl FrameScheduler {
         // to avoid UI refresh aliasing. At 24fps on 60Hz, the old elapsed check quantized
         // to 50ms/frame (20fps); the accumulator produces a 2-3 tick cadence averaging 24fps.
         if !self.frame_pacing_interval.is_zero() {
-            let now = std::time::Instant::now();
+            let now = self.now();
             if let Some(due) = self.next_frame_due {
                 if now < due {
                     return self.current_frame.clone();
@@ -2119,7 +2143,7 @@ impl FrameScheduler {
                             video_start, audio_start, offset.as_millis()
                         );
                         self.playback_start_position = audio_start;
-                        self.playback_start_time = Some(std::time::Instant::now());
+                        self.playback_start_time = Some(self.now());
                         self.current_position = audio_start;
                     }
                     // Defer the playback epoch until video catches up to the live edge.
@@ -2152,7 +2176,7 @@ impl FrameScheduler {
                         // This handles publisher stream loops or permanent audio loss.
                         let timed_out = self
                             .audio_stall_start
-                            .map(|t| t.elapsed() > Duration::from_secs(3))
+                            .map(|t| self.elapsed_since(t) > Duration::from_secs(3))
                             .unwrap_or(false);
                         if timed_out {
                             tracing::warn!(
@@ -2186,8 +2210,12 @@ impl FrameScheduler {
         // Keep popping frames until we find one that should be displayed now
         loop {
             let Some(next_pts) = queue.peek_pts() else {
-                // Queue is empty - we're stalled (buffering)
-                self.handle_stall();
+                // Retaining a previously presented frame is a normal hold, not
+                // an underrun. Enter buffering only when playback has no frame
+                // it can continue to present.
+                if self.current_frame.is_none() {
+                    self.handle_stall();
+                }
                 return self.current_frame.clone();
             };
 
@@ -2206,7 +2234,7 @@ impl FrameScheduler {
                 raw_sync_pos.saturating_sub(Duration::from_micros((-clamped_bias_us) as u64))
             };
 
-            let now = std::time::Instant::now();
+            let now = self.now();
 
             // Clock jump check: if next frame is way ahead (>1s) of our current *position*,
             // the stream might have a large PTS gap (e.g., sparse keyframes in HTTP stream,
@@ -2223,7 +2251,7 @@ impl FrameScheduler {
                 );
                 self.current_position = jump_to;
                 self.playback_start_position = jump_to;
-                self.playback_start_time = Some(std::time::Instant::now());
+                self.playback_start_time = Some(self.now());
                 self.reset_rejection_tracking();
                 // Continue to re-evaluate with the new clock position
                 continue;
@@ -2236,7 +2264,11 @@ impl FrameScheduler {
             let audio_started = self.audio_started_for_timing();
             let gap = next_pts.abs_diff(current_pos);
             let ahead_tolerance = self.compute_ahead_tolerance(audio_started, gap, now);
-            let accept_tolerance = ahead_tolerance.saturating_add(LIVE_ACCEPT_JITTER_TOLERANCE);
+            let accept_tolerance = if self.frame_pacing_interval.is_zero() {
+                ahead_tolerance
+            } else {
+                ahead_tolerance.saturating_add(LIVE_ACCEPT_JITTER_TOLERANCE)
+            };
             let should_accept =
                 next_pts <= current_pos + accept_tolerance || self.current_frame.is_none();
 
@@ -2342,7 +2374,7 @@ impl FrameScheduler {
                             self.current_frame = Some(frame.clone());
                             self.presentation_generation =
                                 self.presentation_generation.wrapping_add(1);
-                            self.playback_start_time = Some(std::time::Instant::now());
+                            self.playback_start_time = Some(self.now());
                             self.playback_start_position = frame.pts;
                             self.advance_frame_pacing();
                             self.record_sync(frame.pts);
@@ -2370,7 +2402,7 @@ impl FrameScheduler {
                             self.current_frame = Some(frame.clone());
                             self.presentation_generation =
                                 self.presentation_generation.wrapping_add(1);
-                            self.playback_start_time = Some(std::time::Instant::now());
+                            self.playback_start_time = Some(self.now());
                             self.playback_start_position = frame.pts;
                             self.advance_frame_pacing();
                             return Some(frame);
@@ -2426,7 +2458,22 @@ impl FrameScheduler {
             }
             self.reset_rejection_tracking();
 
-            let Some(frame) = queue.pop() else { continue };
+            let Some(mut frame) = queue.pop() else {
+                continue;
+            };
+
+            // Collapse frames that are already due into the newest presentable
+            // frame. Late-frame dropping belongs in the scheduler so UI
+            // consumers still poll exactly once and never drain the queue.
+            while queue
+                .peek_pts()
+                .is_some_and(|pts| pts <= current_pos + accept_tolerance)
+            {
+                let Some(newer_due_frame) = queue.pop() else {
+                    break;
+                };
+                frame = newer_due_frame;
+            }
 
             // Skip if this frame is older than what we already have
             if let Some(ref current) = self.current_frame {
@@ -2510,7 +2557,7 @@ impl FrameScheduler {
                     );
                     self.current_position = jump_to;
                     self.playback_start_position = jump_to;
-                    self.playback_start_time = Some(std::time::Instant::now());
+                    self.playback_start_time = Some(self.now());
                 }
             }
 
@@ -2558,7 +2605,7 @@ impl FrameScheduler {
                 self.sync_metrics.set_sync_externally_managed(false);
 
                 if self.audio_start_time.is_none() {
-                    self.audio_start_time = Some(std::time::Instant::now());
+                    self.audio_start_time = Some(self.now());
                     self.audio_start_pos = audio_pos;
                     tracing::info!(
                         "record_sync(MoQ): first measurement video_pts={:?}, audio_pos={:?}, offset={}ms",
@@ -2571,10 +2618,10 @@ impl FrameScheduler {
                 self.sync_metrics.record_frame(video_pts, audio_pos);
 
                 // 10s diagnostic: log content alignment and clock rates
-                let now = std::time::Instant::now();
+                let now = self.now();
                 let elapsed = self
                     .audio_start_time
-                    .map(|t| t.elapsed())
+                    .map(|t| self.elapsed_since(t))
                     .unwrap_or(Duration::ZERO);
                 let should_log = match self.last_clock_delta_log {
                     None => elapsed > Duration::from_secs(1),
@@ -2599,7 +2646,7 @@ impl FrameScheduler {
                 // audio clock rate accuracy vs wall-clock. Any rate drift here
                 // IS the A/V drift since video follows audio by construction.
                 if self.audio_start_time.is_none() {
-                    self.audio_start_time = Some(std::time::Instant::now());
+                    self.audio_start_time = Some(self.now());
                     self.audio_start_pos = audio_pos;
                     if let Some(ref h) = self.audio_handle {
                         let ch = h.channels();
@@ -2631,13 +2678,13 @@ impl FrameScheduler {
                 // Cooldown: audio_start_time resets on each re-baseline, and we require
                 // 2s since last baseline before checking again.
                 if let Some(start) = self.audio_start_time {
-                    let since_start = start.elapsed();
+                    let since_start = self.elapsed_since(start);
                     if since_start >= Duration::from_secs(2) {
                         let audio_delta = audio_pos.saturating_sub(self.audio_start_pos);
                         let drift_abs = since_start.abs_diff(audio_delta);
                         if drift_abs > Duration::from_millis(200) {
                             let old_pos = self.audio_start_pos;
-                            self.audio_start_time = Some(std::time::Instant::now());
+                            self.audio_start_time = Some(self.now());
                             self.audio_start_pos = audio_pos;
                             self.sync_metrics.reset();
                             tracing::info!(
@@ -2655,14 +2702,14 @@ impl FrameScheduler {
                 // so audio_delta=0, and we compare against elapsed=0 → drift=0
                 let elapsed = self
                     .audio_start_time
-                    .map(|t| t.elapsed())
+                    .map(|t| self.elapsed_since(t))
                     .unwrap_or(Duration::ZERO);
                 let audio_delta = audio_pos.saturating_sub(self.audio_start_pos);
                 self.sync_metrics.record_frame(elapsed, audio_delta);
 
                 // 10s clock-source diagnostic: log wall-clock vs audio-clock deltas
                 // to determine whether drift is from audio sample counting or video pacing.
-                let now = std::time::Instant::now();
+                let now = self.now();
                 let should_log = match self.last_clock_delta_log {
                     None => elapsed > Duration::from_secs(1),
                     Some(last) => now.duration_since(last) >= Duration::from_secs(10),
@@ -2702,15 +2749,14 @@ impl FrameScheduler {
         }
         // Only update position if we have a valid playback start time
         if let Some(start_time) = self.playback_start_time {
-            self.current_position = self.playback_start_position + start_time.elapsed();
+            self.current_position = self.playback_start_position + self.elapsed_since(start_time);
         }
         self.stalled = true;
         // Set a minimum cooldown before we allow resume, to prevent
         // stall/resume storms when the decode thread can't keep up.
         // Use 33ms (roughly one 30fps frame) — long enough to prevent
         // the storm but short enough to maintain sync with wall-clock timing.
-        self.stall_cooldown_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(33));
+        self.stall_cooldown_until = Some(self.now() + std::time::Duration::from_millis(33));
 
         // MoQ wall-clock mode: pause audio during video stalls so they stay in sync.
         // Without this, audio continues playing through the ring buffer while the
@@ -2746,13 +2792,13 @@ impl FrameScheduler {
         // This prevents the stall/resume storm when the decode thread produces
         // frames slower than the main loop consumes them.
         if let Some(cooldown) = self.stall_cooldown_until {
-            if std::time::Instant::now() < cooldown {
+            if self.now() < cooldown {
                 return;
             }
         }
         self.stalled = false;
         self.stall_cooldown_until = None;
-        self.playback_start_time = Some(std::time::Instant::now());
+        self.playback_start_time = Some(self.now());
         self.playback_start_position = self.current_position;
         // Reset frame counter for tracking recovery completion
         self.frames_since_recovery = 0;
@@ -2776,11 +2822,11 @@ impl FrameScheduler {
             return;
         }
         if let Some(start_time) = self.playback_start_time {
-            self.current_position = self.playback_start_position + start_time.elapsed();
+            self.current_position = self.playback_start_position + self.elapsed_since(start_time);
         }
         self.playback_start_time = None;
         self.audio_stalled = true;
-        self.audio_stall_start = Some(std::time::Instant::now());
+        self.audio_stall_start = Some(self.now());
         self.sync_metrics.record_underrun();
         self.sync_metrics.record_stall(StallType::Network);
         self.sync_metrics.start_recovery();
@@ -2794,7 +2840,7 @@ impl FrameScheduler {
     fn exit_audio_stall(&mut self) {
         self.audio_stalled = false;
         self.audio_stall_start = None;
-        self.playback_start_time = Some(std::time::Instant::now());
+        self.playback_start_time = Some(self.now());
         self.playback_start_position = self.current_position;
         self.frames_since_recovery = 0;
         tracing::debug!("Resuming from audio stall at {:?}", self.current_position);
@@ -2846,6 +2892,31 @@ mod tests {
     use super::*;
     use crate::video::{CpuFrame, DecodedFrame, PixelFormat, Plane};
 
+    #[derive(Clone)]
+    struct FakeClock {
+        now: Arc<std::sync::Mutex<std::time::Instant>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            }
+        }
+
+        fn scheduler(&self) -> FrameScheduler {
+            let now = Arc::clone(&self.now);
+            FrameScheduler::with_clock(Arc::new(move || {
+                *now.lock().unwrap_or_else(|error| error.into_inner())
+            }))
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.now.lock().unwrap_or_else(|error| error.into_inner());
+            *now += duration;
+        }
+    }
+
     fn make_test_frame(pts: Duration) -> VideoFrame {
         let plane = Plane {
             data: vec![128; 100],
@@ -2892,7 +2963,9 @@ mod tests {
 
     #[test]
     fn test_frame_scheduler_position() {
-        let mut scheduler = FrameScheduler::new();
+        let clock = FakeClock::new();
+        let mut scheduler = clock.scheduler();
+        let queue = FrameQueue::new(2);
 
         assert_eq!(scheduler.position(), Duration::ZERO);
 
@@ -2900,13 +2973,82 @@ mod tests {
         assert_eq!(scheduler.position(), Duration::from_secs(10));
 
         scheduler.start();
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(scheduler.position() >= Duration::from_secs(10));
+        assert!(scheduler.playback_requested);
+        assert!(scheduler.waiting_for_first_frame);
+        assert!(queue.push(make_test_frame(Duration::from_secs(10))));
+        let selected = scheduler.get_next_frame(&queue).unwrap();
+        assert_eq!(selected.pts, Duration::from_secs(10));
+        assert!(scheduler.playback_start_time.is_some());
+        assert!(scheduler.is_playing());
+        assert!(!scheduler.is_stalled());
+        clock.advance(Duration::from_millis(50));
+        assert_eq!(scheduler.position(), Duration::from_millis(10_050));
 
         scheduler.pause();
         let pos = scheduler.position();
-        std::thread::sleep(Duration::from_millis(50));
+        clock.advance(Duration::from_millis(50));
         assert_eq!(scheduler.position(), pos);
+    }
+
+    #[test]
+    fn scheduler_holds_future_frame_until_fake_clock_reaches_it() {
+        let clock = FakeClock::new();
+        let mut scheduler = clock.scheduler();
+        let queue = FrameQueue::new(3);
+        bind_test_audio_metrics_only(&mut scheduler, Duration::from_secs(1));
+        scheduler.start();
+        assert!(queue.push(make_test_frame(Duration::from_secs(1))));
+        assert!(queue.push(make_test_frame(Duration::from_secs(2))));
+
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::from_secs(1)
+        );
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(scheduler.position(), Duration::from_millis(1_500));
+        assert!(scheduler.current_frame.is_some());
+        assert!(scheduler.frame_pacing_interval.is_zero());
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::from_secs(1)
+        );
+        assert_eq!(queue.len(), 1);
+
+        for step in 1..=10 {
+            clock.advance(Duration::from_millis(50));
+            let expected = if step == 10 {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_secs(1)
+            };
+            assert_eq!(scheduler.get_next_frame(&queue).unwrap().pts, expected);
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn scheduler_drops_late_frames_in_one_poll() {
+        let clock = FakeClock::new();
+        let mut scheduler = clock.scheduler();
+        let queue = FrameQueue::new(5);
+        bind_test_audio_metrics_only(&mut scheduler, Duration::from_secs(1));
+        scheduler.start();
+        assert!(queue.push(make_test_frame(Duration::from_secs(1))));
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::from_secs(1)
+        );
+
+        for millis in [1_100, 1_200, 1_300, 2_500] {
+            assert!(queue.push(make_test_frame(Duration::from_millis(millis))));
+        }
+        clock.advance(Duration::from_millis(350));
+
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::from_millis(1_300)
+        );
+        assert_eq!(queue.peek_pts(), Some(Duration::from_millis(2_500)));
     }
 
     /// Bind an AudioHandle with a specific position for drift controller tests.
