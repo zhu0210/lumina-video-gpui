@@ -410,7 +410,118 @@ pub struct ZeroCopyGStreamerDecoder {
     is_local_file: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecoderSelectionPolicy {
+    PreferVaApi,
+    PreferNvidia,
+    SoftwareOnly,
+}
+
+impl DecoderSelectionPolicy {
+    fn skips(self, factory_name: &str) -> bool {
+        let is_va_api = matches!(
+            factory_name,
+            "vah264dec" | "vah265dec" | "vaav1dec" | "vavp8dec" | "vavp9dec"
+        );
+        let is_nvidia = matches!(
+            factory_name,
+            "nvh264dec" | "nvh265dec" | "nvav1dec" | "nvvp8dec" | "nvvp9dec"
+        );
+
+        match self {
+            Self::PreferVaApi => is_nvidia,
+            Self::PreferNvidia => is_va_api,
+            Self::SoftwareOnly => is_va_api || is_nvidia,
+        }
+    }
+}
+
 impl ZeroCopyGStreamerDecoder {
+    /// Applies decoder and device selection to one `uridecodebin` only.
+    ///
+    /// This deliberately avoids changing registry ranks or process
+    /// environment, both of which affect unrelated GStreamer pipelines in the
+    /// embedding application.
+    fn configure_decodebin(
+        source: &gst::Element,
+        policy: DecoderSelectionPolicy,
+        render_node: Option<&str>,
+    ) -> Result<(), VideoError> {
+        let signal_id = gst::glib::subclass::SignalId::lookup("autoplug-select", source.type_())
+            .ok_or_else(|| {
+                VideoError::DecoderInit("uridecodebin does not expose autoplug-select".to_string())
+            })?;
+        let return_type: gst::glib::Type = signal_id.query().return_type().into();
+        let enum_class = gst::glib::EnumClass::with_type(return_type).ok_or_else(|| {
+            VideoError::DecoderInit(
+                "uridecodebin autoplug-select has a non-enum return type".to_string(),
+            )
+        })?;
+        enum_class.to_value(0).ok_or_else(|| {
+            VideoError::DecoderInit("missing autoplug-select TRY value".to_string())
+        })?;
+        enum_class.to_value(2).ok_or_else(|| {
+            VideoError::DecoderInit("missing autoplug-select SKIP value".to_string())
+        })?;
+
+        source.connect_closure(
+            "autoplug-select",
+            false,
+            gst::glib::RustClosure::new(move |values| {
+                let factory_name = values
+                    .get(3)
+                    .and_then(|value| value.get::<gst::ElementFactory>().ok())
+                    .map(|factory| factory.name())
+                    .unwrap_or_default();
+
+                if policy.skips(factory_name.as_str()) {
+                    tracing::debug!(
+                        factory = factory_name.as_str(),
+                        ?policy,
+                        "Skipping decoder for this pipeline"
+                    );
+                    gst::glib::EnumClass::with_type(return_type)?.to_value(2)
+                } else {
+                    gst::glib::EnumClass::with_type(return_type)?.to_value(0)
+                }
+            }),
+        );
+
+        if let Some(render_node) = render_node {
+            let decodebin = source
+                .clone()
+                .downcast::<gst::Bin>()
+                .map_err(|_| VideoError::DecoderInit("uridecodebin is not a GstBin".to_string()))?;
+            let render_node = Arc::<str>::from(render_node);
+            decodebin.connect_deep_element_added(move |_bin, _sub_bin, element| {
+                Self::configure_element_render_node(element, &render_node);
+            });
+        }
+
+        Ok(())
+    }
+
+    fn configure_element_render_node(element: &gst::Element, render_node: &str) {
+        // VA plugins have used different property names across releases. Only
+        // set a property when it exists and is actually a string, avoiding
+        // assumptions about unrelated elements' similarly named properties.
+        for property_name in ["device-path", "render-device", "drm-device"] {
+            let Some(property) = element.find_property(property_name) else {
+                continue;
+            };
+            if property.value_type() == String::static_type() {
+                element.set_property(property_name, render_node);
+                tracing::debug!(
+                    element = element.name().as_str(),
+                    property = property_name,
+                    render_node,
+                    "Configured pipeline-local render device"
+                );
+                break;
+            }
+        }
+    }
+
     /// Creates a new zero-copy GStreamer decoder for the given URL.
     ///
     /// This attempts to set up the optimal pipeline using GStreamer 1.24+:
@@ -642,16 +753,14 @@ impl ZeroCopyGStreamerDecoder {
         //
         // - Unknown/other: try VA-API first (most common case: virtio-gpu,
         //   llvmpipe software rasterizer).
+        //
+        // Selection is installed on each uridecodebin below. Never mutate
+        // process-wide plugin ranks: Lumina can be embedded alongside other
+        // independent GStreamer pipelines.
         if compositor_vendor != Self::VENDOR_NVIDIA {
-            // Compositor uses Intel or AMD — prefer VA-API for DMABuf zero-copy.
-            for feature_name in &["nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec"] {
-                if let Some(feature) = gst::Registry::get().lookup_feature(feature_name) {
-                    feature.set_rank(gst::Rank::MARGINAL);
-                    tracing::debug!(
-                        "Lowered {feature_name} rank to MARGINAL (compositor GPU is {compositor_vendor:#06x}, preferring VA-API)"
-                    );
-                }
-            }
+            tracing::debug!(
+                "Compositor GPU is {compositor_vendor:#06x}; preferring VA-API in this pipeline"
+            );
         } else if Self::nvidia_drm_modeset_active() {
             // NVIDIA GPU with nvidia-drm modesetting enabled.
             // NVDEC can output DMABuf memory for zero-copy Vulkan import.
@@ -663,28 +772,12 @@ impl ZeroCopyGStreamerDecoder {
             );
             return Self::nvidia_dmabuf_pipeline(url, render_node.as_deref());
         } else {
-            // NVIDIA NVDEC outputs CUDAMemory which cannot be exported as DMABuf
-            // and cannot be CPU-mapped. Lower both NVIDIA AND VA-API ranks so
-            // uridecodebin picks software avdec_h264, which outputs system-memory
-            // NV12 that videoconvert/cpu_copy_pipeline can handle.
-            for feature_name in &[
-                "nvh264dec",
-                "nvh265dec",
-                "nvav1dec",
-                "nvvp9dec",
-                "vah264dec",
-                "vah265dec",
-                "vaav1dec",
-                "vavp9dec",
-            ] {
-                if let Some(feature) = gst::Registry::get().lookup_feature(feature_name) {
-                    feature.set_rank(gst::Rank::MARGINAL);
-                }
-            }
+            // NVIDIA NVDEC outputs CUDAMemory which cannot be exported as
+            // DMABuf and cannot be CPU-mapped. The CPU fallback installs a
+            // software-only policy on its own uridecodebin.
             tracing::info!(
                 "Compositor GPU is NVIDIA ({compositor_vendor:#06x}) without nvidia-drm modeset — \
-                 NVDEC has no DMABuf export. Lowered all HW decoder ranks; \
-                 falling back to software decode + CPU copy."
+                 NVDEC has no DMABuf export; falling back to software decode + CPU copy."
             );
             return Err(VideoError::DecoderInit(
                 "Compositor GPU is NVIDIA — zero-copy DMABuf not available. \
@@ -705,6 +798,11 @@ impl ZeroCopyGStreamerDecoder {
             .property("use-buffering", !is_local_file)
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+        Self::configure_decodebin(
+            &source,
+            DecoderSelectionPolicy::PreferVaApi,
+            render_node.as_deref(),
+        )?;
 
         tracing::info!(
             "uridecodebin: use-buffering={} (is_local_file={})",
@@ -723,23 +821,13 @@ impl ZeroCopyGStreamerDecoder {
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create video queue2: {e}")))?;
 
-        // vapostproc converts VAMemory to DMABuf
-        // This is essential for zero-copy: va decoder outputs VASurface,
-        // Align VA-API device with wgpu's GPU before creating any GStreamer
-        // elements. This ensures zero-copy DMABuf targets the same GPU that
-        // GPUI renders on. Must be set before vapostproc/vah264dec init.
-        if let Some(render_node) = Self::compositor_render_node() {
-            std::env::set_var("GST_VA_DRM_DEVICE", &render_node);
-            tracing::debug!(
-                "Set GST_VA_DRM_DEVICE={} (matching wgpu rendering GPU)",
-                render_node
-            );
-        }
-
         // vapostproc outputs DMABuf FD that we can import into Vulkan
         let vapostproc = gst::ElementFactory::make("vapostproc")
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create vapostproc: {e}")))?;
+        if let Some(render_node) = render_node.as_deref() {
+            Self::configure_element_render_node(&vapostproc, render_node);
+        }
 
         // DMABuf caps for appsink
         let dmabuf_caps = gst::Caps::from_str("video/x-raw(memory:DMABuf)")
@@ -855,6 +943,7 @@ impl ZeroCopyGStreamerDecoder {
             .property("use-buffering", !is_local_file)
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+        Self::configure_decodebin(&source, DecoderSelectionPolicy::SoftwareOnly, None)?;
 
         // Add queue2 between uridecodebin and videoconvert to prevent buffer starvation
         let video_queue = gst::ElementFactory::make("queue2")
@@ -1018,6 +1107,12 @@ impl ZeroCopyGStreamerDecoder {
             .property("use-buffering", !is_local_file)
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+        let render_node = Self::compositor_render_node();
+        Self::configure_decodebin(
+            &source,
+            DecoderSelectionPolicy::PreferVaApi,
+            render_node.as_deref(),
+        )?;
 
         // Request DMABuf directly from decoder - no vapostproc
         let dmabuf_caps = gst::Caps::from_str("video/x-raw(memory:DMABuf)")
@@ -1136,6 +1231,7 @@ impl ZeroCopyGStreamerDecoder {
             .property("use-buffering", !is_local_file)
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+        Self::configure_decodebin(&source, DecoderSelectionPolicy::PreferNvidia, render_node)?;
 
         tracing::info!(
             "NVIDIA DMABuf pipeline: use-buffering={}, is_local_file={}",
@@ -1172,6 +1268,9 @@ impl ZeroCopyGStreamerDecoder {
                 .build()
                 .map_err(|e| VideoError::DecoderInit(format!("Failed to create identity: {e}")))?
         };
+        if let Some(render_node) = render_node {
+            Self::configure_element_render_node(&postproc, render_node);
+        }
 
         // DMABuf caps for appsink — this tells GStreamer to negotiate DMABuf output
         let dmabuf_caps = gst::Caps::from_str("video/x-raw(memory:DMABuf)")
@@ -1237,21 +1336,6 @@ impl ZeroCopyGStreamerDecoder {
             .map_err(|e| VideoError::DecoderInit(format!("Failed to link audio queue: {e}")))?;
 
         let audio_handle = GstAudioHandle::new(Some(volume), Some(audiosink));
-
-        // Align GST_VA_DRM_DEVICE if an explicit render node was provided
-        if let Some(node) = render_node {
-            std::env::set_var("GST_VA_DRM_DEVICE", node);
-            tracing::debug!(
-                "NVIDIA DMABuf: set GST_VA_DRM_DEVICE={} (from GpuInfo)",
-                node
-            );
-        } else if let Some(node) = Self::compositor_render_node() {
-            std::env::set_var("GST_VA_DRM_DEVICE", &node);
-            tracing::debug!(
-                "NVIDIA DMABuf: set GST_VA_DRM_DEVICE={} (auto-detected)",
-                node
-            );
-        }
 
         // Connect pad-added: video to queue2, audio to audio_queue
         Self::connect_pad_added(&source, &video_queue, &audio_queue, audio_handle.clone());
@@ -2861,5 +2945,49 @@ impl VideoDecoderBackend for ZeroCopyGStreamerDecoder {
     fn hw_accel_type(&self) -> HwAccelType {
         // Return VA-API since we're using VA-API for decoding
         HwAccelType::Vaapi
+    }
+}
+
+#[cfg(test)]
+mod decoder_selection_tests {
+    use super::DecoderSelectionPolicy;
+
+    #[test]
+    fn va_policy_rejects_only_nvidia_hardware_decoders() {
+        let policy = DecoderSelectionPolicy::PreferVaApi;
+        assert!(policy.skips("nvh264dec"));
+        assert!(policy.skips("nvav1dec"));
+        assert!(!policy.skips("vah264dec"));
+        assert!(!policy.skips("avdec_h264"));
+    }
+
+    #[test]
+    fn nvidia_policy_rejects_only_va_hardware_decoders() {
+        let policy = DecoderSelectionPolicy::PreferNvidia;
+        assert!(policy.skips("vah265dec"));
+        assert!(policy.skips("vavp9dec"));
+        assert!(!policy.skips("nvh265dec"));
+        assert!(!policy.skips("avdec_h265"));
+    }
+
+    #[test]
+    fn software_policy_rejects_supported_hardware_decoder_families() {
+        let policy = DecoderSelectionPolicy::SoftwareOnly;
+        for factory in [
+            "vah264dec",
+            "vah265dec",
+            "vaav1dec",
+            "vavp8dec",
+            "vavp9dec",
+            "nvh264dec",
+            "nvh265dec",
+            "nvav1dec",
+            "nvvp8dec",
+            "nvvp9dec",
+        ] {
+            assert!(policy.skips(factory), "{factory} should be skipped");
+        }
+        assert!(!policy.skips("avdec_h264"));
+        assert!(!policy.skips("dav1ddec"));
     }
 }
