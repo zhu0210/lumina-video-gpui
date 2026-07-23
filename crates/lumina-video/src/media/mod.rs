@@ -18,8 +18,6 @@ pub(crate) use lumina_video_core::audio_ring_buffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::frame_queue;
 #[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::frame_to_texture;
-#[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::network;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::player;
@@ -27,6 +25,8 @@ pub use lumina_video_core::player;
 pub use lumina_video_core::sync_metrics;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::triple_buffer;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_wgpu::frame_to_texture;
 
 // Platform-specific re-exports
 #[cfg(any(target_os = "macos", target_os = "ios"))]

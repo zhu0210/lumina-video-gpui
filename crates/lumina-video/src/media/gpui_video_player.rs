@@ -25,12 +25,12 @@ use std::time::Duration;
 use gpui::*;
 use gpui_wgpu::wgpu;
 
-use lumina_video_core::frame_to_texture::{self, GpuFrameTextures};
 use lumina_video_core::player::{CorePlayer, FramePollResult};
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 #[cfg(feature = "moq")]
 use lumina_video_core::video::VideoDecoderBackend;
 use lumina_video_core::video::{VideoMetadata, VideoState};
+use lumina_video_wgpu::frame_to_texture::{self, GpuFrameTextures};
 
 #[cfg(feature = "moq")]
 use super::moq_decoder::MoqDecoder;
@@ -85,7 +85,7 @@ pub struct GpuiVideoPlayer {
     config: GpuiVideoPlayerConfig,
 
     // GPU state
-    gpu_context: Option<GpuContextHandle>,
+    gpu_context: Option<WgpuContextHandle>,
     /// Current frame as GPU textures (NV12 or RGBA variant).
     frame_textures: Option<GpuFrameTextures>,
     /// Cached textures for reuse (Y, CbCr, RGBA).
@@ -477,8 +477,8 @@ impl GpuiVideoPlayer {
     /// Returns the GPUI element for the video frame.
     ///
     /// Uses `surface()` for GPU compositing:
-    /// - NV12 frames: `surface((y_tex, cbcr_tex, size))` — GPU-side YUV→RGB
-    /// - RGBA frames: `surface((tex, desc))` — passthrough
+    /// - NV12 frames use a validated source with explicit color metadata.
+    /// - RGBA frames use a validated source with explicit alpha metadata.
     /// - No frame: black placeholder
     pub fn surface_element(&self) -> impl IntoElement {
         if let Some(ref textures) = self.frame_textures {
@@ -491,17 +491,23 @@ impl GpuiVideoPlayer {
                 } => {
                     let native_size =
                         size(DevicePixels(*width as i32), DevicePixels(*height as i32));
+                    let Ok(source) = Nv12TextureSource::new(
+                        y_texture.clone(),
+                        cb_cr_texture.clone(),
+                        native_size,
+                        VideoColorMatrix::Bt709,
+                        VideoTransferFunction::Bt709,
+                        VideoColorRange::Limited,
+                    ) else {
+                        return div().size_full().bg(rgb(0x000000)).into_element();
+                    };
                     // Surface must request explicit size; otherwise flex containers
                     // allocate zero bounds to auto-sized children with only aspect_ratio,
                     // and the resulting paint_bounds cause the scissor rect to clip
                     // everything (Issue #1).
                     div()
                         .size_full()
-                        .child(
-                            surface((y_texture.clone(), cb_cr_texture.clone(), native_size))
-                                .size_full()
-                                .object_fit(ObjectFit::Contain),
-                        )
+                        .child(surface(source).size_full().object_fit(ObjectFit::Contain))
                         .into_element()
                 }
                 GpuFrameTextures::Rgba {
@@ -509,20 +515,21 @@ impl GpuiVideoPlayer {
                     width,
                     height,
                 } => {
-                    let desc = GpuTextureDescriptor {
-                        size: size(DevicePixels(*width as i32), DevicePixels(*height as i32)),
-                        format: GpuTextureFormat::Rgba8Unorm,
-                        color_space: GpuTextureColorSpace::Srgb,
+                    let native_size =
+                        size(DevicePixels(*width as i32), DevicePixels(*height as i32));
+                    let Ok(source) = RgbaTextureSource::new(
+                        texture.clone(),
+                        native_size,
+                        GpuTextureAlphaMode::Premultiplied,
+                        GpuTextureColorSpace::Srgb,
+                    ) else {
+                        return div().size_full().bg(rgb(0x000000)).into_element();
                     };
                     // Same rationale as NV12 above: explicit size avoids zero
                     // layout bounds inside flex containers.
                     div()
                         .size_full()
-                        .child(
-                            surface((texture.clone(), desc))
-                                .size_full()
-                                .object_fit(ObjectFit::Contain),
-                        )
+                        .child(surface(source).size_full().object_fit(ObjectFit::Contain))
                         .into_element()
                 }
             }
@@ -782,8 +789,8 @@ impl GpuiVideoPlayer {
             self.loop_seek_pending = false;
             let textures = frame_to_texture::decoded_frame_to_textures(
                 &video_frame.frame,
-                &gpu.device,
-                &gpu.queue,
+                gpu.device(),
+                gpu.queue(),
                 &mut self.y_cache,
                 &mut self.cbcr_cache,
                 &mut self.rgba_cache,
@@ -799,7 +806,7 @@ impl GpuiVideoPlayer {
                 let now = std::time::Instant::now();
                 let should_log = self
                     .last_upload_warn
-                    .map_or(true, |t| now.duration_since(t).as_secs() >= 5);
+                    .is_none_or(|t| now.duration_since(t).as_secs() >= 5);
                 if should_log {
                     tracing::warn!(
                         "Frame upload returned None — decoded frame could not be \
@@ -827,8 +834,8 @@ impl GpuiVideoPlayer {
 
         let textures = frame_to_texture::decoded_frame_to_textures(
             &frame.frame,
-            &gpu.device,
-            &gpu.queue,
+            gpu.device(),
+            gpu.queue(),
             &mut self.y_cache,
             &mut self.cbcr_cache,
             &mut self.rgba_cache,

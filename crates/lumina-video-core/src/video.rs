@@ -424,15 +424,49 @@ unsafe impl Sync for AndroidGpuSurface {}
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct DmaBufPlane {
-    /// The DMABuf file descriptor for this plane.
-    /// Multiple planes may share the same fd (with different offsets) or have separate fds.
-    pub fd: std::os::fd::RawFd,
+    /// Owned DMABuf descriptor. Planes in a single-FD layout share this owner.
+    fd: Arc<std::os::fd::OwnedFd>,
     /// Offset within the buffer where this plane starts (bytes)
     pub offset: u64,
     /// Row pitch/stride in bytes for this plane
     pub stride: u32,
     /// Size of this plane's data in bytes (may be 0 if unknown/not provided)
     pub size: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl DmaBufPlane {
+    pub fn new(fd: std::os::fd::OwnedFd, offset: u64, stride: u32, size: u64) -> Self {
+        Self::from_shared_fd(Arc::new(fd), offset, stride, size)
+    }
+
+    pub fn from_shared_fd(
+        fd: Arc<std::os::fd::OwnedFd>,
+        offset: u64,
+        stride: u32,
+        size: u64,
+    ) -> Self {
+        Self {
+            fd,
+            offset,
+            stride,
+            size,
+        }
+    }
+
+    pub fn fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.fd.as_raw_fd()
+    }
+
+    pub fn shares_fd_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.fd, &other.fd)
+    }
+
+    /// Duplicates this descriptor for an importer that consumes FD ownership.
+    pub fn try_clone_for_import(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        self.fd.try_clone()
+    }
 }
 
 /// Linux GPU surface holding DMABuf file descriptors for zero-copy import.
@@ -501,7 +535,7 @@ pub struct DmaBufPlane {
 ///     // Iterate over all planes for multi-plane formats
 ///     for (i, plane) in surface.planes.iter().enumerate() {
 ///         println!("Plane {}: fd={}, offset={}, stride={}",
-///             i, plane.fd, plane.offset, plane.stride);
+///             i, plane.fd(), plane.offset, plane.stride);
 ///     }
 ///
 ///     // CPU fallback is available for graceful degradation
@@ -518,7 +552,6 @@ pub struct DmaBufPlane {
 ///
 /// The [`LinuxGpuSurface::new()`] and [`LinuxGpuSurface::new_single_plane()`]
 /// constructors are unsafe because:
-/// - All file descriptors in `planes` must be valid DMABuf FDs
 /// - The `owner` must keep the underlying GStreamer sample alive for the surface's lifetime
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
@@ -551,7 +584,6 @@ impl LinuxGpuSurface {
     /// Creates a new Linux GPU surface from multi-plane DMABuf metadata.
     ///
     /// # Safety
-    /// - All fds in `planes` must be valid DMABuf file descriptors
     /// - `owner` must be the object that owns the DMABuf(s) (typically the GStreamer sample)
     /// - The owner must remain alive for the lifetime of this surface
     ///
@@ -598,7 +630,7 @@ impl LinuxGpuSurface {
     /// - The owner must remain alive for the lifetime of this surface
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn new_single_plane(
-        fd: std::os::fd::RawFd,
+        fd: std::os::fd::OwnedFd,
         width: u32,
         height: u32,
         format: PixelFormat,
@@ -609,12 +641,7 @@ impl LinuxGpuSurface {
         cpu_fallback: Option<CpuFrame>,
         owner: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Self {
-        let plane = DmaBufPlane {
-            fd,
-            offset,
-            stride,
-            size,
-        };
+        let plane = DmaBufPlane::new(fd, offset, stride, size);
         Self {
             planes: vec![plane],
             width,
@@ -632,7 +659,7 @@ impl LinuxGpuSurface {
     /// For single-plane formats, this is the only fd.
     /// For multi-plane formats, this is the fd for the Y/luma plane.
     pub fn primary_fd(&self) -> std::os::fd::RawFd {
-        self.planes.first().map(|p| p.fd).unwrap_or(-1)
+        self.planes.first().map(DmaBufPlane::fd).unwrap_or(-1)
     }
 
     /// Returns the primary plane's offset (from plane 0).
@@ -953,6 +980,12 @@ impl DecodedFrame {
 pub struct VideoFrame {
     /// Presentation timestamp (when this frame should be displayed)
     pub pts: Duration,
+    /// Seek/discontinuity generation assigned by the scheduler.
+    pub generation: u64,
+    /// Color interpretation of the decoded pixels.
+    pub color: VideoColorMetadata,
+    /// Producer-to-consumer synchronization metadata.
+    pub synchronization: FrameSynchronization,
     /// The decoded frame data
     pub frame: DecodedFrame,
 }
@@ -960,13 +993,89 @@ pub struct VideoFrame {
 impl VideoFrame {
     /// Creates a new VideoFrame.
     pub fn new(pts: Duration, frame: DecodedFrame) -> Self {
-        Self { pts, frame }
+        Self {
+            pts,
+            generation: 0,
+            color: VideoColorMetadata::default(),
+            synchronization: FrameSynchronization::Implicit,
+            frame,
+        }
+    }
+
+    /// Sets color metadata reported by the decoder.
+    pub fn with_color(mut self, color: VideoColorMetadata) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// Sets producer synchronization metadata.
+    pub fn with_synchronization(mut self, synchronization: FrameSynchronization) -> Self {
+        self.synchronization = synchronization;
+        self
     }
 
     /// Returns the frame dimensions.
     pub fn dimensions(&self) -> (u32, u32) {
         self.frame.dimensions()
     }
+}
+
+/// Color primaries associated with a decoded frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoColorPrimaries {
+    /// ITU-R BT.601 / SMPTE 170M.
+    Bt601,
+    /// ITU-R BT.709.
+    #[default]
+    Bt709,
+    /// ITU-R BT.2020.
+    Bt2020,
+}
+
+/// Transfer function associated with a decoded frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoTransferFunction {
+    /// Standard RGB transfer function.
+    Srgb,
+    /// ITU-R BT.709.
+    #[default]
+    Bt709,
+    /// ITU-R BT.2020 10-bit.
+    Bt2020Ten,
+}
+
+/// Encoded component range associated with a decoded frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoColorRange {
+    /// Studio/video range.
+    #[default]
+    Limited,
+    /// Full component range.
+    Full,
+}
+
+/// Decoder-provided color metadata retained through upload/import.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoColorMetadata {
+    /// Color primaries and YCbCr matrix family.
+    pub primaries: VideoColorPrimaries,
+    /// Transfer function.
+    pub transfer: VideoTransferFunction,
+    /// Encoded component range.
+    pub range: VideoColorRange,
+}
+
+/// Synchronization contract for a native producer frame.
+#[derive(Clone, Debug, Default)]
+pub enum FrameSynchronization {
+    /// The platform's verified implicit synchronization contract applies.
+    #[default]
+    Implicit,
+    /// No producer synchronization is available.
+    None,
+    /// Explicit sync-file fence retained until import.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    SyncFile(std::sync::Arc<std::os::fd::OwnedFd>),
 }
 
 /// Metadata about a video stream.
@@ -1070,7 +1179,7 @@ impl HwAccelType {
 /// If not provided, the decoder auto-detects the compositor GPU via
 /// `/sys/class/drm/card*/` connector status, which is correct for most
 /// single-GPU and primary-display desktop configurations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GpuInfo {
     /// PCI vendor ID (e.g., 0x8086 for Intel, 0x10DE for NVIDIA, 0x1002 for AMD).
     /// 0 means unknown / auto-detect.
@@ -1078,15 +1187,6 @@ pub struct GpuInfo {
     /// DRM render node path (e.g., "/dev/dri/renderD128").
     /// Empty string means unknown / auto-detect.
     pub render_node: String,
-}
-
-impl Default for GpuInfo {
-    fn default() -> Self {
-        Self {
-            vendor_id: 0,
-            render_node: String::new(),
-        }
-    }
 }
 
 /// Trait for video decoder backends.

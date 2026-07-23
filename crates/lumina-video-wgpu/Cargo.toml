@@ -1,0 +1,45 @@
+[package]
+name = "lumina-video-wgpu"
+version = { workspace = true }
+edition = "2021"
+description = "Framework-neutral wgpu upload and native-frame import for lumina-video"
+repository = "https://github.com/lumina-video/lumina-video"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lumina-video-core = { path = "../lumina-video-core" }
+tracing = { workspace = true }
+wgpu = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ash = "0.38"
+libc = "0.2"
+ndk-sys = "0.6"
+wgpu-hal = { workspace = true, features = ["vulkan"] }
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+metal = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+drm-fourcc = "2.2"
+libc = "0.2"
+wgpu-hal = { workspace = true, features = ["vulkan"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = {
+  version = "0.58",
+  features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+  ]
+}
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
+[features]
+default = []
+windows-native-video = ["lumina-video-core/windows-native-video"]

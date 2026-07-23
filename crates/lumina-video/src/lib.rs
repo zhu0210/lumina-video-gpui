@@ -51,10 +51,10 @@ pub use lumina_video_core::{
 
 // Native-only exports
 #[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::{
-    frame_to_texture::{self, GpuFrameTextures},
-    sync_metrics::{SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS},
+pub use lumina_video_core::sync_metrics::{
+    SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS,
 };
+pub use lumina_video_wgpu::frame_to_texture::{self, GpuFrameTextures};
 
 // macOS/iOS FFmpeg decoder (when available)
 #[cfg(any(target_os = "macos", target_os = "ios"))]

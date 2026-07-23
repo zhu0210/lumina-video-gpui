@@ -22,6 +22,7 @@ targets = [
 [dependencies]
 # Core decode + zero-copy pipeline (egui-free, uses same wgpu as GPUI)
 lumina-video-core = { path = "../lumina-video-core" }
+lumina-video-wgpu = { path = "../lumina-video-wgpu" }
 
 # GPUI — the UI framework (replaces egui)
 # "wgpu" is opt-in (not in default features) — required for GpuContextHandle, surface(), etc.
@@ -127,7 +128,10 @@ wgpu = { workspace = true }
 default = []
 
 # Windows: Native Media Foundation + DXVA2/D3D11VA hardware acceleration
-windows-native-video = ["lumina-video-core/windows-native-video"]
+windows-native-video = [
+  "lumina-video-core/windows-native-video",
+  "lumina-video-wgpu/windows-native-video"
+]
 
 # Vendored runtime: Bundle GStreamer libraries with the binary (Linux only)
 # This eliminates the need for users to install GStreamer system packages.

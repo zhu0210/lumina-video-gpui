@@ -5,7 +5,6 @@
 //!
 //! - Core types: [`video`], [`audio`], [`subtitles`]
 //! - Platform decoders: macOS (AVFoundation), Linux (GStreamer), Android (ExoPlayer), Windows (Media Foundation)
-//! - Zero-copy GPU import: [`zero_copy`], [`frame_to_texture`]
 //! - Threading primitives: [`frame_queue`], [`triple_buffer`], [`sync_metrics`]
 //! - Network utilities: [`network`]
 //!
@@ -64,25 +63,6 @@ pub mod ndk_image_reader;
 pub mod windows_audio;
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 pub mod windows_video;
-
-// === Zero-copy GPU import ===
-// Direct platform texture import: IOSurface→Metal→wgpu (macOS),
-// DMABuf→Vulkan→wgpu (Linux), AHardwareBuffer→Vulkan→wgpu (Android),
-// D3D11 handle→D3D12→wgpu (Windows).
-
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "android",
-    all(target_os = "windows", feature = "windows-native-video")
-))]
-pub mod zero_copy;
-
-// === Frame-to-texture conversion (CPU + zero-copy dispatch) ===
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod frame_to_texture;
 
 // === Vendored runtime (Linux only) ===
 

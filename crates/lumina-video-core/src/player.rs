@@ -652,13 +652,14 @@ impl CorePlayer {
         let selected_new_frame = self.scheduler.presentation_generation() != generation_before;
 
         if selected_new_frame {
-            let Some(frame) = frame else {
+            let Some(mut frame) = frame else {
                 return if self.frame_queue.is_eos() {
                     FramePollResult::EndOfStream
                 } else {
                     FramePollResult::Buffering
                 };
             };
+            frame.generation = self.scheduler.seek_generation();
             match self.state {
                 VideoState::Playing { .. } => {
                     self.state = VideoState::Playing {
@@ -906,5 +907,18 @@ mod tests {
             player.poll_frame_result(),
             FramePollResult::EndOfStream
         ));
+    }
+
+    #[test]
+    fn poll_result_stamps_seek_generation() {
+        let mut player = CorePlayer::new("test://scheduler");
+        player.scheduler.start();
+        player.scheduler.seek(Duration::from_secs(5));
+        assert!(player.frame_queue.push(frame(Duration::from_secs(5))));
+
+        let FramePollResult::NewFrame(frame) = player.poll_frame_result() else {
+            panic!("expected a frame after seek");
+        };
+        assert_eq!(frame.generation, 1);
     }
 }

@@ -4143,6 +4143,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "lumina-video-core",
+ "lumina-video-wgpu",
  "moq-lite",
  "moq-native",
  "nostr-sdk",
@@ -4207,8 +4208,6 @@ dependencies = [
  "tracing",
  "url",
  "webpki-roots 1.0.9",
- "wgpu",
- "wgpu-hal",
  "windows 0.58.0",
 ]
 
@@ -4224,6 +4223,22 @@ dependencies = [
  "lumina-video",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lumina-video-wgpu"
+version = "0.2.2"
+dependencies = [
+ "ash",
+ "drm-fourcc",
+ "libc",
+ "lumina-video-core",
+ "metal 0.31.0",
+ "ndk-sys",
+ "tracing",
+ "wgpu",
+ "wgpu-hal",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -10137,28 +10152,3 @@ dependencies = [
  "syn 2.0.119",
  "winnow 1.0.4",
 ]
-
-[[patch.unused]]
-name = "libwebrtc"
-version = "0.3.26"
-source = "git+https://github.com/zed-industries/livekit-rust-sdks?rev=c3a55bbc207008f1ca3474b6037fdd3c443cad0f#c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
-
-[[patch.unused]]
-name = "livekit"
-version = "0.7.32"
-source = "git+https://github.com/zed-industries/livekit-rust-sdks?rev=c3a55bbc207008f1ca3474b6037fdd3c443cad0f#c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
-
-[[patch.unused]]
-name = "notify"
-version = "9.0.0-rc.4"
-source = "git+https://github.com/zed-industries/notify?rev=faecbc33db4f59313e5225ef766bfd9e54a54cfd#faecbc33db4f59313e5225ef766bfd9e54a54cfd"
-
-[[patch.unused]]
-name = "notify-types"
-version = "2.1.0"
-source = "git+https://github.com/zed-industries/notify?rev=faecbc33db4f59313e5225ef766bfd9e54a54cfd#faecbc33db4f59313e5225ef766bfd9e54a54cfd"
-
-[[patch.unused]]
-name = "webrtc-sys"
-version = "0.3.23"
-source = "git+https://github.com/zed-industries/livekit-rust-sdks?rev=c3a55bbc207008f1ca3474b6037fdd3c443cad0f#c3a55bbc207008f1ca3474b6037fdd3c443cad0f"

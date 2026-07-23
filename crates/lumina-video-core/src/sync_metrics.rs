@@ -366,11 +366,7 @@ impl SyncMetrics {
         // Calculate FPS every 500ms (enough samples for accuracy)
         if elapsed_us >= 500_000 {
             // Calculate FPS * 100 for precision (e.g., 2400 = 24.00 fps)
-            let fps_x100 = if elapsed_us > 0 {
-                (frames * 100_000_000) / elapsed_us
-            } else {
-                0
-            };
+            let fps_x100 = (frames * 100_000_000).checked_div(elapsed_us).unwrap_or(0);
             self.inner
                 .current_fps_x100
                 .store(fps_x100, Ordering::Relaxed);
@@ -406,16 +402,6 @@ impl SyncMetrics {
         self.inner
             .last_underrun_time_us
             .store(now, Ordering::Relaxed);
-
-        let count = self.inner.underrun_count.load(Ordering::Relaxed);
-        // Rate-limit: only log every 10th underrun after the first 5
-        if count <= 5 || count % 10 == 0 {
-            tracing::warn!(
-                "Buffer underrun #{} at t={}ms",
-                count,
-                now / 1000
-            );
-        }
     }
 
     /// Records a stall event with the type of stall.
@@ -434,25 +420,11 @@ impl SyncMetrics {
                 self.inner
                     .decode_stall_count
                     .fetch_add(1, Ordering::Relaxed);
-                let dsc = self.inner.decode_stall_count.load(Ordering::Relaxed);
-                // Rate-limit: only log every 10th stall after the first 5
-                if dsc <= 5 || dsc % 10 == 0 {
-                    tracing::warn!(
-                        "Decode stall #{} (total stalls: {})",
-                        dsc,
-                        self.inner.stall_count.load(Ordering::Relaxed)
-                    );
-                }
             }
             StallType::Network => {
                 self.inner
                     .network_stall_count
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    "Network stall #{} (total stalls: {})",
-                    self.inner.network_stall_count.load(Ordering::Relaxed),
-                    self.inner.stall_count.load(Ordering::Relaxed)
-                );
             }
         }
     }
@@ -596,20 +568,14 @@ impl SyncMetrics {
     pub fn snapshot(&self) -> SyncMetricsSnapshot {
         let sample_count = self.inner.sample_count.load(Ordering::Relaxed);
         let total_drift = self.inner.total_drift_us.load(Ordering::Relaxed);
-        let avg_drift_us = if sample_count > 0 {
-            (total_drift / sample_count) as i64
-        } else {
-            0
-        };
+        let avg_drift_us = total_drift.checked_div(sample_count).unwrap_or(0) as i64;
 
         // Calculate recovery average drift
         let recovery_samples = self.inner.recovery_samples.load(Ordering::Relaxed);
         let recovery_total_drift = self.inner.recovery_total_drift_us.load(Ordering::Relaxed);
-        let recovery_avg_drift_us = if recovery_samples > 0 {
-            (recovery_total_drift / recovery_samples) as i64
-        } else {
-            0
-        };
+        let recovery_avg_drift_us = recovery_total_drift
+            .checked_div(recovery_samples)
+            .unwrap_or(0) as i64;
 
         // Calculate time since last underrun
         let last_underrun = self.inner.last_underrun_time_us.load(Ordering::Relaxed);
@@ -628,11 +594,8 @@ impl SyncMetrics {
         let out_of_sync_count = self.inner.out_of_sync_count.load(Ordering::Relaxed);
         let steady_out_of_sync_count = out_of_sync_count.saturating_sub(recovery_out_of_sync);
         let steady_total_drift = total_drift.saturating_sub(recovery_total_drift);
-        let steady_avg_drift_us = if steady_samples > 0 {
-            (steady_total_drift / steady_samples) as i64
-        } else {
-            0
-        };
+        let steady_avg_drift_us =
+            steady_total_drift.checked_div(steady_samples).unwrap_or(0) as i64;
 
         // Get stream PTS offset
         let stream_pts_offset_us = self.inner.stream_pts_offset_us.load(Ordering::Relaxed);

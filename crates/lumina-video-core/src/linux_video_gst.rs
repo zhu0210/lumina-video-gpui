@@ -21,6 +21,7 @@
 //! `drm-format` field (e.g., `NV12:0x0100000000000002` for Intel X-tile).
 //! This module parses the modifier to ensure correct Vulkan import of tiled buffers.
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -614,10 +615,8 @@ impl GStreamerDecoder {
         // Extract per-plane metadata
         let mut planes: Vec<DmaBufPlane> = Vec::with_capacity(num_planes);
 
-        // For single-FD layouts, dup the primary FD once and share it across all planes.
-        // This avoids leaking N-1 FDs per frame (lumina-video-dvh).
-        // The import code only uses primary_fd() for single-FD layouts.
-        let mut primary_dup_fd: RawFd = -1;
+        // For single-FD layouts, own one duplicate and share it across plane metadata.
+        let mut primary_fd: Option<Arc<OwnedFd>> = None;
 
         for plane_idx in 0..num_planes {
             // Get the memory block for this plane
@@ -653,17 +652,10 @@ impl GStreamerDecoder {
                 return Ok(None);
             }
 
-            // SAFETY: dup() the FD so Vulkan gets its own copy to take ownership of.
-            // This avoids double-close: GStreamer closes its FD when GstMemory drops,
-            // Vulkan closes the dup'd FD when vkFreeMemory is called.
-            //
-            // For single-FD layouts: only dup once (first plane), reuse for others.
-            // The import code only uses primary_fd(), so other planes just need
-            // offset/stride metadata - their fd field is set to the shared dup'd fd
-            // but won't be used directly.
-            let fd: RawFd = if is_single_fd {
-                if plane_idx == 0 {
-                    // First plane: dup and save for reuse
+            let fd = if is_single_fd {
+                if let Some(fd) = &primary_fd {
+                    fd.clone()
+                } else {
                     let dup_fd = unsafe { libc::dup(gst_fd) };
                     if dup_fd < 0 {
                         tracing::warn!(
@@ -674,15 +666,12 @@ impl GStreamerDecoder {
                         );
                         return Ok(None);
                     }
-                    primary_dup_fd = dup_fd;
-                    dup_fd
-                } else {
-                    // Subsequent planes in single-FD: reuse the already dup'd fd
-                    // This fd value is stored but not used directly - only offset/stride matter
-                    primary_dup_fd
+                    // SAFETY: dup returned a fresh descriptor owned by this function.
+                    let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(dup_fd) });
+                    primary_fd = Some(fd.clone());
+                    fd
                 }
             } else {
-                // Multi-FD: each plane gets its own dup'd fd
                 let dup_fd = unsafe { libc::dup(gst_fd) };
                 if dup_fd < 0 {
                     tracing::warn!(
@@ -691,41 +680,18 @@ impl GStreamerDecoder {
                         plane_idx,
                         std::io::Error::last_os_error()
                     );
-                    // Close any already-dup'd fds before returning
-                    for plane in &planes {
-                        unsafe { libc::close(plane.fd) };
-                    }
                     return Ok(None);
                 }
-                dup_fd
+                // SAFETY: dup returned a fresh descriptor owned by this function.
+                Arc::new(unsafe { OwnedFd::from_raw_fd(dup_fd) })
             };
 
             // Get stride and offset from VideoInfo (use .get() to avoid panic on malformed caps)
-            // Helper to close FDs on error - for single-FD we only have one unique FD to close
-            let close_fds_on_error =
-                |planes: &[DmaBufPlane], current_fd: RawFd, is_single: bool| {
-                    if is_single {
-                        // Single-FD: all planes share the same fd, close once
-                        if current_fd >= 0 {
-                            unsafe { libc::close(current_fd) };
-                        }
-                    } else {
-                        // Multi-FD: close all unique plane fds plus current
-                        for plane in planes {
-                            unsafe { libc::close(plane.fd) };
-                        }
-                        if current_fd >= 0 {
-                            unsafe { libc::close(current_fd) };
-                        }
-                    }
-                };
-
             let Some(&stride_i32) = video_info.stride().get(plane_idx) else {
                 tracing::warn!(
                     "DMABuf plane {} missing stride entry in VideoInfo",
                     plane_idx
                 );
-                close_fds_on_error(&planes, fd, is_single_fd);
                 return Ok(None);
             };
             let Some(&offset_usize) = video_info.offset().get(plane_idx) else {
@@ -733,7 +699,6 @@ impl GStreamerDecoder {
                     "DMABuf plane {} missing offset entry in VideoInfo",
                     plane_idx
                 );
-                close_fds_on_error(&planes, fd, is_single_fd);
                 return Ok(None);
             };
             if stride_i32 < 0 {
@@ -742,7 +707,6 @@ impl GStreamerDecoder {
                     plane_idx,
                     stride_i32
                 );
-                close_fds_on_error(&planes, fd, is_single_fd);
                 return Ok(None);
             }
             let stride = stride_i32 as u32;
@@ -751,21 +715,17 @@ impl GStreamerDecoder {
             // Calculate plane size (approximate - may not account for padding)
             let plane_size = plane_memory.size() as u64;
 
-            planes.push(DmaBufPlane {
-                fd,
-                offset,
-                stride,
-                size: plane_size,
-            });
+            let plane = DmaBufPlane::from_shared_fd(fd, offset, stride, plane_size);
 
             tracing::debug!(
                 "Extracted DMABuf plane {}: fd={}, offset={}, stride={}, size={}",
                 plane_idx,
-                fd,
+                plane.fd(),
                 offset,
                 stride,
                 plane_size
             );
+            planes.push(plane);
         }
 
         // Get DRM format modifier from caps (GStreamer 1.24+ with va plugin)
@@ -802,7 +762,7 @@ impl GStreamerDecoder {
             tracing::debug!(
                 "Single-FD multi-plane DMABuf detected: {} planes share fd={}",
                 planes.len(),
-                planes.first().map(|p| p.fd).unwrap_or(-1)
+                planes.first().map(DmaBufPlane::fd).unwrap_or(-1)
             );
         }
 

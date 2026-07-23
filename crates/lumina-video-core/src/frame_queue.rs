@@ -2828,6 +2828,11 @@ impl FrameScheduler {
     pub fn presentation_generation(&self) -> u64 {
         self.presentation_generation
     }
+
+    /// Returns the current seek/discontinuity generation.
+    pub fn seek_generation(&self) -> u64 {
+        self.seek_generation
+    }
 }
 
 impl Default for FrameScheduler {

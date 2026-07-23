@@ -30,7 +30,7 @@
 //! Modern GPUs use tiled memory layouts (Intel Y-tiled, AMD tiled, etc.). The DRM format
 //! modifier encodes this layout and must be passed to Vulkan for correct import.
 
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -540,7 +540,9 @@ impl ZeroCopyGStreamerDecoder {
                         .filter(|e| {
                             let fname = e.file_name().to_string_lossy().to_string();
                             // Connector entries are named like card0-HDMI-A-1
-                            if let Some(conn_name) = fname.strip_prefix(&format!("card{render_num}-")) {
+                            if let Some(conn_name) =
+                                fname.strip_prefix(&format!("card{render_num}-"))
+                            {
                                 if conn_name.starts_with("DP-")
                                     || conn_name.starts_with("HDMI-")
                                     || conn_name.starts_with("eDP-")
@@ -586,8 +588,6 @@ impl ZeroCopyGStreamerDecoder {
     }
 
     /// Known PCI vendor IDs.
-    const VENDOR_INTEL: u32 = 0x8086;
-    const VENDOR_AMD: u32 = 0x1002;
     const VENDOR_NVIDIA: u32 = 0x10DE;
 
     /// Checks if nvidia-drm kernel modesetting is active.
@@ -606,7 +606,10 @@ impl ZeroCopyGStreamerDecoder {
             .unwrap_or(false)
     }
 
-    fn try_zero_copy_pipeline(url: &str, gpu_info: crate::video::GpuInfo) -> Result<Self, VideoError> {
+    fn try_zero_copy_pipeline(
+        url: &str,
+        gpu_info: crate::video::GpuInfo,
+    ) -> Result<Self, VideoError> {
         let compositor_vendor = if gpu_info.vendor_id != 0 {
             gpu_info.vendor_id
         } else {
@@ -665,8 +668,14 @@ impl ZeroCopyGStreamerDecoder {
             // uridecodebin picks software avdec_h264, which outputs system-memory
             // NV12 that videoconvert/cpu_copy_pipeline can handle.
             for feature_name in &[
-                "nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec",
-                "vah264dec", "vah265dec", "vaav1dec", "vavp9dec",
+                "nvh264dec",
+                "nvh265dec",
+                "nvav1dec",
+                "nvvp9dec",
+                "vah264dec",
+                "vah265dec",
+                "vaav1dec",
+                "vavp9dec",
             ] {
                 if let Some(feature) = gst::Registry::get().lookup_feature(feature_name) {
                     feature.set_rank(gst::Rank::MARGINAL);
@@ -679,7 +688,8 @@ impl ZeroCopyGStreamerDecoder {
             );
             return Err(VideoError::DecoderInit(
                 "Compositor GPU is NVIDIA — zero-copy DMABuf not available. \
-                 Falling back to CPU copy pipeline.".into(),
+                 Falling back to CPU copy pipeline."
+                    .into(),
             ));
         }
 
@@ -1117,10 +1127,7 @@ impl ZeroCopyGStreamerDecoder {
     ///
     /// The `render_node` parameter (e.g. "/dev/dri/renderD129") aligns
     /// the NVIDIA GPU selection with the wgpu rendering device.
-    fn nvidia_dmabuf_pipeline(
-        url: &str,
-        render_node: Option<&str>,
-    ) -> Result<Self, VideoError> {
+    fn nvidia_dmabuf_pipeline(url: &str, render_node: Option<&str>) -> Result<Self, VideoError> {
         let pipeline = gst::Pipeline::new();
 
         let is_local_file = url.starts_with("file://");
@@ -1143,9 +1150,7 @@ impl ZeroCopyGStreamerDecoder {
             .property("max-size-bytes", 0u32)
             .property("max-size-time", 3_000_000_000u64) // 3 seconds
             .build()
-            .map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to create video queue2: {e}"))
-            })?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create video queue2: {e}")))?;
 
         // Try nvvideoconvert (NVIDIA's vapostproc equivalent). Falls back to
         // direct DMABuf from decoder if not available.
@@ -1165,16 +1170,12 @@ impl ZeroCopyGStreamerDecoder {
             // The DMABuf caps on appsink will request DMABuf directly from uridecodebin.
             gst::ElementFactory::make("identity")
                 .build()
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to create identity: {e}"))
-                })?
+                .map_err(|e| VideoError::DecoderInit(format!("Failed to create identity: {e}")))?
         };
 
         // DMABuf caps for appsink — this tells GStreamer to negotiate DMABuf output
         let dmabuf_caps = gst::Caps::from_str("video/x-raw(memory:DMABuf)")
-            .map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to parse DMABuf caps: {e}"))
-            })?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to parse DMABuf caps: {e}")))?;
 
         let appsink = gst_app::AppSink::builder()
             .caps(&dmabuf_caps)
@@ -1213,15 +1214,11 @@ impl ZeroCopyGStreamerDecoder {
 
         // Link video: queue2 → postproc → appsink
         gst::Element::link_many([&video_queue, &postproc, appsink.upcast_ref()])
-            .map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to link video elements: {e}"))
-            })?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to link video elements: {e}")))?;
 
         // Link audio: audioconvert → audioresample → volume → audiosink
         gst::Element::link_many([&audioconvert, &audioresample, &volume, &audiosink])
-            .map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to link audio elements: {e}"))
-            })?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to link audio elements: {e}")))?;
 
         // Add audio queue for A/V sync decoupling
         let audio_queue = gst::ElementFactory::make("queue2")
@@ -1230,9 +1227,7 @@ impl ZeroCopyGStreamerDecoder {
             .property("max-size-bytes", 0u32)
             .property("max-size-time", 2_000_000_000u64) // 2 seconds
             .build()
-            .map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to create audio queue: {e}"))
-            })?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create audio queue: {e}")))?;
 
         pipeline
             .add(&audio_queue)
@@ -1263,7 +1258,11 @@ impl ZeroCopyGStreamerDecoder {
 
         tracing::info!(
             "NVIDIA DMABuf pipeline created (postproc={}): {}",
-            if use_nvvidconv { "nvvideoconvert" } else { "identity/direct" },
+            if use_nvvidconv {
+                "nvvideoconvert"
+            } else {
+                "identity/direct"
+            },
             url
         );
 
@@ -2048,10 +2047,7 @@ impl ZeroCopyGStreamerDecoder {
             ))
         })?;
 
-        // Duplicate the FD before passing to Vulkan
-        // CRITICAL: Vulkan import takes ownership and will close the FD.
-        // GStreamer also closes the FD when the sample drops.
-        // We must dup() to avoid double-close.
+        // Duplicate the GStreamer-owned FD into the frame's RAII ownership.
         let dup_fd = unsafe { libc::dup(dmabuf_info.fd) };
         if dup_fd < 0 {
             return Err(VideoError::DecodeFailed(format!(
@@ -2061,13 +2057,9 @@ impl ZeroCopyGStreamerDecoder {
             )));
         }
 
-        // Build DmaBufPlane structures for each plane
-        let mut planes = Vec::with_capacity(dmabuf_info.n_planes as usize);
-
         // Validate that we have stride/offset data for all planes before constructing
         let n_planes = dmabuf_info.n_planes as usize;
         if dmabuf_info.strides.len() < n_planes {
-            // Close the dup'd FD before returning error
             unsafe { libc::close(dup_fd) };
             return Err(VideoError::DecodeFailed(format!(
                 "DMABuf has {} planes but only {} strides",
@@ -2076,7 +2068,6 @@ impl ZeroCopyGStreamerDecoder {
             )));
         }
         if dmabuf_info.offsets.len() < n_planes {
-            // Close the dup'd FD before returning error
             unsafe { libc::close(dup_fd) };
             return Err(VideoError::DecodeFailed(format!(
                 "DMABuf has {} planes but only {} offsets",
@@ -2085,10 +2076,13 @@ impl ZeroCopyGStreamerDecoder {
             )));
         }
 
+        // SAFETY: dup returned a fresh descriptor owned by this function.
+        let shared_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(dup_fd) });
+        let mut planes = Vec::with_capacity(n_planes);
+
         for i in 0..n_planes {
             // Bounds-checked access per AGENTS.md
             let Some(&stride) = dmabuf_info.strides.get(i) else {
-                unsafe { libc::close(dup_fd) };
                 return Err(VideoError::DecodeFailed(format!(
                     "Missing stride for plane {} (strides.len()={})",
                     i,
@@ -2096,7 +2090,6 @@ impl ZeroCopyGStreamerDecoder {
                 )));
             };
             let Some(&offset) = dmabuf_info.offsets.get(i) else {
-                unsafe { libc::close(dup_fd) };
                 return Err(VideoError::DecodeFailed(format!(
                     "Missing offset for plane {} (offsets.len()={})",
                     i,
@@ -2107,7 +2100,6 @@ impl ZeroCopyGStreamerDecoder {
 
             // Validate stride is non-zero (a zero stride would produce invalid planes)
             if stride == 0 {
-                unsafe { libc::close(dup_fd) };
                 return Err(VideoError::DecodeFailed(format!(
                     "DMABuf plane {} has zero stride",
                     i
@@ -2125,12 +2117,12 @@ impl ZeroCopyGStreamerDecoder {
 
             let size = (stride * plane_height) as u64;
 
-            planes.push(DmaBufPlane {
-                fd: dup_fd, // Use dup'd FD that Vulkan can take ownership of
+            planes.push(DmaBufPlane::from_shared_fd(
+                shared_fd.clone(),
                 offset,
                 stride,
                 size,
-            });
+            ));
         }
 
         // Check if all planes share the same FD (single-FD multi-plane layout)
@@ -2638,10 +2630,7 @@ impl VideoDecoderBackend for ZeroCopyGStreamerDecoder {
         Self::new(url)
     }
 
-    fn open_with_gpu(
-        url: &str,
-        gpu_info: crate::video::GpuInfo,
-    ) -> Result<Self, VideoError>
+    fn open_with_gpu(url: &str, gpu_info: crate::video::GpuInfo) -> Result<Self, VideoError>
     where
         Self: Sized,
     {

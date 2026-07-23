@@ -1,4 +1,4 @@
-//! Convert decoded video frames to wgpu textures suitable for GPUI's `surface()`.
+//! Convert decoded video frames to reusable wgpu textures.
 //!
 //! Two rendering paths are supported:
 //!
@@ -36,8 +36,8 @@ fn safe_write_texture(
     layout: wgpu::TexelCopyBufferLayout,
     extent: wgpu::Extent3d,
 ) {
-    let required = layout.bytes_per_row.unwrap_or(0) as usize
-        * layout.rows_per_image.unwrap_or(1) as usize;
+    let required =
+        layout.bytes_per_row.unwrap_or(0) as usize * layout.rows_per_image.unwrap_or(1) as usize;
     if data.len() < required {
         tracing::warn!(
             "write_texture skipped: buffer {} bytes < needed {} bytes \
@@ -63,18 +63,6 @@ fn safe_write_texture(
         layout,
         extent,
     );
-}
-
-/// Helper: calls safe_write_texture on a cached texture reference.
-/// Avoids repeating the texture dereference pattern.
-fn safe_write_cached(
-    queue: &wgpu::Queue,
-    texture: &Arc<wgpu::Texture>,
-    data: &[u8],
-    layout: wgpu::TexelCopyBufferLayout,
-    extent: wgpu::Extent3d,
-) {
-    safe_write_texture(queue, texture.as_ref(), data, layout, extent)
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +129,9 @@ pub fn decoded_frame_to_textures(
                 // IOSurface-backed textures cannot be reliably CPU-mapped.
                 tracing::debug!(
                     "macOS IOSurface frame: {}x{} fmt={:?}, attempting zero-copy import",
-                    surface.width, surface.height, surface.format
+                    surface.width,
+                    surface.height,
+                    surface.format
                 );
                 match import_macos_iosurface_frame(surface, device) {
                     Ok(textures) => {
@@ -167,7 +157,10 @@ pub fn decoded_frame_to_textures(
                 // DMABuf memory is GPU-only and cannot be CPU-mapped.
                 tracing::debug!(
                     "Linux DMABuf frame: {}x{} fmt={:?}, {} planes, attempting zero-copy import",
-                    surface.width, surface.height, surface.format, surface.planes.len()
+                    surface.width,
+                    surface.height,
+                    surface.format,
+                    surface.planes.len()
                 );
                 match import_linux_dmabuf_frame(surface, device) {
                     Ok(textures) => {
@@ -227,9 +220,7 @@ fn import_macos_iosurface_frame(
         )
     }
     .map_err(|e| {
-        crate::video::VideoError::DecodeFailed(format!(
-            "IOSurface zero-copy import failed: {e}"
-        ))
+        crate::video::VideoError::DecodeFailed(format!("IOSurface zero-copy import failed: {e}"))
     })?;
 
     // IOSurface textures are always BGRA8Unorm
@@ -252,17 +243,25 @@ fn import_linux_dmabuf_frame(
     use crate::video::PixelFormat;
     use crate::zero_copy::linux::DmaBufHandle;
     use crate::zero_copy::linux::DmaBufPlaneHandle;
+    use std::os::fd::IntoRawFd;
 
     let plane_handles: Vec<DmaBufPlaneHandle> = surface
         .planes
         .iter()
-        .map(|p| DmaBufPlaneHandle {
-            fd: p.fd,
-            offset: p.offset,
-            stride: p.stride,
-            size: p.size,
+        .map(|p| {
+            let fd = p.try_clone_for_import().map_err(|error| {
+                crate::video::VideoError::DecodeFailed(format!(
+                    "failed to duplicate DMABuf plane for import: {error}"
+                ))
+            })?;
+            Ok(DmaBufPlaneHandle {
+                fd: fd.into_raw_fd(),
+                offset: p.offset,
+                stride: p.stride,
+                size: p.size,
+            })
         })
-        .collect();
+        .collect::<Result<_, crate::video::VideoError>>()?;
 
     let dmabuf_handle = DmaBufHandle::new(plane_handles, surface.modifier);
 
@@ -276,9 +275,7 @@ fn import_linux_dmabuf_frame(
         )
     }
     .map_err(|e| {
-        crate::video::VideoError::DecodeFailed(format!(
-            "DMABuf zero-copy import failed: {e}"
-        ))
+        crate::video::VideoError::DecodeFailed(format!("DMABuf zero-copy import failed: {e}"))
     })?;
 
     match surface.format {
