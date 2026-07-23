@@ -31,7 +31,7 @@ use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 use lumina_video_core::video::VideoDecoderBackend;
 use lumina_video_core::video::{VideoMetadata, VideoState};
 use lumina_video_wgpu::frame_to_texture;
-use lumina_video_wgpu::{GpuVideoFrame, GpuVideoFrameTextures};
+use lumina_video_wgpu::{GpuVideoFrame, GpuVideoFrameTextures, VideoImportStats};
 
 #[cfg(feature = "moq")]
 use super::moq_decoder::MoqDecoder;
@@ -93,6 +93,7 @@ pub struct GpuiVideoPlayer {
     y_cache: Option<Arc<wgpu::Texture>>,
     cbcr_cache: Option<Arc<wgpu::Texture>>,
     rgba_cache: Option<Arc<wgpu::Texture>>,
+    import_stats: VideoImportStats,
 
     // Playback state (synced from CorePlayer each update)
     position: Duration,
@@ -152,6 +153,7 @@ impl GpuiVideoPlayer {
             y_cache: None,
             cbcr_cache: None,
             rgba_cache: None,
+            import_stats: VideoImportStats::default(),
             position: Duration::ZERO,
             duration: None,
             metadata: None,
@@ -363,6 +365,11 @@ impl GpuiVideoPlayer {
 
     pub fn current_frame(&self) -> Option<&GpuVideoFrame> {
         self.frame_textures.as_ref()
+    }
+
+    /// Returns realized wgpu import/upload counters for this player.
+    pub fn import_stats(&self) -> VideoImportStats {
+        self.import_stats
     }
 
     // -----------------------------------------------------------------------
@@ -825,11 +832,13 @@ impl GpuiVideoPlayer {
             );
 
             if let Some(tex) = textures {
+                self.import_stats.record_success(tex.path);
                 if self.frame_textures.is_none() {
                     tracing::info!("First video frame uploaded to GPU");
                 }
                 self.frame_textures = Some(tex);
             } else {
+                self.import_stats.record_failure();
                 // Rate-limit: only log once per 5 seconds
                 let now = std::time::Instant::now();
                 let should_log = self
@@ -870,9 +879,11 @@ impl GpuiVideoPlayer {
         );
 
         if let Some(tex) = textures {
+            self.import_stats.record_success(tex.path);
             tracing::trace!("Preview frame uploaded to GPU");
             self.frame_textures = Some(tex);
         } else {
+            self.import_stats.record_failure();
             tracing::warn!("Preview frame upload returned None — missing CPU fallback?");
         }
     }

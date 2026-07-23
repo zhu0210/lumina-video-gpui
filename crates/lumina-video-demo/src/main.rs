@@ -182,6 +182,16 @@ impl Render for DemoApp {
             .and_then(|p| p.frame_rate())
             .map(|f| format!("{f:.1} fps"))
             .unwrap_or_else(|| "—".into());
+        let import_text = self.player.as_ref().map_or_else(
+            || "—".to_string(),
+            |player| {
+                let stats = player.import_stats();
+                format!(
+                    "zero={} cpu={} failed={}",
+                    stats.zero_copy_frames, stats.cpu_upload_frames, stats.import_failures
+                )
+            },
+        );
 
         div()
             .flex()
@@ -594,6 +604,7 @@ impl Render for DemoApp {
                             .child(info_row("Duration", &dur_text))
                             .child(info_row("Resolution", &res_text))
                             .child(info_row("Frame Rate", &fps_text))
+                            .child(info_row("GPU Path", &import_text))
                             .child(div().h(px(12.0)))
                             .child(section("KEYBOARD"))
                             .child(kb("← →", "Seek ±5s"))

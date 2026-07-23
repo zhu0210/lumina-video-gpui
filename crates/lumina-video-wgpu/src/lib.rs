@@ -36,6 +36,55 @@ pub enum RealizedVideoPath {
     Unsupported,
 }
 
+/// Cumulative results observed at the wgpu upload/import boundary.
+///
+/// Unlike decoder-side DMABuf counters, these values only report a zero-copy
+/// frame after native memory was successfully imported into wgpu.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoImportStats {
+    /// Successful imports and uploads.
+    pub successful_frames: u64,
+    /// Successful producer-memory imports.
+    pub zero_copy_frames: u64,
+    /// Successful GPU-copy frames.
+    pub gpu_copy_frames: u64,
+    /// Successful CPU uploads.
+    pub cpu_upload_frames: u64,
+    /// Successful frames explicitly realized as unsupported placeholders.
+    pub unsupported_frames: u64,
+    /// Frames rejected before a usable wgpu texture was produced.
+    pub import_failures: u64,
+}
+
+impl VideoImportStats {
+    /// Records a successfully realized frame.
+    pub fn record_success(&mut self, path: RealizedVideoPath) {
+        self.successful_frames = self.successful_frames.saturating_add(1);
+        let counter = match path {
+            RealizedVideoPath::ZeroCopy => &mut self.zero_copy_frames,
+            RealizedVideoPath::GpuCopy => &mut self.gpu_copy_frames,
+            RealizedVideoPath::CpuUpload => &mut self.cpu_upload_frames,
+            RealizedVideoPath::Unsupported => &mut self.unsupported_frames,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Records a failed native import or CPU upload.
+    pub fn record_failure(&mut self) {
+        self.import_failures = self.import_failures.saturating_add(1);
+    }
+
+    /// Returns successful zero-copy frames as a percentage of successful
+    /// frames. Failed imports remain separately visible in `import_failures`.
+    pub fn zero_copy_percentage(&self) -> f64 {
+        if self.successful_frames == 0 {
+            0.0
+        } else {
+            self.zero_copy_frames as f64 / self.successful_frames as f64 * 100.0
+        }
+    }
+}
+
 /// Realized macOS native-video import capabilities for a renderer device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MacOsInteropCapabilities {
@@ -131,4 +180,39 @@ pub struct GpuVideoFrame {
     pub path: RealizedVideoPath,
     /// Retained producer ownership needed by imported textures.
     pub producer: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RealizedVideoPath, VideoImportStats};
+
+    #[test]
+    fn import_stats_count_only_realized_paths_as_successes() {
+        let mut stats = VideoImportStats::default();
+        stats.record_success(RealizedVideoPath::ZeroCopy);
+        stats.record_success(RealizedVideoPath::CpuUpload);
+        stats.record_failure();
+
+        assert_eq!(stats.successful_frames, 2);
+        assert_eq!(stats.zero_copy_frames, 1);
+        assert_eq!(stats.cpu_upload_frames, 1);
+        assert_eq!(stats.import_failures, 1);
+        assert_eq!(stats.zero_copy_percentage(), 50.0);
+    }
+
+    #[test]
+    fn import_stats_use_saturating_counters() {
+        let mut stats = VideoImportStats {
+            successful_frames: u64::MAX,
+            zero_copy_frames: u64::MAX,
+            import_failures: u64::MAX,
+            ..VideoImportStats::default()
+        };
+        stats.record_success(RealizedVideoPath::ZeroCopy);
+        stats.record_failure();
+
+        assert_eq!(stats.successful_frames, u64::MAX);
+        assert_eq!(stats.zero_copy_frames, u64::MAX);
+        assert_eq!(stats.import_failures, u64::MAX);
+    }
 }
