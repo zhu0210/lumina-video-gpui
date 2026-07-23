@@ -54,7 +54,7 @@ pub use lumina_video_core::windows_audio;
 pub use lumina_video_core::windows_video;
 
 // =============================================================================
-// GPUI video player (replaces egui VideoPlayer)
+// GPUI video player
 // =============================================================================
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -79,7 +79,7 @@ pub mod moq_decoder;
 pub mod nostr_discovery;
 
 // =============================================================================
-// Web/WASM modules (browser APIs — preserved, not GPUI-dependent)
+// Web/WASM MoQ decoder
 // =============================================================================
 
 #[cfg(target_arch = "wasm32")]
@@ -135,8 +135,7 @@ pub use sync_metrics::{SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS
 
 #[cfg(target_arch = "wasm32")]
 pub use web_video::{
-    HlsBufferInfo, HlsQualityLevel, WebVideoPlayer, WebVideoPlayerResponse, WebVideoRenderCallback,
-    WebVideoRenderResources, WebVideoTexture,
+    GpuiWebVideoPlayer, HlsBufferInfo, HlsQualityLevel, WebVideoPlayer, WebVideoTexture,
 };
 
 #[cfg(target_arch = "wasm32")]

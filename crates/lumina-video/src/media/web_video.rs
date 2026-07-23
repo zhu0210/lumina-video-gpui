@@ -26,15 +26,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use egui_wgpu::wgpu;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlVideoElement};
+use wgpu;
 
 use super::video::{VideoError, VideoMetadata, VideoState};
-
-// Re-export egui for convenience in web builds
-pub use egui;
 
 /// Callback type for frame-ready notifications from JavaScript.
 pub type FrameReadyCallback = Rc<RefCell<Option<Box<dyn FnMut()>>>>;
@@ -564,11 +561,12 @@ fn parse_hls_levels(levels: &JsValue) -> Vec<HlsQualityLevel> {
 }
 
 // ============================================================================
-// egui Integration
+// Legacy UI adapter (disabled; GPUI consumes `WebVideoTexture::texture`).
 // ============================================================================
 
 /// Response from showing a web video player in egui.
 #[derive(Default)]
+#[cfg(any())]
 pub struct WebVideoPlayerResponse {
     /// Whether the video state changed (play/pause/seek).
     pub state_changed: bool,
@@ -591,6 +589,7 @@ impl WebVideoPlayer {
     /// }
     /// ```
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any())]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -670,6 +669,38 @@ impl WebVideoPlayer {
             let _ = self.play();
         }
     }
+
+    /// Updates a GPUI-compatible WebGPU texture when the browser reports a
+    /// decoded frame. The returned texture can be wrapped in GPUI's validated
+    /// `RgbaTextureSource`.
+    pub fn update_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &mut Option<WebVideoTexture>,
+    ) -> Result<Option<std::sync::Arc<wgpu::Texture>>, VideoError> {
+        let (width, height) = self.dimensions();
+        if width == 0 || height == 0 {
+            return Ok(None);
+        }
+
+        if texture
+            .as_ref()
+            .is_none_or(|texture| texture.dimensions() != (width, height))
+        {
+            *texture = Some(WebVideoTexture::new(device, width, height));
+        }
+
+        if self.is_frame_ready() {
+            if let Some(texture) = texture.as_ref() {
+                if texture.upload_frame(queue, &self.video)? {
+                    self.clear_frame_ready();
+                }
+            }
+        }
+
+        Ok(texture.as_ref().map(|texture| texture.texture().clone()))
+    }
 }
 
 fn parse_hls_buffer_info(info: &JsValue) -> Option<HlsBufferInfo> {
@@ -718,25 +749,92 @@ fn parse_hls_buffer_info(info: &JsValue) -> Option<HlsBufferInfo> {
 /// for 1080p content.
 pub struct WebVideoTexture {
     /// The wgpu texture for rendering
-    texture: wgpu::Texture,
+    texture: std::sync::Arc<wgpu::Texture>,
     /// Texture view for shader access
     view: wgpu::TextureView,
-    /// Bind group for the texture + sampler
-    bind_group: wgpu::BindGroup,
     /// Current texture dimensions
     width: u32,
     height: u32,
 }
 
+/// GPUI integration for browser-native video and HLS playback.
+///
+/// Decoding and audio remain owned by `HTMLVideoElement`; decoded frames are
+/// copied GPU-to-GPU into a texture created on GPUI's wgpu device.
+pub struct GpuiWebVideoPlayer {
+    player: WebVideoPlayer,
+    upload_texture: Option<WebVideoTexture>,
+    current_texture: Option<std::sync::Arc<wgpu::Texture>>,
+}
+
+impl GpuiWebVideoPlayer {
+    pub fn new(url: &str) -> Result<Self, VideoError> {
+        Ok(Self {
+            player: WebVideoPlayer::new(url)?,
+            upload_texture: None,
+            current_texture: None,
+        })
+    }
+
+    pub fn player(&self) -> &WebVideoPlayer {
+        &self.player
+    }
+
+    pub fn player_mut(&mut self) -> &mut WebVideoPlayer {
+        &mut self.player
+    }
+
+    pub fn update(&mut self, window: &mut gpui::Window) -> Result<(), VideoError> {
+        let Some(context) = window.gpu_context() else {
+            return Ok(());
+        };
+        self.current_texture = self.player.update_texture(
+            context.device(),
+            context.queue(),
+            &mut self.upload_texture,
+        )?;
+
+        if matches!(
+            self.player.state(),
+            VideoState::Loading | VideoState::Playing { .. }
+        ) {
+            window.request_animation_frame();
+        }
+        Ok(())
+    }
+
+    pub fn surface_element(&self) -> gpui::AnyElement {
+        use gpui::{DevicePixels, GpuTextureAlphaMode, GpuTextureColorSpace, IntoElement, Styled};
+
+        let Some(texture) = &self.current_texture else {
+            return gpui::div()
+                .size_full()
+                .bg(gpui::rgb(0x000000))
+                .into_any_element();
+        };
+        let (width, height) = self.player.dimensions();
+        let source = gpui::RgbaTextureSource::new(
+            texture.clone(),
+            gpui::size(DevicePixels(width as i32), DevicePixels(height as i32)),
+            GpuTextureAlphaMode::Opaque,
+            GpuTextureColorSpace::Srgb,
+        );
+        match source {
+            Ok(source) => gpui::surface(source)
+                .size_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+            Err(_) => gpui::div()
+                .size_full()
+                .bg(gpui::rgb(0x000000))
+                .into_any_element(),
+        }
+    }
+}
+
 impl WebVideoTexture {
     /// Creates a new web video texture with the given dimensions.
-    pub fn new(
-        device: &wgpu::Device,
-        bind_group_layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        width: u32,
-        height: u32,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("web_video_texture"),
             size: wgpu::Extent3d {
@@ -755,40 +853,20 @@ impl WebVideoTexture {
             view_formats: &[],
         });
 
+        let texture = std::sync::Arc::new(texture);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("web_video_bind_group"),
-            layout: bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-            ],
-        });
 
         Self {
             texture,
             view,
-            bind_group,
             width,
             height,
         }
     }
 
     /// Returns the underlying wgpu texture.
-    pub fn texture(&self) -> &wgpu::Texture {
+    pub fn texture(&self) -> &std::sync::Arc<wgpu::Texture> {
         &self.texture
-    }
-
-    /// Returns the bind group for rendering.
-    pub fn bind_group(&self) -> &wgpu::BindGroup {
-        &self.bind_group
     }
 
     /// Returns the texture view.
@@ -853,6 +931,7 @@ impl WebVideoTexture {
 
 /// Inline WGSL shader for simple RGBA texture rendering.
 /// This is a minimal shader that just samples an RGBA texture and outputs it.
+#[cfg(any())]
 const WEB_VIDEO_SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -898,6 +977,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 ///
 /// This is simpler than the native VideoRenderResources because web video
 /// frames are already in RGBA format (no YUV conversion needed).
+#[cfg(any())]
 pub struct WebVideoRenderResources {
     /// Render pipeline for RGBA texture
     pipeline: wgpu::RenderPipeline,
@@ -907,6 +987,7 @@ pub struct WebVideoRenderResources {
     sampler: wgpu::Sampler,
 }
 
+#[cfg(any())]
 impl WebVideoRenderResources {
     /// Creates web video render resources.
     pub fn new(wgpu_render_state: &egui_wgpu::RenderState) -> Self {
@@ -1010,11 +1091,13 @@ impl WebVideoRenderResources {
 ///
 /// Use this with `egui::PaintCallback` to render video frames directly
 /// from HTMLVideoElement to the screen without CPU readback.
+#[cfg(any())]
 pub struct WebVideoRenderCallback {
     /// The bind group containing the video texture
     bind_group: wgpu::BindGroup,
 }
 
+#[cfg(any())]
 impl WebVideoRenderCallback {
     /// Creates a new render callback with the given texture bind group.
     pub fn new(bind_group: wgpu::BindGroup) -> Self {
@@ -1022,6 +1105,7 @@ impl WebVideoRenderCallback {
     }
 }
 
+#[cfg(any())]
 impl egui_wgpu::CallbackTrait for WebVideoRenderCallback {
     fn prepare(
         &self,

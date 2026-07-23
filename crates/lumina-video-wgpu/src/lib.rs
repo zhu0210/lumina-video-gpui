@@ -1,4 +1,5 @@
 //! Framework-neutral wgpu upload and native-frame import for Lumina video.
+#![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
 
 #[cfg(target_os = "android")]
 pub use lumina_video_core::android_video;

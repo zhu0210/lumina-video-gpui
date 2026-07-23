@@ -6,9 +6,7 @@ members = [
   "crates/lumina-video-core",
   "crates/lumina-video-wgpu",
   "crates/lumina-video-demo",
-  # "crates/lumina-video-android",    # TODO: port to GPUI
   # "crates/lumina-video-ios",
-  # "crates/lumina-video-web-demo",   # TODO: port to GPUI
 ]
 
 [workspace.dependencies]

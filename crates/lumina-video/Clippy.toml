@@ -1,3 +1,0 @@
-disallowed-methods = [
-  { path = "egui::Context::load_texture", reason = "Use load_texture_checked" }
-]

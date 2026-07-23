@@ -1,4 +1,5 @@
 //! lumina-video: Cross-platform video playback for GPUI with hardware acceleration.
+#![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
 //!
 //! This crate provides hardware-accelerated video playback for GPUI applications
 //! using **native platform media frameworks** — no FFmpeg required by default.
@@ -33,8 +34,9 @@
 pub mod media;
 
 // Re-export core types for convenience
+#[cfg(not(target_arch = "wasm32"))]
 pub use media::{
-    // GPUI video player (replaces the egui VideoPlayer)
+    // GPUI video player
     GpuiVideoPlayer,
     GpuiVideoPlayerConfig,
     GpuiVideoPlayerResponse,
@@ -54,7 +56,12 @@ pub use lumina_video_core::{
 pub use lumina_video_core::sync_metrics::{
     SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS,
 };
-pub use lumina_video_wgpu::frame_to_texture::{self, GpuFrameTextures};
+pub use lumina_video_wgpu::{GpuVideoFrame, GpuVideoFrameTextures, RealizedVideoPath};
+
+#[cfg(target_arch = "wasm32")]
+pub use media::web_video::{
+    GpuiWebVideoPlayer, HlsBufferInfo, HlsQualityLevel, WebVideoPlayer, WebVideoTexture,
+};
 
 // macOS/iOS FFmpeg decoder (when available)
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -67,7 +74,3 @@ pub use lumina_video_core::android_video::{
 };
 #[cfg(target_os = "android")]
 pub use media::AndroidVideoDecoder;
-
-// Web/WASM video player
-#[cfg(target_arch = "wasm32")]
-pub use media::{HlsBufferInfo, HlsQualityLevel, WebVideoPlayer};

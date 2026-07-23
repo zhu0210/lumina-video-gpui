@@ -20,11 +20,11 @@ targets = [
 ]
 
 [dependencies]
-# Core decode + zero-copy pipeline (egui-free, uses same wgpu as GPUI)
+# Core decode pipeline (framework-independent and wgpu-free)
 lumina-video-core = { path = "../lumina-video-core" }
 lumina-video-wgpu = { path = "../lumina-video-wgpu" }
 
-# GPUI — the UI framework (replaces egui)
+# GPUI UI integration
 # "wgpu" is opt-in (not in default features) — required for GpuContextHandle, surface(), etc.
 gpui = {
   path = "../../../zed/crates/gpui",

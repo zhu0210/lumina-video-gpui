@@ -269,6 +269,7 @@ pub struct WebMoqFrameInfo {
 // ============================================================================
 
 /// Shared decoder state updated by JS callbacks.
+#[derive(Default)]
 struct DecoderSharedState {
     /// Latest frame info from decoder output callback
     latest_frame: Option<WebMoqFrameInfo>,
@@ -280,16 +281,7 @@ struct DecoderSharedState {
     frame_count: u64,
 }
 
-impl Default for DecoderSharedState {
-    fn default() -> Self {
-        Self {
-            latest_frame: None,
-            error_message: None,
-            frame_ready: false,
-            frame_count: 0,
-        }
-    }
-}
+type VideoFrameClosure = Closure<dyn FnMut(f64, u32, u32, f64)>;
 
 // ============================================================================
 // WebMoqDecoder implementation
@@ -328,7 +320,7 @@ pub struct WebMoqDecoder {
     /// Video metadata
     metadata: VideoMetadata,
     /// Closure for frame callback (must be kept alive)
-    _frame_callback: Option<Closure<dyn FnMut(f64, u32, u32, f64)>>,
+    _frame_callback: Option<VideoFrameClosure>,
     /// Closure for error callback (must be kept alive)
     _error_callback: Option<Closure<dyn FnMut(String)>>,
     /// Codec string for WebCodecs
@@ -918,7 +910,7 @@ pub struct WebMoqSession {
     /// Shared state for video frame callbacks
     video_shared: Rc<RefCell<DecoderSharedState>>,
     /// Frame callback closure (must keep alive)
-    _video_frame_cb: Option<Closure<dyn FnMut(f64, u32, u32, f64)>>,
+    _video_frame_cb: Option<VideoFrameClosure>,
     /// Error callback closure (must keep alive)
     _video_error_cb: Option<Closure<dyn FnMut(String)>>,
     /// Video dimensions (updated from frame callback)

@@ -76,14 +76,8 @@ use std::fmt;
 // only available on certain platforms. This section provides compile-time
 // verification with clear error messages for unsupported configurations.
 
-/// Compile-time check for WebAssembly - not supported
-#[cfg(target_family = "wasm")]
-compile_error!(
-    "The `zero-copy` feature is not supported on WebAssembly/WASM. \
-     WebGPU does not provide external memory import APIs, so zero-copy \
-     texture import is not possible. Please disable the `zero-copy` feature \
-     when targeting WASM."
-);
+// WebAssembly uses the GPU-copy path (`copyExternalImageToTexture`) and simply
+// exposes no native external-memory importer.
 
 /// Compile-time check for other unsupported Unix platforms (FreeBSD, OpenBSD, etc.)
 #[cfg(all(
