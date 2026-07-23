@@ -165,7 +165,7 @@ pub fn decoded_frame_to_textures(
                 );
                 match import_linux_dmabuf_frame(surface, device) {
                     Ok(textures) => {
-                        tracing::info!("Linux DMABuf zero-copy import succeeded");
+                        tracing::debug!("Linux DMABuf zero-copy import succeeded");
                         Some(textures)
                     }
                     Err(e) => {

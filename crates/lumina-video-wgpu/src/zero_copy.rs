@@ -494,7 +494,7 @@ pub mod linux {
     use ash::vk;
     use std::ffi::CStr;
     use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
-    use tracing::{debug, info, warn};
+    use tracing::{debug, warn};
 
     /// Per-plane DMABuf metadata for multi-plane import.
     ///
@@ -537,8 +537,9 @@ pub mod linux {
         pub modifier: u64,
         /// Whether every plane is backed by an independent DMABuf allocation.
         ///
-        /// A shared allocation cannot be imported as unrelated single-plane
-        /// Vulkan images merely by duplicating its descriptor.
+        /// Shared allocations are imported through independently duplicated
+        /// descriptors while preserving each plane's explicit DRM offset,
+        /// stride, size, and modifier.
         pub disjoint: bool,
     }
 
@@ -1152,7 +1153,7 @@ pub mod linux {
                 ZeroCopyError::TextureCreationFailed(format!("vkBindImageMemory failed: {:?}", e))
             })?;
 
-        info!(
+        debug!(
             "Successfully created Vulkan image from DMABuf fd={} ({}x{} {:?})",
             fd, width, height, format
         );
@@ -1232,7 +1233,7 @@ pub mod linux {
             wgpu::TextureUses::RESOURCE, // sampleable texture
         );
 
-        info!("Successfully imported DMABuf as wgpu texture (zero-copy)");
+        debug!("Successfully imported DMABuf as wgpu texture (zero-copy)");
 
         Ok(wgpu_texture)
     }
@@ -1307,14 +1308,6 @@ pub mod linux {
                 "DMABuf has an unknown DRM format modifier".to_string(),
             ));
         }
-        if !dmabuf.disjoint {
-            return Err(ZeroCopyError::NotAvailable(
-                "Shared-allocation multi-plane DMABuf import requires a true multi-planar \
-                 Vulkan image; duplicated descriptors cannot be imported as unrelated planes"
-                    .to_string(),
-            ));
-        }
-
         let chroma_width = width.div_ceil(2);
         let chroma_height = height.div_ceil(2);
         let plane_specs: Vec<(u32, u32, u32, wgpu::TextureFormat)> = match format {
@@ -1393,12 +1386,13 @@ pub mod linux {
             }
         }
 
-        info!(
-            "Importing multi-plane DMABuf: {:?} ({}x{}, {} planes)",
+        debug!(
+            "Importing multi-plane DMABuf: {:?} ({}x{}, {} planes, disjoint={})",
             format,
             width,
             height,
-            dmabuf.num_planes()
+            dmabuf.num_planes(),
+            dmabuf.disjoint
         );
 
         let mut textures = Vec::with_capacity(plane_specs.len());
@@ -1449,7 +1443,7 @@ pub mod linux {
             }
         }
 
-        info!(
+        debug!(
             "Successfully imported {} planes as wgpu textures (zero-copy multi-plane)",
             textures.len()
         );
