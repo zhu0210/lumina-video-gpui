@@ -522,6 +522,7 @@ fn decode_loop<D: VideoDecoderBackend>(
     let mut playing = false;
     let mut last_metadata_check = std::time::Instant::now();
     let mut last_position_update = std::time::Instant::now();
+    let mut native_clock_started = false;
 
     // Decode one frame immediately for preview (before waiting for Play command)
     // This allows showing the first frame without starting playback
@@ -690,6 +691,13 @@ fn decode_loop<D: VideoDecoderBackend>(
             if playing && last_position_update.elapsed() > Duration::from_millis(16) {
                 if let Some(pos) = decoder.current_time() {
                     audio.set_native_position(pos);
+                    if !native_clock_started && !pos.is_zero() {
+                        native_clock_started = true;
+                        tracing::info!(
+                            position_ms = pos.as_millis(),
+                            "Decoder audio position became the playback master clock"
+                        );
+                    }
                 }
                 last_position_update = std::time::Instant::now();
             }

@@ -381,22 +381,22 @@ impl CorePlayer {
                 if uses_native_audio {
                     if let Some(ref ah) = decoder_audio_handle {
                         self.audio_handle = ah.clone();
-                        self.scheduler.set_audio_handle(self.audio_handle.clone());
-                        tracing::info!("Native audio enabled (decoder handles audio internally, using audio as master clock)");
-                        self.audio_handle.set_available(true);
                     } else {
-                        // Decoder handles audio internally (e.g. GStreamer alsasink)
-                        // but doesn't provide an AudioHandle with position tracking.
-                        // Clear the audio handle so the scheduler uses pure wall-clock
-                        // timing without any audio sync checks that would fail.
-                        self.scheduler.clear_audio_handle();
-                        tracing::info!("Native audio enabled (decoder handles audio internally, using wall-clock for frame pacing)");
+                        // The decode thread publishes decoder.current_time() to
+                        // this handle. If the decoder cannot expose a clock, the
+                        // scheduler falls back to wall time after its startup
+                        // grace period.
+                        self.audio_handle = AudioHandle::new();
                     }
+                    self.scheduler.set_audio_handle(self.audio_handle.clone());
+                    self.audio_handle.set_available(true);
+                    tracing::info!(
+                        "Native audio enabled (decoder position is the master clock when available)"
+                    );
                 }
 
                 let frame_queue = Arc::clone(&self.frame_queue);
 
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 let decode_thread = if uses_native_audio {
                     DecodeThread::with_audio_handle(
                         decoder,
@@ -406,9 +406,6 @@ impl CorePlayer {
                 } else {
                     DecodeThread::new(decoder, frame_queue)
                 };
-
-                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-                let decode_thread = DecodeThread::new(decoder, frame_queue);
 
                 self.decode_thread = Some(decode_thread);
 

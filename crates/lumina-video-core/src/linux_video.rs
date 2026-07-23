@@ -2934,6 +2934,12 @@ impl VideoDecoderBackend for ZeroCopyGStreamerDecoder {
         self.buffering_percent
     }
 
+    fn current_time(&self) -> Option<Duration> {
+        self.pipeline
+            .query_position::<gst::ClockTime>()
+            .map(|position| Duration::from_nanos(position.nseconds()))
+    }
+
     /// GStreamer handles audio internally - no separate FFmpeg audio thread needed.
     fn handles_audio_internally(&self) -> bool {
         true
