@@ -10,23 +10,23 @@
 //!
 //! # Current Implementation Status
 //!
-//! - **macOS**: Fully implemented. IOSurface import to Metal works for supported formats (BGRA, NV12).
-//! - **Linux**: Partial. Only single-plane formats (RGBA/BGRA) work. NV12 falls back
-//!   to CPU copy because `LinuxGpuSurface` only stores single-plane metadata (see
-//!   lumina-video-4m8 for the multi-plane limitation).
+//! - **macOS**: BGRA IOSurface import is available on Metal. NV12 plane import is
+//!   explicitly unsupported until plane metadata and color attachments are wired.
+//! - **Linux**: Disjoint multi-FD planes are validated and importable. Shared
+//!   multi-plane allocations require a true multi-planar Vulkan path.
 //! - **Android**: Rust-side Vulkan import is ready. Waiting for Java/Kotlin ExoPlayer
 //!   integration to expose AHardwareBuffer via ImageReader (see lumina-video-6dn).
-//! - **Windows**: Implemented but missing proper D3D11→D3D12 fence synchronization.
-//!   May cause visual artifacts or crashes under heavy load without sync primitives.
+//! - **Windows**: Shared-handle opening exists internally, but production import
+//!   remains unsupported until LUID matching and shared-fence synchronization.
 //!
 //! # Platform Support
 //!
 //! | Platform | Backend | Import Method | Status |
 //! |----------|---------|---------------|--------|
-//! | macOS | Metal | IOSurface | Supported |
-//! | Linux | Vulkan | DMABuf (VA-API, V4L2) | Partial (single-plane only) |
+//! | macOS | Metal | IOSurface | BGRA only |
+//! | Linux | Vulkan | DMABuf (VA-API, V4L2) | Disjoint planes only |
 //! | Android | Vulkan | AHardwareBuffer (MediaCodec) | Rust ready, Java pending |
-//! | Windows | D3D12 | D3D11 Shared Handle | Partial (missing fence sync) |
+//! | Windows | D3D12 | D3D11 Shared Handle | Unsupported (missing LUID/fence) |
 //! | iOS | Metal | IOSurface | Shared with macOS (Metal/IOSurface) |
 //! | Web/WASM | WebGPU | N/A | Not supported (no external memory) |
 //!
@@ -6333,10 +6333,12 @@ pub mod windows {
 
     /// Checks if D3D11/D3D12 shared handle import is available.
     ///
-    /// This always returns true on Windows when using D3D12 backend,
-    /// as shared handle import is a core D3D12 feature (no extensions needed).
+    /// Opening a handle is insufficient: the supported path also requires
+    /// adapter-LUID matching and shared-fence synchronization. Those guarantees
+    /// are not complete, so production capability reporting remains false.
     pub fn is_shared_handle_import_available(device: &wgpu::Device) -> bool {
-        is_d3d12_backend(device)
+        let _ = device;
+        false
     }
 
     /// Imports a D3D11 shared handle into wgpu as a texture (zero-copy).

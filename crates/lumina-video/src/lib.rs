@@ -56,7 +56,10 @@ pub use lumina_video_core::{
 pub use lumina_video_core::sync_metrics::{
     SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS,
 };
-pub use lumina_video_wgpu::{GpuVideoFrame, GpuVideoFrameTextures, RealizedVideoPath};
+pub use lumina_video_wgpu::{
+    GpuVideoFrame, GpuVideoFrameTextures, MacOsInteropCapabilities, RealizedVideoPath,
+    WindowsInteropCapabilities,
+};
 
 #[cfg(target_arch = "wasm32")]
 pub use media::web_video::{

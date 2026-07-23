@@ -310,6 +310,12 @@ fn import_macos_iosurface_frame(
     surface: &crate::video::MacOSGpuSurface,
     device: &wgpu::Device,
 ) -> Result<GpuFrameTextures, crate::video::VideoError> {
+    if surface.format != crate::video::PixelFormat::Bgra {
+        return Err(crate::video::VideoError::UnsupportedFormat(format!(
+            "IOSurface import currently supports BGRA only, got {:?}",
+            surface.format
+        )));
+    }
     let texture = unsafe {
         crate::zero_copy::macos::import_iosurface(
             device,

@@ -36,6 +36,68 @@ pub enum RealizedVideoPath {
     Unsupported,
 }
 
+/// Realized macOS native-video import capabilities for a renderer device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MacOsInteropCapabilities {
+    /// BGRA IOSurface frames can be sampled without a CPU copy.
+    pub bgra_iosurface_zero_copy: bool,
+    /// NV12 IOSurface planes can be imported with correct plane metadata.
+    pub nv12_iosurface_zero_copy: bool,
+    /// CPU upload remains available as a fallback.
+    pub cpu_upload: bool,
+}
+
+impl MacOsInteropCapabilities {
+    /// Inspects capabilities for a wgpu device.
+    pub fn for_device(device: &wgpu::Device) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            Self {
+                bgra_iosurface_zero_copy: zero_copy::macos::is_metal_backend(device),
+                nv12_iosurface_zero_copy: false,
+                cpu_upload: true,
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let _ = device;
+            Self {
+                cpu_upload: true,
+                ..Self::default()
+            }
+        }
+    }
+}
+
+/// Realized Windows native-video import capabilities for a renderer device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowsInteropCapabilities {
+    /// The decoder and renderer adapters can be matched by LUID.
+    pub adapter_luid_matching: bool,
+    /// BGRA shared textures have validated cross-API synchronization.
+    pub bgra_shared_texture_zero_copy: bool,
+    /// NV12 shared textures have validated plane and synchronization handling.
+    pub nv12_shared_texture_zero_copy: bool,
+    /// Shared D3D11/D3D12 fences are integrated into submission.
+    pub shared_fence_synchronization: bool,
+    /// CPU upload remains available as a fallback.
+    pub cpu_upload: bool,
+}
+
+impl WindowsInteropCapabilities {
+    /// Reports the currently supported Windows path.
+    ///
+    /// Shared-handle opening exists internally, but is not advertised until
+    /// adapter matching and producer/consumer fence synchronization are proven.
+    pub fn for_device(device: &wgpu::Device) -> Self {
+        let _ = device;
+        Self {
+            cpu_upload: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Texture payload of an imported or uploaded frame.
 #[derive(Clone)]
 pub enum GpuVideoFrameTextures {
