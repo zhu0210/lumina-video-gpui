@@ -669,8 +669,10 @@ pub struct GpuiWebVideoPlayer {
 
 impl GpuiWebVideoPlayer {
     pub fn new(url: &str) -> Result<Self, VideoError> {
+        let mut player = WebVideoPlayer::new(url)?;
+        player.start_frame_callbacks()?;
         Ok(Self {
-            player: WebVideoPlayer::new(url)?,
+            player,
             upload_texture: None,
             current_texture: None,
         })
@@ -685,6 +687,10 @@ impl GpuiWebVideoPlayer {
     }
 
     pub fn update(&mut self, window: &mut gpui::Window) -> Result<(), VideoError> {
+        self.player.update_state();
+        if self.player.metadata().is_none() {
+            self.player.update_metadata();
+        }
         let Some(context) = window.gpu_context() else {
             return Ok(());
         };

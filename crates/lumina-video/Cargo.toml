@@ -108,6 +108,7 @@ web-sys = {
     "HtmlElement",
     "HtmlMediaElement",
     "HtmlVideoElement",
+    "Location",
     "MediaError",
     "Node",
     "TimeRanges",
@@ -123,6 +124,13 @@ web-sys = {
 }
 # wgpu for WebGPU zero-copy texture operations (must match GPUI's wgpu)
 wgpu = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+gpui_platform = { path = "../../../zed/crates/gpui_platform" }
+
+[[example]]
+name = "web_hls"
+path = "examples/web_hls.rs"
 
 [features]
 default = []
