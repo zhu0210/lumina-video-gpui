@@ -84,7 +84,7 @@ Each plane is imported as a separate wgpu texture, then combined in the fragment
 Android achieves 1 GPU hop (zero CPU copies) by bypassing wgpu and using raw Vulkan:
 
 ```
-MediaCodec (YUV) → HardwareBuffer → Vulkan Import → YCbCr Blit Pass → RGBA Texture → wgpu → egui
+MediaCodec (YUV) → HardwareBuffer → Vulkan Import → YCbCr Blit Pass → RGBA Texture → wgpu → GPUI
                                                     ↑
                                               (1 GPU hop)
 ```
@@ -111,7 +111,7 @@ See [PR #22](https://github.com/lumina-video/lumina-video/pull/22) for implement
 1. Import AHardwareBuffer via raw Vulkan (`VK_ANDROID_external_memory_android_hardware_buffer`)
 2. Create VkSamplerYcbcrConversion for GPU-side YUV→RGBA
 3. Blit to RGBA texture (1 GPU hop)
-4. Hand RGBA texture to wgpu for egui rendering
+4. Hand the RGBA texture to GPUI's wgpu renderer
 5. If VkSamplerYcbcrConversion unavailable, falls back to CPU-assisted path
 
 ## Testing Status

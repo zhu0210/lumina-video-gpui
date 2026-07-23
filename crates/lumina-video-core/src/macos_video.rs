@@ -563,7 +563,7 @@ impl MacOSVideoDecoder {
         unsafe { player.setMuted(true) };
 
         // Use placeholder metadata - will be updated when video is ready
-        // Note: AVPlayer status transitions happen via the run loop. Since eframe/winit
+        // Note: AVPlayer status transitions happen via the application run loop. Since GPUI
         // runs the main run loop, status will eventually transition to ReadyToPlay
         // through normal event processing. We don't pump manually to avoid conflicting
         // with winit's event handling.
@@ -1027,7 +1027,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         }
 
         // If status is Unknown, log it - AVFoundation is still loading/buffering.
-        // The run loop is pumped by eframe/winit, so status should eventually transition.
+        // GPUI pumps the run loop, so status should eventually transition.
         if item_status == AVPlayerItemStatus(0) {
             // Log if there's an error
             if let Some(ref msg) = error_msg.or_else(|| player_error_msg.clone()) {

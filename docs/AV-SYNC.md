@@ -119,7 +119,7 @@ When the audio ring buffer empties (3 consecutive empty cpal callbacks), video f
 
 ### Rendering Gap Detection (Alt-Tab Recovery)
 
-When the app is backgrounded (alt-tab), egui stops calling `get_next_frame()`. Audio continues playing via the cpal callback, creating drift equal to the gap duration.
+When the app is backgrounded, the UI stops calling `get_next_frame()`. Audio continues playing via the cpal callback, creating drift equal to the gap duration.
 
 Detection and recovery:
 

@@ -1,7 +1,7 @@
 Name:           lumina-video-demo
 Version:        0.1.0
 Release:        1%{?dist}
-Summary:        Hardware-accelerated video player demo for egui
+Summary:        Hardware-accelerated video player demo for GPUI
 
 License:        MIT OR Apache-2.0
 URL:            https://github.com/lumina-video/lumina-video

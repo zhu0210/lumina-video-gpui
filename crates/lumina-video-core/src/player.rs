@@ -1,9 +1,9 @@
-//! Headless video player (decoder-agnostic, egui-free).
+//! Headless video player (decoder-agnostic and UI-framework independent).
 //!
 //! [`CorePlayer`] encapsulates the decode pipeline, frame queue, A/V sync,
 //! and playback state machine. It is consumed by:
 //!
-//! - `lumina-video::VideoPlayer` (egui widget wrapper)
+//! - `lumina-video::GpuiVideoPlayer` (GPUI wrapper)
 //! - `lumina-video-ios` (C FFI for iOS/Swift)
 //!
 //! CorePlayer is MoQ-agnostic: callers choose the decoder (platform default
@@ -54,11 +54,11 @@ fn is_avfoundation_supported_container(url: &str) -> bool {
     )
 }
 
-/// Headless, egui-free video player.
+/// Headless, UI-framework-independent video player.
 ///
 /// Manages the decode pipeline, frame queue, A/V synchronization, and
 /// playback state machine. Does NOT handle GPU texture upload or UI —
-/// that belongs in the egui layer (`VideoPlayer`).
+/// that belongs in the GPUI layer (`GpuiVideoPlayer`).
 ///
 /// # State Machine
 ///
@@ -561,7 +561,7 @@ impl CorePlayer {
         &self.state
     }
 
-    /// Sets the state (used by the egui layer for EOS/loop handling).
+    /// Sets the state (used by the GPUI layer for EOS/loop handling).
     pub fn set_state(&mut self, state: VideoState) {
         self.state = state;
     }

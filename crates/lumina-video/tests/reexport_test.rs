@@ -11,7 +11,7 @@ use lumina_video::{
     VideoMetadata, VideoState,
 };
 
-// GPUI video player types (replaces egui VideoPlayer)
+// GPUI video player types
 #[allow(unused_imports)]
 use lumina_video::{GpuiVideoPlayer, GpuiVideoPlayerConfig, GpuiVideoPlayerResponse};
 

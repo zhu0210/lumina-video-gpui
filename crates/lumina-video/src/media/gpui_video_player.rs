@@ -792,7 +792,7 @@ impl GpuiVideoPlayer {
 
     #[cfg(feature = "moq")]
     fn poll_moq_audio_handle(&mut self) {
-        // Simplified MoQ audio binding — full implementation in the egui
+        // Simplified MoQ audio binding — full implementation in the legacy
         // version has more detailed state management.
         if self.moq_audio_bound {
             return;

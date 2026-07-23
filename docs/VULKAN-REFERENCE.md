@@ -49,7 +49,7 @@ VkMemoryAllocateInfo {
 
 ### VK_KHR_sampler_ycbcr_conversion
 
-**Purpose**: GPU-side YUV to RGB color space conversion (MediaCodec outputs YUV, egui needs RGB).
+**Purpose**: GPU-side YUV to RGB color conversion for renderer-compatible textures.
 
 **Official Spec**: [VK_KHR_sampler_ycbcr_conversion](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_sampler_ycbcr_conversion.html)
 

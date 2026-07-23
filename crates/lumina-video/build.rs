@@ -23,7 +23,7 @@ const DEFAULT_GSTREAMER_VENDOR_URL: &str =
 /// Get the vendor bundle URL, allowing override via environment variable
 #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
 fn get_vendor_url() -> String {
-    env::var("EGUI_VID_VENDOR_BUNDLE_URL")
+    env::var("LUMINA_VIDEO_VENDOR_BUNDLE_URL")
         .unwrap_or_else(|_| DEFAULT_GSTREAMER_VENDOR_URL.to_string())
 }
 
@@ -59,7 +59,7 @@ fn main() {
     // Re-run if feature flags or environment variables change
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_VENDORED_RUNTIME");
     println!("cargo:rerun-if-env-changed=SDKROOT");
-    println!("cargo:rerun-if-env-changed=EGUI_VID_VENDOR_BUNDLE_URL");
+    println!("cargo:rerun-if-env-changed=LUMINA_VIDEO_VENDOR_BUNDLE_URL");
 }
 
 #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]

@@ -1,6 +1,6 @@
 //! lumina-video-core: Core video decode and zero-copy pipeline.
 //!
-//! This crate provides the egui-free foundation for hardware-accelerated video
+//! This crate provides the framework-independent foundation for hardware-accelerated video
 //! playback. It contains:
 //!
 //! - Core types: [`video`], [`audio`], [`subtitles`]
@@ -8,8 +8,8 @@
 //! - Threading primitives: [`frame_queue`], [`triple_buffer`], [`sync_metrics`]
 //! - Network utilities: [`network`]
 //!
-//! This crate has **zero egui dependency**. It is consumed by:
-//! - `lumina-video` (egui integration layer)
+//! This crate has no UI-framework dependency. It is consumed by:
+//! - `lumina-video` (GPUI integration layer)
 //! - `lumina-video-ios` (C FFI for iOS/Swift)
 
 // === Universal modules (compile on all targets including wasm32) ===

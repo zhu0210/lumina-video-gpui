@@ -202,7 +202,7 @@ export function requestVideoFrameCallback(video, callback) {
     rafId = requestAnimationFrame(rafCallback);
 
     // Store cancellation function on video element for explicit cleanup
-    video.__eguiVidRafCancel = () => {
+    video.__luminaVideoRafCancel = () => {
       if (rafId !== null) {
         cancelAnimationFrame(rafId);
         rafId = null;

@@ -2,7 +2,7 @@
 pkgname=lumina-video-demo
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Hardware-accelerated video player demo for egui with zero-copy GPU rendering"
+pkgdesc="Hardware-accelerated video player demo for GPUI with zero-copy GPU rendering"
 arch=('x86_64')
 url="https://github.com/lumina-video/lumina-video"
 license=('MIT OR Apache-2.0')

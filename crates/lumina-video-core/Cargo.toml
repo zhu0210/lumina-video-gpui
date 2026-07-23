@@ -2,7 +2,7 @@
 name = "lumina-video-core"
 version = { workspace = true }
 edition = "2021"
-description = "Core video decode and zero-copy pipeline for lumina-video (egui-free)"
+description = "Framework-independent video decode and timing for lumina-video"
 repository = "https://github.com/lumina-video/lumina-video"
 license = "MIT OR Apache-2.0"
 keywords = ["hardware-acceleration", "multimedia", "video", "zero-copy"]

@@ -116,7 +116,7 @@ LuminaVideo.init(activity)
             -> ExoPlayer [on dedicated HandlerThread]
                 -> ImageReader (PRIVATE) -> HardwareBuffer
                     -> nativeSubmitHardwareBuffer(buffer, ts, w, h, playerId, fenceFd)
-                        -> Per-player Rust queue (PlayerState) -> Vulkan import -> wgpu -> egui
+                        -> Per-player Rust queue (PlayerState) -> Vulkan import -> wgpu -> GPUI
 ```
 
 Key requirements:

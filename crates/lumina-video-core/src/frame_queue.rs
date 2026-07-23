@@ -2050,7 +2050,7 @@ impl FrameScheduler {
             return Some(frame);
         }
 
-        // Rendering gap detection: when the app is backgrounded (alt-tab), egui stops
+        // Rendering gap detection: when the app is backgrounded, the UI stops
         // or throttles repainting, but cpal audio continues playing. This creates A/V
         // drift equal to the gap duration. Detect the gap and resync immediately.
         if !self.use_audio_as_sync_master && self.playback_start_time.is_some() {

@@ -261,7 +261,7 @@ impl GstAudioHandle {
     /// Reset audio sink state after seek to fix PulseAudio/PipeWire freeze bug.
     ///
     /// NOTE: NULL → PLAYING approach breaks the pipeline (disconnects element from graph).
-    /// This is currently a no-op. The workaround is to use alsasink (EGUI_VID_ALSA_AUDIO=1).
+    /// This is currently a no-op. The workaround is to use alsasink.
     ///
     /// TODO: Investigate alternative approaches:
     /// - Separate audio pipeline (isolates audio from video seek)
@@ -271,9 +271,7 @@ impl GstAudioHandle {
         // Disabled - NULL → PLAYING breaks the pipeline
         // The only reliable workaround is using alsasink instead of pulsesink
         if self.inner.audio_sink.is_some() {
-            tracing::trace!(
-                "Audio sink reset skipped (use EGUI_VID_ALSA_AUDIO=1 for reliable seek)"
-            );
+            tracing::trace!("Audio sink reset skipped; the default ALSA sink is seek-safe");
         }
     }
 
@@ -563,30 +561,30 @@ impl ZeroCopyGStreamerDecoder {
         let is_local_file = url.starts_with("file://");
 
         // TEMPORARY: Force CPU-copy to test if seek/resume bug is DMABuf-specific
-        let force_cpu_copy = std::env::var("EGUI_VID_FORCE_CPU_COPY").is_ok();
+        let force_cpu_copy = std::env::var("LUMINA_VIDEO_FORCE_CPU_COPY").is_ok();
         if force_cpu_copy {
-            tracing::warn!("EGUI_VID_FORCE_CPU_COPY set - using CPU copy pipeline for testing");
+            tracing::warn!("LUMINA_VIDEO_FORCE_CPU_COPY set - using CPU copy pipeline for testing");
             return Self::cpu_copy_pipeline(url);
         }
 
         // TEMPORARY: Test direct DMABuf from decoder (skip vapostproc)
-        let try_direct_dmabuf = std::env::var("EGUI_VID_DIRECT_DMABUF").is_ok();
+        let try_direct_dmabuf = std::env::var("LUMINA_VIDEO_DIRECT_DMABUF").is_ok();
         if try_direct_dmabuf {
-            tracing::info!("EGUI_VID_DIRECT_DMABUF set - trying direct DMABuf from decoder");
+            tracing::info!("LUMINA_VIDEO_DIRECT_DMABUF set - trying direct DMABuf from decoder");
             return Self::direct_dmabuf_pipeline(url);
         }
 
         // TEMPORARY: Use playbin3 with CPU copy for HTTP (for comparison testing only)
-        let use_cpu_http = std::env::var("EGUI_VID_CPU_HTTP").is_ok();
+        let use_cpu_http = std::env::var("LUMINA_VIDEO_CPU_HTTP").is_ok();
         if use_cpu_http && !is_local_file {
-            tracing::info!("EGUI_VID_CPU_HTTP set - using CPU copy for HTTP stream");
+            tracing::info!("LUMINA_VIDEO_CPU_HTTP set - using CPU copy for HTTP stream");
             return Self::playbin3_cpu_pipeline(url);
         }
 
         // Force zero-copy even if it would normally fall back (for testing)
-        let force_zero_copy = std::env::var("EGUI_VID_FORCE_ZERO_COPY").is_ok();
+        let force_zero_copy = std::env::var("LUMINA_VIDEO_FORCE_ZERO_COPY").is_ok();
         if force_zero_copy {
-            tracing::info!("EGUI_VID_FORCE_ZERO_COPY set - forcing zero-copy pipeline");
+            tracing::info!("LUMINA_VIDEO_FORCE_ZERO_COPY set - forcing zero-copy pipeline");
             return Self::try_zero_copy_pipeline(url, gpu_info);
         }
 
@@ -860,9 +858,9 @@ impl ZeroCopyGStreamerDecoder {
         Self::install_event_probe(&appsink, "zero-copy");
 
         // Check if audio should be disabled (for testing GitLab #3548 hypothesis)
-        let disable_audio = std::env::var("EGUI_VID_NO_AUDIO").is_ok();
+        let disable_audio = std::env::var("LUMINA_VIDEO_NO_AUDIO").is_ok();
         if disable_audio {
-            tracing::info!("EGUI_VID_NO_AUDIO set - audio disabled for seek testing");
+            tracing::info!("LUMINA_VIDEO_NO_AUDIO set - audio disabled for seek testing");
         }
 
         if disable_audio {
@@ -1445,17 +1443,17 @@ impl ZeroCopyGStreamerDecoder {
         // - These are acceptable trade-offs for reliable video seeking
         //
         // Environment variables to override:
-        // - EGUI_VID_PULSE_AUDIO: Force pulsesink (may freeze on HTTP seek)
-        // - EGUI_VID_PIPEWIRE_AUDIO: Use pipewiresink (has glitches on backward seek)
-        // - EGUI_VID_FAKE_AUDIO: Use fakesink (no audio output, for testing)
-        let pulse_audio = std::env::var("EGUI_VID_PULSE_AUDIO").is_ok();
-        let pipewire_audio = std::env::var("EGUI_VID_PIPEWIRE_AUDIO").is_ok();
-        let fake_audio = std::env::var("EGUI_VID_FAKE_AUDIO").is_ok();
+        // - LUMINA_VIDEO_PULSE_AUDIO: Force pulsesink (may freeze on HTTP seek)
+        // - LUMINA_VIDEO_PIPEWIRE_AUDIO: Use pipewiresink (has glitches on backward seek)
+        // - LUMINA_VIDEO_FAKE_AUDIO: Use fakesink (no audio output, for testing)
+        let pulse_audio = std::env::var("LUMINA_VIDEO_PULSE_AUDIO").is_ok();
+        let pipewire_audio = std::env::var("LUMINA_VIDEO_PIPEWIRE_AUDIO").is_ok();
+        let fake_audio = std::env::var("LUMINA_VIDEO_FAKE_AUDIO").is_ok();
 
         let audiosink = if pulse_audio {
             // PulseAudio - has seek freeze bug on HTTP streams, use only if explicitly requested
             tracing::warn!(
-                "EGUI_VID_PULSE_AUDIO: using pulsesink (may freeze after seek on HTTP streams)"
+                "LUMINA_VIDEO_PULSE_AUDIO: using pulsesink (may freeze after seek on HTTP streams)"
             );
             gst::ElementFactory::make("pulsesink")
                 .build()
@@ -1463,7 +1461,7 @@ impl ZeroCopyGStreamerDecoder {
         } else if pipewire_audio {
             // PipeWire - has glitches on backward seek (GitLab #1245, #1980)
             tracing::info!(
-                "EGUI_VID_PIPEWIRE_AUDIO: using pipewiresink (may glitch on backward seek)"
+                "LUMINA_VIDEO_PIPEWIRE_AUDIO: using pipewiresink (may glitch on backward seek)"
             );
             gst::ElementFactory::make("pipewiresink")
                 .build()
@@ -1471,7 +1469,7 @@ impl ZeroCopyGStreamerDecoder {
                     VideoError::DecoderInit(format!("Failed to create pipewiresink: {e}"))
                 })?
         } else if fake_audio {
-            tracing::info!("EGUI_VID_FAKE_AUDIO: using fakesink for audio (no output)");
+            tracing::info!("LUMINA_VIDEO_FAKE_AUDIO: using fakesink for audio (no output)");
             gst::ElementFactory::make("fakesink")
                 .property("sync", false)
                 .property("async", false)
@@ -1612,7 +1610,7 @@ impl ZeroCopyGStreamerDecoder {
                     }
                 }
             } else if name.starts_with("audio/") {
-                tracing::debug!("Ignoring audio pad (EGUI_VID_NO_AUDIO set): {}", name);
+                tracing::debug!("Ignoring audio pad (LUMINA_VIDEO_NO_AUDIO set): {}", name);
             }
         });
     }

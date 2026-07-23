@@ -32,7 +32,7 @@ Depends: ${shlibs:Depends},
          gstreamer1.0-vaapi,
          libvulkan1,
          mesa-va-drivers | intel-media-va-driver
-Description: Hardware-accelerated video player demo for egui
+Description: Hardware-accelerated video player demo for GPUI
  lumina-video-demo is a demonstration application showcasing the lumina-video
  video player library with zero-copy GPU rendering.
  .
