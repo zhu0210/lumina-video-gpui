@@ -93,6 +93,8 @@ pub struct CorePlayer {
     /// Linux zero-copy metrics
     #[cfg(target_os = "linux")]
     linux_zero_copy_metrics: Arc<Mutex<Option<Arc<crate::linux_video::ZeroCopyMetrics>>>>,
+    /// GPU info for zero-copy alignment (None = auto-detect)
+    gpu_info: crate::video::GpuInfo,
 }
 
 impl CorePlayer {
@@ -120,7 +122,20 @@ impl CorePlayer {
             android_player_id: 0,
             #[cfg(target_os = "linux")]
             linux_zero_copy_metrics: Arc::new(Mutex::new(None)),
+            gpu_info: crate::video::GpuInfo::default(),
         }
+    }
+
+    /// Sets the GPU info for zero-copy DMABuf alignment.
+    ///
+    /// Call this before [`init_decoder`] to explicitly specify which GPU
+    /// the decoder should target for zero-copy output. On multi-GPU systems
+    /// (e.g., Intel iGPU + NVIDIA dGPU), this ensures GStreamer uses the
+    /// same GPU that wgpu renders on.
+    ///
+    /// If not called, the decoder auto-detects the compositor GPU.
+    pub fn set_gpu_info(&mut self, gpu_info: crate::video::GpuInfo) {
+        self.gpu_info = gpu_info;
     }
 
     /// Creates a player with a pre-created decoder.
@@ -155,6 +170,7 @@ impl CorePlayer {
             android_player_id: 0,
             #[cfg(target_os = "linux")]
             linux_zero_copy_metrics: Arc::new(Mutex::new(None)),
+            gpu_info: crate::video::GpuInfo::default(),
         }
     }
 
@@ -208,6 +224,7 @@ impl CorePlayer {
 
         #[cfg(target_os = "linux")]
         let linux_metrics_holder = Arc::clone(&self.linux_zero_copy_metrics);
+        let gpu_info = self.gpu_info.clone();
 
         let handle = std::thread::spawn(move || {
             #[cfg(target_os = "macos")]
@@ -259,7 +276,7 @@ impl CorePlayer {
 
             #[cfg(target_os = "linux")]
             let result: Result<Box<dyn VideoDecoderBackend + Send>, VideoError> = {
-                match ZeroCopyGStreamerDecoder::new(&url) {
+                match ZeroCopyGStreamerDecoder::open_with_gpu(&url, gpu_info) {
                     Ok(decoder) => {
                         *linux_metrics_holder.lock() = Some(Arc::clone(decoder.metrics()));
                         Ok(Box::new(decoder) as Box<dyn VideoDecoderBackend + Send>)

@@ -1192,8 +1192,13 @@ pub mod linux {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
+        // wgpu 30.0.0: initial_state added (3rd arg)
         let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &texture_desc);
+            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &texture_desc,
+                wgpu::TextureUses::RESOURCE, // sampleable texture
+            );
 
         info!("Successfully imported DMABuf as wgpu texture (zero-copy)");
 
@@ -1291,24 +1296,11 @@ pub mod linux {
             }
         }
 
-        // Check for single-FD multi-plane layout (not supported due to offset handling)
-        if dmabuf.planes.len() > 1 {
-            // Check if all planes share the same FD (single-FD layout)
-            let first_fd = dmabuf.planes[0].fd;
-            let is_single_fd = dmabuf.planes.iter().all(|p| p.fd == first_fd);
-            if is_single_fd {
-                warn!(
-                    "Multi-plane single-FD DMABuf layout detected (all {} planes share fd={}). \
-                     Per-plane offsets not honored by vkBindImageMemory. Falling back to CPU path.",
-                    dmabuf.planes.len(),
-                    first_fd
-                );
-                return Err(ZeroCopyError::NotAvailable(
-                    "Multi-plane single-FD DMABuf layout not supported (per-plane offsets not honored). \
-                     Use multi-FD layout or CPU fallback.".to_string()
-                ));
-            }
-        }
+        // Single-FD multi-plane layout: each plane references the same DMABuf FD
+        // with a different offset within the buffer. The per-plane import below
+        // creates separate VkImages and allocates VkDeviceMemory from the shared FD
+        // at per-plane offsets — the kernel DMABuf subsystem handles this correctly.
+        // (Previously rejected; now handled by the existing per-plane import loop.)
 
         info!(
             "Importing multi-plane DMABuf: {:?} ({}x{}, {} planes)",
@@ -1337,7 +1329,30 @@ pub mod linux {
             _ => unreachable!(),
         };
 
-        // Import each plane as a separate texture
+        // Import each plane as a separate texture.
+        // For single-FD multi-plane layouts, dup the FD for ALL planes
+        // upfront. The Vulkan import takes ownership of each FD and closes
+        // it after vkAllocateMemory, so sharing a single FD would cause
+        // ERROR_INVALID_EXTERNAL_HANDLE / EBADF on planes after the first.
+        let is_shared_fd = dmabuf.planes.len() > 1
+            && dmabuf.planes.windows(2).all(|w| w[0].fd == w[1].fd);
+        let duped_fds: Vec<RawFd> = if is_shared_fd {
+            dmabuf.planes.iter().map(|p| {
+                let dup_fd = unsafe { libc::dup(p.fd) };
+                if dup_fd < 0 {
+                    Err(ZeroCopyError::TextureCreationFailed(format!(
+                        "Failed to dup DMABuf fd {}: {}",
+                        p.fd,
+                        std::io::Error::last_os_error()
+                    )))
+                } else {
+                    Ok(dup_fd)
+                }
+            }).collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![]
+        };
+
         let mut textures = Vec::with_capacity(plane_specs.len());
 
         for (i, ((plane_width, plane_height, wgpu_format), plane)) in
@@ -1348,9 +1363,15 @@ pub mod linux {
                 i, plane_width, plane_height, wgpu_format, plane.fd, plane.offset, plane.stride
             );
 
+            let plane_fd = if is_shared_fd {
+                duped_fds[i]
+            } else {
+                plane.fd
+            };
+
             // Create a single-plane handle for this plane
             let single_plane_handle = DmaBufHandle::single_plane(
-                plane.fd,
+                plane_fd,
                 plane.size,
                 plane.offset,
                 plane.stride,
@@ -2153,8 +2174,13 @@ pub mod android {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
+        // wgpu 30.0.0: initial_state added (3rd arg)
         let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &texture_desc);
+            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &texture_desc,
+                wgpu::TextureUses::RESOURCE, // sampleable texture
+            );
 
         info!("Successfully imported AHardwareBuffer as wgpu texture (zero-copy)");
 

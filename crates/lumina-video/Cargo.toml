@@ -26,14 +26,12 @@ lumina-video-core = { path = "../lumina-video-core" }
 # GPUI — the UI framework (replaces egui)
 # "wgpu" is opt-in (not in default features) — required for GpuContextHandle, surface(), etc.
 gpui = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
+  path = "../../../zed/crates/gpui",
   features = ["wgpu"]
 }
 # gpui_wgpu for wgpu types (single wgpu version shared with core)
 gpui_wgpu = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend"
+  path = "../../../zed/crates/gpui_wgpu"
 }
 
 # Utilities

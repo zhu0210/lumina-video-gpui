@@ -1060,6 +1060,35 @@ impl HwAccelType {
     }
 }
 
+/// Information about the GPU device used for rendering.
+///
+/// When performing zero-copy DMABuf import, the GStreamer decoder must target
+/// the same physical GPU that wgpu renders on. This struct carries the PCI
+/// vendor ID and DRM render node path of the rendering GPU, allowing explicit
+/// alignment in multi-GPU systems.
+///
+/// If not provided, the decoder auto-detects the compositor GPU via
+/// `/sys/class/drm/card*/` connector status, which is correct for most
+/// single-GPU and primary-display desktop configurations.
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    /// PCI vendor ID (e.g., 0x8086 for Intel, 0x10DE for NVIDIA, 0x1002 for AMD).
+    /// 0 means unknown / auto-detect.
+    pub vendor_id: u32,
+    /// DRM render node path (e.g., "/dev/dri/renderD128").
+    /// Empty string means unknown / auto-detect.
+    pub render_node: String,
+}
+
+impl Default for GpuInfo {
+    fn default() -> Self {
+        Self {
+            vendor_id: 0,
+            render_node: String::new(),
+        }
+    }
+}
+
 /// Trait for video decoder backends.
 ///
 /// This trait abstracts the platform-specific video decoding implementations,
@@ -1070,6 +1099,18 @@ pub trait VideoDecoderBackend: Send {
     fn open(url: &str) -> Result<Self, VideoError>
     where
         Self: Sized;
+
+    /// Opens a video with explicit GPU alignment.
+    ///
+    /// The `gpu_info` identifies the rendering GPU so the decoder can target
+    /// the same device for zero-copy DMABuf output. Default implementation
+    /// calls [`open`].
+    fn open_with_gpu(url: &str, _gpu_info: GpuInfo) -> Result<Self, VideoError>
+    where
+        Self: Sized,
+    {
+        Self::open(url)
+    }
 
     /// Decodes and returns the next video frame, or None if no more frames.
     fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError>;

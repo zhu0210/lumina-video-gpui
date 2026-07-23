@@ -666,7 +666,7 @@ fn decode_loop<D: VideoDecoderBackend>(
 
         // When paused, wait for commands
         if !playing {
-            tracing::info!("decode_loop: PAUSED branch (playing=false), waiting on recv_timeout");
+            tracing::trace!("decode_loop: PAUSED branch (playing=false), waiting on recv_timeout");
             let cmd = match command_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(cmd) => cmd,
                 Err(_) => continue,
@@ -1090,6 +1090,9 @@ pub struct FrameScheduler {
     playback_requested: bool,
     /// True if we're stalled (queue empty during playback)
     stalled: bool,
+    /// Minimum time to remain stalled before allowing resume, to prevent
+    /// stall/resume storms when queue drains faster than decode produces.
+    stall_cooldown_until: Option<std::time::Instant>,
     /// A/V sync metrics tracker
     sync_metrics: SyncMetrics,
     /// Audio handle for getting playback position
@@ -1184,6 +1187,7 @@ impl FrameScheduler {
             waiting_for_first_frame: false,
             playback_requested: false,
             stalled: false,
+            stall_cooldown_until: None,
             sync_metrics: SyncMetrics::new(),
             audio_handle: None,
             frames_since_recovery: 0,
@@ -1434,6 +1438,7 @@ impl FrameScheduler {
         self.playback_requested = true;
         self.waiting_for_first_frame = true;
         self.stalled = false;
+        self.stall_cooldown_until = None;
         self.reset_rejection_tracking();
         self.last_clock_delta_log = None;
         self.last_clock_delta_values = None;
@@ -1445,6 +1450,7 @@ impl FrameScheduler {
         self.playback_requested = false;
         self.waiting_for_first_frame = false;
         self.stalled = false;
+        self.stall_cooldown_until = None;
         self.reset_rejection_tracking();
         self.audio_start_time = None;
         self.audio_start_pos = Duration::ZERO;
@@ -1486,6 +1492,7 @@ impl FrameScheduler {
         self.playback_start_position = position;
         self.current_frame = None;
         self.stalled = false;
+        self.stall_cooldown_until = None;
         self.reset_rejection_tracking();
         self.seek_generation = self.seek_generation.wrapping_add(1);
         self.video_pts_bias = Duration::ZERO;
@@ -1962,7 +1969,7 @@ impl FrameScheduler {
         // If waiting for first frame, accept any frame to start the clock
         if self.waiting_for_first_frame {
             let queue_len = queue.len();
-            tracing::info!(
+            tracing::debug!(
                 "get_next_frame: waiting_for_first_frame=true, queue_len={queue_len}, playback_requested={}",
                 self.playback_requested
             );
@@ -1998,10 +2005,12 @@ impl FrameScheduler {
                 frame.pts,
                 queue_len
             );
+            self.waiting_for_first_frame = false;
             self.on_frame_received(frame.pts);
             self.current_frame = Some(frame.clone());
             self.current_position = frame.pts;
             self.stalled = false;
+            self.stall_cooldown_until = None;
             self.advance_frame_pacing();
             self.record_sync(frame.pts);
 
@@ -2686,6 +2695,11 @@ impl FrameScheduler {
             self.current_position = self.playback_start_position + start_time.elapsed();
         }
         self.stalled = true;
+        // Set a minimum cooldown before we allow resume, to prevent
+        // stall/resume storms when the decode thread can't keep up.
+        // Use 33ms (roughly one 30fps frame) — long enough to prevent
+        // the storm but short enough to maintain sync with wall-clock timing.
+        self.stall_cooldown_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(33));
 
         // MoQ wall-clock mode: pause audio during video stalls so they stay in sync.
         // Without this, audio continues playing through the ring buffer while the
@@ -2709,7 +2723,7 @@ impl FrameScheduler {
         // Start recovery tracking
         self.sync_metrics.start_recovery();
 
-        tracing::debug!("Stalled at {:?} (queue empty)", self.current_position);
+        tracing::trace!("Stalled at {:?} (queue empty)", self.current_position);
     }
 
     /// Clears stall state and resyncs clock when frames become available.
@@ -2717,7 +2731,16 @@ impl FrameScheduler {
         if !self.stalled {
             return;
         }
+        // Honor stall cooldown: don't exit stall until minimum duration has passed.
+        // This prevents the stall/resume storm when the decode thread produces
+        // frames slower than the main loop consumes them.
+        if let Some(cooldown) = self.stall_cooldown_until {
+            if std::time::Instant::now() < cooldown {
+                return;
+            }
+        }
         self.stalled = false;
+        self.stall_cooldown_until = None;
         self.playback_start_time = Some(std::time::Instant::now());
         self.playback_start_position = self.current_position;
         // Reset frame counter for tracking recovery completion
@@ -2733,7 +2756,7 @@ impl FrameScheduler {
             }
         }
 
-        tracing::debug!("Resuming from stall at {:?}", self.current_position);
+        tracing::trace!("Resuming from stall at {:?}", self.current_position);
     }
 
     /// Enters audio-induced stall (ring buffer underrun during MoQ live).

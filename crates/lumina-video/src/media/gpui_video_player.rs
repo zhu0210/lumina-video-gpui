@@ -107,6 +107,9 @@ pub struct GpuiVideoPlayer {
 
     // Diagnostics: avoid log spam when GPU context is repeatedly unavailable
     gpu_context_missing_logged: bool,
+    // Rate-limit per-frame warnings to once per 5 seconds
+    last_frame_warn: Option<std::time::Instant>,
+    last_upload_warn: Option<std::time::Instant>,
 
     // Subtitles
     subtitle_track: Option<SubtitleTrack>,
@@ -158,6 +161,8 @@ impl GpuiVideoPlayer {
             initialized: false,
             loop_seek_pending: false,
             gpu_context_missing_logged: false,
+            last_frame_warn: None,
+            last_upload_warn: None,
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
@@ -203,6 +208,18 @@ impl GpuiVideoPlayer {
     pub fn with_volume(mut self, volume: f32) -> Self {
         self.config.volume = volume.clamp(0.0, 1.0);
         self.core.set_volume((self.config.volume * 100.0) as u32);
+        self
+    }
+
+    /// Sets the GPU to use for zero-copy DMABuf decoding.
+    ///
+    /// Call this before playback starts to align GStreamer's decoder GPU
+    /// with wgpu's rendering GPU. On multi-GPU systems (e.g., Intel iGPU +
+    /// NVIDIA dGPU), this ensures DMABuf memory targets the correct device.
+    ///
+    /// Pass [`GpuInfo::default()`] for auto-detection (default behavior).
+    pub fn with_gpu_info(mut self, gpu_info: lumina_video_core::video::GpuInfo) -> Self {
+        self.core.set_gpu_info(gpu_info);
         self
     }
 
@@ -410,10 +427,6 @@ impl GpuiVideoPlayer {
 
         // Poll frames and upload to GPU
         if self.core.is_playback_requested() {
-            let qlen = self.core.frame_queue().len();
-            if qlen > 0 {
-                tracing::debug!("update: playback_requested, queue_len={qlen}, state={:?}", self.state);
-            }
             self.poll_and_upload_frames();
         } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
             // Peek at first frame for preview (don't advance queue)
@@ -425,7 +438,7 @@ impl GpuiVideoPlayer {
             if !self.initialized {
                 // Still initializing — expected
             } else {
-                tracing::debug!(
+                tracing::trace!(
                     "update: skipping poll — not playing/ready, state={:?}, qlen={}",
                     self.state,
                     self.core.frame_queue().len()
@@ -760,32 +773,61 @@ impl GpuiVideoPlayer {
         let gpu = match self.gpu_context.as_ref() {
             Some(g) => g,
             None => {
-                tracing::debug!("poll_and_upload_frames: GPU context not yet available");
+                tracing::trace!("poll_and_upload_frames: GPU context not yet available");
                 return;
             }
         };
 
-        // Drain every available frame from the decode queue to prevent
-        // back-pressure ("QUEUE FULL branch, sleeping 5ms").  Upload only
-        // the *last* frame's textures to the GPU — intermediate frames are
-        // just popped and dropped so the decoder thread never stalls.
+        // Drain available frames from the decode queue, uploading only the last.
+        // Cap at 16 iterations: poll_frame() always returns Some(current_frame)
+        // after the first frame (even during stall), so an uncapped loop spins.
         let queue_len_before = self.core.frame_queue().len();
         let mut last_frame = None;
         let mut drained = 0u32;
-        while let Some(video_frame) = self.core.poll_frame() {
+        const MAX_DRAIN: u32 = 16;
+        while drained < MAX_DRAIN {
+            let Some(video_frame) = self.core.poll_frame() else {
+                break;
+            };
             drained += 1;
             self.loop_seek_pending = false;
             last_frame = Some(video_frame);
         }
         if drained > 0 {
-            tracing::debug!(
+            tracing::trace!(
                 "poll_and_upload: drained {drained} frames, queue was {queue_len_before}"
             );
         } else if queue_len_before > 0 {
-            tracing::warn!(
-                "poll_and_upload: drained 0 frames but queue has {queue_len_before} — \
-                 scheduler is holding frames back (audio not started?)"
+            // Rate-limit: only log once per 5 seconds
+            let now = std::time::Instant::now();
+            let should_log = self
+                .last_frame_warn
+                .map_or(true, |t| now.duration_since(t).as_secs() >= 5);
+            if should_log {
+                tracing::warn!(
+                    "poll_and_upload: drained 0 frames but queue has {queue_len_before} — \
+                     scheduler is holding frames back (audio not started?)"
+                );
+                self.last_frame_warn = Some(now);
+            }
+        }
+        if drained > 0 {
+            tracing::trace!(
+                "poll_and_upload: drained {drained} frames, queue was {queue_len_before}"
             );
+        } else if queue_len_before > 0 {
+            // Rate-limit: only log once per 5 seconds to avoid per-frame spam
+            let now = std::time::Instant::now();
+            let should_log = self
+                .last_frame_warn
+                .map_or(true, |t| now.duration_since(t).as_secs() >= 5);
+            if should_log {
+                tracing::warn!(
+                    "poll_and_upload: drained 0 frames but queue has {queue_len_before} — \
+                     scheduler is holding frames back (audio not started?)"
+                );
+                self.last_frame_warn = Some(now);
+            }
         }
 
         if let Some(video_frame) = last_frame {
@@ -798,17 +840,24 @@ impl GpuiVideoPlayer {
                 &mut self.rgba_cache,
             );
 
-            // Only replace textures if we got a valid upload (don't clear on None)
             if let Some(tex) = textures {
                 if self.frame_textures.is_none() {
                     tracing::info!("First video frame uploaded to GPU");
                 }
                 self.frame_textures = Some(tex);
             } else {
-                tracing::warn!(
-                    "Frame upload returned None — decoded frame could not be \
-                     converted to GPU textures (missing CPU fallback?)"
-                );
+                // Rate-limit: only log once per 5 seconds
+                let now = std::time::Instant::now();
+                let should_log = self
+                    .last_upload_warn
+                    .map_or(true, |t| now.duration_since(t).as_secs() >= 5);
+                if should_log {
+                    tracing::warn!(
+                        "Frame upload returned None — decoded frame could not be \
+                         converted to GPU textures (missing CPU fallback?)"
+                    );
+                    self.last_upload_warn = Some(now);
+                }
             }
         }
     }
@@ -837,7 +886,7 @@ impl GpuiVideoPlayer {
         );
 
         if let Some(tex) = textures {
-            tracing::debug!("Preview frame uploaded to GPU");
+            tracing::trace!("Preview frame uploaded to GPU");
             self.frame_textures = Some(tex);
         } else {
             tracing::warn!("Preview frame upload returned None — missing CPU fallback?");

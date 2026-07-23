@@ -426,6 +426,18 @@ impl ZeroCopyGStreamerDecoder {
     /// uridecodebin → videoconvert → video/x-raw,format=NV12 → appsink
     /// ```
     pub fn new(url: &str) -> Result<Self, VideoError> {
+        Self::with_gpu_info(url, crate::video::GpuInfo::default())
+    }
+
+    /// Creates a new decoder with explicit GPU alignment.
+    ///
+    /// The `gpu_info` identifies the rendering GPU so the decoder can target
+    /// the same device for zero-copy DMABuf output. On multi-GPU systems
+    /// (e.g., Intel iGPU + NVIDIA dGPU), this ensures GStreamer uses the
+    /// correct GPU for decoding and DMABuf export.
+    ///
+    /// Pass [`GpuInfo::default()`] to auto-detect the compositor GPU.
+    pub fn with_gpu_info(url: &str, gpu_info: crate::video::GpuInfo) -> Result<Self, VideoError> {
         // Initialize vendored runtime environment before GStreamer init
         #[cfg(feature = "vendored-runtime")]
         {
@@ -464,11 +476,11 @@ impl ZeroCopyGStreamerDecoder {
         let force_zero_copy = std::env::var("EGUI_VID_FORCE_ZERO_COPY").is_ok();
         if force_zero_copy {
             tracing::info!("EGUI_VID_FORCE_ZERO_COPY set - forcing zero-copy pipeline");
-            return Self::try_zero_copy_pipeline(url);
+            return Self::try_zero_copy_pipeline(url, gpu_info);
         }
 
         // Try zero-copy pipeline
-        match Self::try_zero_copy_pipeline(url) {
+        match Self::try_zero_copy_pipeline(url, gpu_info) {
             Ok(decoder) => {
                 tracing::info!(
                     "Zero-copy GStreamer decoder initialized (DMABuf mode): {}x{}",
@@ -502,7 +514,175 @@ impl ZeroCopyGStreamerDecoder {
     ///
     /// On GStreamer 1.24+, vapostproc outputs format=DMA_DRM with drm-format field
     /// containing the actual format and DRM modifier (e.g., NV12:0x0100000000000002).
-    fn try_zero_copy_pipeline(url: &str) -> Result<Self, VideoError> {
+    /// Find the DRM render node that matches the GPU wgpu/GPUI renders on.
+    /// Walks /dev/dri/renderD* and returns the device path for the GPU that
+    /// is driving displays (has connected outputs at the card level).
+    /// Falls back to /dev/dri/renderD128 if detection fails.
+    fn compositor_render_node() -> Option<String> {
+        let mut best_node: Option<String> = None;
+        let mut best_connected = 0u32;
+
+        let Ok(render_dir) = std::fs::read_dir("/dev/dri") else {
+            return Some("/dev/dri/renderD128".into());
+        };
+
+        for entry in render_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(render_num) = name.strip_prefix("renderD") else {
+                continue;
+            };
+
+            // Count connected outputs for the corresponding card
+            let card_dir = format!("/sys/class/drm/card{render_num}");
+            let connected = std::fs::read_dir(&card_dir)
+                .map(|dir| {
+                    dir.flatten()
+                        .filter(|e| {
+                            let fname = e.file_name().to_string_lossy().to_string();
+                            // Connector entries are named like card0-HDMI-A-1
+                            if let Some(conn_name) = fname.strip_prefix(&format!("card{render_num}-")) {
+                                if conn_name.starts_with("DP-")
+                                    || conn_name.starts_with("HDMI-")
+                                    || conn_name.starts_with("eDP-")
+                                    || conn_name.starts_with("LVDS-")
+                                    || conn_name.starts_with("VGA-")
+                                    || conn_name.starts_with("DVI-")
+                                {
+                                    return std::fs::read_to_string(e.path().join("status"))
+                                        .map(|s| s.trim() == "connected")
+                                        .unwrap_or(false);
+                                }
+                            }
+                            false
+                        })
+                        .count() as u32
+                })
+                .unwrap_or(0);
+
+            if connected > best_connected {
+                best_connected = connected;
+                best_node = Some(entry.path().to_string_lossy().to_string());
+            }
+        }
+
+        Some(best_node.unwrap_or_else(|| "/dev/dri/renderD128".into()))
+    }
+
+    /// Reads the PCI vendor ID from the compositor's DRM render node.
+    /// Returns 0 if the vendor cannot be determined.
+    fn compositor_gpu_vendor() -> u32 {
+        let render_node = Self::compositor_render_node().unwrap_or_default();
+        // Map render node path to card device, then read vendor
+        // e.g. /dev/dri/renderD128 → /sys/class/drm/renderD128/device/vendor
+        let render_name = std::path::Path::new(&render_node)
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        let vendor_path = format!("/sys/class/drm/{}/device/vendor", render_name);
+        std::fs::read_to_string(&vendor_path)
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0)
+    }
+
+    /// Known PCI vendor IDs.
+    const VENDOR_INTEL: u32 = 0x8086;
+    const VENDOR_AMD: u32 = 0x1002;
+    const VENDOR_NVIDIA: u32 = 0x10DE;
+
+    /// Checks if nvidia-drm kernel modesetting is active.
+    ///
+    /// NVIDIA zero-copy DMABuf export through NVDEC requires nvidia-drm with
+    /// `modeset=1`. Without this, NVDEC outputs CUDAMemory which cannot be
+    /// exported as DMABuf and cannot be CPU-mapped. The nvidia-drm module with
+    /// modesetting provides a DRM/KMS interface that enables DMABuf allocation
+    /// and export from the GPU.
+    ///
+    /// Returns `true` if `/sys/module/nvidia_drm/parameters/modeset` reads "Y",
+    /// `false` otherwise (modeset=N, file not found, or permission error).
+    fn nvidia_drm_modeset_active() -> bool {
+        std::fs::read_to_string("/sys/module/nvidia_drm/parameters/modeset")
+            .map(|s| s.trim() == "Y")
+            .unwrap_or(false)
+    }
+
+    fn try_zero_copy_pipeline(url: &str, gpu_info: crate::video::GpuInfo) -> Result<Self, VideoError> {
+        let compositor_vendor = if gpu_info.vendor_id != 0 {
+            gpu_info.vendor_id
+        } else {
+            Self::compositor_gpu_vendor()
+        };
+        let render_node = if !gpu_info.render_node.is_empty() {
+            Some(gpu_info.render_node.clone())
+        } else {
+            Self::compositor_render_node()
+        };
+        tracing::debug!(
+            "Compositor GPU vendor: {compositor_vendor:#06x} (render node: {render_node:?}, explicit_gpu={})",
+            gpu_info.vendor_id != 0
+        );
+
+        // Automatic decoder selection matching the compositor's GPU:
+        //
+        // - Intel/AMD: VA-API decoders produce VAMemory which vapostproc
+        //   converts to DMABuf for zero-copy Vulkan import.
+        //   → Lower NVIDIA NVDEC ranks so uridecodebin picks VA-API.
+        //
+        // - NVIDIA with nvidia-drm modeset=1: NVDEC outputs DMABuf directly
+        //   (no CUDAMemory). We use nvvideoconvert (NVIDIA's vapostproc
+        //   equivalent) or direct DMABuf from the decoder, since VA-API
+        //   postproc is not available on NVIDIA GPUs.
+        //
+        // - NVIDIA without nvidia-drm: NVDEC outputs CUDAMemory which cannot
+        //   be exported as DMABuf and cannot be CPU-mapped. Fall back to
+        //   software decode + CPU copy.
+        //
+        // - Unknown/other: try VA-API first (most common case: virtio-gpu,
+        //   llvmpipe software rasterizer).
+        if compositor_vendor != Self::VENDOR_NVIDIA {
+            // Compositor uses Intel or AMD — prefer VA-API for DMABuf zero-copy.
+            for feature_name in &["nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec"] {
+                if let Some(feature) = gst::Registry::get().lookup_feature(feature_name) {
+                    feature.set_rank(gst::Rank::MARGINAL);
+                    tracing::debug!(
+                        "Lowered {feature_name} rank to MARGINAL (compositor GPU is {compositor_vendor:#06x}, preferring VA-API)"
+                    );
+                }
+            }
+        } else if Self::nvidia_drm_modeset_active() {
+            // NVIDIA GPU with nvidia-drm modesetting enabled.
+            // NVDEC can output DMABuf memory for zero-copy Vulkan import.
+            // Don't lower any decoder ranks — uridecodebin picks NVDEC naturally.
+            // Use NVCODEC path (nvvideoconvert or direct DMABuf) since vapostproc is VA-API only.
+            tracing::info!(
+                "Compositor GPU is NVIDIA ({compositor_vendor:#06x}) with nvidia-drm modeset — \
+                 attempting NVDEC DMABuf zero-copy pipeline"
+            );
+            return Self::nvidia_dmabuf_pipeline(url, render_node.as_deref());
+        } else {
+            // NVIDIA NVDEC outputs CUDAMemory which cannot be exported as DMABuf
+            // and cannot be CPU-mapped. Lower both NVIDIA AND VA-API ranks so
+            // uridecodebin picks software avdec_h264, which outputs system-memory
+            // NV12 that videoconvert/cpu_copy_pipeline can handle.
+            for feature_name in &[
+                "nvh264dec", "nvh265dec", "nvav1dec", "nvvp9dec",
+                "vah264dec", "vah265dec", "vaav1dec", "vavp9dec",
+            ] {
+                if let Some(feature) = gst::Registry::get().lookup_feature(feature_name) {
+                    feature.set_rank(gst::Rank::MARGINAL);
+                }
+            }
+            tracing::info!(
+                "Compositor GPU is NVIDIA ({compositor_vendor:#06x}) without nvidia-drm modeset — \
+                 NVDEC has no DMABuf export. Lowered all HW decoder ranks; \
+                 falling back to software decode + CPU copy."
+            );
+            return Err(VideoError::DecoderInit(
+                "Compositor GPU is NVIDIA — zero-copy DMABuf not available. \
+                 Falling back to CPU copy pipeline.".into(),
+            ));
+        }
+
         let pipeline = gst::Pipeline::new();
 
         // Use uridecodebin which auto-detects container and codec
@@ -535,6 +715,17 @@ impl ZeroCopyGStreamerDecoder {
 
         // vapostproc converts VAMemory to DMABuf
         // This is essential for zero-copy: va decoder outputs VASurface,
+        // Align VA-API device with wgpu's GPU before creating any GStreamer
+        // elements. This ensures zero-copy DMABuf targets the same GPU that
+        // GPUI renders on. Must be set before vapostproc/vah264dec init.
+        if let Some(render_node) = Self::compositor_render_node() {
+            std::env::set_var("GST_VA_DRM_DEVICE", &render_node);
+            tracing::debug!(
+                "Set GST_VA_DRM_DEVICE={} (matching wgpu rendering GPU)",
+                render_node
+            );
+        }
+
         // vapostproc outputs DMABuf FD that we can import into Vulkan
         let vapostproc = gst::ElementFactory::make("vapostproc")
             .build()
@@ -906,6 +1097,173 @@ impl ZeroCopyGStreamerDecoder {
 
         tracing::info!(
             "Direct DMABuf pipeline (no vapostproc) created for: {}",
+            url
+        );
+
+        Self::init_pipeline(pipeline, appsink, audio_handle, url, PipelineMode::ZeroCopy)
+    }
+
+    /// Creates a zero-copy DMABuf pipeline for NVIDIA GPUs with nvidia-drm modeset.
+    ///
+    /// Unlike the Intel/AMD path which uses `vapostproc` (VA-API), NVIDIA uses
+    /// `nvvideoconvert` (NVCODEC) as the post-processing element. If
+    /// `nvvideoconvert` is not available, falls back to direct DMABuf from
+    /// the decoder without post-processing.
+    ///
+    /// Pipeline:
+    /// ```text
+    /// uridecodebin → queue2 → nvvideoconvert → video/x-raw(memory:DMABuf) → appsink
+    /// ```
+    ///
+    /// The `render_node` parameter (e.g. "/dev/dri/renderD129") aligns
+    /// the NVIDIA GPU selection with the wgpu rendering device.
+    fn nvidia_dmabuf_pipeline(
+        url: &str,
+        render_node: Option<&str>,
+    ) -> Result<Self, VideoError> {
+        let pipeline = gst::Pipeline::new();
+
+        let is_local_file = url.starts_with("file://");
+        let source = gst::ElementFactory::make("uridecodebin")
+            .property("uri", url)
+            .property("use-buffering", !is_local_file)
+            .build()
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+
+        tracing::info!(
+            "NVIDIA DMABuf pipeline: use-buffering={}, is_local_file={}",
+            !is_local_file,
+            is_local_file
+        );
+
+        // Add queue2 between source and postproc for HTTP buffering
+        let video_queue = gst::ElementFactory::make("queue2")
+            .name("video_queue")
+            .property("max-size-buffers", 0u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 3_000_000_000u64) // 3 seconds
+            .build()
+            .map_err(|e| {
+                VideoError::DecoderInit(format!("Failed to create video queue2: {e}"))
+            })?;
+
+        // Try nvvideoconvert (NVIDIA's vapostproc equivalent). Falls back to
+        // direct DMABuf from decoder if not available.
+        let use_nvvidconv = gst::ElementFactory::find("nvvideoconvert").is_some();
+        let postproc: gst::Element = if use_nvvidconv {
+            tracing::info!("NVIDIA DMABuf: using nvvideoconvert for post-processing");
+            gst::ElementFactory::make("nvvideoconvert")
+                .build()
+                .map_err(|e| {
+                    VideoError::DecoderInit(format!("Failed to create nvvideoconvert: {e}"))
+                })?
+        } else {
+            tracing::info!(
+                "NVIDIA DMABuf: nvvideoconvert not found, using direct DMABuf from decoder"
+            );
+            // Create an identity element as a pass-through when no postproc is available.
+            // The DMABuf caps on appsink will request DMABuf directly from uridecodebin.
+            gst::ElementFactory::make("identity")
+                .build()
+                .map_err(|e| {
+                    VideoError::DecoderInit(format!("Failed to create identity: {e}"))
+                })?
+        };
+
+        // DMABuf caps for appsink — this tells GStreamer to negotiate DMABuf output
+        let dmabuf_caps = gst::Caps::from_str("video/x-raw(memory:DMABuf)")
+            .map_err(|e| {
+                VideoError::DecoderInit(format!("Failed to parse DMABuf caps: {e}"))
+            })?;
+
+        let appsink = gst_app::AppSink::builder()
+            .caps(&dmabuf_caps)
+            .max_buffers(2)
+            .drop(true)
+            .build();
+
+        // VideoMeta support for DMABuf — required for DMABuf negotiation
+        let callbacks = gst_app::AppSinkCallbacks::builder()
+            .propose_allocation(|_appsink, query| {
+                query.add_allocation_meta::<gst_video::VideoMeta>(None);
+                tracing::debug!("Added VideoMeta to allocation query for NVIDIA DMABuf");
+                true
+            })
+            .build();
+        appsink.set_callbacks(callbacks);
+
+        Self::install_event_probe(&appsink, "nvidia-dmabuf");
+
+        // Audio elements
+        let (audioconvert, audioresample, volume, audiosink) = Self::create_audio_elements()?;
+
+        // Add all elements to pipeline
+        pipeline
+            .add_many([
+                &source,
+                &video_queue,
+                &postproc,
+                appsink.upcast_ref(),
+                &audioconvert,
+                &audioresample,
+                &volume,
+                &audiosink,
+            ])
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to add elements: {e}")))?;
+
+        // Link video: queue2 → postproc → appsink
+        gst::Element::link_many([&video_queue, &postproc, appsink.upcast_ref()])
+            .map_err(|e| {
+                VideoError::DecoderInit(format!("Failed to link video elements: {e}"))
+            })?;
+
+        // Link audio: audioconvert → audioresample → volume → audiosink
+        gst::Element::link_many([&audioconvert, &audioresample, &volume, &audiosink])
+            .map_err(|e| {
+                VideoError::DecoderInit(format!("Failed to link audio elements: {e}"))
+            })?;
+
+        // Add audio queue for A/V sync decoupling
+        let audio_queue = gst::ElementFactory::make("queue2")
+            .name("audio_queue")
+            .property("max-size-buffers", 0u32)
+            .property("max-size-bytes", 0u32)
+            .property("max-size-time", 2_000_000_000u64) // 2 seconds
+            .build()
+            .map_err(|e| {
+                VideoError::DecoderInit(format!("Failed to create audio queue: {e}"))
+            })?;
+
+        pipeline
+            .add(&audio_queue)
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to add audio queue: {e}")))?;
+
+        gst::Element::link_many([&audio_queue, &audioconvert])
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to link audio queue: {e}")))?;
+
+        let audio_handle = GstAudioHandle::new(Some(volume), Some(audiosink));
+
+        // Align GST_VA_DRM_DEVICE if an explicit render node was provided
+        if let Some(node) = render_node {
+            std::env::set_var("GST_VA_DRM_DEVICE", node);
+            tracing::debug!(
+                "NVIDIA DMABuf: set GST_VA_DRM_DEVICE={} (from GpuInfo)",
+                node
+            );
+        } else if let Some(node) = Self::compositor_render_node() {
+            std::env::set_var("GST_VA_DRM_DEVICE", &node);
+            tracing::debug!(
+                "NVIDIA DMABuf: set GST_VA_DRM_DEVICE={} (auto-detected)",
+                node
+            );
+        }
+
+        // Connect pad-added: video to queue2, audio to audio_queue
+        Self::connect_pad_added(&source, &video_queue, &audio_queue, audio_handle.clone());
+
+        tracing::info!(
+            "NVIDIA DMABuf pipeline created (postproc={}): {}",
+            if use_nvvidconv { "nvvideoconvert" } else { "identity/direct" },
             url
         );
 
@@ -1524,7 +1882,7 @@ impl ZeroCopyGStreamerDecoder {
                 strides.push(stride as u32);
                 offsets.push(offset as u32);
             }
-            tracing::debug!(
+            tracing::trace!(
                 "Using VideoMeta for plane info: strides={:?}, offsets={:?}",
                 strides,
                 offsets
@@ -1610,7 +1968,7 @@ impl ZeroCopyGStreamerDecoder {
             DRM_FORMAT_MOD_LINEAR
         };
 
-        tracing::debug!(
+        tracing::trace!(
             "Parsed drm-format caps: '{}' -> fourcc='{}', modifier=0x{:016x}",
             drm_format,
             fourcc_str,
@@ -1782,17 +2140,10 @@ impl ZeroCopyGStreamerDecoder {
         // Keep the GStreamer sample alive to ensure DMABuf FDs remain valid
         let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample.clone());
 
-        // DMABuf memory is GPU-only and cannot be CPU-mapped via
-        // map_readable().  The CPU fallback is intentionally None —
-        // decoded_frame_to_textures() will dispatch to zero_copy::linux
-        // for Vulkan DMABuf → wgpu texture import instead.
-
         // Create the LinuxGpuSurface
         // Safety:
-        // - All FDs in `planes` are valid DMABuf FDs obtained from gst_dmabuf_memory_get_fd()
-        // - `owner` keeps the GStreamer sample alive, ensuring DMABuf FDs remain valid
-        // - `width`, `height`, `format`, and `modifier` are validated from GStreamer video_info
-        // - `is_single_fd` is correctly determined from buffer memory layout
+        // - All FDs in `planes` are valid DMABuf FDs
+        // - `owner` keeps the GStreamer sample alive
         let surface = unsafe {
             LinuxGpuSurface::new(
                 planes,
@@ -1801,7 +2152,7 @@ impl ZeroCopyGStreamerDecoder {
                 format,
                 dmabuf_info.modifier,
                 is_single_fd,
-                None, // DMABuf is GPU-only, imports via zero_copy::linux
+                None, // DMABuf is GPU-only, no CPU fallback needed
                 owner,
             )
         };
@@ -2285,6 +2636,16 @@ impl VideoDecoderBackend for ZeroCopyGStreamerDecoder {
         Self: Sized,
     {
         Self::new(url)
+    }
+
+    fn open_with_gpu(
+        url: &str,
+        gpu_info: crate::video::GpuInfo,
+    ) -> Result<Self, VideoError>
+    where
+        Self: Sized,
+    {
+        Self::with_gpu_info(url, gpu_info)
     }
 
     #[allow(clippy::manual_is_multiple_of)]

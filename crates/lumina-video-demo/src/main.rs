@@ -3,6 +3,12 @@
 //! Demonstrates hardware-accelerated video playback in GPUI using
 //! `GpuiVideoPlayer`. Shows NV12 GPU-side YUV→RGB conversion via
 //! GPUI's built-in `surface()` element, plus interactive controls.
+//!
+//! ## GPU Selection
+//!
+//! On multi-GPU Linux systems (e.g., Intel iGPU + NVIDIA dGPU), use the
+//! GPU selector in the sidebar to choose which GPU to decode on. This aligns
+//! GStreamer's decoder with wgpu's rendering device for zero-copy DMABuf import.
 
 use std::time::Duration;
 
@@ -11,6 +17,7 @@ use gpui::{
     div, px, relative, rgb, rgba, size, App, Bounds, FontWeight, KeyDownEvent, MouseButton,
     SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
+use lumina_video::GpuInfo;
 use lumina_video::GpuiVideoPlayer;
 
 const SAMPLE_VIDEOS: &[(&str, &str)] = &[
@@ -89,26 +96,163 @@ struct DemoApp {
     player: Option<GpuiVideoPlayer>,
     selected_sample: usize,
     status: String,
+    render_loop_started: bool,
+    /// Detected GPUs from /sys/class/drm
+    gpus: Vec<DetectedGpu>,
+    /// Index into gpus (gpus.len() = "Auto" option), or gpus.len() for auto-detect
+    selected_gpu: usize,
+}
+
+/// A detected GPU render node.
+#[derive(Clone)]
+struct DetectedGpu {
+    /// Render node path, e.g. "/dev/dri/renderD129"
+    node: String,
+    /// PCI vendor ID
+    vendor_id: u32,
+    /// Human-readable vendor name
+    vendor_name: String,
+    /// Whether this GPU has connected displays (compositor GPU)
+    has_displays: bool,
+    /// Whether nvidia-drm modeset is active (NVIDIA only)
+    nvidia_modeset: bool,
 }
 
 impl DemoApp {
     fn new() -> Self {
-        Self {
+        let mut s = Self {
             player: None,
             selected_sample: 0,
             status: "Select a sample and press Load, or press Enter".into(),
+            render_loop_started: false,
+            gpus: Vec::new(),
+            selected_gpu: 0, // will be set to auto after detection
+        };
+        s.gpus = detect_gpus();
+        s.selected_gpu = s.gpus.len(); // Default: auto-detect
+        // Auto-load test video if LUMINA_TEST_VIDEO env var is set
+        if let Ok(test_url) = std::env::var("LUMINA_TEST_VIDEO") {
+            s.load_video(&test_url);
         }
+        s
     }
 
     fn load_video(&mut self, url: &str) {
         tracing::info!("Loading: {url}");
         self.status = format!("Loading: {url}...");
+
+        // Build GPU info from selection
+        let gpu_info = if self.selected_gpu < self.gpus.len() {
+            let gpu = &self.gpus[self.selected_gpu];
+            tracing::info!(
+                "Using GPU: {} ({}) at {}",
+                gpu.vendor_name,
+                gpu.vendor_id_string(),
+                gpu.node
+            );
+            GpuInfo {
+                vendor_id: gpu.vendor_id,
+                render_node: gpu.node.clone(),
+            }
+        } else {
+            tracing::info!("Using auto-detect GPU selection");
+            GpuInfo::default()
+        };
+
         let player = GpuiVideoPlayer::new(url.to_string())
             .with_autoplay(true)
             .with_controls(true)
-            .with_looping(false);
+            .with_looping(false)
+            .with_gpu_info(gpu_info);
         self.player = Some(player);
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU Detection
+// ---------------------------------------------------------------------------
+
+impl DetectedGpu {
+    fn vendor_id_string(&self) -> String {
+        format!("0x{:04x}", self.vendor_id)
+    }
+}
+
+fn detect_gpus() -> Vec<DetectedGpu> {
+    let mut gpus = Vec::new();
+
+    let Ok(render_dir) = std::fs::read_dir("/dev/dri") else {
+        return gpus;
+    };
+
+    for entry in render_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(render_num) = name.strip_prefix("renderD") else {
+            continue;
+        };
+
+        let node = entry.path().to_string_lossy().to_string();
+
+        // Read PCI vendor ID
+        let vendor_path = format!("/sys/class/drm/{name}/device/vendor");
+        let vendor_id = std::fs::read_to_string(&vendor_path)
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+
+        let vendor_name = match vendor_id {
+            0x8086 => "Intel",
+            0x10DE => "NVIDIA",
+            0x1002 => "AMD",
+            _ => "Unknown",
+        }
+        .to_string();
+
+        // Check for connected displays
+        let card_dir = format!("/sys/class/drm/card{render_num}");
+        let has_displays = std::fs::read_dir(&card_dir).map_or(false, |dir| {
+            dir.flatten().any(|e| {
+                let fname = e.file_name().to_string_lossy().to_string();
+                if let Some(conn) = fname.strip_prefix(&format!("card{render_num}-")) {
+                    if conn.starts_with("DP-")
+                        || conn.starts_with("HDMI-")
+                        || conn.starts_with("eDP-")
+                        || conn.starts_with("LVDS-")
+                        || conn.starts_with("VGA-")
+                        || conn.starts_with("DVI-")
+                    {
+                        return std::fs::read_to_string(e.path().join("status"))
+                            .map(|s| s.trim() == "connected")
+                            .unwrap_or(false);
+                    }
+                }
+                false
+            })
+        });
+
+        // Check nvidia-drm modeset (NVIDIA only)
+        let nvidia_modeset = vendor_id == 0x10DE
+            && std::fs::read_to_string("/sys/module/nvidia_drm/parameters/modeset")
+                .map(|s| s.trim() == "Y")
+                .unwrap_or(false);
+
+        gpus.push(DetectedGpu {
+            node,
+            vendor_id,
+            vendor_name,
+            has_displays,
+            nvidia_modeset,
+        });
+    }
+
+    // Sort: display GPUs first, then by vendor (NVIDIA last since it's usually dGPU)
+    gpus.sort_by(|a, b| {
+        b.has_displays
+            .cmp(&a.has_displays)
+            .then_with(|| a.vendor_name.cmp(&b.vendor_name))
+    });
+
+    gpus
 }
 
 impl Render for DemoApp {
@@ -116,7 +260,23 @@ impl Render for DemoApp {
         // Update video player each frame
         if let Some(ref mut player) = self.player {
             player.update(window, cx);
-            cx.notify(); // continuous rendering at v-sync
+        }
+
+        // Start a continuous render loop for video playback.
+        // cx.notify() / window.refresh() are no-ops inside render(),
+        // so we spawn an async loop using window.spawn() to get fresh AsyncWindowContext.
+        if !self.render_loop_started && self.player.is_some() {
+            self.render_loop_started = true;
+            let view = cx.weak_entity();
+            window.spawn(cx, async move |cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(16))
+                        .await;
+                    _ = view.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
         }
 
         let sel_name = SAMPLE_VIDEOS[self.selected_sample].0;
@@ -555,25 +715,118 @@ impl Render for DemoApp {
                             .child(section("SAMPLE VIDEOS"))
                             .children({
                                 let sel = self.selected_sample;
-                                SAMPLE_VIDEOS.iter().enumerate().map(move |(i, (name, _))| {
+                                let mut items: Vec<gpui::AnyElement> = Vec::new();
+                                for (i, (name, _)) in SAMPLE_VIDEOS.iter().enumerate() {
                                     let selected = i == sel;
-                                    div()
+                                    items.push(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .text_sm()
+                                            .cursor_pointer()
+                                            .when(selected, |d| d.bg(rgb(0x1f6feb)))
+                                            .hover(|d| if selected { d } else { d.bg(rgb(0x21262d)) })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _e, _w, cx| {
+                                                    this.selected_sample = i;
+                                                    cx.notify();
+                                                }),
+                                            )
+                                            .child(*name)
+                                            .into_any_element(),
+                                    );
+                                }
+                                items
+                            })
+                            .child(div().h(px(16.0)))
+                            .child(section("GPU (zero-copy)"))
+                            .child({
+                                // "Auto" option
+                                let auto_selected =
+                                    self.selected_gpu >= self.gpus.len();
+                                let sel_gpu = self.selected_gpu;
+                                let gpus = self.gpus.clone();
+                                let auto_btn = div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .when(auto_selected, |d| d.bg(rgb(0x1f6feb)))
+                                    .hover(|d| {
+                                        if auto_selected {
+                                            d
+                                        } else {
+                                            d.bg(rgb(0x21262d))
+                                        }
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _e, _w, cx| {
+                                            this.selected_gpu = this.gpus.len();
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Auto-detect");
+                                let mut gpu_entries = vec![auto_btn];
+                                for (i, gpu) in gpus.iter().enumerate() {
+                                    let selected = i == sel_gpu;
+                                    let label = if gpu.has_displays {
+                                        format!(
+                                            "{} [display]",
+                                            gpu.vendor_name
+                                        )
+                                    } else {
+                                        gpu.vendor_name.clone()
+                                    };
+                                    let entry = div()
                                         .px_2()
                                         .py_1()
                                         .rounded_sm()
-                                        .text_sm()
+                                        .text_xs()
                                         .cursor_pointer()
                                         .when(selected, |d| d.bg(rgb(0x1f6feb)))
-                                        .hover(|d| if selected { d } else { d.bg(rgb(0x21262d)) })
+                                        .hover(|d| {
+                                            if selected { d } else { d.bg(rgb(0x21262d)) }
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _e, _w, cx| {
-                                                this.selected_sample = i;
+                                                this.selected_gpu = i;
                                                 cx.notify();
                                             }),
                                         )
-                                        .child(*name)
-                                })
+                                        .child(label);
+                                    gpu_entries.push(entry);
+                                }
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .children(gpu_entries)
+                            })
+                            .child({
+                                // Show nvidia-drm modeset warning if NVIDIA selected
+                                if self.selected_gpu < self.gpus.len() {
+                                    let gpu = &self.gpus[self.selected_gpu];
+                                    if gpu.vendor_id == 0x10DE && !gpu.nvidia_modeset {
+                                        div()
+                                            .mt_1()
+                                            .px_2()
+                                            .py_1()
+                                            .text_xs()
+                                            .text_color(rgb(0xf0a060))
+                                            .child(
+                                                "nvidia-drm modeset OFF — zero-copy not available",
+                                            )
+                                    } else {
+                                        div()
+                                    }
+                                } else {
+                                    div()
+                                }
                             })
                             .child(div().h(px(16.0)))
                             .child(section("VIDEO INFO"))

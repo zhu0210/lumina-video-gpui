@@ -407,11 +407,15 @@ impl SyncMetrics {
             .last_underrun_time_us
             .store(now, Ordering::Relaxed);
 
-        tracing::warn!(
-            "Buffer underrun #{} at t={}ms",
-            self.inner.underrun_count.load(Ordering::Relaxed),
-            now / 1000
-        );
+        let count = self.inner.underrun_count.load(Ordering::Relaxed);
+        // Rate-limit: only log every 10th underrun after the first 5
+        if count <= 5 || count % 10 == 0 {
+            tracing::warn!(
+                "Buffer underrun #{} at t={}ms",
+                count,
+                now / 1000
+            );
+        }
     }
 
     /// Records a stall event with the type of stall.
@@ -430,11 +434,15 @@ impl SyncMetrics {
                 self.inner
                     .decode_stall_count
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    "Decode stall #{} (total stalls: {})",
-                    self.inner.decode_stall_count.load(Ordering::Relaxed),
-                    self.inner.stall_count.load(Ordering::Relaxed)
-                );
+                let dsc = self.inner.decode_stall_count.load(Ordering::Relaxed);
+                // Rate-limit: only log every 10th stall after the first 5
+                if dsc <= 5 || dsc % 10 == 0 {
+                    tracing::warn!(
+                        "Decode stall #{} (total stalls: {})",
+                        dsc,
+                        self.inner.stall_count.load(Ordering::Relaxed)
+                    );
+                }
             }
             StallType::Network => {
                 self.inner

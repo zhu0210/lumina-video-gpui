@@ -10,10 +10,7 @@ name = "lumina-video-demo"
 path = "src/main.rs"
 
 [dependencies]
-gpui_wgpu = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend"
-}
+gpui_wgpu = { path = "../../../zed/crates/gpui_wgpu" }
 lumina-video = { path = "../lumina-video" }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -32,59 +29,33 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # =========================================================================
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-gpui = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
-  features = [
+gpui = { path = "../../../zed/crates/gpui", features = [
     "wgpu",    # GpuContextHandle + surface() element
     "wayland", # Wayland display server protocol
     "x11",     # X11 display server protocol
-  ]
-}
-gpui_linux = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
-  features = [
+] }
+gpui_linux = { path = "../../../zed/crates/gpui_linux", features = [
     "wayland", # pulls in gpui_wgpu, wayland-client, etc.
     "x11",     # pulls in gpui_wgpu, x11rb, etc.
-  ]
-}
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
-  features = [
+gpui = { path = "../../../zed/crates/gpui", features = [
     "wgpu",     # GpuContextHandle + surface() element
     "font-kit", # font-kit text system (macOS default)
-  ]
-}
-gpui_macos = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
-  features = [
+] }
+gpui_macos = { path = "../../../zed/crates/gpui_macos", features = [
     "wgpu-renderer", # switches from Metal renderer → WgpuRenderer
     "font-kit",       # font-kit text system
-  ]
-}
+] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-gpui = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
-  features = [
+gpui = { path = "../../../zed/crates/gpui", features = [
     "wgpu", # GpuContextHandle + surface() element
-    # text system: gpui_wgpu::CosmicTextSystem (from wgpu-renderer),
-    # NOT font-kit / DirectWrite
-  ]
-}
-gpui_windows = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
-  features = [
+] }
+gpui_windows = { path = "../../../zed/crates/gpui_windows", features = [
     "wgpu-renderer", # switches from DirectX renderer → WgpuRenderer
-  ]
-}
+] }
 
 [features]
 # Windows still requires explicit feature flag

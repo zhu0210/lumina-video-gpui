@@ -94,8 +94,8 @@ pub mod web_video;
 pub use audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples, AudioState, AudioSync};
 pub use subtitles::{SubtitleCue, SubtitleError, SubtitleStyle, SubtitleTrack};
 pub use video::{
-    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
-    VideoFrame, VideoMetadata, VideoPlayerHandle, VideoState,
+    CpuFrame, DecodedFrame, GpuInfo, HwAccelType, PixelFormat, Plane, VideoDecoderBackend,
+    VideoError, VideoFrame, VideoMetadata, VideoPlayerHandle, VideoState,
 };
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
