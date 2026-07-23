@@ -2140,11 +2140,12 @@ impl ZeroCopyGStreamerDecoder {
                 std::io::Error::last_os_error()
             )));
         }
+        // SAFETY: dup returned a fresh descriptor owned by this function.
+        let shared_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(dup_fd) });
 
         // Validate that we have stride/offset data for all planes before constructing
         let n_planes = dmabuf_info.n_planes as usize;
         if dmabuf_info.strides.len() < n_planes {
-            unsafe { libc::close(dup_fd) };
             return Err(VideoError::DecodeFailed(format!(
                 "DMABuf has {} planes but only {} strides",
                 n_planes,
@@ -2152,7 +2153,6 @@ impl ZeroCopyGStreamerDecoder {
             )));
         }
         if dmabuf_info.offsets.len() < n_planes {
-            unsafe { libc::close(dup_fd) };
             return Err(VideoError::DecodeFailed(format!(
                 "DMABuf has {} planes but only {} offsets",
                 n_planes,
@@ -2160,8 +2160,6 @@ impl ZeroCopyGStreamerDecoder {
             )));
         }
 
-        // SAFETY: dup returned a fresh descriptor owned by this function.
-        let shared_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(dup_fd) });
         let mut planes = Vec::with_capacity(n_planes);
 
         for i in 0..n_planes {
@@ -2216,24 +2214,16 @@ impl ZeroCopyGStreamerDecoder {
         // Keep the GStreamer sample alive to ensure DMABuf FDs remain valid
         let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample.clone());
 
-        // Create the LinuxGpuSurface
-        // Safety:
-        // - All FDs in `planes` are valid DMABuf FDs
-        // - `owner` keeps the GStreamer sample alive
-        let surface = unsafe {
-            LinuxGpuSurface::new(
-                planes,
-                dmabuf_info.width,
-                dmabuf_info.height,
-                format,
-                dmabuf_info.modifier,
-                is_single_fd,
-                None, // DMABuf is GPU-only, no CPU fallback needed
-                owner,
-            )
-        };
-
-        Ok(surface)
+        LinuxGpuSurface::try_new(
+            planes,
+            dmabuf_info.width,
+            dmabuf_info.height,
+            format,
+            dmabuf_info.modifier,
+            is_single_fd,
+            None, // DMABuf is GPU-only, no CPU fallback needed
+            owner,
+        )
     }
 
     /// Converts a GStreamer sample to VideoFrame, using zero-copy if available.

@@ -212,6 +212,19 @@ pub fn video_frame_to_gpu(
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Option<GpuVideoFrame> {
+    if frame.frame.is_gpu_surface()
+        && !matches!(
+            &frame.synchronization,
+            crate::video::FrameSynchronization::Implicit
+        )
+    {
+        tracing::warn!(
+            synchronization = ?frame.synchronization,
+            "Native frame import rejected because producer synchronization is not supported"
+        );
+        return None;
+    }
+
     let path = realized_path(&frame.frame);
     let textures =
         decoded_frame_to_textures(&frame.frame, device, queue, y_cache, cbcr_cache, rgba_cache)?;
@@ -330,7 +343,6 @@ fn import_linux_dmabuf_frame(
     use crate::video::PixelFormat;
     use crate::zero_copy::linux::DmaBufHandle;
     use crate::zero_copy::linux::DmaBufPlaneHandle;
-    use std::os::fd::IntoRawFd;
 
     let plane_handles: Vec<DmaBufPlaneHandle> = surface
         .planes
@@ -342,7 +354,7 @@ fn import_linux_dmabuf_frame(
                 ))
             })?;
             Ok(DmaBufPlaneHandle {
-                fd: fd.into_raw_fd(),
+                fd,
                 offset: p.offset,
                 stride: p.stride,
                 size: p.size,
@@ -350,7 +362,7 @@ fn import_linux_dmabuf_frame(
         })
         .collect::<Result<_, crate::video::VideoError>>()?;
 
-    let dmabuf_handle = DmaBufHandle::new(plane_handles, surface.modifier);
+    let dmabuf_handle = DmaBufHandle::new(plane_handles, surface.modifier, !surface.is_single_fd);
 
     let textures = unsafe {
         crate::zero_copy::linux::import_dmabuf_multi_plane(

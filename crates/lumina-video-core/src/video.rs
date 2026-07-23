@@ -581,6 +581,86 @@ pub struct LinuxGpuSurface {
 
 #[cfg(target_os = "linux")]
 impl LinuxGpuSurface {
+    /// Validates and creates a Linux GPU surface.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        planes: Vec<DmaBufPlane>,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        modifier: u64,
+        is_single_fd: bool,
+        cpu_fallback: Option<CpuFrame>,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, VideoError> {
+        if width == 0 || height == 0 {
+            return Err(VideoError::DecodeFailed(
+                "DMABuf dimensions must be non-zero".to_string(),
+            ));
+        }
+        if planes.len() != format.num_planes() {
+            return Err(VideoError::DecodeFailed(format!(
+                "{format:?} requires {} DMABuf planes, got {}",
+                format.num_planes(),
+                planes.len()
+            )));
+        }
+        if is_single_fd
+            && planes
+                .windows(2)
+                .any(|planes| !planes[0].shares_fd_with(&planes[1]))
+        {
+            return Err(VideoError::DecodeFailed(
+                "DMABuf is marked single-FD but planes have different owners".to_string(),
+            ));
+        }
+
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        for (index, plane) in planes.iter().enumerate() {
+            let (minimum_stride, plane_height) = match (format, index) {
+                (PixelFormat::Nv12, 0) | (PixelFormat::Yuv420p, 0) => (width, height),
+                (PixelFormat::Nv12, _) => (chroma_width.saturating_mul(2), chroma_height),
+                (PixelFormat::Yuv420p, _) => (chroma_width, chroma_height),
+                (PixelFormat::Rgb24, _) => (width.saturating_mul(3), height),
+                (PixelFormat::Rgba | PixelFormat::Bgra, _) => (width.saturating_mul(4), height),
+            };
+            if plane.stride < minimum_stride {
+                return Err(VideoError::DecodeFailed(format!(
+                    "DMABuf plane {index} stride {} is smaller than {minimum_stride}",
+                    plane.stride
+                )));
+            }
+            let required_size = u64::from(plane.stride)
+                .checked_mul(u64::from(plane_height))
+                .ok_or_else(|| {
+                    VideoError::DecodeFailed(format!(
+                        "DMABuf plane {index} stride/height overflows"
+                    ))
+                })?;
+            if plane.size < required_size {
+                return Err(VideoError::DecodeFailed(format!(
+                    "DMABuf plane {index} size {} is smaller than {required_size}",
+                    plane.size
+                )));
+            }
+            plane.offset.checked_add(plane.size).ok_or_else(|| {
+                VideoError::DecodeFailed(format!("DMABuf plane {index} offset/size overflows"))
+            })?;
+        }
+
+        Ok(Self {
+            planes,
+            width,
+            height,
+            format,
+            modifier,
+            is_single_fd,
+            cpu_fallback,
+            _owner: owner,
+        })
+    }
+
     /// Creates a new Linux GPU surface from multi-plane DMABuf metadata.
     ///
     /// # Safety
@@ -1543,5 +1623,68 @@ mod tests {
         assert_eq!(PixelFormat::Yuv420p.num_planes(), 3);
         assert_eq!(PixelFormat::Nv12.num_planes(), 2);
         assert_eq!(PixelFormat::Rgba.num_planes(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_dmabuf_fd() -> Arc<std::os::fd::OwnedFd> {
+        let file = std::fs::File::open("/dev/null").expect("open test descriptor");
+        Arc::new(file.into())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_surface_validates_plane_count_and_stride() {
+        let fd = test_dmabuf_fd();
+        let one_plane = vec![DmaBufPlane::from_shared_fd(fd.clone(), 0, 64, 64 * 64)];
+        let error = LinuxGpuSurface::try_new(
+            one_plane,
+            64,
+            64,
+            PixelFormat::Nv12,
+            0,
+            true,
+            None,
+            Arc::new(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires 2 DMABuf planes"));
+
+        let undersized_stride = vec![
+            DmaBufPlane::from_shared_fd(fd.clone(), 0, 63, 63 * 64),
+            DmaBufPlane::from_shared_fd(fd, 4096, 64, 64 * 32),
+        ];
+        let error = LinuxGpuSurface::try_new(
+            undersized_stride,
+            64,
+            64,
+            PixelFormat::Nv12,
+            0,
+            true,
+            None,
+            Arc::new(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stride 63 is smaller than 64"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_surface_rejects_false_single_fd_claim() {
+        let planes = vec![
+            DmaBufPlane::from_shared_fd(test_dmabuf_fd(), 0, 64, 64 * 64),
+            DmaBufPlane::from_shared_fd(test_dmabuf_fd(), 4096, 64, 64 * 32),
+        ];
+        let error = LinuxGpuSurface::try_new(
+            planes,
+            64,
+            64,
+            PixelFormat::Nv12,
+            0,
+            true,
+            None,
+            Arc::new(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different owners"));
     }
 }

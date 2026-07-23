@@ -493,18 +493,18 @@ pub mod linux {
     use super::ZeroCopyError;
     use ash::vk;
     use std::ffi::CStr;
-    use std::os::fd::RawFd;
+    use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
     use tracing::{debug, info, warn};
 
     /// Per-plane DMABuf metadata for multi-plane import.
     ///
     /// Multi-plane formats like NV12 require separate metadata for each plane.
     /// This struct mirrors `DmaBufPlane` from video.rs for use in the import API.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug)]
     pub struct DmaBufPlaneHandle {
-        /// The file descriptor for this plane.
-        /// Multiple planes may share the same fd (with different offsets) or have separate fds.
-        pub fd: RawFd,
+        /// Owned descriptor for this plane. It remains RAII-managed until
+        /// Vulkan successfully consumes ownership.
+        pub fd: OwnedFd,
         /// Offset within the buffer where this plane starts (bytes)
         pub offset: u64,
         /// Row pitch/stride in bytes for this plane
@@ -528,23 +528,38 @@ pub mod linux {
     /// Note: Actual Vulkan multi-plane import requires VkSamplerYcbcrConversion
     /// which is not yet implemented. The current import_dmabuf() only handles
     /// single-plane formats. Multi-plane metadata is preserved for future use.
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub struct DmaBufHandle {
         /// Per-plane metadata. For single-plane formats, this has length 1.
         pub planes: Vec<DmaBufPlaneHandle>,
         /// DRM format modifier (e.g., I915_FORMAT_MOD_Y_TILED)
         /// Use DRM_FORMAT_MOD_LINEAR (0) for linear layout
         pub modifier: u64,
+        /// Whether every plane is backed by an independent DMABuf allocation.
+        ///
+        /// A shared allocation cannot be imported as unrelated single-plane
+        /// Vulkan images merely by duplicating its descriptor.
+        pub disjoint: bool,
     }
 
     impl DmaBufHandle {
         /// Creates a multi-plane DmaBufHandle.
-        pub fn new(planes: Vec<DmaBufPlaneHandle>, modifier: u64) -> Self {
-            Self { planes, modifier }
+        pub fn new(planes: Vec<DmaBufPlaneHandle>, modifier: u64, disjoint: bool) -> Self {
+            Self {
+                planes,
+                modifier,
+                disjoint,
+            }
         }
 
         /// Creates a single-plane DmaBufHandle (convenience for RGBA/BGRA).
-        pub fn single_plane(fd: RawFd, size: u64, offset: u64, stride: u32, modifier: u64) -> Self {
+        pub fn single_plane(
+            fd: OwnedFd,
+            size: u64,
+            offset: u64,
+            stride: u32,
+            modifier: u64,
+        ) -> Self {
             Self {
                 planes: vec![DmaBufPlaneHandle {
                     fd,
@@ -553,12 +568,13 @@ pub mod linux {
                     size,
                 }],
                 modifier,
+                disjoint: true,
             }
         }
 
         /// Returns the primary file descriptor (plane 0).
         pub fn fd(&self) -> RawFd {
-            self.planes.first().map(|p| p.fd).unwrap_or(-1)
+            self.planes.first().map(|p| p.fd.as_raw_fd()).unwrap_or(-1)
         }
 
         /// Returns the primary plane's size.
@@ -585,6 +601,18 @@ pub mod linux {
         pub fn is_multi_plane(&self) -> bool {
             self.planes.len() > 1
         }
+    }
+
+    fn dmabuf_allocation_size(fd: &OwnedFd) -> Option<u64> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fd` is live and `stat` points to writable storage.
+        let result = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+        if result != 0 {
+            return None;
+        }
+        // SAFETY: fstat initialized the structure after returning success.
+        let size = unsafe { stat.assume_init() }.st_size;
+        u64::try_from(size).ok().filter(|size| *size != 0)
     }
 
     /// Extension names required for DMABuf import
@@ -915,6 +943,31 @@ pub mod linux {
                     .to_string(),
             ));
         }
+        let modifier = dmabuf.modifier;
+        let plane =
+            dmabuf.planes.into_iter().next().ok_or_else(|| {
+                ZeroCopyError::InvalidResource("DMABuf has no planes".to_string())
+            })?;
+        let import_fd = plane.fd;
+        let fd = import_fd.as_raw_fd();
+        let offset = plane.offset;
+        let size = plane.size;
+        let stride = plane.stride;
+        if width == 0 || height == 0 || stride == 0 || size == 0 {
+            return Err(ZeroCopyError::InvalidResource(
+                "DMABuf dimensions, stride, and size must be non-zero".to_string(),
+            ));
+        }
+        let end = offset.checked_add(size).ok_or_else(|| {
+            ZeroCopyError::InvalidResource("DMABuf offset/size overflows".to_string())
+        })?;
+        if let Some(allocation_size) = dmabuf_allocation_size(&import_fd) {
+            if end > allocation_size {
+                return Err(ZeroCopyError::InvalidResource(format!(
+                    "DMABuf range ends at {end}, beyond allocation {allocation_size}"
+                )));
+            }
+        }
 
         // Access the Vulkan HAL device
         let hal_device = device.as_hal::<wgpu::hal::api::Vulkan>().ok_or_else(|| {
@@ -941,13 +994,13 @@ pub mod linux {
         // For single-FD multi-plane layouts, each plane has a different offset.
         // Without explicit plane layout, Vulkan binds memory at offset 0, causing
         // planes to read wrong data (e.g., UV plane reading Y data → color corruption).
-        let has_nonzero_offset = dmabuf.offset() != 0;
+        let has_nonzero_offset = offset != 0;
         let use_drm_modifier = has_drm_modifier
-            && (dmabuf.modifier != drm_modifiers::DRM_FORMAT_MOD_LINEAR || has_nonzero_offset);
+            && (modifier != drm_modifiers::DRM_FORMAT_MOD_LINEAR || has_nonzero_offset);
 
         debug!(
                         "Importing DMABuf fd={} ({}x{} {:?}, modifier=0x{:x}, offset={}, use_drm={}) into Vulkan",
-                        dmabuf.fd(), width, height, format, dmabuf.modifier, dmabuf.offset(), use_drm_modifier
+                        fd, width, height, format, modifier, offset, use_drm_modifier
                     );
 
         let vk_device = hal_device.raw_device();
@@ -986,21 +1039,21 @@ pub mod linux {
         if use_drm_modifier {
             // Use explicit DRM format modifier
             plane_layout = vk::SubresourceLayout {
-                offset: dmabuf.offset(),
-                size: dmabuf.size(),
-                row_pitch: dmabuf.stride() as u64,
+                offset,
+                size,
+                row_pitch: stride as u64,
                 array_pitch: 0,
                 depth_pitch: 0,
             };
 
             drm_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-                .drm_format_modifier(dmabuf.modifier)
+                .drm_format_modifier(modifier)
                 .plane_layouts(std::slice::from_ref(&plane_layout));
 
             image_create_info = image_create_info
                 .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
                 .push_next(&mut drm_modifier_info);
-        } else if dmabuf.modifier == drm_modifiers::DRM_FORMAT_MOD_LINEAR {
+        } else if modifier == drm_modifiers::DRM_FORMAT_MOD_LINEAR {
             // Linear format - use LINEAR tiling
             // IMPORTANT: Linear tiling without DRM modifier extension cannot honor
             // non-zero offsets. If we have an offset, we reach this branch because
@@ -1009,7 +1062,7 @@ pub mod linux {
                 return Err(ZeroCopyError::NotAvailable(format!(
                                 "DMABuf with non-zero offset ({}) requires VK_EXT_image_drm_format_modifier extension \
                                  for correct plane binding. Without it, planes would read from wrong memory locations.",
-                                dmabuf.offset()
+                                offset
                             )));
             }
             image_create_info = image_create_info.tiling(vk::ImageTiling::LINEAR);
@@ -1019,12 +1072,12 @@ pub mod linux {
             if !has_drm_modifier {
                 return Err(ZeroCopyError::NotAvailable(format!(
                                 "Non-linear DMABuf modifier 0x{:x} requires VK_EXT_image_drm_format_modifier extension",
-                                dmabuf.modifier
+                                modifier
                             )));
             }
 
             // Store modifier in outer-scoped variable so the slice lives until create_image
-            modifiers = [dmabuf.modifier];
+            modifiers = [modifier];
             drm_modifier_list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
                 .drm_format_modifiers(&modifiers);
 
@@ -1045,7 +1098,7 @@ pub mod linux {
         // Step 3: Import external memory from DMABuf fd
         let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(dmabuf.fd());
+            .fd(fd);
 
         // Find suitable memory type (device local preferred)
         let memory_type_index = find_memory_type_index(
@@ -1076,15 +1129,19 @@ pub mod linux {
             .memory_type_index(memory_type_index)
             .push_next(&mut import_memory_info);
 
-        let device_memory = vk_device
-            .allocate_memory(&memory_allocate_info, None)
-            .map_err(|e| {
+        let device_memory = match vk_device.allocate_memory(&memory_allocate_info, None) {
+            Ok(memory) => {
+                // Vulkan consumes the descriptor only after successful import.
+                let _ = import_fd.into_raw_fd();
+                memory
+            }
+            Err(error) => {
                 vk_device.destroy_image(vk_image, None);
-                ZeroCopyError::TextureCreationFailed(format!(
-                    "vkAllocateMemory (DMABuf import) failed: {:?}",
-                    e
-                ))
-            })?;
+                return Err(ZeroCopyError::TextureCreationFailed(format!(
+                    "vkAllocateMemory (DMABuf import) failed: {error:?}"
+                )));
+            }
+        };
 
         // Step 4: Bind memory to image
         vk_device
@@ -1097,10 +1154,7 @@ pub mod linux {
 
         info!(
             "Successfully created Vulkan image from DMABuf fd={} ({}x{} {:?})",
-            dmabuf.fd(),
-            width,
-            height,
-            format
+            fd, width, height, format
         );
 
         // Step 5: Transition image layout and acquire queue ownership
@@ -1243,10 +1297,51 @@ pub mod linux {
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
         use super::super::video::PixelFormat;
 
-        // Validate plane count matches format
-        let expected_planes = match format {
-            PixelFormat::Nv12 => 2,
-            PixelFormat::Yuv420p => 3,
+        if width == 0 || height == 0 {
+            return Err(ZeroCopyError::InvalidResource(
+                "DMABuf dimensions must be non-zero".to_string(),
+            ));
+        }
+        if dmabuf.modifier == drm_modifiers::DRM_FORMAT_MOD_INVALID {
+            return Err(ZeroCopyError::InvalidResource(
+                "DMABuf has an unknown DRM format modifier".to_string(),
+            ));
+        }
+        if !dmabuf.disjoint {
+            return Err(ZeroCopyError::NotAvailable(
+                "Shared-allocation multi-plane DMABuf import requires a true multi-planar \
+                 Vulkan image; duplicated descriptors cannot be imported as unrelated planes"
+                    .to_string(),
+            ));
+        }
+
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        let plane_specs: Vec<(u32, u32, u32, wgpu::TextureFormat)> = match format {
+            PixelFormat::Nv12 => vec![
+                (width, height, width, wgpu::TextureFormat::R8Unorm),
+                (
+                    chroma_width,
+                    chroma_height,
+                    chroma_width.saturating_mul(2),
+                    wgpu::TextureFormat::Rg8Unorm,
+                ),
+            ],
+            PixelFormat::Yuv420p => vec![
+                (width, height, width, wgpu::TextureFormat::R8Unorm),
+                (
+                    chroma_width,
+                    chroma_height,
+                    chroma_width,
+                    wgpu::TextureFormat::R8Unorm,
+                ),
+                (
+                    chroma_width,
+                    chroma_height,
+                    chroma_width,
+                    wgpu::TextureFormat::R8Unorm,
+                ),
+            ],
             _ => {
                 return Err(ZeroCopyError::InvalidResource(format!(
                     "Format {:?} is not a multi-plane YUV format",
@@ -1255,30 +1350,48 @@ pub mod linux {
             }
         };
 
-        if dmabuf.num_planes() != expected_planes {
+        if dmabuf.num_planes() != plane_specs.len() {
             return Err(ZeroCopyError::InvalidResource(format!(
                 "Expected {} planes for {:?}, got {}",
-                expected_planes,
+                plane_specs.len(),
                 format,
                 dmabuf.num_planes()
             )));
         }
 
-        // Validate all FDs
-        for (i, plane) in dmabuf.planes.iter().enumerate() {
-            if plane.fd < 0 {
+        for (i, (plane, (_, plane_height, minimum_stride, _))) in
+            dmabuf.planes.iter().zip(plane_specs.iter()).enumerate()
+        {
+            if plane.stride < *minimum_stride {
                 return Err(ZeroCopyError::InvalidResource(format!(
-                    "Plane {} has invalid fd (negative)",
-                    i
+                    "Plane {i} stride {} is smaller than required row size {minimum_stride}",
+                    plane.stride
                 )));
             }
+            let required_size = u64::from(plane.stride)
+                .checked_mul(u64::from(*plane_height))
+                .ok_or_else(|| {
+                    ZeroCopyError::InvalidResource(format!(
+                        "Plane {i} stride/height size overflows"
+                    ))
+                })?;
+            if plane.size < required_size {
+                return Err(ZeroCopyError::InvalidResource(format!(
+                    "Plane {i} size {} is smaller than required {required_size}",
+                    plane.size
+                )));
+            }
+            let plane_end = plane.offset.checked_add(plane.size).ok_or_else(|| {
+                ZeroCopyError::InvalidResource(format!("Plane {i} offset/size overflows"))
+            })?;
+            if let Some(allocation_size) = dmabuf_allocation_size(&plane.fd) {
+                if plane_end > allocation_size {
+                    return Err(ZeroCopyError::InvalidResource(format!(
+                        "Plane {i} ends at {plane_end}, beyond DMABuf allocation {allocation_size}"
+                    )));
+                }
+            }
         }
-
-        // Single-FD multi-plane layout: each plane references the same DMABuf FD
-        // with a different offset within the buffer. The per-plane import below
-        // creates separate VkImages and allocates VkDeviceMemory from the shared FD
-        // at per-plane offsets — the kernel DMABuf subsystem handles this correctly.
-        // (Previously rejected; now handled by the existing per-plane import loop.)
 
         info!(
             "Importing multi-plane DMABuf: {:?} ({}x{}, {} planes)",
@@ -1288,72 +1401,29 @@ pub mod linux {
             dmabuf.num_planes()
         );
 
-        // Build per-plane import specifications
-        let plane_specs: Vec<(u32, u32, wgpu::TextureFormat)> = match format {
-            PixelFormat::Nv12 => vec![
-                // Plane 0: Y (luma) - full resolution, R8
-                (width, height, wgpu::TextureFormat::R8Unorm),
-                // Plane 1: UV (chroma) - half resolution, RG8 (interleaved)
-                (width / 2, height / 2, wgpu::TextureFormat::Rg8Unorm),
-            ],
-            PixelFormat::Yuv420p => vec![
-                // Plane 0: Y (luma) - full resolution, R8
-                (width, height, wgpu::TextureFormat::R8Unorm),
-                // Plane 1: U (Cb) - half resolution, R8
-                (width / 2, height / 2, wgpu::TextureFormat::R8Unorm),
-                // Plane 2: V (Cr) - half resolution, R8
-                (width / 2, height / 2, wgpu::TextureFormat::R8Unorm),
-            ],
-            _ => unreachable!(),
-        };
-
-        // Import each plane as a separate texture.
-        // For single-FD multi-plane layouts, dup the FD for ALL planes
-        // upfront. The Vulkan import takes ownership of each FD and closes
-        // it after vkAllocateMemory, so sharing a single FD would cause
-        // ERROR_INVALID_EXTERNAL_HANDLE / EBADF on planes after the first.
-        let is_shared_fd =
-            dmabuf.planes.len() > 1 && dmabuf.planes.windows(2).all(|w| w[0].fd == w[1].fd);
-        let duped_fds: Vec<RawFd> = if is_shared_fd {
-            dmabuf
-                .planes
-                .iter()
-                .map(|p| {
-                    let dup_fd = unsafe { libc::dup(p.fd) };
-                    if dup_fd < 0 {
-                        Err(ZeroCopyError::TextureCreationFailed(format!(
-                            "Failed to dup DMABuf fd {}: {}",
-                            p.fd,
-                            std::io::Error::last_os_error()
-                        )))
-                    } else {
-                        Ok(dup_fd)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            vec![]
-        };
-
         let mut textures = Vec::with_capacity(plane_specs.len());
+        let modifier = dmabuf.modifier;
 
-        for (i, ((plane_width, plane_height, wgpu_format), plane)) in
-            plane_specs.iter().zip(dmabuf.planes.iter()).enumerate()
+        for (i, ((plane_width, plane_height, _, wgpu_format), plane)) in
+            plane_specs.iter().zip(dmabuf.planes).enumerate()
         {
             debug!(
                 "Importing plane {}: {}x{} {:?} (fd={}, offset={}, stride={})",
-                i, plane_width, plane_height, wgpu_format, plane.fd, plane.offset, plane.stride
+                i,
+                plane_width,
+                plane_height,
+                wgpu_format,
+                plane.fd.as_raw_fd(),
+                plane.offset,
+                plane.stride
             );
 
-            let plane_fd = if is_shared_fd { duped_fds[i] } else { plane.fd };
-
-            // Create a single-plane handle for this plane
             let single_plane_handle = DmaBufHandle::single_plane(
-                plane_fd,
+                plane.fd,
                 plane.size,
                 plane.offset,
                 plane.stride,
-                dmabuf.modifier,
+                modifier,
             );
 
             // Import using the existing single-plane function
@@ -1427,6 +1497,7 @@ pub mod linux {
     /// A vector of wgpu::Textures:
     /// - NV12: `[Y (R8, full size), UV (RG8, half size)]`
     /// - YUV420p: `[Y (R8, full size), U (R8, half size), V (R8, half size)]`
+    #[cfg(any())]
     pub unsafe fn import_dmabuf_single_fd_multi_plane(
         device: &wgpu::Device,
         fd: std::os::fd::RawFd,
@@ -6467,5 +6538,25 @@ mod tests {
         stats.zero_copy_frames = 75;
         stats.fallback_frames = 25;
         assert!((stats.zero_copy_percentage() - 75.0).abs() < 0.01);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dmabuf_handle_closes_unconsumed_descriptor() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd: OwnedFd = stream.into();
+        let raw_fd = fd.as_raw_fd();
+        let handle = linux::DmaBufHandle::single_plane(fd, 4096, 0, 64, 0);
+        drop(handle);
+
+        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        let result = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 }
