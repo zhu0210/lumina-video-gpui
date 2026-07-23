@@ -12,8 +12,8 @@
 //!
 //! - **macOS**: BGRA IOSurface import is available on Metal. NV12 plane import is
 //!   explicitly unsupported until plane metadata and color attachments are wired.
-//! - **Linux**: Disjoint multi-FD planes are validated and importable. Shared
-//!   multi-plane allocations require a true multi-planar Vulkan path.
+//! - **Linux**: Disjoint and shared-allocation planes are validated and
+//!   importable as separately sampled Vulkan images with explicit layouts.
 //! - **Android**: Rust-side Vulkan import is ready. Waiting for Java/Kotlin ExoPlayer
 //!   integration to expose AHardwareBuffer via ImageReader (see lumina-video-6dn).
 //! - **Windows**: Shared-handle opening exists internally, but production import
@@ -24,7 +24,7 @@
 //! | Platform | Backend | Import Method | Status |
 //! |----------|---------|---------------|--------|
 //! | macOS | Metal | IOSurface | BGRA only |
-//! | Linux | Vulkan | DMABuf (VA-API, V4L2) | Disjoint planes only |
+//! | Linux | Vulkan | DMABuf (VA-API, V4L2) | Disjoint/shared planes |
 //! | Android | Vulkan | AHardwareBuffer (MediaCodec) | Rust ready, Java pending |
 //! | Windows | D3D12 | D3D11 Shared Handle | Unsupported (missing LUID/fence) |
 //! | iOS | Metal | IOSurface | Shared with macOS (Metal/IOSurface) |
@@ -525,9 +525,9 @@ pub mod linux {
     /// - **Single-plane (RGBA/BGRA)**: Use `DmaBufHandle::single_plane()`
     /// - **Multi-plane (NV12)**: Use `DmaBufHandle::new()` with plane metadata
     ///
-    /// Note: Actual Vulkan multi-plane import requires VkSamplerYcbcrConversion
-    /// which is not yet implemented. The current import_dmabuf() only handles
-    /// single-plane formats. Multi-plane metadata is preserved for future use.
+    /// `import_dmabuf()` handles one texture plane. Use
+    /// `import_dmabuf_multi_plane()` to validate and import YUV planes as
+    /// separately sampled textures for shader-based conversion.
     #[derive(Debug)]
     pub struct DmaBufHandle {
         /// Per-plane metadata. For single-plane formats, this has length 1.
@@ -614,6 +614,79 @@ pub mod linux {
         // SAFETY: fstat initialized the structure after returning success.
         let size = unsafe { stat.assume_init() }.st_size;
         u64::try_from(size).ok().filter(|size| *size != 0)
+    }
+
+    fn texture_format_bytes_per_pixel(format: wgpu::TextureFormat) -> Result<u32, ZeroCopyError> {
+        match format {
+            wgpu::TextureFormat::R8Unorm => Ok(1),
+            wgpu::TextureFormat::Rg8Unorm => Ok(2),
+            wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Bgra8UnormSrgb
+            | wgpu::TextureFormat::Rgba8UnormSrgb => Ok(4),
+            _ => Err(ZeroCopyError::InvalidResource(format!(
+                "Unsupported single-plane DMABuf texture format {format:?}"
+            ))),
+        }
+    }
+
+    pub(crate) fn validate_dmabuf_single_plane_layout(
+        dmabuf: &DmaBufHandle,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Result<(), ZeroCopyError> {
+        if dmabuf.num_planes() != 1 {
+            return Err(ZeroCopyError::InvalidResource(format!(
+                "Expected one DMABuf plane, got {}",
+                dmabuf.num_planes()
+            )));
+        }
+        if width == 0 || height == 0 {
+            return Err(ZeroCopyError::InvalidResource(
+                "DMABuf dimensions must be non-zero".to_string(),
+            ));
+        }
+        if dmabuf.modifier == drm_modifiers::DRM_FORMAT_MOD_INVALID {
+            return Err(ZeroCopyError::InvalidResource(
+                "DMABuf has an unknown DRM format modifier".to_string(),
+            ));
+        }
+
+        let plane = &dmabuf.planes[0];
+        let minimum_stride = width
+            .checked_mul(texture_format_bytes_per_pixel(format)?)
+            .ok_or_else(|| {
+                ZeroCopyError::InvalidResource("DMABuf minimum stride overflows".to_string())
+            })?;
+        if plane.stride < minimum_stride {
+            return Err(ZeroCopyError::InvalidResource(format!(
+                "DMABuf stride {} is smaller than required row size {minimum_stride}",
+                plane.stride
+            )));
+        }
+        let required_size = u64::from(plane.stride)
+            .checked_mul(u64::from(height))
+            .ok_or_else(|| {
+                ZeroCopyError::InvalidResource("DMABuf stride/height size overflows".to_string())
+            })?;
+        if plane.size < required_size {
+            return Err(ZeroCopyError::InvalidResource(format!(
+                "DMABuf size {} is smaller than required {required_size}",
+                plane.size
+            )));
+        }
+        let end = plane.offset.checked_add(plane.size).ok_or_else(|| {
+            ZeroCopyError::InvalidResource("DMABuf offset/size overflows".to_string())
+        })?;
+        if let Some(allocation_size) = dmabuf_allocation_size(&plane.fd) {
+            if end > allocation_size {
+                return Err(ZeroCopyError::InvalidResource(format!(
+                    "DMABuf range ends at {end}, beyond allocation {allocation_size}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Extension names required for DMABuf import
@@ -929,13 +1002,6 @@ pub mod linux {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> Result<wgpu::Texture, ZeroCopyError> {
-        // Validate the handle
-        if dmabuf.fd() < 0 {
-            return Err(ZeroCopyError::InvalidResource(
-                "DMABuf fd is invalid (negative)".to_string(),
-            ));
-        }
-
         // Multi-plane formats require VkSamplerYcbcrConversion - not yet implemented
         if dmabuf.is_multi_plane() {
             return Err(ZeroCopyError::NotAvailable(
@@ -944,6 +1010,7 @@ pub mod linux {
                     .to_string(),
             ));
         }
+        validate_dmabuf_single_plane_layout(&dmabuf, width, height, format)?;
         let modifier = dmabuf.modifier;
         let plane =
             dmabuf.planes.into_iter().next().ok_or_else(|| {
@@ -954,22 +1021,6 @@ pub mod linux {
         let offset = plane.offset;
         let size = plane.size;
         let stride = plane.stride;
-        if width == 0 || height == 0 || stride == 0 || size == 0 {
-            return Err(ZeroCopyError::InvalidResource(
-                "DMABuf dimensions, stride, and size must be non-zero".to_string(),
-            ));
-        }
-        let end = offset.checked_add(size).ok_or_else(|| {
-            ZeroCopyError::InvalidResource("DMABuf offset/size overflows".to_string())
-        })?;
-        if let Some(allocation_size) = dmabuf_allocation_size(&import_fd) {
-            if end > allocation_size {
-                return Err(ZeroCopyError::InvalidResource(format!(
-                    "DMABuf range ends at {end}, beyond allocation {allocation_size}"
-                )));
-            }
-        }
-
         // Access the Vulkan HAL device
         let hal_device = device.as_hal::<wgpu::hal::api::Vulkan>().ok_or_else(|| {
             ZeroCopyError::HalAccessFailed("wgpu not using Vulkan backend".to_string())
@@ -1238,6 +1289,103 @@ pub mod linux {
         Ok(wgpu_texture)
     }
 
+    type DmaBufPlaneSpec = (u32, u32, u32, wgpu::TextureFormat);
+
+    pub(crate) fn validate_dmabuf_multi_plane_layout(
+        dmabuf: &DmaBufHandle,
+        width: u32,
+        height: u32,
+        format: super::super::video::PixelFormat,
+    ) -> Result<Vec<DmaBufPlaneSpec>, ZeroCopyError> {
+        use super::super::video::PixelFormat;
+
+        if width == 0 || height == 0 {
+            return Err(ZeroCopyError::InvalidResource(
+                "DMABuf dimensions must be non-zero".to_string(),
+            ));
+        }
+        if dmabuf.modifier == drm_modifiers::DRM_FORMAT_MOD_INVALID {
+            return Err(ZeroCopyError::InvalidResource(
+                "DMABuf has an unknown DRM format modifier".to_string(),
+            ));
+        }
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        let plane_specs = match format {
+            PixelFormat::Nv12 => vec![
+                (width, height, width, wgpu::TextureFormat::R8Unorm),
+                (
+                    chroma_width,
+                    chroma_height,
+                    chroma_width.saturating_mul(2),
+                    wgpu::TextureFormat::Rg8Unorm,
+                ),
+            ],
+            PixelFormat::Yuv420p => vec![
+                (width, height, width, wgpu::TextureFormat::R8Unorm),
+                (
+                    chroma_width,
+                    chroma_height,
+                    chroma_width,
+                    wgpu::TextureFormat::R8Unorm,
+                ),
+                (
+                    chroma_width,
+                    chroma_height,
+                    chroma_width,
+                    wgpu::TextureFormat::R8Unorm,
+                ),
+            ],
+            _ => {
+                return Err(ZeroCopyError::InvalidResource(format!(
+                    "Format {format:?} is not a multi-plane YUV format"
+                )));
+            }
+        };
+
+        if dmabuf.num_planes() != plane_specs.len() {
+            return Err(ZeroCopyError::InvalidResource(format!(
+                "Expected {} planes for {format:?}, got {}",
+                plane_specs.len(),
+                dmabuf.num_planes()
+            )));
+        }
+        for (i, (plane, (_, plane_height, minimum_stride, _))) in
+            dmabuf.planes.iter().zip(plane_specs.iter()).enumerate()
+        {
+            if plane.stride < *minimum_stride {
+                return Err(ZeroCopyError::InvalidResource(format!(
+                    "Plane {i} stride {} is smaller than required row size {minimum_stride}",
+                    plane.stride
+                )));
+            }
+            let required_size = u64::from(plane.stride)
+                .checked_mul(u64::from(*plane_height))
+                .ok_or_else(|| {
+                    ZeroCopyError::InvalidResource(format!(
+                        "Plane {i} stride/height size overflows"
+                    ))
+                })?;
+            if plane.size < required_size {
+                return Err(ZeroCopyError::InvalidResource(format!(
+                    "Plane {i} size {} is smaller than required {required_size}",
+                    plane.size
+                )));
+            }
+            let plane_end = plane.offset.checked_add(plane.size).ok_or_else(|| {
+                ZeroCopyError::InvalidResource(format!("Plane {i} offset/size overflows"))
+            })?;
+            if let Some(allocation_size) = dmabuf_allocation_size(&plane.fd) {
+                if plane_end > allocation_size {
+                    return Err(ZeroCopyError::InvalidResource(format!(
+                        "Plane {i} ends at {plane_end}, beyond DMABuf allocation {allocation_size}"
+                    )));
+                }
+            }
+        }
+        Ok(plane_specs)
+    }
+
     /// Imports a multi-plane DMABuf (NV12/YUV420p) into wgpu as separate textures.
     ///
     /// This function creates separate wgpu::Textures for each YUV plane, enabling
@@ -1282,7 +1430,8 @@ pub mod linux {
     ///     DmaBufPlaneHandle { fd: y_fd, offset: 0, stride: 1920, size: 1920 * 1080 },
     ///     DmaBufPlaneHandle { fd: uv_fd, offset: 0, stride: 1920, size: 960 * 540 * 2 },
     /// ];
-    /// let dmabuf = DmaBufHandle::new(planes, drm_modifiers::DRM_FORMAT_MOD_LINEAR);
+    /// let dmabuf =
+    ///     DmaBufHandle::new(planes, drm_modifiers::DRM_FORMAT_MOD_LINEAR, true);
     ///
     /// let textures = unsafe {
     ///     import_dmabuf_multi_plane(&device, dmabuf, 1920, 1080, PixelFormat::Nv12)?
@@ -1296,95 +1445,7 @@ pub mod linux {
         height: u32,
         format: super::super::video::PixelFormat,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use super::super::video::PixelFormat;
-
-        if width == 0 || height == 0 {
-            return Err(ZeroCopyError::InvalidResource(
-                "DMABuf dimensions must be non-zero".to_string(),
-            ));
-        }
-        if dmabuf.modifier == drm_modifiers::DRM_FORMAT_MOD_INVALID {
-            return Err(ZeroCopyError::InvalidResource(
-                "DMABuf has an unknown DRM format modifier".to_string(),
-            ));
-        }
-        let chroma_width = width.div_ceil(2);
-        let chroma_height = height.div_ceil(2);
-        let plane_specs: Vec<(u32, u32, u32, wgpu::TextureFormat)> = match format {
-            PixelFormat::Nv12 => vec![
-                (width, height, width, wgpu::TextureFormat::R8Unorm),
-                (
-                    chroma_width,
-                    chroma_height,
-                    chroma_width.saturating_mul(2),
-                    wgpu::TextureFormat::Rg8Unorm,
-                ),
-            ],
-            PixelFormat::Yuv420p => vec![
-                (width, height, width, wgpu::TextureFormat::R8Unorm),
-                (
-                    chroma_width,
-                    chroma_height,
-                    chroma_width,
-                    wgpu::TextureFormat::R8Unorm,
-                ),
-                (
-                    chroma_width,
-                    chroma_height,
-                    chroma_width,
-                    wgpu::TextureFormat::R8Unorm,
-                ),
-            ],
-            _ => {
-                return Err(ZeroCopyError::InvalidResource(format!(
-                    "Format {:?} is not a multi-plane YUV format",
-                    format
-                )));
-            }
-        };
-
-        if dmabuf.num_planes() != plane_specs.len() {
-            return Err(ZeroCopyError::InvalidResource(format!(
-                "Expected {} planes for {:?}, got {}",
-                plane_specs.len(),
-                format,
-                dmabuf.num_planes()
-            )));
-        }
-
-        for (i, (plane, (_, plane_height, minimum_stride, _))) in
-            dmabuf.planes.iter().zip(plane_specs.iter()).enumerate()
-        {
-            if plane.stride < *minimum_stride {
-                return Err(ZeroCopyError::InvalidResource(format!(
-                    "Plane {i} stride {} is smaller than required row size {minimum_stride}",
-                    plane.stride
-                )));
-            }
-            let required_size = u64::from(plane.stride)
-                .checked_mul(u64::from(*plane_height))
-                .ok_or_else(|| {
-                    ZeroCopyError::InvalidResource(format!(
-                        "Plane {i} stride/height size overflows"
-                    ))
-                })?;
-            if plane.size < required_size {
-                return Err(ZeroCopyError::InvalidResource(format!(
-                    "Plane {i} size {} is smaller than required {required_size}",
-                    plane.size
-                )));
-            }
-            let plane_end = plane.offset.checked_add(plane.size).ok_or_else(|| {
-                ZeroCopyError::InvalidResource(format!("Plane {i} offset/size overflows"))
-            })?;
-            if let Some(allocation_size) = dmabuf_allocation_size(&plane.fd) {
-                if plane_end > allocation_size {
-                    return Err(ZeroCopyError::InvalidResource(format!(
-                        "Plane {i} ends at {plane_end}, beyond DMABuf allocation {allocation_size}"
-                    )));
-                }
-            }
-        }
+        let plane_specs = validate_dmabuf_multi_plane_layout(&dmabuf, width, height, format)?;
 
         debug!(
             "Importing multi-plane DMABuf: {:?} ({}x{}, {} planes, disjoint={})",
@@ -6554,5 +6615,196 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::EBADF)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sized_test_fd(size: u64) -> std::os::fd::OwnedFd {
+        use std::fs::OpenOptions;
+        use std::os::fd::OwnedFd;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "lumina-dmabuf-layout-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(size).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let fd: OwnedFd = file.into();
+        fd
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_plane(
+        allocation_size: u64,
+        offset: u64,
+        stride: u32,
+        size: u64,
+    ) -> linux::DmaBufPlaneHandle {
+        linux::DmaBufPlaneHandle {
+            fd: sized_test_fd(allocation_size),
+            offset,
+            stride,
+            size,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_plane_layout_rejects_malformed_ranges() {
+        let valid = linux::DmaBufHandle::single_plane(sized_test_fd(256), 256, 0, 16, 0);
+        assert!(linux::validate_dmabuf_single_plane_layout(
+            &valid,
+            4,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm
+        )
+        .is_ok());
+
+        let short_stride = linux::DmaBufHandle::single_plane(sized_test_fd(256), 256, 0, 15, 0);
+        assert!(linux::validate_dmabuf_single_plane_layout(
+            &short_stride,
+            4,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm
+        )
+        .is_err());
+
+        let short_size = linux::DmaBufHandle::single_plane(sized_test_fd(256), 63, 0, 16, 0);
+        assert!(linux::validate_dmabuf_single_plane_layout(
+            &short_size,
+            4,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm
+        )
+        .is_err());
+
+        let outside_allocation = linux::DmaBufHandle::single_plane(sized_test_fd(64), 64, 1, 16, 0);
+        assert!(linux::validate_dmabuf_single_plane_layout(
+            &outside_allocation,
+            4,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn layout_validation_rejects_dimensions_modifiers_and_formats() {
+        use lumina_video_core::video::PixelFormat;
+
+        let zero_width = linux::DmaBufHandle::single_plane(sized_test_fd(64), 64, 0, 16, 0);
+        assert!(linux::validate_dmabuf_single_plane_layout(
+            &zero_width,
+            0,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm
+        )
+        .is_err());
+
+        let invalid_modifier = linux::DmaBufHandle::single_plane(
+            sized_test_fd(64),
+            64,
+            0,
+            16,
+            linux::drm_modifiers::DRM_FORMAT_MOD_INVALID,
+        );
+        assert!(linux::validate_dmabuf_single_plane_layout(
+            &invalid_modifier,
+            4,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm
+        )
+        .is_err());
+
+        let unsupported_texture =
+            linux::DmaBufHandle::single_plane(sized_test_fd(64), 64, 0, 16, 0);
+        assert!(linux::validate_dmabuf_single_plane_layout(
+            &unsupported_texture,
+            4,
+            4,
+            wgpu::TextureFormat::Depth32Float
+        )
+        .is_err());
+
+        let unsupported_video = linux::DmaBufHandle::new(vec![test_plane(64, 0, 16, 64)], 0, true);
+        assert!(linux::validate_dmabuf_multi_plane_layout(
+            &unsupported_video,
+            4,
+            4,
+            PixelFormat::Rgba
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multi_plane_layout_validates_odd_nv12_geometry() {
+        use lumina_video_core::video::PixelFormat;
+
+        let valid = linux::DmaBufHandle::new(
+            vec![test_plane(15, 0, 5, 15), test_plane(12, 0, 6, 12)],
+            0,
+            true,
+        );
+        assert!(linux::validate_dmabuf_multi_plane_layout(&valid, 5, 3, PixelFormat::Nv12).is_ok());
+
+        let short_uv_stride = linux::DmaBufHandle::new(
+            vec![test_plane(15, 0, 5, 15), test_plane(12, 0, 5, 12)],
+            0,
+            true,
+        );
+        assert!(linux::validate_dmabuf_multi_plane_layout(
+            &short_uv_stride,
+            5,
+            3,
+            PixelFormat::Nv12
+        )
+        .is_err());
+
+        let wrong_plane_count = linux::DmaBufHandle::new(vec![test_plane(15, 0, 5, 15)], 0, true);
+        assert!(linux::validate_dmabuf_multi_plane_layout(
+            &wrong_plane_count,
+            5,
+            3,
+            PixelFormat::Nv12
+        )
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validation_failure_releases_every_owned_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let first = test_plane(64, 0, 8, 64);
+        let second = test_plane(32, u64::MAX, 8, 32);
+        let raw_fds = [first.fd.as_raw_fd(), second.fd.as_raw_fd()];
+        let handle = linux::DmaBufHandle::new(vec![first, second], 0, false);
+        assert!(linux::validate_dmabuf_multi_plane_layout(
+            &handle,
+            8,
+            8,
+            lumina_video_core::video::PixelFormat::Nv12
+        )
+        .is_err());
+        drop(handle);
+
+        for raw_fd in raw_fds {
+            // SAFETY: F_GETFD only inspects the numeric descriptor.
+            assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+        }
     }
 }
