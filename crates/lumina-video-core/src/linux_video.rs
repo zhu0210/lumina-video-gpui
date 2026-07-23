@@ -507,7 +507,9 @@ impl ZeroCopyGStreamerDecoder {
             let Some(property) = element.find_property(property_name) else {
                 continue;
             };
-            if property.value_type() == String::static_type() {
+            if property.value_type() == String::static_type()
+                && property.flags().contains(gst::glib::ParamFlags::WRITABLE)
+            {
                 element.set_property(property_name, render_node);
                 tracing::debug!(
                     element = element.name().as_str(),
@@ -517,6 +519,13 @@ impl ZeroCopyGStreamerDecoder {
                 );
                 break;
             }
+            tracing::trace!(
+                element = element.name().as_str(),
+                property = property_name,
+                writable = property.flags().contains(gst::glib::ParamFlags::WRITABLE),
+                value_type = property.value_type().name(),
+                "Ignoring incompatible pipeline render-device property"
+            );
         }
     }
 
@@ -698,6 +707,8 @@ impl ZeroCopyGStreamerDecoder {
 
     /// Known PCI vendor IDs.
     const VENDOR_NVIDIA: u32 = 0x10DE;
+    const VENDOR_INTEL: u32 = 0x8086;
+    const VENDOR_AMD: u32 = 0x1002;
 
     /// Checks if nvidia-drm kernel modesetting is active.
     ///
@@ -733,6 +744,19 @@ impl ZeroCopyGStreamerDecoder {
             "Compositor GPU vendor: {compositor_vendor:#06x} (render node: {render_node:?}, explicit_gpu={})",
             gpu_info.vendor_id != 0
         );
+
+        // VA-API currently exports Intel and AMD NV12 frames as one shared
+        // multi-plane allocation. The safe Vulkan importer intentionally does
+        // not split that allocation into unrelated plane images. Select the
+        // supported CPU pipeline up front instead of negotiating frames that
+        // cannot be displayed.
+        if matches!(compositor_vendor, Self::VENDOR_INTEL | Self::VENDOR_AMD) {
+            return Err(VideoError::DecoderInit(
+                "Intel/AMD VA-API produces shared multi-plane DMABuf frames; \
+                 true multi-planar Vulkan import is not available yet"
+                    .into(),
+            ));
+        }
 
         // Automatic decoder selection matching the compositor's GPU:
         //
@@ -2219,7 +2243,7 @@ impl ZeroCopyGStreamerDecoder {
             format,
             dmabuf_info.modifier,
             is_single_fd,
-            None, // DMABuf is GPU-only, no CPU fallback needed
+            None,
             owner,
         )
     }
