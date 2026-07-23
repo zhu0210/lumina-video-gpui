@@ -4,7 +4,7 @@
 //! enabling smooth playback by decoupling decoding from rendering.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -57,19 +57,22 @@ pub struct FrameQueue {
     eos: Arc<AtomicBool>,
     /// Flag indicating the queue has been stopped (for shutdown)
     stopped: Arc<AtomicBool>,
+    /// Frames evicted to keep live playback at the newest bounded window.
+    live_frames_dropped: AtomicU64,
 }
 
 impl FrameQueue {
     /// Creates a new frame queue with the specified capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
-            frames: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
-            capacity,
+            frames: Arc::new(Mutex::new(VecDeque::with_capacity(capacity.max(1)))),
+            capacity: capacity.max(1),
             frame_available: Arc::new(Condvar::new()),
             space_available: Arc::new(Condvar::new()),
             flushing: Arc::new(AtomicBool::new(false)),
             eos: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
+            live_frames_dropped: AtomicU64::new(0),
         }
     }
 
@@ -121,6 +124,34 @@ impl FrameQueue {
         frames.push_back(frame);
         self.frame_available.notify_one();
         true
+    }
+
+    /// Pushes a live frame without blocking, evicting the oldest queued frame
+    /// when the bounded queue is full.
+    ///
+    /// Live producers must stay near the live edge; applying VOD-style
+    /// backpressure would let latency grow outside this queue.
+    pub fn push_live(&self, frame: VideoFrame) -> bool {
+        if self.flushing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let mut frames = self.frames.lock();
+        if self.flushing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        if frames.len() >= self.capacity {
+            frames.pop_front();
+            self.live_frames_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        frames.push_back(frame);
+        self.frame_available.notify_one();
+        true
+    }
+
+    /// Returns the number of oldest frames evicted by [`Self::push_live`].
+    pub fn live_frames_dropped(&self) -> u64 {
+        self.live_frames_dropped.load(Ordering::Relaxed)
     }
 
     /// Takes the next frame from the queue.
@@ -679,8 +710,9 @@ fn decode_loop<D: VideoDecoderBackend>(
             continue;
         }
 
-        // Don't decode if queue is full
-        if frame_queue.is_full() {
+        // VOD applies bounded producer backpressure. Live playback keeps
+        // decoding and lets push_live evict the oldest queued frame.
+        if !is_live && frame_queue.is_full() {
             tracing::debug!(
                 "decode_loop: QUEUE FULL branch, sleeping 5ms (queue len={})",
                 frame_queue.len()
@@ -710,7 +742,12 @@ fn decode_loop<D: VideoDecoderBackend>(
         };
 
         tracing::trace!("Decoded frame at {:?}", frame.pts);
-        if !frame_queue.push(frame) {
+        let accepted = if is_live {
+            frame_queue.push_live(frame)
+        } else {
+            frame_queue.push(frame)
+        };
+        if !accepted {
             tracing::debug!("Frame rejected by queue (flushing)");
         }
     }
@@ -2959,6 +2996,48 @@ mod tests {
 
         assert!(queue.is_empty());
         assert!(!queue.is_eos());
+    }
+
+    #[test]
+    fn live_queue_drops_oldest_frame_without_exceeding_capacity() {
+        let queue = FrameQueue::new(2);
+        assert!(queue.push_live(make_test_frame(Duration::from_millis(0))));
+        assert!(queue.push_live(make_test_frame(Duration::from_millis(33))));
+        assert!(queue.push_live(make_test_frame(Duration::from_millis(66))));
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.live_frames_dropped(), 1);
+        assert_eq!(
+            queue.pop().map(|frame| frame.pts),
+            Some(Duration::from_millis(33))
+        );
+        assert_eq!(
+            queue.pop().map(|frame| frame.pts),
+            Some(Duration::from_millis(66))
+        );
+    }
+
+    #[test]
+    fn vod_queue_applies_bounded_producer_backpressure() {
+        let queue = Arc::new(FrameQueue::new(1));
+        assert!(queue.push(make_test_frame(Duration::ZERO)));
+        let producer_queue = Arc::clone(&queue);
+        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
+        let producer = std::thread::spawn(move || {
+            let accepted = producer_queue.push(make_test_frame(Duration::from_millis(33)));
+            completed_tx.send(accepted).unwrap();
+        });
+
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_millis(30))
+                .is_err(),
+            "producer should remain blocked while the bounded VOD queue is full"
+        );
+        assert!(queue.pop().is_some());
+        assert_eq!(completed_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+        producer.join().unwrap();
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
