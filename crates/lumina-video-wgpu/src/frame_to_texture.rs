@@ -20,6 +20,7 @@ use wgpu;
 #[cfg(test)]
 use crate::video::Plane;
 use crate::video::{CpuFrame, DecodedFrame, PixelFormat};
+use crate::{GpuVideoFrame, GpuVideoFrameTextures, RealizedVideoPath};
 
 // ---------------------------------------------------------------------------
 // Write-texture guard — prevents GPU validation crashes when frame
@@ -196,6 +197,92 @@ pub fn decoded_frame_to_textures(
             } else {
                 tracing::warn!("Windows GPU surface without CPU fallback — frame dropped");
                 None
+            }
+        }
+    }
+}
+
+/// Uploads or imports a scheduled frame and preserves its timing, generation,
+/// color metadata, producer lifetime, and realized path.
+pub fn video_frame_to_gpu(
+    frame: &crate::video::VideoFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_cache: &mut Option<Arc<wgpu::Texture>>,
+    cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+    rgba_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> Option<GpuVideoFrame> {
+    let path = realized_path(&frame.frame);
+    let textures =
+        decoded_frame_to_textures(&frame.frame, device, queue, y_cache, cbcr_cache, rgba_cache)?;
+    let (textures, width, height) = match textures {
+        GpuFrameTextures::Rgba {
+            texture,
+            width,
+            height,
+        } => (GpuVideoFrameTextures::Rgba(texture), width, height),
+        GpuFrameTextures::Nv12 {
+            y_texture,
+            cb_cr_texture,
+            width,
+            height,
+        } => (
+            GpuVideoFrameTextures::Nv12 {
+                y: y_texture,
+                cb_cr: cb_cr_texture,
+            },
+            width,
+            height,
+        ),
+    };
+    Some(GpuVideoFrame {
+        textures,
+        width,
+        height,
+        timestamp: frame.pts,
+        generation: frame.generation,
+        color: frame.color,
+        path,
+        producer: frame
+            .frame
+            .is_gpu_surface()
+            .then(|| Arc::new(frame.frame.clone()) as Arc<dyn std::any::Any + Send + Sync>),
+    })
+}
+
+fn realized_path(frame: &DecodedFrame) -> RealizedVideoPath {
+    match frame {
+        DecodedFrame::Cpu(_) => RealizedVideoPath::CpuUpload,
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        DecodedFrame::MacOS(surface) => {
+            if surface.cpu_fallback.is_some() {
+                RealizedVideoPath::CpuUpload
+            } else {
+                RealizedVideoPath::ZeroCopy
+            }
+        }
+        #[cfg(target_os = "linux")]
+        DecodedFrame::Linux(surface) => {
+            if surface.cpu_fallback.is_some() {
+                RealizedVideoPath::CpuUpload
+            } else {
+                RealizedVideoPath::ZeroCopy
+            }
+        }
+        #[cfg(target_os = "android")]
+        DecodedFrame::Android(surface) => {
+            if surface.cpu_fallback.is_some() {
+                RealizedVideoPath::CpuUpload
+            } else {
+                RealizedVideoPath::Unsupported
+            }
+        }
+        #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+        DecodedFrame::Windows(surface) => {
+            if surface.cpu_fallback.is_some() {
+                RealizedVideoPath::CpuUpload
+            } else {
+                RealizedVideoPath::Unsupported
             }
         }
     }

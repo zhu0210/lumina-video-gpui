@@ -30,7 +30,8 @@ use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 #[cfg(feature = "moq")]
 use lumina_video_core::video::VideoDecoderBackend;
 use lumina_video_core::video::{VideoMetadata, VideoState};
-use lumina_video_wgpu::frame_to_texture::{self, GpuFrameTextures};
+use lumina_video_wgpu::frame_to_texture;
+use lumina_video_wgpu::{GpuVideoFrame, GpuVideoFrameTextures};
 
 #[cfg(feature = "moq")]
 use super::moq_decoder::MoqDecoder;
@@ -87,7 +88,7 @@ pub struct GpuiVideoPlayer {
     // GPU state
     gpu_context: Option<WgpuContextHandle>,
     /// Current frame as GPU textures (NV12 or RGBA variant).
-    frame_textures: Option<GpuFrameTextures>,
+    frame_textures: Option<GpuVideoFrame>,
     /// Cached textures for reuse (Y, CbCr, RGBA).
     y_cache: Option<Arc<wgpu::Texture>>,
     cbcr_cache: Option<Arc<wgpu::Texture>>,
@@ -231,6 +232,7 @@ impl GpuiVideoPlayer {
 
     pub fn seek(&mut self, position: Duration) {
         self.core.seek(position);
+        self.frame_textures = None;
     }
 
     pub fn toggle_mute(&mut self) {
@@ -359,7 +361,7 @@ impl GpuiVideoPlayer {
     // Frame textures for external rendering
     // -----------------------------------------------------------------------
 
-    pub fn current_textures(&self) -> Option<&GpuFrameTextures> {
+    pub fn current_frame(&self) -> Option<&GpuVideoFrame> {
         self.frame_textures.as_ref()
     }
 
@@ -467,6 +469,10 @@ impl GpuiVideoPlayer {
         if let Some(m) = self.core.metadata() {
             self.metadata = Some(m.clone());
         }
+
+        if matches!(self.state, VideoState::Loading | VideoState::Playing { .. }) {
+            window.request_animation_frame();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -480,23 +486,48 @@ impl GpuiVideoPlayer {
     /// - RGBA frames use a validated source with explicit alpha metadata.
     /// - No frame: black placeholder
     pub fn surface_element(&self) -> impl IntoElement {
-        if let Some(ref textures) = self.frame_textures {
-            match textures {
-                GpuFrameTextures::Nv12 {
-                    y_texture,
-                    cb_cr_texture,
-                    width,
-                    height,
-                } => {
-                    let native_size =
-                        size(DevicePixels(*width as i32), DevicePixels(*height as i32));
+        if let Some(frame) = &self.frame_textures {
+            match &frame.textures {
+                GpuVideoFrameTextures::Nv12 { y, cb_cr } => {
+                    let native_size = size(
+                        DevicePixels(frame.width as i32),
+                        DevicePixels(frame.height as i32),
+                    );
+                    let matrix = match frame.color.primaries {
+                        lumina_video_core::video::VideoColorPrimaries::Bt601 => {
+                            VideoColorMatrix::Bt601
+                        }
+                        lumina_video_core::video::VideoColorPrimaries::Bt709 => {
+                            VideoColorMatrix::Bt709
+                        }
+                        lumina_video_core::video::VideoColorPrimaries::Bt2020 => {
+                            VideoColorMatrix::Bt2020
+                        }
+                    };
+                    let transfer = match frame.color.transfer {
+                        lumina_video_core::video::VideoTransferFunction::Srgb => {
+                            VideoTransferFunction::Srgb
+                        }
+                        lumina_video_core::video::VideoTransferFunction::Bt709 => {
+                            VideoTransferFunction::Bt709
+                        }
+                        lumina_video_core::video::VideoTransferFunction::Bt2020Ten => {
+                            VideoTransferFunction::Bt2020Ten
+                        }
+                    };
+                    let range = match frame.color.range {
+                        lumina_video_core::video::VideoColorRange::Limited => {
+                            VideoColorRange::Limited
+                        }
+                        lumina_video_core::video::VideoColorRange::Full => VideoColorRange::Full,
+                    };
                     let Ok(source) = Nv12TextureSource::new(
-                        y_texture.clone(),
-                        cb_cr_texture.clone(),
+                        y.clone(),
+                        cb_cr.clone(),
                         native_size,
-                        VideoColorMatrix::Bt709,
-                        VideoTransferFunction::Bt709,
-                        VideoColorRange::Limited,
+                        matrix,
+                        transfer,
+                        range,
                     ) else {
                         return div().size_full().bg(rgb(0x000000)).into_element();
                     };
@@ -509,13 +540,11 @@ impl GpuiVideoPlayer {
                         .child(surface(source).size_full().object_fit(ObjectFit::Contain))
                         .into_element()
                 }
-                GpuFrameTextures::Rgba {
-                    texture,
-                    width,
-                    height,
-                } => {
-                    let native_size =
-                        size(DevicePixels(*width as i32), DevicePixels(*height as i32));
+                GpuVideoFrameTextures::Rgba(texture) => {
+                    let native_size = size(
+                        DevicePixels(frame.width as i32),
+                        DevicePixels(frame.height as i32),
+                    );
                     let Ok(source) = RgbaTextureSource::new(
                         texture.clone(),
                         native_size,
@@ -786,8 +815,8 @@ impl GpuiVideoPlayer {
         // consume future frames and turns held frames into needless GPU uploads.
         if let FramePollResult::NewFrame(video_frame) = self.core.poll_frame_result() {
             self.loop_seek_pending = false;
-            let textures = frame_to_texture::decoded_frame_to_textures(
-                &video_frame.frame,
+            let textures = frame_to_texture::video_frame_to_gpu(
+                &video_frame,
                 gpu.device(),
                 gpu.queue(),
                 &mut self.y_cache,
@@ -831,8 +860,8 @@ impl GpuiVideoPlayer {
             return;
         };
 
-        let textures = frame_to_texture::decoded_frame_to_textures(
-            &frame.frame,
+        let textures = frame_to_texture::video_frame_to_gpu(
+            &frame,
             gpu.device(),
             gpu.queue(),
             &mut self.y_cache,
