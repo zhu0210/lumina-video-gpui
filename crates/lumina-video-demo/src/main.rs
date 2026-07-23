@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, relative, rgb, rgba, size, App, Bounds, FontWeight, KeyDownEvent, MouseButton,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    canvas, div, px, relative, rgb, rgba, size, App, Bounds, FontWeight, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, SharedString, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 use lumina_video::GpuiVideoPlayer;
 
@@ -89,6 +90,7 @@ struct DemoApp {
     player: Option<GpuiVideoPlayer>,
     selected_sample: usize,
     status: String,
+    seek_drag_fraction: Option<f32>,
 }
 
 impl DemoApp {
@@ -97,6 +99,7 @@ impl DemoApp {
             player: None,
             selected_sample: 0,
             status: "Select a sample and press Load, or press Enter".into(),
+            seek_drag_fraction: None,
         };
         // Auto-load test video if LUMINA_TEST_VIDEO env var is set
         if let Ok(test_url) = std::env::var("LUMINA_TEST_VIDEO") {
@@ -114,6 +117,36 @@ impl DemoApp {
             .with_controls(true)
             .with_looping(false);
         self.player = Some(player);
+    }
+
+    fn seek_fraction_at(pointer_x: Pixels, bounds: Bounds<Pixels>) -> f32 {
+        if bounds.size.width <= px(0.0) {
+            return 0.0;
+        }
+        ((pointer_x - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0)
+    }
+
+    fn seek_to_fraction(&mut self, fraction: f32) {
+        let Some(player) = self.player.as_mut() else {
+            return;
+        };
+        let Some(duration) = player.duration() else {
+            return;
+        };
+        let Some(target) = Self::seek_target(duration, fraction) else {
+            return;
+        };
+        player.seek(target);
+        self.status = format!("Seek to {}", format_time(target));
+    }
+
+    fn seek_target(duration: Duration, fraction: f32) -> Option<Duration> {
+        if duration.is_zero() || !fraction.is_finite() {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            duration.as_secs_f64() * f64::from(fraction.clamp(0.0, 1.0)),
+        ))
     }
 }
 
@@ -149,7 +182,9 @@ impl Render for DemoApp {
             .as_ref()
             .map_or(Duration::ZERO, |p| p.position());
         let duration = self.player.as_ref().and_then(|p| p.duration());
-        let seek_progress = self.player.as_ref().map_or(0.0f32, |p| p.seek_progress());
+        let seek_progress = self
+            .seek_drag_fraction
+            .unwrap_or_else(|| self.player.as_ref().map_or(0.0f32, |p| p.seek_progress()));
         let buffering = self.player.as_ref().map_or(100, |p| p.buffering_percent());
 
         // Sidebar info
@@ -192,6 +227,50 @@ impl Render for DemoApp {
                 )
             },
         );
+        let seek_entity = cx.entity();
+        let seek_interaction = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let entity = seek_entity.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
+                    if event.button != MouseButton::Left || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    let fraction = DemoApp::seek_fraction_at(event.position.x, bounds);
+                    entity.update(cx, |this, cx| {
+                        this.seek_drag_fraction = Some(fraction);
+                        this.seek_to_fraction(fraction);
+                        cx.notify();
+                    });
+                });
+
+                let entity = seek_entity.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+                    let fraction = DemoApp::seek_fraction_at(event.position.x, bounds);
+                    entity.update(cx, |this, cx| {
+                        if this.seek_drag_fraction.is_some() {
+                            this.seek_drag_fraction = Some(fraction);
+                            cx.notify();
+                        }
+                    });
+                });
+
+                window.on_mouse_event(move |_: &MouseUpEvent, _, _, cx| {
+                    seek_entity.update(cx, |this, cx| {
+                        if let Some(fraction) = this.seek_drag_fraction.take() {
+                            this.seek_to_fraction(fraction);
+                            cx.notify();
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+        .cursor_pointer();
 
         div()
             .flex()
@@ -498,22 +577,40 @@ impl Render for DemoApp {
                                             .text_color(rgb(0xcccccc))
                                             .child(pos_text.clone()),
                                     )
-                                    // Seek bar (visual only)
+                                    // Click or drag to seek.
                                     .child(
-                                        div().flex_1().h(px(20.0)).flex().items_center().child(
-                                            div()
-                                                .w_full()
-                                                .h(px(4.0))
-                                                .bg(rgba(0xffffff33))
-                                                .rounded_full()
-                                                .child(
-                                                    div()
-                                                        .h_full()
-                                                        .bg(rgb(0x3b82f6))
-                                                        .rounded_full()
-                                                        .w(relative(seek_progress)),
-                                                ),
-                                        ),
+                                        div()
+                                            .flex_1()
+                                            .h(px(20.0))
+                                            .relative()
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .top(px(8.0))
+                                                    .h(px(4.0))
+                                                    .bg(rgba(0xffffff33))
+                                                    .rounded_full()
+                                                    .child(
+                                                        div()
+                                                            .h_full()
+                                                            .bg(rgb(0x3b82f6))
+                                                            .rounded_full()
+                                                            .w(relative(seek_progress)),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .absolute()
+                                                    .top(px(5.0))
+                                                    .left(relative(seek_progress))
+                                                    .ml(px(-5.0))
+                                                    .size(px(10.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(0xffffff)),
+                                            )
+                                            .child(seek_interaction),
                                     )
                                     // Duration
                                     .child(
@@ -692,5 +789,34 @@ fn format_time(d: Duration) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DemoApp;
+    use std::time::Duration;
+
+    #[test]
+    fn seek_target_clamps_to_media_bounds() {
+        let duration = Duration::from_secs(100);
+        assert_eq!(
+            DemoApp::seek_target(duration, 0.25),
+            Some(Duration::from_secs(25))
+        );
+        assert_eq!(DemoApp::seek_target(duration, -1.0), Some(Duration::ZERO));
+        assert_eq!(
+            DemoApp::seek_target(duration, 2.0),
+            Some(Duration::from_secs(100))
+        );
+    }
+
+    #[test]
+    fn seek_target_rejects_live_or_invalid_progress() {
+        assert_eq!(DemoApp::seek_target(Duration::ZERO, 0.5), None);
+        assert_eq!(
+            DemoApp::seek_target(Duration::from_secs(10), f32::NAN),
+            None
+        );
     }
 }
