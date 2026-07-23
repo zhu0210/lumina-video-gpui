@@ -209,18 +209,6 @@ impl GpuiVideoPlayer {
         self
     }
 
-    /// Sets the GPU to use for zero-copy DMABuf decoding.
-    ///
-    /// Call this before playback starts to align GStreamer's decoder GPU
-    /// with wgpu's rendering GPU. On multi-GPU systems (e.g., Intel iGPU +
-    /// NVIDIA dGPU), this ensures DMABuf memory targets the correct device.
-    ///
-    /// Pass [`GpuInfo::default()`] for auto-detection (default behavior).
-    pub fn with_gpu_info(mut self, gpu_info: lumina_video_core::video::GpuInfo) -> Self {
-        self.core.set_gpu_info(gpu_info);
-        self
-    }
-
     // -----------------------------------------------------------------------
     // Playback control
     // -----------------------------------------------------------------------
@@ -394,6 +382,17 @@ impl GpuiVideoPlayer {
                     self.gpu_context_missing_logged = true;
                 }
             } else {
+                #[cfg(target_os = "linux")]
+                if let Some(context) = &self.gpu_context {
+                    let identity = context.adapter_identity();
+                    self.core.set_gpu_info(lumina_video_core::video::GpuInfo {
+                        vendor_id: identity.vendor_id,
+                        render_node: identity
+                            .drm_render_node
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    });
+                }
                 tracing::info!("GPU context acquired successfully");
                 // Reset the flag so if the context is lost we log again.
                 self.gpu_context_missing_logged = false;

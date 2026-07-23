@@ -44,8 +44,8 @@ pub use media::{
 pub use lumina_video_core::{
     audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples, AudioState, AudioSync},
     video::{
-        CpuFrame, DecodedFrame, GpuInfo, HwAccelType, PixelFormat, Plane, VideoDecoderBackend,
-        VideoError, VideoFrame, VideoMetadata, VideoState,
+        CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
+        VideoFrame, VideoMetadata, VideoState,
     },
 };
 
