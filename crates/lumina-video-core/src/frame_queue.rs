@@ -1084,6 +1084,12 @@ const REJECT_BURST_TOLERANCE_HOLD: Duration = Duration::from_secs(2);
 const AUDIO_CLOCK_START_GRACE: Duration = Duration::from_secs(2);
 /// Minimum interval between repeated audio-clock-zero diagnostics.
 const AUDIO_ZERO_DIAG_COOLDOWN: Duration = Duration::from_secs(2);
+/// A future frame is normally held for one frame interval. Only classify the
+/// hold as a reject window after it persists long enough to indicate a stall.
+const REJECT_WINDOW_REPORT_THRESHOLD: Duration = Duration::from_millis(200);
+/// Permit the final queued frame when the audio clock stops just before its
+/// timestamp at EOS (a common one-frame tail difference).
+const EOS_LAST_FRAME_TOLERANCE: Duration = Duration::from_millis(250);
 /// Larger gaps are treated as stale and dropped.
 const STALE_GAP_THRESHOLD: Duration = Duration::from_secs(10);
 /// If repeated forced-resync attempts fail in one reject window, drop one head frame.
@@ -1169,6 +1175,8 @@ pub struct FrameScheduler {
     rejection_peak_gap: Duration,
     /// Number of force-resync attempts in the current reject window.
     forced_resyncs_in_window: u32,
+    /// Whether the current prolonged reject window has been reported.
+    reject_window_reported: bool,
     /// Last wall-clock time when a reject window started.
     last_reject_window_start: Option<std::time::Instant>,
     /// Number of rapid reject-window starts in the current burst.
@@ -1177,6 +1185,8 @@ pub struct FrameScheduler {
     burst_tolerance_until: Option<std::time::Instant>,
     /// Last time we logged detailed "audio clock still zero" diagnostics.
     last_audio_zero_diag: Option<std::time::Instant>,
+    /// One-shot guard for the wall-clock fallback transition.
+    audio_clock_fallback_reported: bool,
     /// Current reject-handling phase.
     reject_state: RejectHandlingState,
     /// Number of frames aggressively accepted while in catch-up.
@@ -1254,10 +1264,12 @@ impl FrameScheduler {
             rejection_count: 0,
             rejection_peak_gap: Duration::ZERO,
             forced_resyncs_in_window: 0,
+            reject_window_reported: false,
             last_reject_window_start: None,
             reject_burst_count: 0,
             burst_tolerance_until: None,
             last_audio_zero_diag: None,
+            audio_clock_fallback_reported: false,
             reject_state: RejectHandlingState::Normal,
             catch_up_frames_in_window: 0,
             offset_rebased_in_window: false,
@@ -1306,6 +1318,7 @@ impl FrameScheduler {
     pub fn set_audio_handle(&mut self, audio_handle: AudioHandle) {
         self.audio_handle = Some(audio_handle);
         self.last_audio_zero_diag = None;
+        self.audio_clock_fallback_reported = false;
         self.sync_metrics.set_using_audio_clock(true);
         self.use_audio_as_sync_master = true;
     }
@@ -1316,6 +1329,7 @@ impl FrameScheduler {
     pub fn set_audio_handle_metrics_only(&mut self, audio_handle: AudioHandle) {
         self.audio_handle = Some(audio_handle);
         self.last_audio_zero_diag = None;
+        self.audio_clock_fallback_reported = false;
         self.sync_metrics.set_using_audio_clock(true);
         self.use_audio_as_sync_master = false;
     }
@@ -1323,6 +1337,7 @@ impl FrameScheduler {
     /// Clears the audio handle, falling back to wall-clock for frame pacing.
     pub fn clear_audio_handle(&mut self) {
         self.audio_handle = None;
+        self.audio_clock_fallback_reported = false;
         self.sync_metrics.set_using_audio_clock(false);
         self.use_audio_as_sync_master = true; // reset to default
         self.audio_start_time = None;
@@ -1454,7 +1469,7 @@ impl FrameScheduler {
     /// - No audio handle is set
     /// - Audio is not available
     /// - Audio hasn't started yet (position == 0)
-    fn sync_position(&self) -> Duration {
+    fn sync_position(&mut self) -> Duration {
         // Get wall-clock position as baseline
         let wall_clock_pos = self.position();
 
@@ -1470,6 +1485,7 @@ impl FrameScheduler {
                 let audio_pos = audio.position_for_sync();
                 // Only use audio position if audio has actually started
                 if audio_pos > Duration::ZERO {
+                    self.audio_clock_fallback_reported = false;
                     // Once audio has started, always use it as master clock.
                     // Don't fall back to wall-clock even if audio is behind -
                     // video should slow down to match audio, not race ahead.
@@ -1489,10 +1505,13 @@ impl FrameScheduler {
                     }
                     // If we've been waiting too long (>500ms), something is wrong
                     // with audio - fall back to wall-clock to avoid stall
-                    tracing::warn!(
-                        "sync_position: audio not started after {:?}ms, falling back to wall-clock",
-                        elapsed.as_millis()
-                    );
+                    if !self.audio_clock_fallback_reported {
+                        self.audio_clock_fallback_reported = true;
+                        tracing::warn!(
+                            "Audio clock did not start within {}ms; using wall-clock fallback",
+                            elapsed.as_millis()
+                        );
+                    }
                 }
             }
         }
@@ -1934,6 +1953,7 @@ impl FrameScheduler {
         self.rejection_count = 0;
         self.rejection_peak_gap = Duration::ZERO;
         self.forced_resyncs_in_window = 0;
+        self.reject_window_reported = false;
         self.reject_state = RejectHandlingState::Normal;
         self.catch_up_frames_in_window = 0;
         self.offset_rebased_in_window = false;
@@ -2314,8 +2334,9 @@ impl FrameScheduler {
             } else {
                 ahead_tolerance.saturating_add(LIVE_ACCEPT_JITTER_TOLERANCE)
             };
-            let should_accept =
-                next_pts <= current_pos + accept_tolerance || self.current_frame.is_none();
+            let should_accept = next_pts <= current_pos + accept_tolerance
+                || self.current_frame.is_none()
+                || (queue.is_eos() && gap <= EOS_LAST_FRAME_TOLERANCE);
 
             if !should_accept {
                 let rejection_start = *self.rejection_start_time.get_or_insert(now);
@@ -2325,7 +2346,9 @@ impl FrameScheduler {
                 let lead = next_pts.saturating_sub(current_pos);
                 let audio_pos = self.audio_position();
 
-                if self.rejection_count == 1 {
+                if !self.reject_window_reported && stuck_duration >= REJECT_WINDOW_REPORT_THRESHOLD
+                {
+                    self.reject_window_reported = true;
                     self.record_reject_window_start(now);
                     tracing::warn!(
                         "get_next_frame: reject window start sync_pos={:?}, effective_pos={:?}, next_pts={:?}, gap={}ms, lead={}ms, tolerance={}ms, eff_bias={}ms, state={:?}, audio_pos={:?}, seek_gen={}",
@@ -3111,6 +3134,78 @@ mod tests {
             assert_eq!(scheduler.get_next_frame(&queue).unwrap().pts, expected);
         }
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn normal_frame_interval_hold_does_not_open_a_reject_window() {
+        let clock = FakeClock::new();
+        let mut scheduler = clock.scheduler();
+        let queue = FrameQueue::new(2);
+        scheduler.start();
+        assert!(queue.push(make_test_frame(Duration::ZERO)));
+        assert!(queue.push(make_test_frame(Duration::from_millis(33))));
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::ZERO
+        );
+
+        for _ in 0..4 {
+            clock.advance(Duration::from_millis(5));
+            assert!(scheduler.get_next_frame(&queue).is_some());
+        }
+
+        assert!(!scheduler.reject_window_reported);
+        assert_eq!(scheduler.reject_burst_count, 0);
+    }
+
+    #[test]
+    fn missing_audio_clock_reports_fallback_once_until_clock_recovers() {
+        let clock = FakeClock::new();
+        let mut scheduler = clock.scheduler();
+        let audio = AudioHandle::new();
+        audio.set_available(true);
+        audio.set_native_position(Duration::ZERO);
+        audio.enable_playback_epoch();
+        scheduler.set_audio_handle(audio.clone());
+        scheduler.playback_start_time = Some(scheduler.now());
+        scheduler.playback_start_position = Duration::ZERO;
+
+        clock.advance(Duration::from_millis(600));
+        assert_eq!(scheduler.sync_position(), Duration::from_millis(600));
+        assert!(scheduler.audio_clock_fallback_reported);
+        assert_eq!(scheduler.sync_position(), Duration::from_millis(600));
+        assert!(scheduler.audio_clock_fallback_reported);
+
+        audio.set_native_position(Duration::from_millis(650));
+        assert_eq!(scheduler.sync_position(), Duration::from_millis(650));
+        assert!(!scheduler.audio_clock_fallback_reported);
+    }
+
+    #[test]
+    fn eos_accepts_one_frame_audio_tail_without_recovery_warning() {
+        let clock = FakeClock::new();
+        let mut scheduler = clock.scheduler();
+        let audio = AudioHandle::new();
+        audio.set_available(true);
+        audio.enable_playback_epoch();
+        audio.set_native_position(Duration::from_secs(1));
+        scheduler.set_audio_handle(audio);
+        scheduler.start();
+        let queue = FrameQueue::new(2);
+        assert!(queue.push(make_test_frame(Duration::from_secs(1))));
+        assert!(queue.push(make_test_frame(Duration::from_millis(1_033))));
+
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::from_secs(1)
+        );
+        queue.set_eos();
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::from_millis(1_033)
+        );
+        assert!(queue.is_empty());
+        assert!(!scheduler.reject_window_reported);
     }
 
     #[test]
