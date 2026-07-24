@@ -110,24 +110,44 @@ pub struct CorePlayer {
 }
 
 impl CorePlayer {
+    fn platform_frame_queue(_url: &str) -> Arc<FrameQueue> {
+        // Android native frames retain ImageReader slots until their Vulkan
+        // conversion fence signals. Keep this queue within the shared
+        // maxImages budget instead of using the desktop default of five.
+        #[cfg(target_os = "android")]
+        {
+            // Java ImageReader has maxImages=8 shared across the decoder,
+            // scheduler and Vulkan conversion lifetime. A desktop-sized queue
+            // of five can exhaust it during brief reject windows or rapid
+            // source switches. GPU conversion remains triple-buffered, so a
+            // two-frame scheduler queue does not reduce rendering throughput.
+            Arc::new(FrameQueue::new(2))
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Arc::new(FrameQueue::with_default_capacity())
+        }
+    }
+
     /// Creates a new player for the given URL.
     ///
     /// The player starts in [`VideoState::Loading`]. Call [`init_decoder`] to
     /// begin async initialization, then poll with [`check_init_complete`].
     pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
         let audio_handle = AudioHandle::new();
         let scheduler = FrameScheduler::with_audio_handle(audio_handle.clone());
         Self {
             state: VideoState::Loading,
             metadata: None,
-            frame_queue: Arc::new(FrameQueue::with_default_capacity()),
+            frame_queue: Self::platform_frame_queue(&url),
             decode_thread: None,
             scheduler,
             audio_handle,
             #[cfg(target_os = "macos")]
             audio_thread: None,
             initialized: false,
-            url: url.into(),
+            url,
             init_thread: None,
             init_promise: None,
             #[cfg(target_os = "android")]
@@ -158,10 +178,11 @@ impl CorePlayer {
         url: impl Into<String>,
         decoder: Box<dyn VideoDecoderBackend + Send>,
     ) -> Self {
+        let url = url.into();
         let audio_handle = AudioHandle::new();
         let scheduler = FrameScheduler::with_audio_handle(audio_handle.clone());
         let metadata = decoder.metadata().clone();
-        let frame_queue = Arc::new(FrameQueue::with_default_capacity());
+        let frame_queue = Self::platform_frame_queue(&url);
 
         let decode_thread = DecodeThread::new(decoder, Arc::clone(&frame_queue));
 
@@ -175,7 +196,7 @@ impl CorePlayer {
             #[cfg(target_os = "macos")]
             audio_thread: None,
             initialized: true,
-            url: url.into(),
+            url,
             init_thread: None,
             init_promise: None,
             #[cfg(target_os = "android")]
@@ -236,6 +257,7 @@ impl CorePlayer {
 
         #[cfg(target_os = "linux")]
         let linux_metrics_holder = Arc::clone(&self.linux_zero_copy_metrics);
+        #[cfg(target_os = "linux")]
         let gpu_info = self.gpu_info.clone();
 
         let handle = std::thread::spawn(move || {
@@ -744,6 +766,11 @@ impl CorePlayer {
                     self.scheduler.clear_frame_rate_pacing();
                 }
             }
+        } else if metadata.duration.is_none() {
+            // HLS manifests often omit a stable frame-rate. It is still a live
+            // source and must not fall back to the strict VOD scheduler, which
+            // consumes segment bursts without presentation pacing.
+            self.scheduler.set_frame_rate_pacing(30.0);
         }
     }
 

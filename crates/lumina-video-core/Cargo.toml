@@ -28,7 +28,6 @@ tokio = { workspace = true }
 
 # Android native decoder + zero-copy
 [target.'cfg(target_os = "android")'.dependencies]
-android-activity = { version = "0.6", features = ["game-activity"] }
 ash = { version = "0.38" }
 cpal = { workspace = true }
 jni = { workspace = true }
@@ -125,6 +124,7 @@ default = []
 vendored-runtime = []
 windows-native-video = ["profiling", "rodio", "windows"]
 zero-copy = []
+android-zero-copy = ["zero-copy"]
 
 [lints.rust]
 unexpected_cfgs = {

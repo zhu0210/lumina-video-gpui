@@ -76,23 +76,32 @@ object LuminaVideo {
         if (activity is LifecycleOwner) {
             activity.lifecycle.addObserver(LifecycleEventObserver { _, event ->
                 if (event == Lifecycle.Event.ON_DESTROY) {
-                    Log.i(TAG, "Activity destroying, releasing ${activeBridges.size} bridge(s)")
-                    synchronized(activeBridges) {
-                        for (bridge in activeBridges) {
-                            bridge.release()
-                        }
-                        activeBridges.clear()
-                    }
-                    // Reset so a recreated Activity can call init() again
-                    // and register a fresh lifecycle observer
-                    appContext = null
-                    customBuilder = null
-                    initialized.set(false)
+                    shutdown()
                 }
             })
         } else {
-            Log.w(TAG, "Activity is not a LifecycleOwner, bridges won't auto-release on destroy")
+            Log.i(TAG, "Activity is not a LifecycleOwner; host must call LuminaVideo.shutdown()")
         }
+    }
+
+    /**
+     * Releases every active player and resets global bridge state.
+     *
+     * NativeActivity hosts are not LifecycleOwner instances, so they call
+     * this explicitly from Activity.onDestroy().
+     */
+    @JvmStatic
+    fun shutdown() {
+        Log.i(TAG, "Shutting down, releasing ${activeBridges.size} bridge(s)")
+        synchronized(activeBridges) {
+            for (bridge in activeBridges) {
+                bridge.release()
+            }
+            activeBridges.clear()
+        }
+        appContext = null
+        customBuilder = null
+        initialized.set(false)
     }
 
     /**

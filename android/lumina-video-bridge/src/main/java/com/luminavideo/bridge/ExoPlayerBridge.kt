@@ -33,6 +33,7 @@ import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
@@ -55,7 +56,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         private const val TAG = "ExoPlayerBridge"
 
         /** Maximum number of images to hold in the ImageReader buffer */
-        private const val MAX_IMAGES = 3
+        // Covers the displayed frame, bounded scheduler queue, and Vulkan's
+        // four-frame conversion ring without returning an in-use slot early.
+        private const val MAX_IMAGES = 8
 
         /** Timeout for ExoPlayer creation on the HandlerThread */
         private const val INIT_TIMEOUT_SECONDS = 5L
@@ -69,8 +72,11 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 nativeLibraryLoaded = true
                 Log.i(TAG, "Loaded liblumina_video_android.so")
             } catch (e: UnsatisfiedLinkError) {
-                nativeLibraryLoaded = false
-                Log.e(TAG, "Failed to load liblumina_video_android.so: ${e.message}")
+                // Embedders such as GPUI Mobile load the Rust cdylib through
+                // NativeActivity under the application's library name. JNI
+                // entry points are already resident in that case.
+                nativeLibraryLoaded = true
+                Log.i(TAG, "Using native library loaded by the host application")
             }
         }
     }
@@ -114,6 +120,97 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     // from Rust's decode thread. These volatile fields provide stale-but-safe reads.
     @Volatile private var cachedPositionMs: Long = 0L
     @Volatile private var cachedDurationMs: Long = -1L
+
+    // ImageReader timestamps use Android's monotonic clock rather than the
+    // media timeline. Their deltas are nevertheless the decoder's precise
+    // presentation cadence, so anchor those deltas to ExoPlayer position.
+    private var frameClockImageAnchorNs: Long = Long.MIN_VALUE
+    private var frameClockMediaAnchorNs: Long = 0L
+    private var lastFrameMediaTimestampNs: Long = Long.MIN_VALUE
+    private var currentSourceIsHls: Boolean = false
+    private var livePositionOffsetMs: Long = 0L
+    private var lastLivePositionMs: Long = Long.MIN_VALUE
+
+    private fun resetFrameClock() {
+        frameClockImageAnchorNs = Long.MIN_VALUE
+        frameClockMediaAnchorNs = 0L
+        lastFrameMediaTimestampNs = Long.MIN_VALUE
+    }
+
+    private fun resetLivePositionClock() {
+        livePositionOffsetMs = 0L
+        lastLivePositionMs = Long.MIN_VALUE
+    }
+
+    /**
+     * ExoPlayer reports a position relative to the current HLS live window.
+     * When that window slides at a segment boundary, the raw position can move
+     * backwards (for example 3s -> 2s). Convert it to one monotonic playback
+     * timeline shared by frame PTS, the native audio clock, and the UI.
+     */
+    private fun normalizedPositionMs(rawPositionMs: Long): Long {
+        val raw = rawPositionMs.coerceAtLeast(0L)
+        if (!currentSourceIsHls) {
+            return raw
+        }
+
+        var normalized = raw + livePositionOffsetMs
+        if (lastLivePositionMs != Long.MIN_VALUE && normalized < lastLivePositionMs) {
+            livePositionOffsetMs += lastLivePositionMs - normalized
+            normalized = lastLivePositionMs
+        }
+        lastLivePositionMs = normalized
+        return normalized
+    }
+
+    private fun mediaTimestampForImage(imageTimestampNs: Long, mediaPositionMs: Long): Long {
+        val currentMediaNs = mediaPositionMs.coerceAtLeast(0L) * 1_000_000L
+
+        // MediaCodec/ImageReader timestamps can jump at HLS segment boundaries.
+        // ExoPlayer's position is already the authoritative media/audio clock,
+        // so map live HLS frames directly onto it instead of interpreting a
+        // segment timestamp jump as a gap in the presentation timeline.
+        if (currentSourceIsHls) {
+            val mappedMediaNs = if (lastFrameMediaTimestampNs == Long.MIN_VALUE) {
+                currentMediaNs
+            } else {
+                // Multiple ImageReader callbacks may observe the same
+                // millisecond-resolution ExoPlayer position. Preserve ordering
+                // without manufacturing a visible lead over the master clock.
+                maxOf(currentMediaNs, lastFrameMediaTimestampNs + 1_000_000L)
+            }
+            lastFrameMediaTimestampNs = mappedMediaNs
+            return mappedMediaNs
+        }
+
+        if (frameClockImageAnchorNs == Long.MIN_VALUE) {
+            frameClockImageAnchorNs = imageTimestampNs
+            frameClockMediaAnchorNs = currentMediaNs
+            lastFrameMediaTimestampNs = currentMediaNs
+            return currentMediaNs
+        }
+
+        val imageDeltaNs = (imageTimestampNs - frameClockImageAnchorNs).coerceAtLeast(0L)
+        var predictedMediaNs = frameClockMediaAnchorNs + imageDeltaNs
+
+        // Pauses, seeks, decoder flushes, and surface recreation break the
+        // monotonic-to-media mapping. Re-anchor instead of allowing drift.
+        val driftNs = kotlin.math.abs(predictedMediaNs - currentMediaNs)
+        // ImageReader/MediaCodec can expose frames roughly 150-200ms ahead of
+        // ExoPlayer's audio clock. With a bounded two-frame queue that offset
+        // never drains and every frame misses the scheduler's 33ms window.
+        // Re-anchor once drift exceeds roughly one 24/30fps frame.
+        if (driftNs > 40_000_000L ||
+            predictedMediaNs < lastFrameMediaTimestampNs
+        ) {
+            frameClockImageAnchorNs = imageTimestampNs
+            frameClockMediaAnchorNs = currentMediaNs
+            predictedMediaNs = currentMediaNs
+        }
+
+        lastFrameMediaTimestampNs = predictedMediaNs
+        return predictedMediaNs
+    }
 
     /**
      * Creates ExoPlayer on a dedicated HandlerThread and sets up ImageReader.
@@ -216,9 +313,23 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 updateCachedValues()
                 if (nativeHandle != 0L) {
                     val dur = exoPlayer.duration
-                    val durationMs = if (dur == androidx.media3.common.C.TIME_UNSET) -1L else dur
+                    val durationMs =
+                        if (currentSourceIsHls || dur == androidx.media3.common.C.TIME_UNSET) {
+                            -1L
+                        } else {
+                            dur
+                        }
                     nativeOnDurationChanged(nativeHandle, durationMs)
                 }
+            }
+
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int
+            ) {
+                resetFrameClock()
+                cachedPositionMs = normalizedPositionMs(newPosition.positionMs)
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -255,10 +366,32 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 return@post
             }
             Log.d(TAG, "play($url)")
-            val mediaItem = MediaItem.fromUri(url)
-            p.setMediaItem(mediaItem)
-            p.prepare()
-            p.play()
+            try {
+                currentSourceIsHls =
+                    url.contains("/hls/", ignoreCase = true) ||
+                    url.contains(".m3u8", ignoreCase = true)
+                resetFrameClock()
+                resetLivePositionClock()
+                val mediaItem = MediaItem.Builder()
+                    .setUri(url)
+                    .apply {
+                        if (currentSourceIsHls) {
+                            setMimeType(MimeTypes.APPLICATION_M3U8)
+                        }
+                    }
+                    .build()
+                p.setMediaItem(mediaItem)
+                p.prepare()
+                p.play()
+            } catch (error: Exception) {
+                Log.e(TAG, "Failed to start playback for $url: ${error.message}", error)
+                if (nativeHandle != 0L) {
+                    nativeOnError(
+                        nativeHandle,
+                        error.message ?: "Failed to configure ExoPlayer media source"
+                    )
+                }
+            }
         } ?: Log.w(TAG, "play() called before initializeWithPlayer()")
     }
 
@@ -282,7 +415,11 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
      * @param positionMs Position in milliseconds
      */
     fun seek(positionMs: Long) {
-        handler?.post { player?.seekTo(positionMs) }
+        handler?.post {
+            resetFrameClock()
+            resetLivePositionClock()
+            player?.seekTo(positionMs)
+        }
     }
 
     /**
@@ -318,9 +455,14 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
      */
     private fun updateCachedValues() {
         player?.let { p ->
-            cachedPositionMs = p.currentPosition
+            cachedPositionMs = normalizedPositionMs(p.currentPosition)
             val dur = p.duration
-            cachedDurationMs = if (dur == androidx.media3.common.C.TIME_UNSET) -1L else dur
+            cachedDurationMs =
+                if (currentSourceIsHls || dur == androidx.media3.common.C.TIME_UNSET) {
+                    -1L
+                } else {
+                    dur
+                }
         }
     }
 
@@ -405,10 +547,12 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             return
         }
 
-        imageReader?.close()
-        imageReader = null
-        surface?.release()
-        surface = null
+        // Keep the previous BufferQueue alive until ExoPlayer/MediaCodec has
+        // completed its asynchronous setOutputSurface handoff. Closing it here
+        // first abandons the queue while the hardware decoder still owns
+        // dequeued buffers, which can release the codec before setSurface runs.
+        val previousReader = imageReader
+        val previousSurface = surface
 
         Log.i(TAG, "Setting up ImageReader: ${width}x${height}")
 
@@ -433,6 +577,14 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             videoWidth = width
             videoHeight = height
 
+            if (previousReader != null || previousSurface != null) {
+                handler?.postDelayed({
+                    previousSurface?.release()
+                    previousReader?.close()
+                    Log.d(TAG, "Retired previous ImageReader after surface handoff")
+                }, 1_000L)
+            }
+
             Log.i(TAG, "ImageReader created and attached to player")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create ImageReader: ${e.message}")
@@ -454,14 +606,27 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         } ?: return
 
         var hardwareBuffer: HardwareBuffer? = null
+        var retainedByNative = false
         try {
             hardwareBuffer = image.hardwareBuffer
             if (hardwareBuffer != null) {
                 val fenceFd = -1
+                // Image.timestamp is a CLOCK_MONOTONIC capture timestamp (effectively
+                // device uptime), not a timestamp in the media timeline. Feeding it to
+                // Lumina as a frame PTS makes the displayed position jump by hours and
+                // causes the scheduler to drop otherwise valid frames. This callback
+                // runs on ExoPlayer's application looper, so currentPosition is safe to
+                // query here and tracks the audio/media clock used for presentation.
+                val mediaPositionMs = player?.currentPosition
+                    ?.let(::normalizedPositionMs)
+                    ?: cachedPositionMs.coerceAtLeast(0L)
+                cachedPositionMs = mediaPositionMs
+                val mediaTimestampNs = mediaTimestampForImage(image.timestamp, mediaPositionMs)
 
-                nativeSubmitHardwareBuffer(
+                retainedByNative = nativeSubmitHardwareBuffer(
+                    image,
                     hardwareBuffer,
-                    image.timestamp,
+                    mediaTimestampNs,
                     image.width,
                     image.height,
                     playerId,
@@ -474,7 +639,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             Log.e(TAG, "Error processing frame: ${e.message}")
         } finally {
             hardwareBuffer?.close()
-            image.close()
+            if (!retainedByNative) {
+                image.close()
+            }
         }
     }
 
@@ -495,39 +662,68 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
 
         Log.i(TAG, "Releasing bridge (submitted ${frameCount.get()} frames, player_id=$playerId)")
 
-        // Post cleanup to the player's thread
-        handler?.post {
-            playerListener?.let { listener ->
-                player?.removeListener(listener)
-            }
-            playerListener = null
-
-            player?.setVideoSurface(null)
-            player?.release()
-            player = null
-
-            surface?.release()
-            surface = null
-
-            imageReader?.close()
-            imageReader = null
-        }
-
-        // Wait for cleanup to complete before nulling references.
-        // quitSafely() processes pending messages then terminates.
+        // ExoPlayer must be completely released on its application Looper
+        // before that Looper is asked to quit. Posting cleanup and immediately
+        // calling quitSafely raced Media3's listener notifications with a dead
+        // MessageQueue, especially during rapid source switching.
+        val playerHandler = handler
         val thread = handlerThread
-        thread?.quitSafely()
-        try {
-            thread?.join(2000) // 2s timeout to avoid blocking indefinitely
-        } catch (_: InterruptedException) {
-            Log.w(TAG, "Interrupted while waiting for HandlerThread to finish")
-        }
-        handlerThread = null
-        handler = null
+        val cleanupComplete = CountDownLatch(1)
+        val cleanup = Runnable {
+            try {
+                playerListener?.let { listener ->
+                    player?.removeListener(listener)
+                }
+                playerListener = null
 
-        if (nativeLibraryLoaded && playerId != 0L) {
-            nativeReleasePlayer(playerId)
+                // Releasing the old codec is the synchronization boundary for
+                // a source switch. The next player must not compete with it for
+                // MediaCodec/Surface resources.
+                player?.release()
+                player = null
+
+                surface?.release()
+                surface = null
+
+                imageReader?.close()
+                imageReader = null
+
+                // This runs after all earlier ImageReader callbacks on the same
+                // Looper, so no old callback can recreate the native queue.
+                if (nativeLibraryLoaded && playerId != 0L) {
+                    nativeReleasePlayer(playerId)
+                }
+            } finally {
+                cleanupComplete.countDown()
+
+                // Media3 worker threads can deliver tail events after release.
+                // Drain them without making the source-switch path join this
+                // HandlerThread.
+                playerHandler?.postDelayed({
+                    thread?.quitSafely()
+                    if (handlerThread === thread) {
+                        handlerThread = null
+                        handler = null
+                    }
+                }, 1_500L)
+            }
         }
+
+        if (playerHandler != null && thread != null) {
+            if (Thread.currentThread() === thread) {
+                cleanup.run()
+            } else if (!playerHandler.post(cleanup)) {
+                Log.w(TAG, "Player thread already stopped; releasing remaining resources directly")
+                cleanup.run()
+            } else if (!cleanupComplete.await(INIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                Log.w(TAG, "Timed out waiting for old ExoPlayer codec release")
+            }
+        } else {
+            cleanup.run()
+        }
+
+        // The codec is gone before returning, but the old Looper drains and
+        // exits asynchronously; there is deliberately no thread join here.
     }
 
     // ========================================================================
@@ -539,13 +735,14 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     private external fun nativeReleasePlayer(playerId: Long)
 
     private external fun nativeSubmitHardwareBuffer(
+        image: android.media.Image,
         buffer: HardwareBuffer,
         timestampNs: Long,
         width: Int,
         height: Int,
         playerId: Long,
         fenceFd: Int
-    )
+    ): Boolean
 
     private external fun nativeOnVideoSizeChanged(nativeHandle: Long, width: Int, height: Int)
 

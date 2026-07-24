@@ -435,6 +435,61 @@ impl DecoderSelectionPolicy {
 }
 
 impl ZeroCopyGStreamerDecoder {
+    fn is_hls_url(url: &str) -> bool {
+        let url = url.to_ascii_lowercase();
+        url.contains("/hls/") || url.contains(".m3u8")
+    }
+
+    fn uri_decode_source(url: &str, use_buffering: bool) -> Result<gst::Element, VideoError> {
+        // adaptivedemux2/hlsdemux2 requires the stream-collection-aware
+        // decodebin3 family. Legacy uridecodebin embeds decodebin2 and fails
+        // before preroll with "Element requires a streams-aware context".
+        let factory = if Self::is_hls_url(url) {
+            "uridecodebin3"
+        } else {
+            "uridecodebin"
+        };
+        gst::ElementFactory::make(factory)
+            .property("uri", url)
+            .property("use-buffering", use_buffering)
+            .build()
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create {factory}: {e}")))
+    }
+
+    fn configure_decodebin3(
+        source: &gst::Element,
+        policy: DecoderSelectionPolicy,
+        render_node: Option<&str>,
+    ) -> Result<(), VideoError> {
+        tracing::debug!(
+            ?policy,
+            "uridecodebin3 selected for HLS; decoder selection follows pipeline-local GStreamer ranks"
+        );
+        if let Some(render_node) = render_node {
+            let decodebin = source.clone().downcast::<gst::Bin>().map_err(|_| {
+                VideoError::DecoderInit("uridecodebin3 is not a GstBin".to_string())
+            })?;
+            let render_node = Arc::<str>::from(render_node);
+            decodebin.connect_deep_element_added(move |_bin, _sub_bin, element| {
+                Self::configure_element_render_node(element, &render_node);
+            });
+        }
+        Ok(())
+    }
+
+    fn configure_uri_decodebin(
+        source: &gst::Element,
+        url: &str,
+        policy: DecoderSelectionPolicy,
+        render_node: Option<&str>,
+    ) -> Result<(), VideoError> {
+        if Self::is_hls_url(url) {
+            Self::configure_decodebin3(source, policy, render_node)
+        } else {
+            Self::configure_decodebin(source, policy, render_node)
+        }
+    }
+
     /// Applies decoder and device selection to one `uridecodebin` only.
     ///
     /// This deliberately avoids changing registry ranks or process
@@ -794,19 +849,17 @@ impl ZeroCopyGStreamerDecoder {
         }
 
         let pipeline = gst::Pipeline::new();
+        pipeline.set_bin_flags(gst::BinFlags::STREAMS_AWARE);
 
         // Use uridecodebin which auto-detects container and codec
         // For local files, disable buffering (not needed, and our buffering handling has issues).
         // For HTTP streams, keep buffering enabled but we rely on the improved seek handling
         // to avoid the post-seek stall issue.
         let is_local_file = url.starts_with("file://");
-        let source = gst::ElementFactory::make("uridecodebin")
-            .property("uri", url)
-            .property("use-buffering", !is_local_file)
-            .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
-        Self::configure_decodebin(
+        let source = Self::uri_decode_source(url, !is_local_file)?;
+        Self::configure_uri_decodebin(
             &source,
+            url,
             DecoderSelectionPolicy::PreferVaApi,
             render_node.as_deref(),
         )?;
@@ -943,14 +996,11 @@ impl ZeroCopyGStreamerDecoder {
     /// Creates a CPU copy fallback pipeline.
     fn cpu_copy_pipeline(url: &str) -> Result<Self, VideoError> {
         let pipeline = gst::Pipeline::new();
+        pipeline.set_bin_flags(gst::BinFlags::STREAMS_AWARE);
 
         let is_local_file = url.starts_with("file://");
-        let source = gst::ElementFactory::make("uridecodebin")
-            .property("uri", url)
-            .property("use-buffering", !is_local_file)
-            .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
-        Self::configure_decodebin(&source, DecoderSelectionPolicy::SoftwareOnly, None)?;
+        let source = Self::uri_decode_source(url, !is_local_file)?;
+        Self::configure_uri_decodebin(&source, url, DecoderSelectionPolicy::SoftwareOnly, None)?;
 
         // Add queue2 between uridecodebin and videoconvert to prevent buffer starvation
         let video_queue = gst::ElementFactory::make("queue2")
@@ -1107,16 +1157,14 @@ impl ZeroCopyGStreamerDecoder {
     /// This tests whether vapostproc is the cause of seek issues on HTTP streams.
     fn direct_dmabuf_pipeline(url: &str) -> Result<Self, VideoError> {
         let pipeline = gst::Pipeline::new();
+        pipeline.set_bin_flags(gst::BinFlags::STREAMS_AWARE);
 
         let is_local_file = url.starts_with("file://");
-        let source = gst::ElementFactory::make("uridecodebin")
-            .property("uri", url)
-            .property("use-buffering", !is_local_file)
-            .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+        let source = Self::uri_decode_source(url, !is_local_file)?;
         let render_node = Self::compositor_render_node();
-        Self::configure_decodebin(
+        Self::configure_uri_decodebin(
             &source,
+            url,
             DecoderSelectionPolicy::PreferVaApi,
             render_node.as_deref(),
         )?;
@@ -1231,14 +1279,16 @@ impl ZeroCopyGStreamerDecoder {
     /// the NVIDIA GPU selection with the wgpu rendering device.
     fn nvidia_dmabuf_pipeline(url: &str, render_node: Option<&str>) -> Result<Self, VideoError> {
         let pipeline = gst::Pipeline::new();
+        pipeline.set_bin_flags(gst::BinFlags::STREAMS_AWARE);
 
         let is_local_file = url.starts_with("file://");
-        let source = gst::ElementFactory::make("uridecodebin")
-            .property("uri", url)
-            .property("use-buffering", !is_local_file)
-            .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
-        Self::configure_decodebin(&source, DecoderSelectionPolicy::PreferNvidia, render_node)?;
+        let source = Self::uri_decode_source(url, !is_local_file)?;
+        Self::configure_uri_decodebin(
+            &source,
+            url,
+            DecoderSelectionPolicy::PreferNvidia,
+            render_node,
+        )?;
 
         tracing::info!(
             "NVIDIA DMABuf pipeline: use-buffering={}, is_local_file={}",

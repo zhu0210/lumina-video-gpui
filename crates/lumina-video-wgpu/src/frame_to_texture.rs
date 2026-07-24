@@ -183,8 +183,17 @@ pub fn decoded_frame_to_textures(
                     cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
                 ))
             } else {
-                tracing::warn!("Android GPU surface without CPU fallback — frame dropped");
-                None
+                match import_android_hardware_buffer(surface, device) {
+                    Ok(texture) => Some(GpuFrameTextures::Rgba {
+                        texture: Arc::new(texture),
+                        width: surface.width,
+                        height: surface.height,
+                    }),
+                    Err(error) => {
+                        tracing::warn!("Android AHardwareBuffer import failed: {error}");
+                        None
+                    }
+                }
             }
         }
 
@@ -256,10 +265,22 @@ pub fn video_frame_to_gpu(
         generation: frame.generation,
         color: frame.color,
         path,
-        producer: frame
-            .frame
-            .is_gpu_surface()
-            .then(|| Arc::new(frame.frame.clone()) as Arc<dyn std::any::Any + Send + Sync>),
+        producer: match &frame.frame {
+            #[cfg(target_os = "android")]
+            DecodedFrame::Android(surface)
+                if crate::android_video::is_yuv_candidate_hardware_buffer_format(
+                    surface.hardware_buffer_format,
+                ) =>
+            {
+                // The conversion fence owns the source Image/AHardwareBuffer.
+                // The returned RGBA texture no longer references that source.
+                None
+            }
+            _ if frame.frame.is_gpu_surface() => {
+                Some(Arc::new(frame.frame.clone()) as Arc<dyn std::any::Any + Send + Sync>)
+            }
+            _ => None,
+        },
     })
 }
 
@@ -287,7 +308,7 @@ fn realized_path(frame: &DecodedFrame) -> RealizedVideoPath {
             if surface.cpu_fallback.is_some() {
                 RealizedVideoPath::CpuUpload
             } else {
-                RealizedVideoPath::Unsupported
+                RealizedVideoPath::ZeroCopy
             }
         }
         #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
@@ -297,6 +318,36 @@ fn realized_path(frame: &DecodedFrame) -> RealizedVideoPath {
             } else {
                 RealizedVideoPath::Unsupported
             }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn import_android_hardware_buffer(
+    surface: &crate::video::AndroidGpuSurface,
+    device: &wgpu::Device,
+) -> Result<wgpu::Texture, crate::zero_copy::ZeroCopyError> {
+    unsafe {
+        if crate::android_video::is_yuv_candidate_hardware_buffer_format(
+            surface.hardware_buffer_format,
+        ) {
+            crate::zero_copy::android::import_ahardwarebuffer_yuv_zero_copy(
+                device,
+                surface.ahardware_buffer,
+                surface.width,
+                surface.height,
+                None,
+                surface.fence_fd,
+                surface.producer_owner(),
+            )
+        } else {
+            crate::zero_copy::android::import_ahardwarebuffer(
+                device,
+                surface.ahardware_buffer,
+                surface.width,
+                surface.height,
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
         }
     }
 }

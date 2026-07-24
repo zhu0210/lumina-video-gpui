@@ -1622,6 +1622,7 @@ pub mod linux {
 pub mod android {
     use super::ZeroCopyError;
     use ash::vk::{self, Handle};
+    use std::collections::VecDeque;
     use std::ffi::CStr;
     use tracing::{debug, info, warn};
 
@@ -1765,313 +1766,297 @@ pub mod android {
             ));
         }
 
-        // Access the Vulkan HAL device and create the texture
-        let hal_texture_result = device
-            .as_hal::<wgpu::hal::api::Vulkan, _, Result<wgpu::hal::vulkan::Texture, ZeroCopyError>>(
-                |hal_device| {
-                    let Some(hal_device) = hal_device else {
-                        warn!("Failed to get Vulkan HAL device");
-                        return Err(ZeroCopyError::HalAccessFailed(
-                            "wgpu not using Vulkan backend".to_string(),
-                        ));
-                    };
+        // wgpu 30 exposes the backend device through a lifetime guard.
+        let hal_device = device.as_hal::<wgpu::hal::api::Vulkan>().ok_or_else(|| {
+            warn!("Failed to get Vulkan HAL device");
+            ZeroCopyError::HalAccessFailed("wgpu not using Vulkan backend".to_string())
+        })?;
 
-                    // Check for required extension
-                    let enabled_extensions = hal_device.enabled_device_extensions();
-                    let has_ahb_extension = enabled_extensions
-                        .contains(&VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
+        // Check for required extension
+        let enabled_extensions = hal_device.enabled_device_extensions();
+        let has_ahb_extension = enabled_extensions
+            .contains(&VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
 
-                    if !has_ahb_extension {
-                        warn!("VK_ANDROID_external_memory_android_hardware_buffer not available");
-                        return Err(ZeroCopyError::NotAvailable(
-                            "VK_ANDROID_external_memory_android_hardware_buffer extension not enabled".to_string(),
-                        ));
-                    }
+        if !has_ahb_extension {
+            warn!("VK_ANDROID_external_memory_android_hardware_buffer not available");
+            return Err(ZeroCopyError::NotAvailable(
+                "VK_ANDROID_external_memory_android_hardware_buffer extension not enabled"
+                    .to_string(),
+            ));
+        }
 
-                    let raw_device = hal_device.raw_device();
-                    let instance = hal_device.shared_instance();
-                    let raw_instance = instance.raw_instance();
-                    let physical_device = hal_device.raw_physical_device();
-                    let vk_queue = hal_device.raw_queue();
-                    let queue_family_index = hal_device.queue_family_index();
+        let raw_device = hal_device.raw_device();
+        let instance = hal_device.shared_instance();
+        let raw_instance = instance.raw_instance();
+        let physical_device = hal_device.raw_physical_device();
+        let vk_queue = hal_device.raw_queue();
+        let queue_family_index = hal_device.queue_family_index();
 
-                    debug!(
-                        "Creating Vulkan image from AHardwareBuffer ({}x{} {:?})",
-                        width, height, format
-                    );
+        debug!(
+            "Creating Vulkan image from AHardwareBuffer ({}x{} {:?})",
+            width, height, format
+        );
 
-                    // Step 1: Get AHardwareBuffer format properties
-                    // Query VkAndroidHardwareBufferFormatPropertiesANDROID and extract all needed
-                    // values. The push_next pattern creates a mutable borrow chain, so we must
-                    // scope ahb_props to drop it before accessing ahb_format_props fields.
-                    let mut ahb_format_props = vk::AndroidHardwareBufferFormatPropertiesANDROID::default();
-                    let (ahb_allocation_size, ahb_memory_type_bits) = {
-                        let mut ahb_props = vk::AndroidHardwareBufferPropertiesANDROID::default()
-                            .push_next(&mut ahb_format_props);
+        // Step 1: Get AHardwareBuffer format properties
+        // Query VkAndroidHardwareBufferFormatPropertiesANDROID and extract all needed
+        // values. The push_next pattern creates a mutable borrow chain, so we must
+        // scope ahb_props to drop it before accessing ahb_format_props fields.
+        let mut ahb_format_props = vk::AndroidHardwareBufferFormatPropertiesANDROID::default();
+        let (ahb_allocation_size, ahb_memory_type_bits) = {
+            let mut ahb_props = vk::AndroidHardwareBufferPropertiesANDROID::default()
+                .push_next(&mut ahb_format_props);
 
-                        // Get the AHardwareBuffer properties using the extension function
-                        // We need to load the extension function manually since ash doesn't
-                        // have a convenient wrapper for this extension
-                        type GetAndroidHardwareBufferPropertiesFn = unsafe extern "system" fn(
-                            device: vk::Device,
-                            buffer: *const std::ffi::c_void,
-                            properties: *mut vk::AndroidHardwareBufferPropertiesANDROID,
-                        ) -> vk::Result;
+            // Get the AHardwareBuffer properties using the extension function
+            // We need to load the extension function manually since ash doesn't
+            // have a convenient wrapper for this extension
+            type GetAndroidHardwareBufferPropertiesFn = unsafe extern "system" fn(
+                device: vk::Device,
+                buffer: *const std::ffi::c_void,
+                properties: *mut vk::AndroidHardwareBufferPropertiesANDROID,
+            )
+                -> vk::Result;
 
-                        let get_ahb_props_fn: GetAndroidHardwareBufferPropertiesFn = {
-                            let fn_name = CStr::from_bytes_with_nul_unchecked(
-                                b"vkGetAndroidHardwareBufferPropertiesANDROID\0"
-                            );
-                            let fn_ptr = raw_instance
-                                .get_device_proc_addr(raw_device.handle(), fn_name.as_ptr());
-                            if fn_ptr.is_none() {
-                                return Err(ZeroCopyError::HalAccessFailed(
-                                    "vkGetAndroidHardwareBufferPropertiesANDROID not found"
-                                        .to_string(),
-                                ));
-                            }
-                            // SAFETY: fn_ptr is verified non-null above. The function pointer
-                            // is obtained from vkGetDeviceProcAddr for a valid extension function
-                            // name, and we transmute it to a matching function signature as
-                            // defined by the Vulkan spec for VK_ANDROID_external_memory_android_hardware_buffer.
-                            std::mem::transmute(fn_ptr)
-                        };
+            let get_ahb_props_fn: GetAndroidHardwareBufferPropertiesFn = {
+                let fn_name = CStr::from_bytes_with_nul_unchecked(
+                    b"vkGetAndroidHardwareBufferPropertiesANDROID\0",
+                );
+                let fn_ptr =
+                    raw_instance.get_device_proc_addr(raw_device.handle(), fn_name.as_ptr());
+                if fn_ptr.is_none() {
+                    return Err(ZeroCopyError::HalAccessFailed(
+                        "vkGetAndroidHardwareBufferPropertiesANDROID not found".to_string(),
+                    ));
+                }
+                // SAFETY: fn_ptr is verified non-null above. The function pointer
+                // is obtained from vkGetDeviceProcAddr for a valid extension function
+                // name, and we transmute it to a matching function signature as
+                // defined by the Vulkan spec for VK_ANDROID_external_memory_android_hardware_buffer.
+                std::mem::transmute(fn_ptr)
+            };
 
-                        let result = get_ahb_props_fn(
-                            raw_device.handle(),
-                            ahardware_buffer,
-                            &mut ahb_props,
-                        );
+            let result = get_ahb_props_fn(raw_device.handle(), ahardware_buffer, &mut ahb_props);
 
-                        if result != vk::Result::SUCCESS {
-                            warn!("vkGetAndroidHardwareBufferPropertiesANDROID failed: {:?}", result);
-                            return Err(ZeroCopyError::InvalidResource(
-                                format!("Failed to get AHardwareBuffer properties: {:?}", result),
-                            ));
-                        }
+            if result != vk::Result::SUCCESS {
+                warn!(
+                    "vkGetAndroidHardwareBufferPropertiesANDROID failed: {:?}",
+                    result
+                );
+                return Err(ZeroCopyError::InvalidResource(format!(
+                    "Failed to get AHardwareBuffer properties: {:?}",
+                    result
+                )));
+            }
 
-                        // Extract ahb_props values before it drops (releasing borrow on ahb_format_props)
-                        (ahb_props.allocation_size, ahb_props.memory_type_bits)
-                    };
-                    // Now ahb_props is dropped, we can access ahb_format_props
-                    let ahb_format = ahb_format_props.format;
-                    let ahb_external_format = ahb_format_props.external_format;
+            // Extract ahb_props values before it drops (releasing borrow on ahb_format_props)
+            (ahb_props.allocation_size, ahb_props.memory_type_bits)
+        };
+        // Now ahb_props is dropped, we can access ahb_format_props
+        let ahb_format = ahb_format_props.format;
+        let ahb_external_format = ahb_format_props.external_format;
 
-                    debug!(
-                        "AHardwareBuffer properties: size={}, memory_type_bits={:#x}, format={:?}",
-                        ahb_allocation_size,
-                        ahb_memory_type_bits,
-                        ahb_format
-                    );
+        debug!(
+            "AHardwareBuffer properties: size={}, memory_type_bits={:#x}, format={:?}",
+            ahb_allocation_size, ahb_memory_type_bits, ahb_format
+        );
 
-                    // Check for YCbCr/YUV formats that require VkSamplerYcbcrConversion.
-                    // These formats are common from Android camera/video sources but require
-                    // additional Vulkan setup that is not yet implemented:
-                    // - VkSamplerYcbcrConversion object
-                    // - VkSamplerYcbcrConversionInfo in image view and sampler creation
-                    // - Immutable samplers in descriptor set layout
-                    // Reject them explicitly with a clear error until this is implemented.
-                    if is_ycbcr_format(ahb_format) {
-                        warn!(
-                            "AHardwareBuffer has YCbCr/YUV format {:?} which is not supported",
-                            ahb_format
-                        );
-                        return Err(ZeroCopyError::InvalidResource(
-                            "YCbCr/YUV formats require VkSamplerYcbcrConversion which is not yet implemented".to_string(),
-                        ));
-                    }
+        // Check for YCbCr/YUV formats that require VkSamplerYcbcrConversion.
+        // These formats are common from Android camera/video sources but require
+        // additional Vulkan setup that is not yet implemented:
+        // - VkSamplerYcbcrConversion object
+        // - VkSamplerYcbcrConversionInfo in image view and sampler creation
+        // - Immutable samplers in descriptor set layout
+        // Reject them explicitly with a clear error until this is implemented.
+        if is_ycbcr_format(ahb_format) {
+            warn!(
+                "AHardwareBuffer has YCbCr/YUV format {:?} which is not supported",
+                ahb_format
+            );
+            return Err(ZeroCopyError::InvalidResource(
+                "YCbCr/YUV formats require VkSamplerYcbcrConversion which is not yet implemented"
+                    .to_string(),
+            ));
+        }
 
-                    // Step 2: Create VkImage with external memory info
-                    let vk_format = wgpu_format_to_vulkan(format)?;
+        // Step 2: Create VkImage with external memory info
+        let vk_format = wgpu_format_to_vulkan(format)?;
 
-                    // Check for external-format AHardwareBuffers.
-                    // When format == VK_FORMAT_UNDEFINED but external_format != 0, the buffer
-                    // uses an implementation-specific format that requires VkExternalFormatANDROID
-                    // and VkSamplerYcbcrConversion. This path is complex and not yet supported.
-                    if ahb_format == vk::Format::UNDEFINED && ahb_external_format != 0 {
-                        warn!(
+        // Check for external-format AHardwareBuffers.
+        // When format == VK_FORMAT_UNDEFINED but external_format != 0, the buffer
+        // uses an implementation-specific format that requires VkExternalFormatANDROID
+        // and VkSamplerYcbcrConversion. This path is complex and not yet supported.
+        if ahb_format == vk::Format::UNDEFINED && ahb_external_format != 0 {
+            warn!(
                             "AHardwareBuffer has external format {:#x} which requires VkExternalFormatANDROID (not supported)",
                             ahb_external_format
                         );
-                        return Err(ZeroCopyError::NotAvailable(
+            return Err(ZeroCopyError::NotAvailable(
                             "External-format AHardwareBuffers are not supported in RGBA import; use import_ahardwarebuffer_yuv_zero_copy".to_string(),
                         ));
-                    }
+        }
 
-                    // Validate AHardwareBuffer format matches expected format
-                    if ahb_format != vk::Format::UNDEFINED && ahb_format != vk_format {
-                        warn!(
+        // Validate AHardwareBuffer format matches expected format
+        if ahb_format != vk::Format::UNDEFINED && ahb_format != vk_format {
+            warn!(
                             "AHardwareBuffer format {:?} doesn't match expected wgpu format {:?} (Vulkan: {:?})",
                             ahb_format, format, vk_format
                         );
-                        return Err(ZeroCopyError::FormatMismatch(format!(
-                            "AHardwareBuffer has format {:?} but expected {:?}",
-                            ahb_format, vk_format
-                        )));
-                    }
+            return Err(ZeroCopyError::FormatMismatch(format!(
+                "AHardwareBuffer has format {:?} but expected {:?}",
+                ahb_format, vk_format
+            )));
+        }
 
-                    // Specify that this image will use external Android hardware buffer memory
-                    let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
-                        .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
+        // Specify that this image will use external Android hardware buffer memory
+        let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
 
-                    // Use the format from AHardwareBuffer if it's valid, otherwise use converted format
-                    let image_format = if ahb_format != vk::Format::UNDEFINED {
-                        debug!(
-                            "Using AHardwareBuffer's native format {:?} (requested: {:?})",
-                            ahb_format, vk_format
-                        );
-                        ahb_format
-                    } else {
-                        debug!(
-                            "AHardwareBuffer format is UNDEFINED, using converted format {:?}",
-                            vk_format
-                        );
-                        vk_format
-                    };
-
-                    let image_create_info = vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(image_format)
-                        .extent(vk::Extent3D {
-                            width,
-                            height,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .initial_layout(vk::ImageLayout::UNDEFINED)
-                        .push_next(&mut external_memory_info);
-
-                    let vk_image = raw_device.create_image(&image_create_info, None)
-                        .map_err(|e| {
-                            warn!("Failed to create VkImage: {:?}", e);
-                            ZeroCopyError::TextureCreationFailed(
-                                format!("Vulkan image creation failed: {:?}", e),
-                            )
-                        })?;
-
-                    // Step 3: Allocate and bind memory from AHardwareBuffer
-                    // VkImportAndroidHardwareBufferInfoANDROID
-                    let mut import_ahb_info = vk::ImportAndroidHardwareBufferInfoANDROID::default()
-                        .buffer(ahardware_buffer);
-
-                    // Find suitable memory type
-                    let mem_properties = raw_instance
-                        .get_physical_device_memory_properties(physical_device);
-
-                    let memory_type_index = find_memory_type_index(
-                        ahb_memory_type_bits,
-                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                        &mem_properties,
-                    ).ok_or_else(|| {
-                        raw_device.destroy_image(vk_image, None);
-                        ZeroCopyError::TextureCreationFailed(
-                            "No suitable memory type found for AHardwareBuffer".to_string(),
-                        )
-                    })?;
-
-                    // VkMemoryDedicatedAllocateInfo - required for AHardwareBuffer
-                    let mut dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default()
-                        .image(vk_image);
-
-                    let memory_allocate_info = vk::MemoryAllocateInfo::default()
-                        .allocation_size(ahb_allocation_size)
-                        .memory_type_index(memory_type_index)
-                        .push_next(&mut import_ahb_info)
-                        .push_next(&mut dedicated_alloc_info);
-
-                    let vk_memory = raw_device.allocate_memory(&memory_allocate_info, None)
-                        .map_err(|e| {
-                            raw_device.destroy_image(vk_image, None);
-                            warn!("Failed to allocate memory from AHardwareBuffer: {:?}", e);
-                            ZeroCopyError::TextureCreationFailed(
-                                format!("Memory allocation failed: {:?}", e),
-                            )
-                        })?;
-
-                    // Bind memory to image
-                    raw_device.bind_image_memory(vk_image, vk_memory, 0)
-                        .map_err(|e| {
-                            raw_device.free_memory(vk_memory, None);
-                            raw_device.destroy_image(vk_image, None);
-                            warn!("Failed to bind image memory: {:?}", e);
-                            ZeroCopyError::TextureCreationFailed(
-                                format!("Memory binding failed: {:?}", e),
-                            )
-                        })?;
-
-                    info!(
-                        "Created Vulkan image from AHardwareBuffer: {}x{} {:?}",
-                        width, height, format
-                    );
-
-                    // Step 4: Transition image layout and acquire queue ownership
-                    // External memory requires explicit layout transition from UNDEFINED
-                    // to SHADER_READ_ONLY_OPTIMAL and queue family ownership transfer
-                    // from VK_QUEUE_FAMILY_EXTERNAL to our graphics queue family.
-                    transition_image_layout_external(
-                        raw_device,
-                        vk_queue,
-                        queue_family_index,
-                        vk_image,
-                    )
-                    .map_err(|e| {
-                        raw_device.free_memory(vk_memory, None);
-                        raw_device.destroy_image(vk_image, None);
-                        e
-                    })?;
-
-                    // Step 5: Create wgpu-hal Texture descriptor
-                    let texture_desc = wgpu::hal::TextureDescriptor {
-                        label: Some("zero-copy AHardwareBuffer texture"),
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        usage: wgpu::TextureUses::RESOURCE,
-                        memory_flags: wgpu::hal::MemoryFlags::empty(),
-                        view_formats: vec![],
-                    };
-
-                    // Create a drop callback to free imported Vulkan resources when
-                    // the texture is destroyed. Clone the device handle for the callback.
-                    let device_clone = raw_device.clone();
-                    let drop_callback = Box::new(move || {
-                        debug!("Freeing imported AHardwareBuffer Vulkan resources");
-                        // SAFETY: vk_image and vk_memory were allocated by us and are valid
-                        // until this callback is invoked when the texture is dropped.
-                        // The AHardwareBuffer itself remains valid (caller's responsibility).
-                        // destroy_image must be called before free_memory.
-                        unsafe {
-                            device_clone.destroy_image(vk_image, None);
-                            device_clone.free_memory(vk_memory, None);
-                        }
-                    });
-
-                    // drop_callback is called when wgpu is done with the texture,
-                    // allowing us to free the externally managed VkDeviceMemory
-                    let hal_texture = hal_device.texture_from_raw(
-                        vk_image,
-                        &texture_desc,
-                        Some(drop_callback),
-                        wgpu::hal::vulkan::TextureMemory::External,
-                    );
-
-                    Ok(hal_texture)
-                },
+        // Use the format from AHardwareBuffer if it's valid, otherwise use converted format
+        let image_format = if ahb_format != vk::Format::UNDEFINED {
+            debug!(
+                "Using AHardwareBuffer's native format {:?} (requested: {:?})",
+                ahb_format, vk_format
             );
+            ahb_format
+        } else {
+            debug!(
+                "AHardwareBuffer format is UNDEFINED, using converted format {:?}",
+                vk_format
+            );
+            vk_format
+        };
 
-        // Get the HAL texture from the closure result
-        let hal_texture = hal_texture_result?;
+        let image_create_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(image_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_memory_info);
+
+        let vk_image = raw_device
+            .create_image(&image_create_info, None)
+            .map_err(|e| {
+                warn!("Failed to create VkImage: {:?}", e);
+                ZeroCopyError::TextureCreationFailed(format!(
+                    "Vulkan image creation failed: {:?}",
+                    e
+                ))
+            })?;
+
+        // Step 3: Allocate and bind memory from AHardwareBuffer
+        // VkImportAndroidHardwareBufferInfoANDROID
+        let mut import_ahb_info =
+            vk::ImportAndroidHardwareBufferInfoANDROID::default().buffer(ahardware_buffer);
+
+        // Find suitable memory type
+        let mem_properties = raw_instance.get_physical_device_memory_properties(physical_device);
+
+        let memory_type_index = find_memory_type_index(
+            ahb_memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            &mem_properties,
+        )
+        .ok_or_else(|| {
+            raw_device.destroy_image(vk_image, None);
+            ZeroCopyError::TextureCreationFailed(
+                "No suitable memory type found for AHardwareBuffer".to_string(),
+            )
+        })?;
+
+        // VkMemoryDedicatedAllocateInfo - required for AHardwareBuffer
+        let mut dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(vk_image);
+
+        let memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(ahb_allocation_size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_ahb_info)
+            .push_next(&mut dedicated_alloc_info);
+
+        let vk_memory = raw_device
+            .allocate_memory(&memory_allocate_info, None)
+            .map_err(|e| {
+                raw_device.destroy_image(vk_image, None);
+                warn!("Failed to allocate memory from AHardwareBuffer: {:?}", e);
+                ZeroCopyError::TextureCreationFailed(format!("Memory allocation failed: {:?}", e))
+            })?;
+
+        // Bind memory to image
+        raw_device
+            .bind_image_memory(vk_image, vk_memory, 0)
+            .map_err(|e| {
+                raw_device.free_memory(vk_memory, None);
+                raw_device.destroy_image(vk_image, None);
+                warn!("Failed to bind image memory: {:?}", e);
+                ZeroCopyError::TextureCreationFailed(format!("Memory binding failed: {:?}", e))
+            })?;
+
+        info!(
+            "Created Vulkan image from AHardwareBuffer: {}x{} {:?}",
+            width, height, format
+        );
+
+        // Step 4: Transition image layout and acquire queue ownership
+        // External memory requires explicit layout transition from UNDEFINED
+        // to SHADER_READ_ONLY_OPTIMAL and queue family ownership transfer
+        // from VK_QUEUE_FAMILY_EXTERNAL to our graphics queue family.
+        transition_image_layout_external(raw_device, vk_queue, queue_family_index, vk_image)
+            .map_err(|e| {
+                raw_device.free_memory(vk_memory, None);
+                raw_device.destroy_image(vk_image, None);
+                e
+            })?;
+
+        // Step 5: Create wgpu-hal Texture descriptor
+        let texture_desc = wgpu::hal::TextureDescriptor {
+            label: Some("zero-copy AHardwareBuffer texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+
+        // Create a drop callback to free imported Vulkan resources when
+        // the texture is destroyed. Clone the device handle for the callback.
+        let device_clone = raw_device.clone();
+        let drop_callback = Box::new(move || {
+            debug!("Freeing imported AHardwareBuffer Vulkan resources");
+            // SAFETY: vk_image and vk_memory were allocated by us and are valid
+            // until this callback is invoked when the texture is dropped.
+            // The AHardwareBuffer itself remains valid (caller's responsibility).
+            // destroy_image must be called before free_memory.
+            unsafe {
+                device_clone.destroy_image(vk_image, None);
+                device_clone.free_memory(vk_memory, None);
+            }
+        });
+
+        // drop_callback is called when wgpu is done with the texture,
+        // allowing us to free the externally managed VkDeviceMemory
+        let hal_texture = hal_device.texture_from_raw(
+            vk_image,
+            &texture_desc,
+            Some(drop_callback),
+            wgpu::hal::vulkan::TextureMemory::External,
+        );
+
+        let hal_texture = hal_texture;
 
         // Create wgpu texture descriptor
         let texture_desc = wgpu::TextureDescriptor {
@@ -2171,6 +2156,7 @@ pub mod android {
         height: u32,
         color_space: Option<YuvColorSpace>,
         fence_fd: i32,
+        producer_owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<wgpu::Texture, ZeroCopyError> {
         if ahardware_buffer.is_null() {
             return Err(ZeroCopyError::InvalidResource(
@@ -2178,78 +2164,77 @@ pub mod android {
             ));
         }
 
-        // Access Vulkan HAL device
-        let result = device
-            .as_hal::<wgpu::hal::api::Vulkan, _, Result<wgpu::Texture, ZeroCopyError>>(
-                |hal_device| {
-                    let Some(hal_device) = hal_device else {
-                        warn!("Failed to get Vulkan HAL device");
-                        return Err(ZeroCopyError::HalAccessFailed(
-                            "wgpu not using Vulkan backend".to_string(),
-                        ));
-                    };
+        let hal_device = device.as_hal::<wgpu::hal::api::Vulkan>().ok_or_else(|| {
+            warn!("Failed to get Vulkan HAL device");
+            ZeroCopyError::HalAccessFailed("wgpu not using Vulkan backend".to_string())
+        })?;
 
-                    let raw_device = hal_device.raw_device();
-                    let instance = hal_device.shared_instance();
-                    let raw_instance = instance.raw_instance();
-                    let physical_device = hal_device.raw_physical_device();
-                    let vk_queue = hal_device.raw_queue();
-                    let queue_family_index = hal_device.queue_family_index();
+        let raw_device = hal_device.raw_device();
+        let instance = hal_device.shared_instance();
+        let raw_instance = instance.raw_instance();
+        let physical_device = hal_device.raw_physical_device();
+        let vk_queue = hal_device.raw_queue();
+        let queue_family_index = hal_device.queue_family_index();
 
-                    // Get or create the YUV pipeline (cached per thread, keyed by device)
-                    let current_device_handle = raw_device.handle().as_raw();
-                    YUV_PIPELINE_CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
+        // Get or create the YUV pipeline (cached per thread, keyed by device)
+        let current_device_handle = raw_device.handle().as_raw();
+        YUV_PIPELINE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
 
-                        // Check if cached pipeline is for a different device (stale)
-                        if let Some((cached_handle, _)) = cache.as_ref() {
-                            if *cached_handle != current_device_handle {
-                                debug!(
-                                    "Device changed (0x{:x} -> 0x{:x}), clearing stale pipeline cache",
-                                    cached_handle, current_device_handle
-                                );
-                                *cache = None;
-                            }
-                        }
+            // Check if cached pipeline is for a different device (stale)
+            if let Some((cached_handle, _)) = cache.as_ref() {
+                if *cached_handle != current_device_handle {
+                    debug!(
+                        "Device changed (0x{:x} -> 0x{:x}), clearing stale pipeline cache",
+                        cached_handle, current_device_handle
+                    );
+                    *cache = None;
+                }
+            }
 
-                        // Create pipeline if not cached or was cleared
-                        if cache.is_none() {
-                            debug!("Creating VulkanYuvPipeline for device 0x{:x}", current_device_handle);
-                            match VulkanYuvPipeline::new(raw_device.clone(), raw_instance, physical_device, queue_family_index) {
-                                Ok(pipeline) => {
-                                    *cache = Some((current_device_handle, pipeline));
-                                }
-                                Err(e) => {
-                                    warn!("Failed to create VulkanYuvPipeline: {:?}", e);
-                                    return Err(e);
-                                }
-                            }
-                        }
+            // Create pipeline if not cached or was cleared
+            if cache.is_none() {
+                debug!(
+                    "Creating VulkanYuvPipeline for device 0x{:x}",
+                    current_device_handle
+                );
+                match VulkanYuvPipeline::new(
+                    raw_device.clone(),
+                    raw_instance,
+                    physical_device,
+                    queue_family_index,
+                ) {
+                    Ok(pipeline) => {
+                        *cache = Some((current_device_handle, pipeline));
+                    }
+                    Err(e) => {
+                        warn!("Failed to create VulkanYuvPipeline: {:?}", e);
+                        return Err(e);
+                    }
+                }
+            }
 
-                        let Some((_, pipeline)) = cache.as_ref() else {
-                            // This should never happen - cache was just populated above
-                            return Err(ZeroCopyError::ImportFailed(
-                                "VulkanYuvPipeline cache unexpectedly empty".into(),
-                            ));
-                        };
+            let Some((_, pipeline)) = cache.as_ref() else {
+                // This should never happen - cache was just populated above
+                return Err(ZeroCopyError::ImportFailed(
+                    "VulkanYuvPipeline cache unexpectedly empty".into(),
+                ));
+            };
 
-                        // Perform the conversion
-                        pipeline.convert_yuv_ahardwarebuffer(
-                            device,
-                            ahardware_buffer,
-                            raw_instance,
-                            physical_device,
-                            vk_queue,
-                            width,
-                            height,
-                            color_space,
-                            fence_fd,
-                        )
-                    })
-                },
-            );
-
-        result
+            // Perform the conversion
+            pipeline.convert_yuv_ahardwarebuffer(
+                device,
+                ahardware_buffer,
+                raw_instance,
+                physical_device,
+                vk_queue,
+                width,
+                height,
+                color_space,
+                fence_fd,
+                producer_owner,
+            )
+        })
     }
 
     /// Imports a YUV AHardwareBuffer as separate plane textures for shader-based conversion.
@@ -2981,6 +2966,14 @@ pub mod android {
         device: ash::Device,
         /// Instance handle for loading device extension functions
         instance: ash::Instance,
+        /// Submitted conversions whose temporary Vulkan resources must remain
+        /// alive until their GPU fence signals.
+        pending_conversions: RefCell<VecDeque<PendingConversion>>,
+    }
+
+    struct PendingConversion {
+        fence: vk::Fence,
+        cleanup: Option<Box<dyn FnOnce()>>,
     }
 
     /// Color space and range for YUV→RGB conversion.
@@ -3455,7 +3448,57 @@ pub mod android {
                 queue_family_index,
                 device,
                 instance: raw_instance.clone(),
+                pending_conversions: RefCell::new(VecDeque::new()),
             })
+        }
+
+        /// Reclaims completed conversion resources without blocking. If the
+        /// bounded in-flight ring is full, wait only for its oldest submission.
+        unsafe fn reap_conversions(&self) -> Result<(), ZeroCopyError> {
+            const MAX_IN_FLIGHT: usize = 3;
+            let mut pending = self.pending_conversions.borrow_mut();
+
+            while let Some(front) = pending.front() {
+                let complete = self.device.get_fence_status(front.fence).map_err(|e| {
+                    ZeroCopyError::TextureCreationFailed(format!(
+                        "Failed to query Android conversion fence: {e:?}"
+                    ))
+                })?;
+                if !complete {
+                    break;
+                }
+                let mut finished = pending.pop_front().expect("front was present");
+                self.device.destroy_fence(finished.fence, None);
+                if let Some(cleanup) = finished.cleanup.take() {
+                    cleanup();
+                }
+            }
+
+            if pending.len() >= MAX_IN_FLIGHT {
+                let fence = pending.front().expect("ring is non-empty").fence;
+                self.device
+                    .wait_for_fences(&[fence], true, 1_000_000_000)
+                    .map_err(|e| {
+                        ZeroCopyError::TextureCreationFailed(format!(
+                            "Android conversion ring stalled: {e:?}"
+                        ))
+                    })?;
+                let mut finished = pending.pop_front().expect("front was present");
+                self.device.destroy_fence(finished.fence, None);
+                if let Some(cleanup) = finished.cleanup.take() {
+                    cleanup();
+                }
+            }
+            Ok(())
+        }
+
+        fn retain_conversion(&self, fence: vk::Fence, cleanup: Box<dyn FnOnce()>) {
+            self.pending_conversions
+                .borrow_mut()
+                .push_back(PendingConversion {
+                    fence,
+                    cleanup: Some(cleanup),
+                });
         }
 
         /// Updates the uniform buffer with parameters for the specified color space.
@@ -3867,12 +3910,14 @@ pub mod android {
             height: u32,
             color_space: Option<YuvColorSpace>,
             fence_fd: i32,
+            producer_owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         ) -> Result<wgpu::Texture, ZeroCopyError> {
             if ahardware_buffer.is_null() {
                 return Err(ZeroCopyError::InvalidResource(
                     "AHardwareBuffer is null".to_string(),
                 ));
             }
+            self.reap_conversions()?;
 
             // RAII guard to ensure fence_fd is closed on any exit path (early return, error, or success)
             // For NV12 path: we do a CPU wait then close. For external format path: fence_guard is
@@ -4003,6 +4048,7 @@ pub mod android {
                     suggested_y_chroma_offset,
                     sampler_ycbcr_components,
                     external_fence_fd,
+                    producer_owner,
                 );
             } else {
                 // Gate standard formats to NV12 only - our pipeline hardcodes 2-plane binding
@@ -4375,6 +4421,7 @@ pub mod android {
                 vk_queue,
                 raw_instance,
                 yuv_image,
+                yuv_memory,
                 y_view,
                 uv_view,
                 rgba_image,
@@ -4383,13 +4430,8 @@ pub mod android {
                 height,
                 color_space.unwrap_or_default(),
                 nv12_fence_fd,
+                producer_owner,
             );
-
-            // Cleanup YUV resources (no longer needed after conversion)
-            self.device.destroy_image_view(uv_view, None);
-            self.device.destroy_image_view(y_view, None);
-            self.device.free_memory(yuv_memory, None);
-            self.device.destroy_image(yuv_image, None);
 
             if let Err(e) = convert_result {
                 self.device.destroy_image_view(rgba_view, None);
@@ -4397,9 +4439,6 @@ pub mod android {
                 self.device.destroy_image(rgba_image, None);
                 return Err(e);
             }
-
-            // Cleanup intermediate RGBA view (texture will have its own)
-            self.device.destroy_image_view(rgba_view, None);
 
             // Step 7: Wrap RGBA image as wgpu texture
             let texture_desc = wgpu::hal::TextureDescriptor {
@@ -4430,10 +4469,16 @@ pub mod android {
                 }
             });
 
-            let hal_texture = wgpu::hal::vulkan::Device::texture_from_raw(
+            let hal_device = wgpu_device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or_else(|| {
+                    ZeroCopyError::HalAccessFailed("wgpu not using Vulkan backend".to_string())
+                })?;
+            let hal_texture = hal_device.texture_from_raw(
                 rgba_image,
                 &texture_desc,
                 Some(drop_callback),
+                wgpu::hal::vulkan::TextureMemory::External,
             );
 
             let wgpu_desc = wgpu::TextureDescriptor {
@@ -4451,10 +4496,13 @@ pub mod android {
                 view_formats: &[],
             };
 
-            let wgpu_texture = wgpu_device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc);
+            let wgpu_texture = wgpu_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu_desc,
+                wgpu::TextureUses::RESOURCE,
+            );
 
-            info!(
+            debug!(
                 "Successfully converted YUV AHardwareBuffer to RGBA ({}x{})",
                 width, height
             );
@@ -4495,6 +4543,7 @@ pub mod android {
             sampler_ycbcr_components: vk::ComponentMapping,
             // Sync fence FD from producer (-1 if none)
             fence_fd: i32,
+            producer_owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         ) -> Result<wgpu::Texture, ZeroCopyError> {
             use std::ffi::CStr;
 
@@ -4521,7 +4570,7 @@ pub mod android {
 
             let mut fence_guard = FenceFdGuard(fence_fd);
 
-            info!(
+            debug!(
                 "Importing AHB with external format {} ({}x{}) using YCbCr conversion",
                 external_format, width, height
             );
@@ -4876,6 +4925,7 @@ pub mod android {
                 raw_instance,
                 vk_queue,
                 yuv_image,
+                yuv_memory,
                 yuv_view,
                 ycbcr_sampler,
                 ycbcr_conversion,
@@ -4884,14 +4934,8 @@ pub mod android {
                 width,
                 height,
                 fence_guard.take(),
+                producer_owner,
             );
-
-            // Cleanup YUV resources (blit is complete)
-            self.device.destroy_image_view(yuv_view, None);
-            self.device.destroy_sampler(ycbcr_sampler, None);
-            self.device.free_memory(yuv_memory, None);
-            self.device.destroy_image(yuv_image, None);
-            self.destroy_ycbcr_conversion(raw_instance, ycbcr_conversion);
 
             if let Err(e) = blit_result {
                 self.device.destroy_image_view(rgba_view, None);
@@ -4899,8 +4943,6 @@ pub mod android {
                 self.device.destroy_image(rgba_image, None);
                 return Err(e);
             }
-
-            self.device.destroy_image_view(rgba_view, None);
 
             // Step 8: Wrap RGBA as wgpu texture
             let texture_desc = wgpu::hal::TextureDescriptor {
@@ -4928,10 +4970,16 @@ pub mod android {
                 }
             });
 
-            let hal_texture = wgpu::hal::vulkan::Device::texture_from_raw(
+            let hal_device = wgpu_device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or_else(|| {
+                    ZeroCopyError::HalAccessFailed("wgpu not using Vulkan backend".to_string())
+                })?;
+            let hal_texture = hal_device.texture_from_raw(
                 rgba_image,
                 &texture_desc,
                 Some(drop_callback),
+                wgpu::hal::vulkan::TextureMemory::External,
             );
 
             let wgpu_desc = wgpu::TextureDescriptor {
@@ -4949,10 +4997,13 @@ pub mod android {
                 view_formats: &[],
             };
 
-            let wgpu_texture = wgpu_device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc);
+            let wgpu_texture = wgpu_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu_desc,
+                wgpu::TextureUses::RESOURCE,
+            );
 
-            info!(
+            debug!(
                 "Successfully imported AHB via YCbCr conversion ({}x{})",
                 width, height
             );
@@ -5003,6 +5054,7 @@ pub mod android {
             raw_instance: &ash::Instance,
             vk_queue: vk::Queue,
             yuv_image: vk::Image,
+            yuv_memory: vk::DeviceMemory,
             yuv_view: vk::ImageView,
             ycbcr_sampler: vk::Sampler,
             ycbcr_conversion: vk::SamplerYcbcrConversion,
@@ -5011,6 +5063,7 @@ pub mod android {
             width: u32,
             height: u32,
             fence_fd: i32,
+            producer_owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         ) -> Result<(), ZeroCopyError> {
             // For YCbCr sampling, we need a descriptor set layout with immutable sampler
             // This is required because YCbCr samplers must be immutable
@@ -5463,45 +5516,53 @@ pub mod android {
                     ZeroCopyError::TextureCreationFailed(format!("Failed to submit: {:?}", e))
                 })?;
 
-            // Wait for this specific command buffer to complete (1 second timeout)
-            self.device
-                .wait_for_fences(&[fence], true, 1_000_000_000)
-                .map_err(|e| {
-                    if let Some(sem) = wait_semaphore {
-                        self.device.destroy_semaphore(sem, None);
+            // Do not wait on the render thread. GPUI submits its sampling draw
+            // to this same queue, so Vulkan queue order guarantees that the
+            // conversion completes first. Retire temporary objects when the
+            // conversion fence signals on a later frame.
+            let device = self.device.clone();
+            let instance = raw_instance.clone();
+            let command_pool = self.command_pool;
+            self.retain_conversion(
+                fence,
+                Box::new(move || unsafe {
+                    if let Some(frame) =
+                        producer_owner.downcast_ref::<crate::android_video::AndroidVideoFrame>()
+                    {
+                        frame.release_image();
                     }
-                    self.device.destroy_fence(fence, None);
-                    self.device
-                        .free_command_buffers(self.command_pool, &cmd_buffers);
-                    self.device.destroy_framebuffer(framebuffer, None);
-                    self.device.destroy_pipeline(ycbcr_pipeline, None);
-                    self.device.destroy_pipeline_layout(pipeline_layout, None);
-                    self.device.destroy_descriptor_pool(ycbcr_pool, None);
-                    self.device
-                        .destroy_descriptor_set_layout(ycbcr_desc_layout, None);
-                    ZeroCopyError::TextureCreationFailed(format!(
-                        "Failed to wait for fence: {:?}",
-                        e
-                    ))
-                })?;
+                    if let Some(semaphore) = wait_semaphore {
+                        device.destroy_semaphore(semaphore, None);
+                    }
+                    device.free_command_buffers(command_pool, &cmd_buffers);
+                    device.destroy_framebuffer(framebuffer, None);
+                    device.destroy_pipeline(ycbcr_pipeline, None);
+                    device.destroy_pipeline_layout(pipeline_layout, None);
+                    device.destroy_descriptor_pool(ycbcr_pool, None);
+                    device.destroy_descriptor_set_layout(ycbcr_desc_layout, None);
+                    device.destroy_image_view(rgba_view, None);
+                    device.destroy_image_view(yuv_view, None);
+                    device.destroy_sampler(ycbcr_sampler, None);
+                    device.free_memory(yuv_memory, None);
+                    device.destroy_image(yuv_image, None);
 
-            // Clean up sync resources
-            if let Some(sem) = wait_semaphore {
-                self.device.destroy_semaphore(sem, None);
-            }
-            self.device.destroy_fence(fence, None);
+                    let fn_name =
+                        CStr::from_bytes_with_nul_unchecked(b"vkDestroySamplerYcbcrConversion\0");
+                    if let Some(function) =
+                        instance.get_device_proc_addr(device.handle(), fn_name.as_ptr())
+                    {
+                        type DestroyFn = unsafe extern "system" fn(
+                            vk::Device,
+                            vk::SamplerYcbcrConversion,
+                            *const vk::AllocationCallbacks,
+                        );
+                        let destroy: DestroyFn = std::mem::transmute(function);
+                        destroy(device.handle(), ycbcr_conversion, std::ptr::null());
+                    }
+                }),
+            );
 
-            // Cleanup
-            self.device
-                .free_command_buffers(self.command_pool, &cmd_buffers);
-            self.device.destroy_framebuffer(framebuffer, None);
-            self.device.destroy_pipeline(ycbcr_pipeline, None);
-            self.device.destroy_pipeline_layout(pipeline_layout, None);
-            self.device.destroy_descriptor_pool(ycbcr_pool, None);
-            self.device
-                .destroy_descriptor_set_layout(ycbcr_desc_layout, None);
-
-            debug!("YCbCr blit pass completed successfully");
+            debug!("YCbCr blit pass submitted asynchronously");
             Ok(())
         }
 
@@ -5647,6 +5708,7 @@ pub mod android {
             vk_queue: vk::Queue,
             raw_instance: &ash::Instance,
             yuv_image: vk::Image,
+            yuv_memory: vk::DeviceMemory,
             y_view: vk::ImageView,
             uv_view: vk::ImageView,
             _rgba_image: vk::Image,
@@ -5655,6 +5717,7 @@ pub mod android {
             height: u32,
             color_space: YuvColorSpace,
             fence_fd: i32,
+            producer_owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         ) -> Result<(), ZeroCopyError> {
             // Update uniform buffer with color space parameters
             if !self.update_color_space(color_space) {
@@ -6039,40 +6102,38 @@ pub mod android {
                     ))
                 })?;
 
-            // Wait for completion (1 second timeout)
-            self.device
-                .wait_for_fences(&[fence], true, 1_000_000_000)
-                .map_err(|e| {
-                    if let Some(sem) = wait_semaphore {
-                        self.device.destroy_semaphore(sem, None);
+            // The GPUI draw is submitted to the same Vulkan queue after this
+            // conversion, so queue order provides the consumer dependency. Keep
+            // all input and command resources alive until this fence signals,
+            // instead of blocking the render thread here.
+            let device = self.device.clone();
+            let command_pool = self.command_pool;
+            let descriptor_pool = self.descriptor_pool;
+            self.retain_conversion(
+                fence,
+                Box::new(move || unsafe {
+                    if let Some(frame) =
+                        producer_owner.downcast_ref::<crate::android_video::AndroidVideoFrame>()
+                    {
+                        frame.release_image();
                     }
-                    self.device
-                        .free_command_buffers(self.command_pool, &[cmd_buf]);
-                    self.device.destroy_fence(fence, None);
-                    self.device.destroy_framebuffer(framebuffer, None);
-                    self.device
-                        .free_descriptor_sets(self.descriptor_pool, &[descriptor_set])
+                    if let Some(semaphore) = wait_semaphore {
+                        device.destroy_semaphore(semaphore, None);
+                    }
+                    device.free_command_buffers(command_pool, &[cmd_buf]);
+                    device.destroy_framebuffer(framebuffer, None);
+                    device
+                        .free_descriptor_sets(descriptor_pool, &[descriptor_set])
                         .ok();
-                    ZeroCopyError::TextureCreationFailed(format!(
-                        "Timeout waiting for YUV conversion: {:?}",
-                        e
-                    ))
-                })?;
+                    device.destroy_image_view(rgba_view, None);
+                    device.destroy_image_view(uv_view, None);
+                    device.destroy_image_view(y_view, None);
+                    device.free_memory(yuv_memory, None);
+                    device.destroy_image(yuv_image, None);
+                }),
+            );
 
-            // Cleanup
-            if let Some(sem) = wait_semaphore {
-                self.device.destroy_semaphore(sem, None);
-            }
-            self.device.destroy_fence(fence, None);
-            self.device.destroy_framebuffer(framebuffer, None);
-            self.device
-                .free_descriptor_sets(self.descriptor_pool, &[descriptor_set])
-                .ok();
-            // Free command buffer to prevent leak on repeated conversions
-            self.device
-                .free_command_buffers(self.command_pool, &[cmd_buf]);
-
-            debug!("YUV→RGBA conversion completed successfully");
+            debug!("YUV→RGBA conversion submitted asynchronously");
             Ok(())
         }
     }
@@ -6081,6 +6142,16 @@ pub mod android {
         fn drop(&mut self) {
             unsafe {
                 debug!("Destroying VulkanYuvPipeline");
+                let pending = self.pending_conversions.get_mut();
+                while let Some(mut conversion) = pending.pop_front() {
+                    let _ = self
+                        .device
+                        .wait_for_fences(&[conversion.fence], true, 1_000_000_000);
+                    self.device.destroy_fence(conversion.fence, None);
+                    if let Some(cleanup) = conversion.cleanup.take() {
+                        cleanup();
+                    }
+                }
                 self.device.destroy_command_pool(self.command_pool, None);
                 self.device.free_memory(self.yuv_params_memory, None);
                 self.device.destroy_buffer(self.yuv_params_buffer, None);

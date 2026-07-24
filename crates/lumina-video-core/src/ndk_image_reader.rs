@@ -227,6 +227,7 @@ impl NdkImageReaderBridge {
             format,
             player_id,
             fence_fd, // Now we have the actual fence from the producer!
+            image_owner: parking_lot::Mutex::new(None),
         };
 
         // Send to render thread

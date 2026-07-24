@@ -51,8 +51,8 @@ use jni::sys::{jint, jlong};
 use jni::{JNIEnv, JavaVM};
 
 use crate::video::{
-    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
-    VideoFrame, VideoMetadata,
+    AndroidGpuSurface, CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane,
+    VideoDecoderBackend, VideoError, VideoFrame, VideoMetadata,
 };
 
 /// Gets the Java VM from the Android context.
@@ -398,6 +398,39 @@ impl AndroidVideoDecoder {
         VideoFrame::new(self.last_position, DecodedFrame::Cpu(placeholder))
     }
 
+    /// Transfers a queued HardwareBuffer into the normal scheduled frame path.
+    fn hardware_buffer_video_frame(&self, frame: AndroidVideoFrame) -> VideoFrame {
+        let pts = Duration::from_nanos(frame.timestamp_ns.max(0) as u64);
+        let pixel_format = if is_yuv_candidate_hardware_buffer_format(frame.format) {
+            PixelFormat::Nv12
+        } else {
+            PixelFormat::Rgba
+        };
+        let buffer = frame.buffer;
+        let width = frame.width;
+        let height = frame.height;
+        let hardware_buffer_format = frame.format;
+        let fence_fd = frame.fence_fd;
+
+        // The owner releases the acquired AHardwareBuffer reference after the
+        // imported wgpu texture and every held frame clone have expired.
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(frame);
+        let surface = unsafe {
+            AndroidGpuSurface::new_with_import_metadata(
+                buffer,
+                width,
+                height,
+                pixel_format,
+                hardware_buffer_format,
+                fence_fd,
+                None,
+                owner,
+            )
+        };
+
+        VideoFrame::new(pts, DecodedFrame::Android(surface))
+    }
+
     /// Starts playback if not already started.
     fn start_playback(&mut self) -> Result<(), VideoError> {
         if self.started {
@@ -485,7 +518,10 @@ impl Drop for AndroidVideoDecoder {
         // Release ExoPlayer resources FIRST to stop all callbacks
         // before invalidating the native handle
         if let Ok(vm) = get_jvm() {
-            if let Ok(mut env) = vm.attach_current_thread() {
+            // `bridge` is a GlobalRef field and is dropped after this Drop
+            // implementation returns. A temporary AttachGuard would detach
+            // first, so keep this worker attached through field destruction.
+            if let Ok(mut env) = vm.attach_current_thread_permanently() {
                 let _ = env.call_method(&self.bridge, "release", "()V", &[]);
             }
         }
@@ -574,7 +610,13 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
             }
         }
 
-        // Return placeholder — the real frame is delivered via HardwareBuffer queue
+        if let Some(frame) = try_receive_hardware_buffer_for_player(self.player_id) {
+            return Ok(Some(self.hardware_buffer_video_frame(frame)));
+        }
+
+        // A callback may race the non-consuming readiness check. Keep the
+        // decode loop alive until the next callback without manufacturing an
+        // additional HardwareBuffer consumer.
         Ok(Some(self.create_placeholder_frame()))
     }
 
@@ -617,6 +659,13 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
     /// Android ExoPlayer handles audio internally - no separate FFmpeg audio thread needed.
     fn handles_audio_internally(&self) -> bool {
         true
+    }
+
+    fn current_time(&self) -> Option<Duration> {
+        // ExoPlayer owns audio playback, so its media position is the master
+        // clock. The Kotlin bridge keeps this value cached, including on every
+        // decoded frame, making this JNI read non-blocking.
+        self.get_position().ok()
     }
 
     fn set_muted(&mut self, muted: bool) -> Result<(), VideoError> {
@@ -945,7 +994,8 @@ use std::sync::OnceLock;
 /// Per-player frame queues for HardwareBuffer submissions.
 /// Each player has its own queue to avoid frame stealing between players.
 /// Max queue size per player to prevent unbounded memory growth.
-const MAX_QUEUE_SIZE_PER_PLAYER: usize = 8;
+// Leave ImageReader capacity for the displayed frame and GPU conversions.
+const MAX_QUEUE_SIZE_PER_PLAYER: usize = 2;
 
 /// Per-player state combining the frame queue and zero-copy stats.
 /// Co-locating these avoids the need for a separate global stats map.
@@ -1163,6 +1213,9 @@ pub struct AndroidVideoFrame {
     /// The consumer (Vulkan) must wait on this fence before reading the buffer.
     /// This is critical for correct synchronization with hardware video decoders.
     pub fence_fd: i32,
+    /// Retains the ImageReader Image so its BufferQueue slot cannot be reused
+    /// while Vulkan is still consuming the AHardwareBuffer.
+    image_owner: parking_lot::Mutex<Option<GlobalRef>>,
 }
 
 // SAFETY: AndroidVideoFrame can be sent and shared between threads because:
@@ -1176,6 +1229,29 @@ unsafe impl Sync for AndroidVideoFrame {}
 
 impl Drop for AndroidVideoFrame {
     fn drop(&mut self) {
+        self.release_image();
+        self.release_native_resources();
+    }
+}
+
+impl AndroidVideoFrame {
+    /// Releases the Java ImageReader slot once the GPU conversion fence has
+    /// signalled. This is intentionally independent from the frame object's
+    /// lifetime because the scheduler may retain frame metadata much longer.
+    pub fn release_image(&self) {
+        if let Some(image) = self.image_owner.lock().take() {
+            if let Ok(vm) = get_jvm() {
+                if let Ok(mut env) = vm.attach_current_thread_permanently() {
+                    let _ = env.call_method(image.as_obj(), "close", "()V", &[]);
+                    drop(image);
+                    return;
+                }
+            }
+            drop(image);
+        }
+    }
+
+    fn release_native_resources(&mut self) {
         if !self.buffer.is_null() {
             // AHardwareBuffer_release is safe to call from any thread
             extern "C" {
@@ -1195,6 +1271,7 @@ impl Drop for AndroidVideoFrame {
             unsafe {
                 close(self.fence_fd);
             }
+            self.fence_fd = -1;
         }
     }
 }
@@ -1424,20 +1501,21 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnDurationCh
 ///
 /// - `buffer` must be a valid HardwareBuffer JNI object
 /// - The HardwareBuffer is retained by this function (AHardwareBuffer_acquire called)
-/// - The caller (Java) can safely close their Image after this returns
+/// - `image` is retained by this function and closed when the frame is released
 /// - `player_id` should be the value returned by nativeGeneratePlayerId
 /// - `fence_fd` is the sync fence from the producer (-1 if none/already signaled)
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwareBuffer(
     env: JNIEnv,
     _this: JObject,
+    image: JObject,
     buffer: JObject,
     timestamp_ns: jlong,
     width: jint,
     height: jint,
     player_id: jlong,
     fence_fd: jint,
-) {
+) -> jni::sys::jboolean {
     // Ensure queues are initialized
     if HARDWARE_BUFFER_QUEUE.get().is_none() {
         init_hardware_buffer_queue();
@@ -1477,8 +1555,16 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
         tracing::warn!(
             "nativeSubmitHardwareBuffer: AHardwareBuffer_fromHardwareBuffer returned null"
         );
-        return;
+        return 0;
     }
+
+    let image_owner = match env.new_global_ref(&image) {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::warn!("nativeSubmitHardwareBuffer: failed to retain Image: {error}");
+            return 0;
+        }
+    };
 
     // Query the buffer format using AHardwareBuffer_describe
     let format = unsafe {
@@ -1503,6 +1589,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
         format,
         player_id: player_id_u64,
         fence_fd,
+        image_owner: parking_lot::Mutex::new(Some(image_owner)),
     };
 
     // Route to the appropriate queue based on player_id
@@ -1539,4 +1626,5 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
             state.queue.push_back(frame);
         }
     }
+    1
 }

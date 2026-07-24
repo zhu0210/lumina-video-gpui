@@ -642,9 +642,23 @@ fn decode_loop<D: VideoDecoderBackend>(
         }
     }
 
-    // Pause the decoder after getting preview frame (for decoders like ExoPlayer that auto-play)
-    if let Err(e) = decoder.pause() {
-        tracing::debug!("Failed to pause after preview: {}", e);
+    // Autoplay may have been requested while a slower native decoder was
+    // producing its preview/metadata. Consume those commands before deciding
+    // whether to pause: posting an unconditional pause followed by a delayed
+    // resume races MediaCodec surface startup on some H.264/AV1 decoders.
+    while let Ok(cmd) = command_rx.try_recv() {
+        match process_decode_command(cmd, &mut decoder, &frame_queue) {
+            CommandResult::Stop => return,
+            CommandResult::Continue(Some(new_playing)) => playing = new_playing,
+            CommandResult::Continue(None) | CommandResult::Seeking => {}
+        }
+    }
+
+    if !playing {
+        // No play request arrived, so keep the decoded preview frame paused.
+        if let Err(e) = decoder.pause() {
+            tracing::debug!("Failed to pause after preview: {}", e);
+        }
     }
 
     // Note: We no longer count consecutive Nones for EOS detection.
@@ -1063,7 +1077,7 @@ const NEAR_BOUNDARY_FORCE_TIMEOUT: Duration = Duration::from_millis(900);
 const AUDIO_STARTUP_AHEAD_TOLERANCE: Duration = Duration::from_millis(500);
 /// VOD frames should follow their timestamps closely; live jitter tolerance is
 /// enabled separately through frame-rate pacing.
-const VOD_AHEAD_TOLERANCE: Duration = Duration::from_millis(5);
+const VOD_AHEAD_TOLERANCE: Duration = Duration::from_millis(33);
 /// Base live tolerance once audio is running.
 const LIVE_BASE_AHEAD_TOLERANCE: Duration = Duration::from_millis(2000);
 /// Maximum adaptive live tolerance to avoid unbounded A/V divergence.

@@ -822,6 +822,7 @@ impl GpuiVideoPlayer {
         // consume future frames and turns held frames into needless GPU uploads.
         if let FramePollResult::NewFrame(video_frame) = self.core.poll_frame_result() {
             self.loop_seek_pending = false;
+            let import_started = std::time::Instant::now();
             let textures = frame_to_texture::video_frame_to_gpu(
                 &video_frame,
                 gpu.device(),
@@ -830,6 +831,7 @@ impl GpuiVideoPlayer {
                 &mut self.cbcr_cache,
                 &mut self.rgba_cache,
             );
+            let import_elapsed = import_started.elapsed();
 
             if let Some(tex) = textures {
                 self.import_stats.record_success(tex.path);
@@ -837,6 +839,20 @@ impl GpuiVideoPlayer {
                     tracing::info!("First video frame uploaded to GPU");
                 }
                 self.frame_textures = Some(tex);
+                if import_elapsed >= Duration::from_millis(16) {
+                    let now = std::time::Instant::now();
+                    let should_log = self
+                        .last_upload_warn
+                        .is_none_or(|t| now.duration_since(t).as_secs() >= 5);
+                    if should_log {
+                        tracing::warn!(
+                            elapsed_ms = import_elapsed.as_millis(),
+                            path = ?self.frame_textures.as_ref().map(|frame| frame.path),
+                            "Video frame import blocked the render thread"
+                        );
+                        self.last_upload_warn = Some(now);
+                    }
+                }
             } else {
                 self.import_stats.record_failure();
                 // Rate-limit: only log once per 5 seconds

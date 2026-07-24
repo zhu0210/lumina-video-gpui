@@ -16,13 +16,11 @@ use lumina_video::GpuiVideoPlayer;
 
 const SAMPLE_VIDEOS: &[(&str, &str)] = &[
     (
-        "Big Buck Bunny (MP4)",
-        "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4",
+        "Lorem Video H.264 (MP4)",
+        "https://lorem.video/720p_h264_10s",
     ),
-    (
-        "Sintel (MP4)",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4",
-    ),
+    ("Lorem Video AV1 (MP4)", "https://lorem.video/720p_av1"),
+    ("Lorem Video Cat (Live HLS)", "https://lorem.video/hls/cat/"),
     (
         "Elephant's Dream (MP4)",
         "https://archive.org/download/ElephantsDream/ed_hd.mp4",

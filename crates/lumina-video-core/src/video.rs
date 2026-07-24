@@ -345,6 +345,10 @@ pub struct AndroidGpuSurface {
     pub height: u32,
     /// Pixel format
     pub format: PixelFormat,
+    /// Native AHardwareBuffer format reported by the decoder.
+    pub hardware_buffer_format: u32,
+    /// Producer sync fence, or -1 when implicit synchronization is used.
+    pub fence_fd: i32,
     /// CPU fallback frame data for when zero-copy import fails.
     /// Populated at decode time to ensure graceful degradation.
     pub cpu_fallback: Option<CpuFrame>,
@@ -355,6 +359,11 @@ pub struct AndroidGpuSurface {
 
 #[cfg(target_os = "android")]
 impl AndroidGpuSurface {
+    /// Clones the producer lifetime token for an asynchronous importer.
+    pub fn producer_owner(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        Arc::clone(&self._owner)
+    }
+
     /// Creates a new Android GPU surface from an AHardwareBuffer.
     ///
     /// # Safety
@@ -373,6 +382,32 @@ impl AndroidGpuSurface {
             width,
             height,
             format,
+            hardware_buffer_format: 0,
+            fence_fd: -1,
+            cpu_fallback,
+            _owner: owner,
+        }
+    }
+
+    /// Creates a surface with the native format and synchronization metadata
+    /// required by the Vulkan AHardwareBuffer importer.
+    pub unsafe fn new_with_import_metadata(
+        ahardware_buffer: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        hardware_buffer_format: u32,
+        fence_fd: i32,
+        cpu_fallback: Option<CpuFrame>,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            ahardware_buffer,
+            width,
+            height,
+            format,
+            hardware_buffer_format,
+            fence_fd,
             cpu_fallback,
             _owner: owner,
         }
@@ -387,6 +422,8 @@ impl Clone for AndroidGpuSurface {
             width: self.width,
             height: self.height,
             format: self.format,
+            hardware_buffer_format: self.hardware_buffer_format,
+            fence_fd: self.fence_fd,
             cpu_fallback: self.cpu_fallback.clone(),
             _owner: Arc::clone(&self._owner),
         }
