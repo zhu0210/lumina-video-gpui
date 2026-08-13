@@ -24,18 +24,8 @@ targets = [
 lumina-video-native-frame = { path = "../lumina-video-native-frame" }
 lumina-video-core = { path = "../lumina-video-core" }
 
-# GPUI — the UI framework (replaces egui)
-# "wgpu" is opt-in (not in default features) — required for GpuContextHandle, surface(), etc.
-gpui = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
-  features = ["wgpu"]
-}
-# gpui_wgpu for wgpu types (single wgpu version shared with core)
-gpui_wgpu = {
-  git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend"
-}
+# GPUI composition boundary.
+lumina-video-gpui = { path = "../lumina-video-gpui" }
 
 # Utilities
 bytemuck = { version = "1.14", features = ["derive"] }
@@ -57,39 +47,6 @@ parking_lot = { workspace = true }
 poll-promise = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
-
-# MoQ (Media over QUIC) transport dependencies
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.quinn]
-version = "0.11"
-optional = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-lite]
-git = "https://github.com/kixelated/moq"
-rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca"
-optional = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.moq-native]
-git = "https://github.com/kixelated/moq"
-rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca"
-optional = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.hang]
-git = "https://github.com/kixelated/moq"
-rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca"
-optional = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.async-channel]
-version = "2.0"
-optional = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.bytes]
-version = "1.5"
-optional = true
-
-# Nostr client for MoQ stream discovery (NIP-53 Live Activities)
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.nostr-sdk]
-version = "0.37"
-optional = true
 
 # Web/WASM video playback using browser APIs
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -143,13 +100,8 @@ android-zero-copy = ["lumina-video-native-frame/android-zero-copy"]
 
 # MoQ: Media over QUIC live streaming transport
 moq = [
-  "async-channel",
-  "bytes",
-  "hang",
-  "moq-lite",
-  "moq-native",
-  "nostr-sdk",
-  "quinn"
+  "lumina-video-native-frame/moq",
+  "lumina-video-gpui/moq"
 ]
 
 [lints.rust]

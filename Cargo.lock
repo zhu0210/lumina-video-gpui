@@ -546,8 +546,7 @@ dependencies = [
 [[package]]
 name = "async-process"
 version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc50921ec0055cdd8a16de48773bfeec5c972598674347252c0399676be7da75"
+source = "git+https://github.com/zed-industries/async-process.git?rev=0b6d6713570af61806e1e5cb40e0f757cb93fd9d#0b6d6713570af61806e1e5cb40e0f757cb93fd9d"
 dependencies = [
  "async-channel 2.5.0",
  "async-io",
@@ -634,8 +633,7 @@ dependencies = [
 [[package]]
 name = "async-task"
 version = "4.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
+source = "git+https://github.com/smol-rs/async-task.git?rev=b4486cd71e4e94fbda54ce6302444de14f4d190e#b4486cd71e4e94fbda54ce6302444de14f4d190e"
 
 [[package]]
 name = "async-trait"
@@ -3075,6 +3073,7 @@ dependencies = [
  "strum",
  "util",
  "uuid",
+ "zed-font-kit",
 ]
 
 [[package]]
@@ -4290,26 +4289,18 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 name = "lumina-video"
 version = "0.2.2"
 dependencies = [
- "async-channel 2.5.0",
  "bytemuck",
- "bytes",
  "crossbeam-channel",
- "gpui",
- "gpui_wgpu",
- "hang",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "js-sys",
  "lumina-video-core",
+ "lumina-video-gpui",
  "lumina-video-native-frame",
- "moq-lite",
- "moq-native",
- "nostr-sdk",
  "parking_lot",
  "poll-promise",
- "quinn",
  "rustls",
  "thiserror 2.0.18",
  "tokio",
@@ -4355,6 +4346,13 @@ dependencies = [
 [[package]]
 name = "lumina-video-gpui"
 version = "0.2.2"
+dependencies = [
+ "gpui",
+ "gpui_wgpu",
+ "lumina-video-core",
+ "lumina-video-native-frame",
+ "tracing",
+]
 
 [[package]]
 name = "lumina-video-gst"
@@ -4366,8 +4364,10 @@ version = "0.2.2"
 dependencies = [
  "android-activity",
  "ash",
+ "async-channel 2.5.0",
  "block2 0.6.2",
  "bytemuck",
+ "bytes",
  "cpal",
  "crossbeam-channel",
  "dispatch2",
@@ -4377,6 +4377,7 @@ dependencies = [
  "gstreamer-allocators",
  "gstreamer-app",
  "gstreamer-video",
+ "hang",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -4385,9 +4386,12 @@ dependencies = [
  "libc",
  "lumina-video-core",
  "metal 0.31.0",
+ "moq-lite",
+ "moq-native",
  "ndk",
  "ndk-context",
  "ndk-sys",
+ "nostr-sdk",
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-core-foundation",
@@ -4399,6 +4403,7 @@ dependencies = [
  "parking_lot",
  "poll-promise",
  "profiling",
+ "quinn",
  "rodio",
  "rustls",
  "symphonia-codec-aac",
@@ -10526,3 +10531,38 @@ dependencies = [
  "syn",
  "winnow 1.0.3",
 ]
+
+[[patch.unused]]
+name = "calloop"
+version = "0.14.3"
+source = "git+https://github.com/zed-industries/calloop#eb6b4fd17b9af5ecc226546bdd04185391b3e265"
+
+[[patch.unused]]
+name = "libwebrtc"
+version = "0.3.26"
+source = "git+https://github.com/zed-industries/livekit-rust-sdks?rev=c3a55bbc207008f1ca3474b6037fdd3c443cad0f#c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
+
+[[patch.unused]]
+name = "livekit"
+version = "0.7.32"
+source = "git+https://github.com/zed-industries/livekit-rust-sdks?rev=c3a55bbc207008f1ca3474b6037fdd3c443cad0f#c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
+
+[[patch.unused]]
+name = "notify"
+version = "9.0.0-rc.4"
+source = "git+https://github.com/zed-industries/notify?rev=faecbc33db4f59313e5225ef766bfd9e54a54cfd#faecbc33db4f59313e5225ef766bfd9e54a54cfd"
+
+[[patch.unused]]
+name = "notify-types"
+version = "2.1.0"
+source = "git+https://github.com/zed-industries/notify?rev=faecbc33db4f59313e5225ef766bfd9e54a54cfd#faecbc33db4f59313e5225ef766bfd9e54a54cfd"
+
+[[patch.unused]]
+name = "webrtc-sys"
+version = "0.3.23"
+source = "git+https://github.com/zed-industries/livekit-rust-sdks?rev=c3a55bbc207008f1ca3474b6037fdd3c443cad0f#c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
+
+[[patch.unused]]
+name = "windows-capture"
+version = "1.4.3"
+source = "git+https://github.com/zed-industries/windows-capture.git?rev=f0d6c1b6691db75461b732f6d5ff56eed002eeb9#f0d6c1b6691db75461b732f6d5ff56eed002eeb9"
