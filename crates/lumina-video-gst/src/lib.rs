@@ -14,14 +14,14 @@ use std::time::Duration;
 
 use crossbeam_channel::{self, Receiver, Sender, TryRecvError, TrySendError};
 use lumina_video_core::audio::AudioHandle;
-pub use lumina_video_core::session::AudioObservation;
+pub use lumina_video_core::session::{AudioObservation, AudioTrack};
 use lumina_video_core::session::{
     CapabilityTier, MediaSession, SessionCommand, SessionError, SessionEvent, SessionMetadata,
     SessionSnapshot, SessionState,
 };
 pub use lumina_video_native_frame::linux_video_gst::GstAudioSinkMode;
 use lumina_video_native_frame::linux_video_gst::{
-    GStreamerDecoder, GstLifecycleControl, DEFAULT_LIFECYCLE_TIMEOUT,
+    AudioTrackSelectionResult, GStreamerDecoder, GstLifecycleControl, DEFAULT_LIFECYCLE_TIMEOUT,
 };
 use lumina_video_native_frame::video::{
     CpuFrame, DecodedFrame, VideoDecoderBackend, VideoError, VideoFrame,
@@ -104,6 +104,8 @@ impl ControlLane {
 #[derive(Clone)]
 struct ControlSender {
     metadata: ControlLane,
+    audio_tracks: ControlLane,
+    audio_selection: ControlLane,
     state: ControlLane,
     error: ControlLane,
     terminal: ControlLane,
@@ -113,6 +115,8 @@ struct ControlSender {
 
 struct ControlReceiver {
     metadata: Receiver<SequencedEvent>,
+    audio_tracks: Receiver<SequencedEvent>,
+    audio_selection: Receiver<SequencedEvent>,
     state: Receiver<SequencedEvent>,
     error: Receiver<SequencedEvent>,
     terminal: Receiver<SequencedEvent>,
@@ -121,6 +125,8 @@ struct ControlReceiver {
 
 fn control_channels() -> (ControlSender, ControlReceiver) {
     let (metadata, metadata_receiver) = ControlLane::new();
+    let (audio_tracks, audio_tracks_receiver) = ControlLane::new();
+    let (audio_selection, audio_selection_receiver) = ControlLane::new();
     let (state, state_receiver) = ControlLane::new();
     let (error, error_receiver) = ControlLane::new();
     let (terminal, terminal_receiver) = ControlLane::new();
@@ -128,6 +134,8 @@ fn control_channels() -> (ControlSender, ControlReceiver) {
     (
         ControlSender {
             metadata,
+            audio_tracks,
+            audio_selection,
             state,
             error,
             terminal,
@@ -136,6 +144,8 @@ fn control_channels() -> (ControlSender, ControlReceiver) {
         },
         ControlReceiver {
             metadata: metadata_receiver,
+            audio_tracks: audio_tracks_receiver,
+            audio_selection: audio_selection_receiver,
             state: state_receiver,
             error: error_receiver,
             terminal: terminal_receiver,
@@ -306,11 +316,14 @@ fn owned_cpu_lease(
 fn send_control(sender: &ControlSender, event: SequencedEvent) -> bool {
     match &event.event {
         SessionEvent::Metadata { .. } => sender.metadata.send(event),
+        SessionEvent::AudioTracks { .. } => sender.audio_tracks.send(event),
         SessionEvent::Error(_) => sender.error.send(event),
         SessionEvent::Ended => sender.terminal.send(event),
         SessionEvent::StateChanged {
             state: SessionState::Ready | SessionState::Ended | SessionState::Error(_),
         } => sender.state.send(event),
+        SessionEvent::AudioTrackSelected { .. }
+        | SessionEvent::AudioTrackSelectionFailed { .. } => sender.audio_selection.send(event),
         SessionEvent::StateChanged { .. } | SessionEvent::Frame { .. } => {
             let mut event = event;
             loop {
@@ -372,6 +385,65 @@ fn publish_state(
     let event = SequencedEvent {
         sequence: *sequence,
         event: SessionEvent::StateChanged { state: next_state },
+    };
+    *sequence = sequence.saturating_add(1);
+    send_control(control_sender, event)
+}
+
+fn publish_audio_tracks(
+    state: &Arc<SnapshotState>,
+    control_sender: &ControlSender,
+    sequence: &mut u64,
+    tracks: Vec<AudioTrack>,
+    selected_id: Option<String>,
+) -> bool {
+    {
+        let mut snapshot = state.snapshot.write();
+        snapshot.audio_tracks = tracks.clone();
+        snapshot.selected_audio_track_id = selected_id.clone();
+    }
+    let event = SequencedEvent {
+        sequence: *sequence,
+        event: SessionEvent::AudioTracks {
+            tracks,
+            selected_id,
+        },
+    };
+    *sequence = sequence.saturating_add(1);
+    send_control(control_sender, event)
+}
+
+fn publish_audio_selected(
+    state: &Arc<SnapshotState>,
+    control_sender: &ControlSender,
+    sequence: &mut u64,
+    track: AudioTrack,
+) -> bool {
+    state.snapshot.write().selected_audio_track_id = Some(track.id.clone());
+    let event = SequencedEvent {
+        sequence: *sequence,
+        event: SessionEvent::AudioTrackSelected { track },
+    };
+    *sequence = sequence.saturating_add(1);
+    send_control(control_sender, event)
+}
+
+fn publish_audio_selection_failed(
+    state: &Arc<SnapshotState>,
+    control_sender: &ControlSender,
+    sequence: &mut u64,
+    requested_id: String,
+    prior_restored_id: Option<String>,
+    reason: String,
+) -> bool {
+    state.snapshot.write().selected_audio_track_id = prior_restored_id.clone();
+    let event = SequencedEvent {
+        sequence: *sequence,
+        event: SessionEvent::AudioTrackSelectionFailed {
+            requested_id,
+            prior_restored_id,
+            reason,
+        },
     };
     *sequence = sequence.saturating_add(1);
     send_control(control_sender, event)
@@ -533,6 +605,37 @@ fn process_command(
             audio_handle.set_volume((volume * 100.0) as u32);
             true
         }
+        SessionCommand::SelectAudioTrack { id } => {
+            let selection = decoder.select_audio_track(&id);
+            if let Some(tracks) = decoder.take_audio_tracks_update() {
+                if !publish_audio_tracks(
+                    state,
+                    control_sender,
+                    sequence,
+                    tracks,
+                    decoder.selected_audio_track_id().map(str::to_owned),
+                ) {
+                    return false;
+                }
+            }
+            match selection {
+                AudioTrackSelectionResult::Selected(track) => {
+                    publish_audio_selected(state, control_sender, sequence, track)
+                }
+                AudioTrackSelectionResult::Failed {
+                    requested_id,
+                    prior_restored_id,
+                    reason,
+                } => publish_audio_selection_failed(
+                    state,
+                    control_sender,
+                    sequence,
+                    requested_id,
+                    prior_restored_id,
+                    reason,
+                ),
+            }
+        }
         SessionCommand::Renegotiate { .. } => {
             let _ = publish_error(
                 state,
@@ -684,6 +787,29 @@ fn run_worker(
         return;
     }
     sequence = sequence.saturating_add(1);
+    let initial_audio_tracks = decoder.audio_tracks().to_vec();
+    if !publish_audio_tracks(
+        &state,
+        &control_sender,
+        &mut sequence,
+        initial_audio_tracks.clone(),
+        decoder.selected_audio_track_id().map(str::to_owned),
+    ) {
+        shutdown_worker(&mut decoder, &lifecycle_control);
+        return;
+    }
+    if let Some(selected_id) = decoder.selected_audio_track_id() {
+        if let Some(track) = initial_audio_tracks
+            .iter()
+            .find(|track| track.id == selected_id)
+            .cloned()
+        {
+            if !publish_audio_selected(&state, &control_sender, &mut sequence, track) {
+                shutdown_worker(&mut decoder, &lifecycle_control);
+                return;
+            }
+        }
+    }
     if !publish_state(&state, &control_sender, &mut sequence, SessionState::Ready) {
         shutdown_worker(&mut decoder, &lifecycle_control);
         return;
@@ -749,6 +875,18 @@ fn run_worker(
                 &state,
                 &control_sender,
                 &mut sequence,
+            ) {
+                shutdown_worker(&mut decoder, &lifecycle_control);
+                return;
+            }
+        }
+        if let Some(tracks) = decoder.take_audio_tracks_update() {
+            if !publish_audio_tracks(
+                &state,
+                &control_sender,
+                &mut sequence,
+                tracks,
+                decoder.selected_audio_track_id().map(str::to_owned),
             ) {
                 shutdown_worker(&mut decoder, &lifecycle_control);
                 return;
@@ -890,6 +1028,8 @@ pub struct GstMediaSession {
     generation_drop_receiver: Receiver<GenerationIntent>,
     control_receiver: ControlReceiver,
     pending_metadata: Option<SequencedEvent>,
+    pending_audio_tracks: Option<SequencedEvent>,
+    pending_audio_selection: Option<SequencedEvent>,
     pending_state: Option<SequencedEvent>,
     pending_error: Option<SequencedEvent>,
     pending_terminal: Option<SequencedEvent>,
@@ -1010,6 +1150,8 @@ impl GstMediaSession {
             generation_drop_receiver,
             control_receiver,
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1064,6 +1206,16 @@ impl GstMediaSession {
         }
     }
 
+    /// Returns the latest discoverable audio tracks without consuming events.
+    pub fn audio_tracks(&self) -> Vec<AudioTrack> {
+        self.state.snapshot.read().audio_tracks.clone()
+    }
+
+    /// Returns the latest confirmed audio selection, if known.
+    pub fn selected_audio_track_id(&self) -> Option<String> {
+        self.state.snapshot.read().selected_audio_track_id.clone()
+    }
+
     /// Polls one event and maps it to the GPUI presentation decision.
     pub fn try_next_presentation(&mut self) -> Result<PresentationDecision, SessionError> {
         let decision =
@@ -1087,6 +1239,14 @@ impl GstMediaSession {
 
     fn fill_pending(&mut self) {
         Self::fill_control_pending(&mut self.pending_metadata, &self.control_receiver.metadata);
+        Self::fill_control_pending(
+            &mut self.pending_audio_tracks,
+            &self.control_receiver.audio_tracks,
+        );
+        Self::fill_control_pending(
+            &mut self.pending_audio_selection,
+            &self.control_receiver.audio_selection,
+        );
         Self::fill_control_pending(&mut self.pending_state, &self.control_receiver.state);
         Self::fill_control_pending(&mut self.pending_error, &self.control_receiver.error);
         Self::fill_control_pending(&mut self.pending_terminal, &self.control_receiver.terminal);
@@ -1214,38 +1374,50 @@ impl MediaSession for GstMediaSession {
         if let Some(event) = self.pending_metadata.as_ref() {
             source = Some((event.sequence, 0));
         }
-        if let Some(event) = self.pending_state.as_ref() {
+        if let Some(event) = self.pending_audio_tracks.as_ref() {
             if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
                 source = Some((event.sequence, 1));
             }
         }
-        if let Some(event) = self.pending_error.as_ref() {
+        if let Some(event) = self.pending_audio_selection.as_ref() {
             if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
                 source = Some((event.sequence, 2));
             }
         }
-        if let Some(event) = self.pending_terminal.as_ref() {
+        if let Some(event) = self.pending_state.as_ref() {
             if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
                 source = Some((event.sequence, 3));
             }
         }
-        if let Some(event) = self.pending_transient.as_ref() {
+        if let Some(event) = self.pending_error.as_ref() {
             if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
                 source = Some((event.sequence, 4));
             }
         }
-        if let Some(event) = self.pending_frame.as_ref() {
+        if let Some(event) = self.pending_terminal.as_ref() {
             if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
                 source = Some((event.sequence, 5));
             }
         }
+        if let Some(event) = self.pending_transient.as_ref() {
+            if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
+                source = Some((event.sequence, 6));
+            }
+        }
+        if let Some(event) = self.pending_frame.as_ref() {
+            if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
+                source = Some((event.sequence, 7));
+            }
+        }
         let next = match source.map(|(_, kind)| kind) {
             Some(0) => self.pending_metadata.take(),
-            Some(1) => self.pending_state.take(),
-            Some(2) => self.pending_error.take(),
-            Some(3) => self.pending_terminal.take(),
-            Some(4) => self.pending_transient.take(),
-            Some(5) => self.pending_frame.take(),
+            Some(1) => self.pending_audio_tracks.take(),
+            Some(2) => self.pending_audio_selection.take(),
+            Some(3) => self.pending_state.take(),
+            Some(4) => self.pending_error.take(),
+            Some(5) => self.pending_terminal.take(),
+            Some(6) => self.pending_transient.take(),
+            Some(7) => self.pending_frame.take(),
             _ => None,
         };
         if let Some(event) = next {
@@ -1381,6 +1553,8 @@ mod tests {
             audio_handle,
             dropped_frames: Arc::clone(&dropped_frames),
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1470,6 +1644,8 @@ mod tests {
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1531,6 +1707,8 @@ mod tests {
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1582,6 +1760,8 @@ mod tests {
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1623,6 +1803,8 @@ mod tests {
             generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1668,6 +1850,8 @@ mod tests {
             generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1823,6 +2007,8 @@ mod tests {
             generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1872,6 +2058,8 @@ mod tests {
             generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -1976,6 +2164,8 @@ mod tests {
             generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
             pending_state: None,
             pending_error: None,
             pending_terminal: None,
@@ -2068,6 +2258,82 @@ mod tests {
                 event: SessionEvent::Error(SessionError::Open(_)),
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn audio_track_selection_failure_is_nonterminal_and_explicit() {
+        let state = Arc::new(SnapshotState::new());
+        let (sender, receiver) = control_channels();
+        let mut sequence = 0;
+
+        assert!(publish_audio_selection_failed(
+            &state,
+            &sender,
+            &mut sequence,
+            "audio-missing".into(),
+            None,
+            "rollback failed; current selection unknown".into(),
+        ));
+        assert!(matches!(
+            &state.snapshot.read().state,
+            SessionState::Loading
+        ));
+        assert!(matches!(
+            receiver.audio_selection.try_recv(),
+            Ok(SequencedEvent {
+                event: SessionEvent::AudioTrackSelectionFailed {
+                    requested_id,
+                    prior_restored_id: None,
+                    reason,
+                },
+                ..
+            }) if requested_id == "audio-missing" && reason.contains("current selection unknown")
+        ));
+    }
+
+    #[test]
+    fn audio_track_snapshot_and_selection_event_share_confirmed_id() {
+        let state = Arc::new(SnapshotState::new());
+        let (sender, receiver) = control_channels();
+        let track = AudioTrack {
+            id: "audio-eng".into(),
+            language: Some("eng".into()),
+            title: Some("English".into()),
+            codec: "AAC".into(),
+        };
+        let mut sequence = 0;
+
+        assert!(publish_audio_tracks(
+            &state,
+            &sender,
+            &mut sequence,
+            vec![track.clone()],
+            Some(track.id.clone()),
+        ));
+        assert!(publish_audio_selected(
+            &state,
+            &sender,
+            &mut sequence,
+            track.clone()
+        ));
+        assert_eq!(
+            state.snapshot.read().selected_audio_track_id.as_deref(),
+            Some("audio-eng")
+        );
+        assert!(matches!(
+            receiver.audio_tracks.try_recv(),
+            Ok(SequencedEvent {
+                event: SessionEvent::AudioTracks { selected_id: Some(id), .. },
+                ..
+            }) if id == "audio-eng"
+        ));
+        assert!(matches!(
+            receiver.audio_selection.try_recv(),
+            Ok(SequencedEvent {
+                event: SessionEvent::AudioTrackSelected { track: selected },
+                ..
+            }) if selected == track
         ));
     }
 }

@@ -5,7 +5,9 @@ use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lumina_video_core::session::{CapabilityTier, MediaSession, SessionCommand, SessionState};
+use lumina_video_core::session::{
+    CapabilityTier, MediaSession, SessionCommand, SessionEvent, SessionState,
+};
 use lumina_video_gst::{GstAudioSinkMode, GstMediaSession, PresentationDecision};
 use lumina_video_native_frame::NativeMemory;
 
@@ -18,11 +20,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     };
 
+    let source_kind = source.clone();
     let mut session = GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
         source,
         true,
         GstAudioSinkMode::Fake,
-        Duration::from_secs(10),
+        Duration::from_secs(2),
         0,
     );
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -50,11 +53,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut expected_duration_seen = false;
     let mut position_seen = false;
     let mut post_seek_position_seen = false;
+    let mut audio_tracks_seen = false;
+    let mut audio_selection_requested = None;
+    let mut audio_selection_seen = false;
+    let mut missing_selection_requested = false;
+    let mut missing_selection_failed = false;
+    let mut missing_selection_prior_id = None;
+    let mut opus_track_seen = false;
 
     while Instant::now() < deadline && !replayed_seen {
         // One and only one public session poll per animation-like tick.
         polls = polls.saturating_add(1);
-        match session.try_next_presentation()? {
+        let next_event = session.try_next_event()?;
+        if let Some(SessionEvent::AudioTrackSelectionFailed {
+            requested_id,
+            prior_restored_id,
+            reason,
+        }) = next_event.as_ref()
+        {
+            if requested_id == "missing-audio-stream" {
+                missing_selection_failed = true;
+                missing_selection_prior_id = prior_restored_id.clone();
+                if !reason.contains("prior audio selection unchanged") {
+                    return Err(io::Error::other(
+                        "missing audio selection did not report unchanged prior selection",
+                    )
+                    .into());
+                }
+            }
+        }
+        match PresentationDecision::from_event(next_event, presented) {
             PresentationDecision::Advanced(frame) => {
                 frames = frames.saturating_add(1);
                 presented = true;
@@ -96,6 +124,34 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(io::Error::other(format!("fixture session error: {error}")).into());
         }
         metadata_seen |= snapshot.metadata.is_some();
+        audio_tracks_seen |= !snapshot.audio_tracks.is_empty();
+        opus_track_seen |= snapshot
+            .audio_tracks
+            .iter()
+            .any(|track| track.codec.to_ascii_lowercase().contains("opus"));
+        if source_kind.contains("dual-aac")
+            && audio_selection_requested.is_none()
+            && snapshot.audio_tracks.len() >= 2
+        {
+            if let Some(alternate) = snapshot.audio_tracks.get(1) {
+                let alternate_id = alternate.id.clone();
+                session.command(SessionCommand::SelectAudioTrack {
+                    id: alternate_id.clone(),
+                })?;
+                audio_selection_requested = Some(alternate_id);
+            }
+        }
+        if let Some(requested_id) = audio_selection_requested.as_deref() {
+            audio_selection_seen |=
+                Some(requested_id) == snapshot.selected_audio_track_id.as_deref();
+        }
+        if source_kind.contains("dual-aac") && audio_selection_seen && !missing_selection_requested
+        {
+            session.command(SessionCommand::SelectAudioTrack {
+                id: "missing-audio-stream".into(),
+            })?;
+            missing_selection_requested = true;
+        }
         duration_seen |= snapshot
             .metadata
             .as_ref()
@@ -168,9 +224,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         || !expected_duration_seen
         || !position_seen
         || !post_seek_position_seen
+        || !audio_tracks_seen
+        || (source_kind.contains("vp9-opus") && !opus_track_seen)
+        || (source_kind.contains("dual-aac")
+            && (!audio_selection_requested.is_some()
+                || !audio_selection_seen
+                || !missing_selection_requested
+                || !missing_selection_failed
+                || missing_selection_prior_id != audio_selection_requested))
     {
         return Err(io::Error::other(format!(
-            "fixture session incomplete: metadata={metadata_seen} playing={playing_seen} frames={frames} ended={ended_seen} replayed={replayed_seen} paused={paused_seen} resumed={resumed_seen} seek={seek_seen} seek_pts={seek_pts:?} duration={duration_seen} expected_duration={expected_duration_seen} position={position_seen} post_seek_position={post_seek_position_seen}"
+            "fixture session incomplete: metadata={metadata_seen} audio_tracks={audio_tracks_seen} opus={opus_track_seen} audio_selection_requested={audio_selection_requested:?} audio_selection_seen={audio_selection_seen} missing_selection_requested={missing_selection_requested} missing_selection_failed={missing_selection_failed} missing_selection_prior_id={missing_selection_prior_id:?} playing={playing_seen} frames={frames} ended={ended_seen} replayed={replayed_seen} paused={paused_seen} resumed={resumed_seen} seek={seek_seen} seek_pts={seek_pts:?} duration={duration_seen} expected_duration={expected_duration_seen} position={position_seen} post_seek_position={post_seek_position_seen}"
         ))
         .into());
     }
@@ -198,8 +262,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("GStreamer audio path is not enabled").into());
     }
 
+    let audio_switch_evidence = if source_kind.contains("dual-aac") {
+        if audio_selection_seen {
+            "confirmed"
+        } else {
+            "missing"
+        }
+    } else {
+        "not-applicable"
+    };
+    let invalid_id_evidence = if source_kind.contains("dual-aac") {
+        if missing_selection_failed {
+            "nonterminal-preflight-failure"
+        } else {
+            "missing"
+        }
+    } else {
+        "not-applicable"
+    };
+
     println!(
-        "metadata={} playing={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload",
+        "metadata={} playing={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload audio_switch={} invalid_id={} invalid_id_prior={:?}",
         metadata_seen,
         playing_seen,
         frames,
@@ -217,6 +300,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         session.dropped_frame_count(),
         audio_connected_seen,
         audio_buffers_seen,
+        audio_switch_evidence,
+        invalid_id_evidence,
+        missing_selection_prior_id,
     );
     Ok(())
 }

@@ -29,6 +29,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
+use lumina_video_core::session::AudioTrack;
 
 use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
@@ -52,6 +53,23 @@ pub enum GstAudioSinkMode {
 #[derive(Clone)]
 pub struct GstAudioHandle {
     inner: Arc<GstAudioHandleInner>,
+}
+
+/// Result of an in-session audio stream selection attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioTrackSelectionResult {
+    Selected(AudioTrack),
+    Failed {
+        requested_id: String,
+        prior_restored_id: Option<String>,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AudioSelectionAttemptError {
+    Failed(String),
+    Cancelled,
 }
 
 struct GstAudioHandleInner {
@@ -222,8 +240,8 @@ impl Default for GstLifecycleControl {
 /// GStreamer-based video decoder for Linux.
 ///
 /// Uses a GStreamer pipeline:
-/// - Video: `uridecodebin ! videoconvert ! video/x-raw,format=NV12 ! appsink`
-/// - Audio: `uridecodebin ! audioconvert ! audioresample ! volume ! autoaudiosink`
+/// - Video: `uridecodebin3 ! videoconvert ! video/x-raw,format=NV12 ! appsink`
+/// - Audio: `uridecodebin3 ! audioconvert ! audioresample ! volume ! autoaudiosink`
 ///
 /// This handles:
 /// - HTTP/HTTPS streaming
@@ -262,12 +280,190 @@ pub struct GStreamerDecoder {
     pending_error: Option<VideoError>,
     /// Audio control handle
     audio_handle: GstAudioHandle,
+    /// Discoverable audio tracks from the latest StreamCollection.
+    audio_tracks: Vec<AudioTrack>,
+    /// Every video stream id from the latest StreamCollection. GStreamer
+    /// requires these ids to accompany an audio id in SELECT_STREAMS.
+    video_stream_ids: Vec<String>,
+    /// The collection's preferred video id when no selected video is confirmed.
+    preferred_video_stream_id: Option<String>,
+    /// Video ids confirmed by the latest StreamsSelected message.
+    selected_video_stream_ids: Vec<String>,
+    /// Audio id confirmed by the latest StreamsSelected message.
+    selected_audio_stream_id: Option<String>,
+    /// Set when public track metadata or the confirmed audio id changes.
+    audio_tracks_changed: bool,
     lifecycle_timeout: Duration,
     lifecycle_control: GstLifecycleControl,
     cleaned_up: bool,
 }
 
 impl GStreamerDecoder {
+    fn stream_audio_track(stream: &gst::Stream) -> Option<AudioTrack> {
+        let id = stream.stream_id()?.to_string();
+        let tags = stream.tags();
+        let language = tags
+            .as_ref()
+            .and_then(|tags| tags.get::<gst::tags::LanguageCode>())
+            .map(|value| value.get().to_string());
+        let title = tags
+            .as_ref()
+            .and_then(|tags| tags.get::<gst::tags::Title>())
+            .map(|value| value.get().to_string());
+        let codec = tags
+            .as_ref()
+            .and_then(|tags| tags.get::<gst::tags::AudioCodec>())
+            .map(|value| value.get().to_string())
+            .or_else(|| stream.caps().and_then(Self::caps_audio_codec))
+            .unwrap_or_else(|| "unknown".into());
+
+        Some(AudioTrack {
+            id,
+            language,
+            title,
+            codec,
+        })
+    }
+
+    fn caps_audio_codec(caps: gst::Caps) -> Option<String> {
+        let structure = caps.structure(0)?;
+        let name = structure.name().as_str();
+        match name {
+            "audio/mpeg" => match structure.get::<i32>("mpegversion").ok() {
+                Some(4) => Some("AAC".into()),
+                _ => Some(name.to_string()),
+            },
+            "audio/x-opus" => Some("Opus".into()),
+            "audio/x-vorbis" => Some("Vorbis".into()),
+            _ => Some(name.to_string()),
+        }
+    }
+
+    fn collection_metadata(collection: &gst::StreamCollection) -> (Vec<AudioTrack>, Vec<String>) {
+        let mut audio_tracks = Vec::new();
+        let mut video_stream_ids = Vec::new();
+        for stream in collection {
+            let stream_type = stream.stream_type();
+            if stream_type.contains(gst::StreamType::AUDIO) {
+                if let Some(track) = Self::stream_audio_track(&stream) {
+                    audio_tracks.push(track);
+                }
+            }
+            if stream_type.contains(gst::StreamType::VIDEO) {
+                if let Some(id) = stream.stream_id() {
+                    video_stream_ids.push(id.to_string());
+                }
+            }
+        }
+        (audio_tracks, video_stream_ids)
+    }
+
+    fn preferred_video_stream_id(collection: &gst::StreamCollection) -> Option<String> {
+        let mut first_video_id = None;
+        for stream in collection {
+            if !stream.stream_type().contains(gst::StreamType::VIDEO) {
+                continue;
+            }
+            let Some(stream_id) = stream.stream_id() else {
+                continue;
+            };
+            if first_video_id.is_none() {
+                first_video_id = Some(stream_id.to_string());
+            }
+            if stream.stream_flags().contains(gst::StreamFlags::SELECT) {
+                return Some(stream_id.to_string());
+            }
+        }
+        first_video_id
+    }
+
+    fn video_selection_id<'a>(
+        video_stream_ids: &'a [String],
+        selected_video_stream_ids: &[String],
+        preferred_video_stream_id: Option<&'a str>,
+    ) -> Option<&'a str> {
+        selected_video_stream_ids
+            .iter()
+            .find_map(|selected_id| {
+                video_stream_ids
+                    .iter()
+                    .find(|video_id| video_id.as_str() == selected_id)
+                    .map(String::as_str)
+            })
+            .or_else(|| {
+                preferred_video_stream_id.filter(|preferred_id| {
+                    video_stream_ids
+                        .iter()
+                        .any(|video_id| video_id.as_str() == *preferred_id)
+                })
+            })
+            .or_else(|| video_stream_ids.first().map(String::as_str))
+    }
+
+    fn selection_message_matches(
+        expected_seqnum: gst::Seqnum,
+        selected: &gst::message::StreamsSelected,
+    ) -> bool {
+        selected.message().seqnum() == expected_seqnum
+    }
+
+    fn selected_audio_id(message: &gst::message::StreamsSelected) -> Option<String> {
+        message.streams().find_map(|stream| {
+            if stream.stream_type().contains(gst::StreamType::AUDIO) {
+                stream.stream_id().map(|id| id.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn capture_stream_collection(&mut self, collection: &gst::StreamCollection) {
+        let (audio_tracks, video_stream_ids) = Self::collection_metadata(collection);
+        let preferred_video_stream_id = Self::preferred_video_stream_id(collection);
+        let selected_audio_stream_id = self
+            .selected_audio_stream_id
+            .as_ref()
+            .filter(|selected_id| audio_tracks.iter().any(|track| &track.id == *selected_id))
+            .cloned();
+        let selected_video_stream_ids = self
+            .selected_video_stream_ids
+            .iter()
+            .filter(|selected_id| video_stream_ids.iter().any(|id| id == *selected_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let audio_selection_changed = self.selected_audio_stream_id != selected_audio_stream_id;
+        let metadata_changed = self.audio_tracks != audio_tracks
+            || self.video_stream_ids != video_stream_ids
+            || self.preferred_video_stream_id != preferred_video_stream_id;
+
+        self.audio_tracks = audio_tracks;
+        self.video_stream_ids = video_stream_ids;
+        self.preferred_video_stream_id = preferred_video_stream_id;
+        self.selected_audio_stream_id = selected_audio_stream_id;
+        self.selected_video_stream_ids = selected_video_stream_ids;
+        if metadata_changed || audio_selection_changed {
+            self.audio_tracks_changed = true;
+        }
+    }
+
+    fn capture_selected_streams(&mut self, message: &gst::message::StreamsSelected) {
+        let selected_audio_stream_id = Self::selected_audio_id(message);
+        if self.selected_audio_stream_id != selected_audio_stream_id {
+            self.selected_audio_stream_id = selected_audio_stream_id;
+            self.audio_tracks_changed = true;
+        }
+        self.selected_video_stream_ids = message
+            .streams()
+            .filter_map(|stream| {
+                if stream.stream_type().contains(gst::StreamType::VIDEO) {
+                    stream.stream_id().map(|id| id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+
     fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
         match (first, second) {
             (Some(first), Some(second)) => Some(if first <= second { first } else { second }),
@@ -345,6 +541,25 @@ impl GStreamerDecoder {
         )
     }
 
+    /// Returns the latest discoverable audio tracks.
+    pub fn audio_tracks(&self) -> &[AudioTrack] {
+        &self.audio_tracks
+    }
+
+    /// Returns the audio stream id confirmed by GStreamer.
+    pub fn selected_audio_track_id(&self) -> Option<&str> {
+        self.selected_audio_stream_id.as_deref()
+    }
+
+    /// Takes a track update observed after initialization.
+    pub fn take_audio_tracks_update(&mut self) -> Option<Vec<AudioTrack>> {
+        if !self.audio_tracks_changed {
+            return None;
+        }
+        self.audio_tracks_changed = false;
+        Some(self.audio_tracks.clone())
+    }
+
     fn new_with_memory_policy_and_audio_sink_and_timeout(
         url: &str,
         system_memory_only: bool,
@@ -374,10 +589,10 @@ impl GStreamerDecoder {
         let pipeline = gst::Pipeline::new();
 
         // Source element - handles HTTP, HTTPS, file://
-        let source = gst::ElementFactory::make("uridecodebin")
+        let source = gst::ElementFactory::make("uridecodebin3")
             .property("uri", url)
             .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin: {e}")))?;
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
 
         // === Video elements ===
         let videoconvert = gst::ElementFactory::make("videoconvert")
@@ -459,7 +674,9 @@ impl GStreamerDecoder {
             });
         }
 
-        // Handle dynamic pad creation from uridecodebin
+        // Handle dynamic pad creation from uridecodebin3. Its stream
+        // selection can remove and add pads in-session; the removed pad is
+        // unlinked by GStreamer before the replacement arrives.
         let videoconvert_weak = videoconvert.downgrade();
         let audioconvert_weak = audioconvert.downgrade();
         let audio_handle_clone = audio_handle.clone();
@@ -518,6 +735,11 @@ impl GStreamerDecoder {
         let mut width = 0u32;
         let mut height = 0u32;
         let mut duration = None;
+        let mut initial_audio_tracks = Vec::new();
+        let mut initial_video_stream_ids = Vec::new();
+        let mut initial_preferred_video_stream_id = None;
+        let mut initial_selected_audio_stream_id = None;
+        let mut initial_selected_video_stream_ids = Vec::new();
 
         // Track buffering during init (in case 100% is reached before decode loop starts)
         let mut init_buffering_percent = 0i32;
@@ -553,6 +775,27 @@ impl GStreamerDecoder {
                     }
                     break;
                 }
+                gst::MessageView::StreamCollection(collection) => {
+                    let (audio_tracks, video_stream_ids) =
+                        Self::collection_metadata(&collection.stream_collection());
+                    initial_audio_tracks = audio_tracks;
+                    initial_video_stream_ids = video_stream_ids;
+                    initial_preferred_video_stream_id =
+                        Self::preferred_video_stream_id(&collection.stream_collection());
+                }
+                gst::MessageView::StreamsSelected(selected) => {
+                    initial_selected_audio_stream_id = Self::selected_audio_id(selected);
+                    initial_selected_video_stream_ids = selected
+                        .streams()
+                        .filter_map(|stream| {
+                            if stream.stream_type().contains(gst::StreamType::VIDEO) {
+                                stream.stream_id().map(|id| id.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                }
                 gst::MessageView::Error(err) => {
                     // Clean up pipeline before returning error
                     Self::cleanup_pipeline(&pipeline, init_deadline);
@@ -584,6 +827,22 @@ impl GStreamerDecoder {
                 _ => {}
             }
         }
+
+        if initial_selected_audio_stream_id
+            .as_ref()
+            .is_some_and(|selected_id| {
+                !initial_audio_tracks
+                    .iter()
+                    .any(|track| &track.id == selected_id)
+            })
+        {
+            initial_selected_audio_stream_id = None;
+        }
+        initial_selected_video_stream_ids.retain(|selected_id| {
+            initial_video_stream_ids
+                .iter()
+                .any(|stream_id| stream_id == selected_id)
+        });
 
         // Get video dimensions and frame rate from appsink caps
         let mut frame_rate = 30.0f32; // Default fallback
@@ -707,6 +966,12 @@ impl GStreamerDecoder {
             user_paused: false,
             pending_error: None,
             audio_handle,
+            audio_tracks: initial_audio_tracks,
+            video_stream_ids: initial_video_stream_ids,
+            preferred_video_stream_id: initial_preferred_video_stream_id,
+            selected_video_stream_ids: initial_selected_video_stream_ids,
+            selected_audio_stream_id: initial_selected_audio_stream_id,
+            audio_tracks_changed: false,
             lifecycle_timeout,
             lifecycle_control,
             cleaned_up: false,
@@ -1446,6 +1711,236 @@ impl GStreamerDecoder {
         gst::ClockTime::from_nseconds(nanos)
     }
 
+    fn send_audio_selection(
+        &self,
+        audio_id: Option<&str>,
+    ) -> Result<gst::Seqnum, AudioSelectionAttemptError> {
+        let mut stream_ids = Vec::with_capacity(2);
+        if let Some(video_id) = Self::video_selection_id(
+            &self.video_stream_ids,
+            &self.selected_video_stream_ids,
+            self.preferred_video_stream_id.as_deref(),
+        ) {
+            stream_ids.push(video_id);
+        }
+        if let Some(audio_id) = audio_id {
+            stream_ids.push(audio_id);
+        }
+        let event = gst::event::SelectStreams::new(stream_ids);
+        let seqnum = event.seqnum();
+        if self.pipeline.send_event(event) {
+            Ok(seqnum)
+        } else {
+            Err(AudioSelectionAttemptError::Failed(
+                "pipeline rejected SELECT_STREAMS".into(),
+            ))
+        }
+    }
+
+    fn wait_for_audio_selection(
+        &mut self,
+        requested_id: Option<&str>,
+        expected_seqnum: gst::Seqnum,
+        deadline: Instant,
+    ) -> Result<(), AudioSelectionAttemptError> {
+        let Some(bus) = self.pipeline.bus() else {
+            return Err(AudioSelectionAttemptError::Failed(
+                "pipeline has no bus".into(),
+            ));
+        };
+        loop {
+            if self.lifecycle_control.is_cancelled() {
+                return Err(AudioSelectionAttemptError::Cancelled);
+            }
+            let remaining = Self::remaining(deadline);
+            if remaining.is_zero() {
+                return Err(AudioSelectionAttemptError::Failed(
+                    "audio stream selection timed out".into(),
+                ));
+            }
+            let Some(message) =
+                bus.timed_pop(Some(Self::clock_time(remaining.min(LIFECYCLE_POLL))))
+            else {
+                continue;
+            };
+            match message.view() {
+                gst::MessageView::StreamCollection(collection) => {
+                    self.capture_stream_collection(&collection.stream_collection());
+                }
+                gst::MessageView::StreamsSelected(selected) => {
+                    self.capture_selected_streams(selected);
+                    if !Self::selection_message_matches(expected_seqnum, selected) {
+                        continue;
+                    }
+                    let selected_id = self.selected_audio_stream_id.as_deref();
+                    let confirmed = match requested_id {
+                        Some(requested_id) => selected_id == Some(requested_id),
+                        None => selected_id.is_none(),
+                    };
+                    if confirmed {
+                        return Ok(());
+                    }
+                    return Err(AudioSelectionAttemptError::Failed(format!(
+                        "GStreamer selected {:?} instead of {:?}",
+                        selected_id, requested_id
+                    )));
+                }
+                gst::MessageView::Error(_) | gst::MessageView::Eos(_) => {
+                    let is_eos = matches!(message.view(), gst::MessageView::Eos(_));
+                    match self.process_bus_message(&message) {
+                        Some(Err(error)) => {
+                            return Err(AudioSelectionAttemptError::Failed(format!(
+                                "pipeline rejected audio stream selection: {error}"
+                            )));
+                        }
+                        Some(Ok(Some(_))) => {
+                            return Err(AudioSelectionAttemptError::Failed(
+                                "pipeline produced a frame during audio stream selection".into(),
+                            ));
+                        }
+                        Some(Ok(None)) => {
+                            let reason = if is_eos {
+                                "pipeline reached EOS during audio stream selection"
+                            } else {
+                                "pipeline rejected audio stream selection"
+                            };
+                            return Err(AudioSelectionAttemptError::Failed(reason.into()));
+                        }
+                        None => {
+                            let reason = if is_eos {
+                                "pipeline reached EOS during audio stream selection"
+                            } else {
+                                "pipeline rejected audio stream selection"
+                            };
+                            return Err(AudioSelectionAttemptError::Failed(reason.into()));
+                        }
+                    }
+                }
+                gst::MessageView::Buffering(_) => {
+                    if let Some(result) = self.process_bus_message(&message) {
+                        match result {
+                            Ok(Some(_)) => {
+                                return Err(AudioSelectionAttemptError::Failed(
+                                    "pipeline produced a frame during audio stream selection"
+                                        .into(),
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                return Err(AudioSelectionAttemptError::Failed(format!(
+                                    "pipeline rejected audio stream selection: {error}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn resolve_audio_selection<F>(
+        tracks: &[AudioTrack],
+        prior_id: Option<String>,
+        requested_id: &str,
+        deadline: Instant,
+        mut attempt: F,
+    ) -> AudioTrackSelectionResult
+    where
+        F: FnMut(Option<&str>, Instant) -> Result<Option<AudioTrack>, AudioSelectionAttemptError>,
+    {
+        if !tracks.iter().any(|track| track.id == requested_id) {
+            return AudioTrackSelectionResult::Failed {
+                requested_id: requested_id.to_string(),
+                prior_restored_id: prior_id,
+                reason: "requested audio stream id is not in the latest StreamCollection; prior audio selection unchanged".into(),
+            };
+        }
+
+        let primary_reason = match attempt(Some(requested_id), deadline) {
+            Ok(Some(track)) if track.id == requested_id => {
+                return AudioTrackSelectionResult::Selected(track);
+            }
+            Ok(Some(_)) => "confirmed audio stream metadata did not match the requested id".into(),
+            Ok(None) => {
+                "confirmed audio stream is no longer present in the latest StreamCollection".into()
+            }
+            Err(AudioSelectionAttemptError::Cancelled) => {
+                return AudioTrackSelectionResult::Failed {
+                    requested_id: requested_id.to_string(),
+                    prior_restored_id: None,
+                    reason: "audio stream selection cancelled; current selection unknown".into(),
+                };
+            }
+            Err(AudioSelectionAttemptError::Failed(reason)) => reason,
+        };
+
+        let rollback_confirmed = if Self::remaining(deadline).is_zero() {
+            false
+        } else {
+            match attempt(prior_id.as_deref(), deadline) {
+                Ok(Some(track)) => prior_id.as_deref() == Some(track.id.as_str()),
+                Ok(None) => prior_id.is_none(),
+                Err(_) => false,
+            }
+        };
+
+        if rollback_confirmed {
+            AudioTrackSelectionResult::Failed {
+                requested_id: requested_id.to_string(),
+                prior_restored_id: prior_id,
+                reason: format!("{primary_reason}; prior audio selection restored"),
+            }
+        } else {
+            AudioTrackSelectionResult::Failed {
+                requested_id: requested_id.to_string(),
+                prior_restored_id: None,
+                reason: format!(
+                    "{primary_reason}; rollback failed or timed out; current selection unknown"
+                ),
+            }
+        }
+    }
+
+    /// Selects one audio stream without rebuilding the pipeline or player.
+    ///
+    /// The selection confirmation and best-effort rollback use one absolute
+    /// operation deadline. A failed rollback deliberately reports that the
+    /// current selection is unknown rather than guessing.
+    pub fn select_audio_track(&mut self, requested_id: &str) -> AudioTrackSelectionResult {
+        let tracks = self.audio_tracks.clone();
+        let deadline = self.begin_operation_deadline();
+        let prior_id = self.selected_audio_stream_id.clone();
+        let result = Self::resolve_audio_selection(
+            &tracks,
+            prior_id,
+            requested_id,
+            deadline,
+            |audio_id, attempt_deadline| {
+                let seqnum = self.send_audio_selection(audio_id)?;
+                self.wait_for_audio_selection(audio_id, seqnum, attempt_deadline)
+                    .map(|_| {
+                        self.audio_tracks
+                            .iter()
+                            .find(|track| Some(track.id.as_str()) == audio_id)
+                            .cloned()
+                    })
+            },
+        );
+        match &result {
+            AudioTrackSelectionResult::Selected(track) => {
+                self.selected_audio_stream_id = Some(track.id.clone());
+            }
+            AudioTrackSelectionResult::Failed {
+                prior_restored_id, ..
+            } => {
+                self.selected_audio_stream_id = prior_restored_id.clone();
+            }
+        }
+        self.active_operation_deadline = None;
+        result
+    }
+
     fn cleanup_with_deadline(&mut self, deadline: Instant) {
         if self.cleaned_up {
             return;
@@ -1659,6 +2154,12 @@ impl GStreamerDecoder {
             }
             gst::MessageView::Buffering(buffering) => {
                 self.handle_buffering_message(buffering.percent());
+            }
+            gst::MessageView::StreamCollection(collection) => {
+                self.capture_stream_collection(&collection.stream_collection());
+            }
+            gst::MessageView::StreamsSelected(selected) => {
+                self.capture_selected_streams(selected);
             }
             _ => {}
         }
@@ -1994,7 +2495,7 @@ impl VideoDecoderBackend for GStreamerDecoder {
     }
 
     fn hw_accel_type(&self) -> HwAccelType {
-        // GStreamer handles HW accel internally via uridecodebin auto-selection.
+        // GStreamer handles HW accel internally via uridecodebin3 auto-selection.
         // We can't know at runtime which decoder (VA-API, software, etc.) is in use.
         HwAccelType::None
     }
@@ -2002,7 +2503,12 @@ impl VideoDecoderBackend for GStreamerDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{GStreamerDecoder, GstLifecycleControl};
+    use super::{
+        AudioSelectionAttemptError, AudioTrackSelectionResult, GStreamerDecoder,
+        GstLifecycleControl,
+    };
+    use gstreamer as gst;
+    use lumina_video_core::session::AudioTrack;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2034,5 +2540,270 @@ mod tests {
             GStreamerDecoder::earliest_deadline(Some(operation), Some(lifecycle)),
             Some(lifecycle)
         );
+    }
+
+    #[test]
+    fn sent_selection_failure_confirms_rollback_on_the_same_deadline() {
+        let english = AudioTrack {
+            id: "audio-eng".into(),
+            language: Some("eng".into()),
+            title: Some("English".into()),
+            codec: "AAC".into(),
+        };
+        let spanish = AudioTrack {
+            id: "audio-spa".into(),
+            language: Some("spa".into()),
+            title: Some("Spanish".into()),
+            codec: "AAC".into(),
+        };
+        let tracks = vec![english.clone(), spanish];
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut attempts = Vec::new();
+        let mut attempt_deadlines = Vec::new();
+        let mut selected_id = Some("audio-eng".to_string());
+
+        let result = GStreamerDecoder::resolve_audio_selection(
+            &tracks,
+            selected_id.clone(),
+            "audio-spa",
+            deadline,
+            |requested_id, attempt_deadline| {
+                attempts.push(requested_id.map(str::to_owned));
+                attempt_deadlines.push(attempt_deadline);
+                if attempts.len() == 1 {
+                    Err(AudioSelectionAttemptError::Failed(
+                        "StreamsSelected rejected requested stream".into(),
+                    ))
+                } else {
+                    selected_id = requested_id.map(str::to_owned);
+                    Ok(Some(english.clone()))
+                }
+            },
+        );
+
+        assert_eq!(
+            attempts,
+            vec![Some("audio-spa".into()), Some("audio-eng".into())]
+        );
+        assert_eq!(attempt_deadlines, vec![deadline, deadline]);
+        assert_eq!(selected_id.as_deref(), Some("audio-eng"));
+        assert_eq!(
+            result,
+            AudioTrackSelectionResult::Failed {
+                requested_id: "audio-spa".into(),
+                prior_restored_id: Some("audio-eng".into()),
+                reason: "StreamsSelected rejected requested stream; prior audio selection restored"
+                    .into(),
+            }
+        );
+    }
+
+    #[test]
+    fn sent_selection_failure_without_confirmed_rollback_reports_unknown() {
+        let tracks = vec![
+            AudioTrack {
+                id: "audio-eng".into(),
+                language: Some("eng".into()),
+                title: Some("English".into()),
+                codec: "AAC".into(),
+            },
+            AudioTrack {
+                id: "audio-spa".into(),
+                language: Some("spa".into()),
+                title: Some("Spanish".into()),
+                codec: "AAC".into(),
+            },
+        ];
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut attempts = Vec::new();
+        let mut attempt_deadlines = Vec::new();
+
+        let result = GStreamerDecoder::resolve_audio_selection(
+            &tracks,
+            Some("audio-eng".into()),
+            "audio-spa",
+            deadline,
+            |requested_id, attempt_deadline| {
+                attempts.push(requested_id.map(str::to_owned));
+                attempt_deadlines.push(attempt_deadline);
+                Err(AudioSelectionAttemptError::Failed(
+                    "StreamsSelected rejected requested stream".into(),
+                ))
+            },
+        );
+
+        assert_eq!(
+            attempts,
+            vec![Some("audio-spa".into()), Some("audio-eng".into())]
+        );
+        assert_eq!(attempt_deadlines, vec![deadline, deadline]);
+        assert!(matches!(
+            result,
+            AudioTrackSelectionResult::Failed {
+                prior_restored_id: None,
+                reason,
+                ..
+            } if reason.contains("current selection unknown")
+        ));
+    }
+
+    #[test]
+    fn cancelled_selection_does_not_attempt_rollback() {
+        let tracks = vec![AudioTrack {
+            id: "audio-spa".into(),
+            language: Some("spa".into()),
+            title: Some("Spanish".into()),
+            codec: "AAC".into(),
+        }];
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut attempts = Vec::new();
+
+        let result = GStreamerDecoder::resolve_audio_selection(
+            &tracks,
+            Some("audio-eng".into()),
+            "audio-spa",
+            deadline,
+            |requested_id, _| {
+                attempts.push(requested_id.map(str::to_owned));
+                Err(AudioSelectionAttemptError::Cancelled)
+            },
+        );
+
+        assert_eq!(attempts, vec![Some("audio-spa".into())]);
+        assert!(matches!(
+            result,
+            AudioTrackSelectionResult::Failed {
+                prior_restored_id: None,
+                reason,
+                ..
+            } if reason.contains("selection cancelled")
+        ));
+    }
+
+    #[test]
+    fn stream_collection_metadata_uses_raw_ids_and_audio_tags() {
+        if gst::init().is_err() {
+            return;
+        }
+        let mut tags = gst::TagList::new();
+        let Some(tags_ref) = tags.get_mut() else {
+            return;
+        };
+        tags_ref.add::<gst::tags::LanguageCode>(&"eng", gst::TagMergeMode::Append);
+        tags_ref.add::<gst::tags::Title>(&"English", gst::TagMergeMode::Append);
+        tags_ref.add::<gst::tags::AudioCodec>(&"AAC", gst::TagMergeMode::Append);
+
+        let video = gst::Stream::new(
+            Some("video-raw-id"),
+            None,
+            gst::StreamType::VIDEO,
+            gst::StreamFlags::empty(),
+        );
+        let selected_video = gst::Stream::new(
+            Some("video-selected-id"),
+            None,
+            gst::StreamType::VIDEO,
+            gst::StreamFlags::SELECT,
+        );
+        let audio = gst::Stream::new(
+            Some("audio-raw-id"),
+            None,
+            gst::StreamType::AUDIO,
+            gst::StreamFlags::empty(),
+        );
+        audio.set_tags(Some(&tags));
+        let collection = gst::StreamCollection::builder(None)
+            .streams([video, selected_video, audio])
+            .build();
+
+        let (tracks, video_ids) = GStreamerDecoder::collection_metadata(&collection);
+        assert_eq!(video_ids, ["video-raw-id", "video-selected-id"]);
+        assert_eq!(
+            GStreamerDecoder::preferred_video_stream_id(&collection).as_deref(),
+            Some("video-selected-id")
+        );
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks.first().map(|track| track.id.as_str()),
+            Some("audio-raw-id")
+        );
+        assert_eq!(
+            tracks.first().and_then(|track| track.language.as_deref()),
+            Some("eng")
+        );
+        assert_eq!(
+            tracks.first().and_then(|track| track.title.as_deref()),
+            Some("English")
+        );
+        assert_eq!(
+            tracks.first().map(|track| track.codec.as_str()),
+            Some("AAC")
+        );
+    }
+
+    #[test]
+    fn audio_selection_keeps_one_confirmed_video_id() {
+        let available = vec!["video-a".into(), "video-b".into()];
+        let confirmed = vec!["stale-video".into(), "video-b".into(), "video-a".into()];
+
+        assert_eq!(
+            GStreamerDecoder::video_selection_id(&available, &confirmed, Some("video-a"),),
+            Some("video-b")
+        );
+        assert_eq!(
+            GStreamerDecoder::video_selection_id(&available, &[], Some("video-b")),
+            Some("video-b")
+        );
+        assert_eq!(
+            GStreamerDecoder::video_selection_id(&available, &[], Some("stale-video")),
+            Some("video-a")
+        );
+    }
+
+    #[test]
+    fn selection_confirmation_rejects_stale_seqnum() {
+        if gst::init().is_err() {
+            return;
+        }
+        let video = gst::Stream::new(
+            Some("video-id"),
+            None,
+            gst::StreamType::VIDEO,
+            gst::StreamFlags::SELECT,
+        );
+        let audio = gst::Stream::new(
+            Some("audio-id"),
+            None,
+            gst::StreamType::AUDIO,
+            gst::StreamFlags::empty(),
+        );
+        let collection = gst::StreamCollection::builder(None)
+            .streams([video.clone(), audio.clone()])
+            .build();
+        let expected = gst::Seqnum::next();
+        let stale = gst::Seqnum::next();
+        let stale_message = gst::message::StreamsSelected::builder(&collection)
+            .streams([video.clone(), audio.clone()])
+            .seqnum(stale)
+            .build();
+        let matching_message = gst::message::StreamsSelected::builder(&collection)
+            .streams([video, audio])
+            .seqnum(expected)
+            .build();
+
+        if let gst::MessageView::StreamsSelected(selected) = stale_message.view() {
+            assert!(!GStreamerDecoder::selection_message_matches(
+                expected, selected
+            ));
+        } else {
+            panic!("expected StreamsSelected message");
+        }
+        if let gst::MessageView::StreamsSelected(selected) = matching_message.view() {
+            assert!(GStreamerDecoder::selection_message_matches(
+                expected, selected
+            ));
+        } else {
+            panic!("expected StreamsSelected message");
+        }
     }
 }
