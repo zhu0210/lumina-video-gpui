@@ -334,7 +334,7 @@ impl GpuiVideoPlayer {
             return;
         }
         #[cfg(target_os = "linux")]
-        if let Some(session) = self.session.as_ref() {
+        if let Some(session) = self.session.as_mut() {
             let _ = session.command(lumina_video_core::session::SessionCommand::Play);
         }
     }
@@ -346,7 +346,7 @@ impl GpuiVideoPlayer {
             return;
         }
         #[cfg(target_os = "linux")]
-        if let Some(session) = self.session.as_ref() {
+        if let Some(session) = self.session.as_mut() {
             let _ = session.command(lumina_video_core::session::SessionCommand::Pause);
         }
     }
@@ -366,7 +366,7 @@ impl GpuiVideoPlayer {
             return;
         }
         #[cfg(target_os = "linux")]
-        if let Some(session) = self.session.as_ref() {
+        if let Some(session) = self.session.as_mut() {
             let _ = session.command(lumina_video_core::session::SessionCommand::Seek { position });
         }
     }
@@ -651,10 +651,10 @@ impl GpuiVideoPlayer {
                 self.seek(Duration::ZERO);
                 self.play();
             } else if !self.config.looping || self.loop_seek_pending {
-                    if self.loop_seek_pending {
-                        tracing::debug!("Loop seek failed (EOS reappeared), ending");
-                        self.loop_seek_pending = false;
-                    }
+                if self.loop_seek_pending {
+                    tracing::debug!("Loop seek failed (EOS reappeared), ending");
+                    self.loop_seek_pending = false;
+                }
                 if let Some(core) = self.core.as_mut() {
                     core.set_state(VideoState::Ended);
                 }
@@ -913,10 +913,7 @@ impl GpuiVideoPlayer {
     pub fn buffering_overlay(&self) -> Option<impl IntoElement> {
         let pct = self.buffering_percent;
         #[cfg(any(not(target_os = "linux"), feature = "moq"))]
-        let is_audio_stall = self
-            .core
-            .as_ref()
-            .is_some_and(CorePlayer::is_audio_stall);
+        let is_audio_stall = self.core.as_ref().is_some_and(CorePlayer::is_audio_stall);
         #[cfg(all(target_os = "linux", not(feature = "moq")))]
         let is_audio_stall = false;
         if (pct >= 100 && !is_audio_stall) || !self.is_playing() {
