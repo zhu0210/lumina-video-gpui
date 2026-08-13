@@ -174,6 +174,57 @@ const LIFECYCLE_POLL: Duration = Duration::from_millis(50);
 /// Default bound for one seek/resync or decoder teardown operation.
 pub const DEFAULT_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn gst_error_message(error: &gst::glib::Error, debug: Option<&str>) -> String {
+    match debug {
+        Some(debug) => format!("{error} ({debug})"),
+        None => error.to_string(),
+    }
+}
+
+fn is_gio_error_domain(error: &gst::glib::Error) -> bool {
+    error.domain() == gst::glib::Quark::from_str("g-io-error-quark")
+}
+
+fn is_gst_transport_resource_error(error: &gst::glib::Error) -> bool {
+    matches!(
+        error.kind::<gst::ResourceError>(),
+        Some(
+            gst::ResourceError::Failed
+                | gst::ResourceError::TooLazy
+                | gst::ResourceError::NotFound
+                | gst::ResourceError::Busy
+                | gst::ResourceError::OpenRead
+                | gst::ResourceError::OpenWrite
+                | gst::ResourceError::OpenReadWrite
+                | gst::ResourceError::Close
+                | gst::ResourceError::Read
+                | gst::ResourceError::Write
+                | gst::ResourceError::Seek
+                | gst::ResourceError::Sync
+                | gst::ResourceError::NoSpaceLeft
+                | gst::ResourceError::NotAuthorized
+        )
+    )
+}
+
+fn classify_gst_error(
+    error: &gst::glib::Error,
+    debug: Option<&str>,
+    network_source: bool,
+    fallback: fn(String) -> VideoError,
+) -> VideoError {
+    let message = gst_error_message(error, debug);
+    if error.domain() == gst::glib::Quark::from_str("g-tls-error-quark") {
+        VideoError::Tls(message)
+    } else if network_source
+        && (is_gst_transport_resource_error(error) || is_gio_error_domain(error))
+    {
+        VideoError::Network(message)
+    } else {
+        fallback(message)
+    }
+}
+
 /// Cancellation shared by a session and its GStreamer worker.
 ///
 /// This is deliberately separate from the command mailbox: dropping or
@@ -252,6 +303,7 @@ impl Default for GstLifecycleControl {
 pub struct GStreamerDecoder {
     pipeline: gst::Pipeline,
     appsink: gst_app::AppSink,
+    network_source: bool,
     /// Keep the #7 session on the owned system-memory path.
     system_memory_only: bool,
     metadata: VideoMetadata,
@@ -491,6 +543,7 @@ impl GStreamerDecoder {
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
             GstLifecycleControl::new(),
+            None,
         )
     }
 
@@ -506,6 +559,7 @@ impl GStreamerDecoder {
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
             GstLifecycleControl::new(),
+            None,
         )
     }
 
@@ -520,6 +574,7 @@ impl GStreamerDecoder {
             audio_sink,
             DEFAULT_LIFECYCLE_TIMEOUT,
             GstLifecycleControl::new(),
+            None,
         )
     }
 
@@ -538,6 +593,27 @@ impl GStreamerDecoder {
             audio_sink,
             lifecycle_timeout,
             lifecycle_control,
+            None,
+        )
+    }
+
+    /// Test-only instance-scoped CA configuration used by the public session
+    /// integration tests. Production constructors keep the system trust store.
+    #[doc(hidden)]
+    pub fn new_system_memory_with_audio_sink_and_timeout_and_control_and_ca_file(
+        url: &str,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        lifecycle_control: GstLifecycleControl,
+        ssl_ca_file: Option<String>,
+    ) -> Result<Self, VideoError> {
+        Self::new_with_memory_policy_and_audio_sink_and_timeout(
+            url,
+            true,
+            audio_sink,
+            lifecycle_timeout,
+            lifecycle_control,
+            ssl_ca_file,
         )
     }
 
@@ -566,6 +642,7 @@ impl GStreamerDecoder {
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
         lifecycle_control: GstLifecycleControl,
+        ssl_ca_file: Option<String>,
     ) -> Result<Self, VideoError> {
         let init_now = Instant::now();
         let init_deadline = init_now.checked_add(lifecycle_timeout).unwrap_or(init_now);
@@ -593,6 +670,19 @@ impl GStreamerDecoder {
             .property("uri", url)
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
+
+        if let Some(ssl_ca_file) = ssl_ca_file {
+            source.connect("source-setup", false, move |values| {
+                let source_value = values.get(1)?;
+                let Ok(source) = source_value.get::<gst::Element>() else {
+                    return None;
+                };
+                if source.find_property("ssl-ca-file").is_some() {
+                    source.set_property("ssl-ca-file", ssl_ca_file.as_str());
+                }
+                None
+            });
+        }
 
         // === Video elements ===
         let videoconvert = gst::ElementFactory::make("videoconvert")
@@ -799,11 +889,14 @@ impl GStreamerDecoder {
                 gst::MessageView::Error(err) => {
                     // Clean up pipeline before returning error
                     Self::cleanup_pipeline(&pipeline, init_deadline);
-                    return Err(VideoError::DecoderInit(format!(
-                        "Pipeline error: {} ({:?})",
-                        err.error(),
-                        err.debug()
-                    )));
+                    let error = err.error();
+                    let debug = err.debug();
+                    return Err(classify_gst_error(
+                        &error,
+                        debug.as_deref(),
+                        url.starts_with("http://") || url.starts_with("https://"),
+                        VideoError::DecoderInit,
+                    ));
                 }
                 gst::MessageView::StateChanged(state) => {
                     if state
@@ -951,6 +1044,7 @@ impl GStreamerDecoder {
         Ok(Self {
             pipeline,
             appsink,
+            network_source: url.starts_with("http://") || url.starts_with("https://"),
             system_memory_only,
             metadata,
             position: Duration::ZERO,
@@ -2022,11 +2116,14 @@ impl GStreamerDecoder {
                     gst::MessageView::Error(err) => {
                         self.seeking = false;
                         self.seek_target = None;
-                        return Err(VideoError::SeekFailed(format!(
-                            "Seek error: {} ({:?})",
-                            err.error(),
-                            err.debug()
-                        )));
+                        let error = err.error();
+                        let debug = err.debug();
+                        return Err(classify_gst_error(
+                            &error,
+                            debug.as_deref(),
+                            self.network_source,
+                            VideoError::SeekFailed,
+                        ));
                     }
                     _ => {}
                 }
@@ -2035,10 +2132,10 @@ impl GStreamerDecoder {
 
         self.position = position;
         self.eof = false;
-        // Assume rebuffering will be needed after seek (HTTP streams)
-        self.buffering_percent = 0;
-        // Reset so we don't pause during post-seek buffering
-        self.was_fully_buffered = false;
+        // Network sources need to refill after a seek; local files are ready
+        // as soon as their first post-seek sample has been prerollled.
+        self.buffering_percent = if self.network_source { 0 } else { 100 };
+        self.was_fully_buffered = !self.network_source;
 
         Ok(())
     }
@@ -2139,7 +2236,14 @@ impl GStreamerDecoder {
     ) -> Option<Result<Option<VideoFrame>, VideoError>> {
         match msg.view() {
             gst::MessageView::Error(err) => {
-                let error = VideoError::DecodeFailed(format!("Pipeline error: {}", err.error()));
+                let error_value = err.error();
+                let debug = err.debug();
+                let error = classify_gst_error(
+                    &error_value,
+                    debug.as_deref(),
+                    self.network_source,
+                    VideoError::DecodeFailed,
+                );
                 if self.seeking {
                     // Queue error to return on next decode_next() call
                     // Don't silently drop real pipeline failures during seek
@@ -2504,12 +2608,57 @@ impl VideoDecoderBackend for GStreamerDecoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioSelectionAttemptError, AudioTrackSelectionResult, GStreamerDecoder,
-        GstLifecycleControl,
+        classify_gst_error, AudioSelectionAttemptError, AudioTrackSelectionResult,
+        GStreamerDecoder, GstLifecycleControl,
     };
+    use crate::video::VideoError;
     use gstreamer as gst;
     use lumina_video_core::session::AudioTrack;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn stable_gstreamer_and_gio_domains_preserve_tls_network_and_parse_errors() {
+        let tls = gst::glib::Error::with_domain(
+            gst::glib::Quark::from_str("g-tls-error-quark"),
+            2,
+            "certificate rejected",
+        );
+        assert!(matches!(
+            classify_gst_error(&tls, None, true, VideoError::DecoderInit),
+            VideoError::Tls(message) if message == "certificate rejected"
+        ));
+
+        let resource = gst::glib::Error::new(gst::ResourceError::OpenRead, "connection refused");
+        assert!(matches!(
+            classify_gst_error(&resource, None, true, VideoError::DecodeFailed),
+            VideoError::Network(message) if message == "connection refused"
+        ));
+        assert!(matches!(
+            classify_gst_error(&resource, None, false, VideoError::DecodeFailed),
+            VideoError::DecodeFailed(message) if message == "connection refused"
+        ));
+        let settings = gst::glib::Error::new(gst::ResourceError::Settings, "invalid HLS settings");
+        assert!(matches!(
+            classify_gst_error(&settings, None, true, VideoError::DecodeFailed),
+            VideoError::DecodeFailed(message) if message == "invalid HLS settings"
+        ));
+
+        let gio_error = gst::glib::Error::with_domain(
+            gst::glib::Quark::from_str("g-io-error-quark"),
+            39,
+            "connection refused",
+        );
+        assert!(matches!(
+            classify_gst_error(&gio_error, None, true, VideoError::DecoderInit),
+            VideoError::Network(_)
+        ));
+
+        let parse = gst::glib::Error::new(gst::CoreError::Negotiation, "bad HLS data");
+        assert!(matches!(
+            classify_gst_error(&parse, None, true, VideoError::DecodeFailed),
+            VideoError::DecodeFailed(message) if message == "bad HLS data"
+        ));
+    }
 
     #[test]
     fn lifecycle_cancellation_shares_one_absolute_deadline() {

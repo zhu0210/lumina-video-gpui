@@ -35,6 +35,22 @@ cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/vp
 cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/dual-aac.mkv
 ```
 
+The deterministic HTTP redirect, HTTPS-success, invalid-certificate, range,
+and unreachable-endpoint checks use the same generated HLS VOD fixture through
+the public `GstMediaSession` seam. Run the complete network check with:
+
+```bash
+./fixtures/generate.sh
+cargo test -p lumina-video-gst public_network_vod_handles_redirect_https_and_typed_failures -- --nocapture
+```
+
+The test creates its loopback server with `std::net::TcpListener` and its
+short-lived certificate with the existing Rustls/rcgen test dependencies. The
+trusted CA is passed to that test decoder instance only; normal constructors
+continue to use the platform trust store. If generated fixtures are absent,
+the network test reports the required generate command and skips rather than
+failing unrelated unit-test runs.
+
 On Linux the example opens the source through the public `GstMediaSession`
 seam. It polls exactly one event per tick, checks metadata and autoplay state,
 asserts that frames are owned CPU memory, observes the bounded drop-oldest

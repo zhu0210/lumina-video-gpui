@@ -52,6 +52,7 @@ pub enum VideoError {
     SeekFailed(String),
     UnsupportedFormat(String),
     Network(String),
+    Tls(String),
     Generic(String),
 }
 
@@ -64,6 +65,7 @@ impl std::fmt::Display for VideoError {
             Self::SeekFailed(message) => write!(f, "Seek failed: {message}"),
             Self::UnsupportedFormat(message) => write!(f, "Unsupported format: {message}"),
             Self::Network(message) => write!(f, "Network error: {message}"),
+            Self::Tls(message) => write!(f, "TLS error: {message}"),
             Self::Generic(message) => write!(f, "Video error: {message}"),
         }
     }

@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut frames = 0_u32;
     let mut metadata_seen = false;
     let mut playing_seen = false;
+    let mut buffering_seen = false;
     let mut ended_seen = false;
     let mut presented = false;
     let mut empty_before_frame_seen = false;
@@ -65,6 +66,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         // One and only one public session poll per animation-like tick.
         polls = polls.saturating_add(1);
         let next_event = session.try_next_event()?;
+        buffering_seen |= matches!(
+            next_event.as_ref(),
+            Some(SessionEvent::StateChanged {
+                state: SessionState::Buffering { .. }
+            })
+        );
         if let Some(SessionEvent::AudioTrackSelectionFailed {
             requested_id,
             prior_restored_id,
@@ -124,6 +131,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(io::Error::other(format!("fixture session error: {error}")).into());
         }
         metadata_seen |= snapshot.metadata.is_some();
+        buffering_seen |= matches!(&snapshot.state, SessionState::Buffering { .. });
         audio_tracks_seen |= !snapshot.audio_tracks.is_empty();
         opus_track_seen |= snapshot
             .audio_tracks
@@ -234,7 +242,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 || missing_selection_prior_id != audio_selection_requested))
     {
         return Err(io::Error::other(format!(
-            "fixture session incomplete: metadata={metadata_seen} audio_tracks={audio_tracks_seen} opus={opus_track_seen} audio_selection_requested={audio_selection_requested:?} audio_selection_seen={audio_selection_seen} missing_selection_requested={missing_selection_requested} missing_selection_failed={missing_selection_failed} missing_selection_prior_id={missing_selection_prior_id:?} playing={playing_seen} frames={frames} ended={ended_seen} replayed={replayed_seen} paused={paused_seen} resumed={resumed_seen} seek={seek_seen} seek_pts={seek_pts:?} duration={duration_seen} expected_duration={expected_duration_seen} position={position_seen} post_seek_position={post_seek_position_seen}"
+            "fixture session incomplete: metadata={metadata_seen} audio_tracks={audio_tracks_seen} opus={opus_track_seen} audio_selection_requested={audio_selection_requested:?} audio_selection_seen={audio_selection_seen} missing_selection_requested={missing_selection_requested} missing_selection_failed={missing_selection_failed} missing_selection_prior_id={missing_selection_prior_id:?} playing={playing_seen} buffering={buffering_seen} frames={frames} ended={ended_seen} replayed={replayed_seen} paused={paused_seen} resumed={resumed_seen} seek={seek_seen} seek_pts={seek_pts:?} duration={duration_seen} expected_duration={expected_duration_seen} position={position_seen} post_seek_position={post_seek_position_seen}"
         ))
         .into());
     }
@@ -282,9 +290,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     println!(
-        "metadata={} playing={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload audio_switch={} invalid_id={} invalid_id_prior={:?}",
+        "metadata={} playing={} buffering={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload audio_switch={} invalid_id={} invalid_id_prior={:?}",
         metadata_seen,
         playing_seen,
+        buffering_seen,
         frames,
         polls,
         ended_seen,

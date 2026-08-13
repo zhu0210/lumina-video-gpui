@@ -273,6 +273,7 @@ fn session_error(error: VideoError) -> SessionError {
         VideoError::DecodeFailed(message) => SessionError::Decode(message),
         VideoError::SeekFailed(message) => SessionError::Seek(message),
         VideoError::Network(message) => SessionError::Network(message),
+        VideoError::Tls(message) => SessionError::Tls(message),
         VideoError::UnsupportedFormat(message) => SessionError::Unsupported(message),
         VideoError::Generic(message) => SessionError::Fatal(message),
     }
@@ -468,12 +469,52 @@ fn publish_error(
 
 struct PlaybackState {
     playing: bool,
+    buffering: bool,
     position: Duration,
     stream_generation: u64,
 }
 
 fn mark_eos(playback: &mut PlaybackState) {
     playback.playing = false;
+    playback.buffering = false;
+}
+
+fn playback_session_state(playback: &PlaybackState) -> SessionState {
+    if !playback.playing {
+        SessionState::Paused {
+            position: playback.position,
+        }
+    } else if playback.buffering {
+        SessionState::Buffering {
+            position: playback.position,
+        }
+    } else {
+        SessionState::Playing {
+            position: playback.position,
+        }
+    }
+}
+
+fn apply_buffering_state(playback: &mut PlaybackState, buffering: bool) -> Option<SessionState> {
+    if playback.buffering == buffering {
+        return None;
+    }
+    playback.buffering = buffering;
+    Some(playback_session_state(playback))
+}
+
+fn sync_buffering_state(
+    playback: &mut PlaybackState,
+    decoder: &GStreamerDecoder,
+    state: &Arc<SnapshotState>,
+    control_sender: &ControlSender,
+    sequence: &mut u64,
+) -> bool {
+    let buffering = playback.playing && decoder.buffering_percent() < 100;
+    let Some(next_state) = apply_buffering_state(playback, buffering) else {
+        return true;
+    };
+    publish_state(state, control_sender, sequence, next_state)
 }
 
 fn process_command(
@@ -510,19 +551,19 @@ fn process_command(
                     return false;
                 }
                 playback.position = Duration::ZERO;
+                state.position_us.store(0, Ordering::Relaxed);
                 playback.stream_generation = target_generation;
             }
             match decoder.resume() {
                 Ok(()) => {
                     playback.playing = true;
+                    playback.buffering = decoder.buffering_percent() < 100;
                     audio_handle.start_playback_epoch();
                     publish_state(
                         state,
                         control_sender,
                         sequence,
-                        SessionState::Playing {
-                            position: playback.position,
-                        },
+                        playback_session_state(playback),
                     )
                 }
                 Err(error) => {
@@ -534,13 +575,12 @@ fn process_command(
         SessionCommand::Pause => match decoder.pause() {
             Ok(()) => {
                 playback.playing = false;
+                playback.buffering = false;
                 publish_state(
                     state,
                     control_sender,
                     sequence,
-                    SessionState::Paused {
-                        position: playback.position,
-                    },
+                    playback_session_state(playback),
                 )
             }
             Err(error) => {
@@ -578,17 +618,17 @@ fn process_command(
                 Ok(()) => {
                     playback.stream_generation = target_generation;
                     playback.position = target;
+                    state
+                        .position_us
+                        .store(target.as_micros() as u64, Ordering::Relaxed);
+                    playback.buffering = playback.playing && decoder.buffering_percent() < 100;
                     audio_handle.set_native_position(target);
-                    let next_state = if playback.playing {
-                        SessionState::Playing {
-                            position: playback.position,
-                        }
-                    } else {
-                        SessionState::Paused {
-                            position: playback.position,
-                        }
-                    };
-                    publish_state(state, control_sender, sequence, next_state)
+                    publish_state(
+                        state,
+                        control_sender,
+                        sequence,
+                        playback_session_state(playback),
+                    )
                 }
                 Err(error) => {
                     let _ = publish_error(state, control_sender, sequence, session_error(error));
@@ -660,6 +700,7 @@ struct WorkerIo {
     dropped_frames: Arc<AtomicU64>,
     audio_handle: AudioHandle,
     audio_sink: GstAudioSinkMode,
+    ssl_ca_file: Option<String>,
     lifecycle_control: GstLifecycleControl,
 }
 
@@ -716,6 +757,7 @@ fn run_worker(
         dropped_frames,
         audio_handle,
         audio_sink,
+        ssl_ca_file,
         lifecycle_control,
     } = io;
     let mut sequence = 0_u64;
@@ -737,11 +779,12 @@ fn run_worker(
         }
     };
     let mut decoder =
-        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeout_and_control(
+        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeout_and_control_and_ca_file(
             &source,
             audio_sink,
             lifecycle_timeout,
             lifecycle_control.clone(),
+            ssl_ca_file,
         ) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -817,6 +860,7 @@ fn run_worker(
 
     let mut playback = PlaybackState {
         playing: false,
+        buffering: false,
         position: Duration::ZERO,
         stream_generation: initial_stream_generation,
     };
@@ -826,14 +870,13 @@ fn run_worker(
         match decoder.resume() {
             Ok(()) => {
                 playback.playing = true;
+                playback.buffering = decoder.buffering_percent() < 100;
                 audio_handle.start_playback_epoch();
                 if !publish_state(
                     &state,
                     &control_sender,
                     &mut sequence,
-                    SessionState::Playing {
-                        position: playback.position,
-                    },
+                    playback_session_state(&playback),
                 ) {
                     shutdown_worker(&mut decoder, &lifecycle_control);
                     return;
@@ -891,6 +934,16 @@ fn run_worker(
                 shutdown_worker(&mut decoder, &lifecycle_control);
                 return;
             }
+        }
+        if !sync_buffering_state(
+            &mut playback,
+            &decoder,
+            &state,
+            &control_sender,
+            &mut sequence,
+        ) {
+            shutdown_worker(&mut decoder, &lifecycle_control);
+            return;
         }
         if lifecycle_cancelled(&lifecycle_control) {
             if lifecycle_control.is_stop_requested() {
@@ -1097,6 +1150,43 @@ impl GstMediaSession {
         lifecycle_timeout: Duration,
         stream_generation: u64,
     ) -> Self {
+        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_ca_file(
+            source,
+            autoplay,
+            audio_sink,
+            lifecycle_timeout,
+            stream_generation,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_ca_file(
+        source: impl Into<String>,
+        autoplay: bool,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        stream_generation: u64,
+        ssl_ca_file: String,
+    ) -> Self {
+        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_ca_file(
+            source,
+            autoplay,
+            audio_sink,
+            lifecycle_timeout,
+            stream_generation,
+            Some(ssl_ca_file),
+        )
+    }
+
+    fn new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_ca_file(
+        source: impl Into<String>,
+        autoplay: bool,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        stream_generation: u64,
+        ssl_ca_file: Option<String>,
+    ) -> Self {
         let source = source.into();
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
@@ -1133,6 +1223,7 @@ impl GstMediaSession {
                         dropped_frames: worker_dropped_frames,
                         audio_handle: worker_audio_handle,
                         audio_sink,
+                        ssl_ca_file,
                         lifecycle_control: worker_lifecycle_control,
                     },
                 )
@@ -1454,6 +1545,547 @@ impl Drop for GstMediaSession {
 mod tests {
     use super::*;
     use lumina_video_native_frame::CpuPlane;
+    use std::fs;
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    struct ControlledServer {
+        address: SocketAddr,
+        stop: Option<mpsc::Sender<()>>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl ControlledServer {
+        fn spawn(root: PathBuf, tls_config: Option<Arc<rustls::ServerConfig>>) -> io::Result<Self> {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            listener.set_nonblocking(true)?;
+            let address = listener.local_addr()?;
+            let (stop, stop_receiver) = mpsc::channel();
+            let worker = thread::Builder::new()
+                .name("lumina-gst-fixture-server".into())
+                .spawn(move || loop {
+                    if stop_receiver.try_recv().is_ok() {
+                        break;
+                    }
+                    let (stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    if let Some(config) = tls_config.as_ref() {
+                        let Ok(connection) = rustls::ServerConnection::new(Arc::clone(config))
+                        else {
+                            continue;
+                        };
+                        let mut stream = rustls::StreamOwned::new(connection, stream);
+                        let _ = serve_fixture_request(&mut stream, &root);
+                    } else {
+                        let mut stream = stream;
+                        let _ = serve_fixture_request(&mut stream, &root);
+                    }
+                })?;
+            Ok(Self {
+                address,
+                stop: Some(stop),
+                worker: Some(worker),
+            })
+        }
+
+        fn url(&self, scheme: &str, path: &str) -> String {
+            format!("{scheme}://127.0.0.1:{}{path}", self.address.port())
+        }
+    }
+
+    impl Drop for ControlledServer {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn serve_fixture_request<S: Read + Write>(stream: &mut S, root: &Path) -> io::Result<()> {
+        let Some(request) = read_fixture_request(stream)? else {
+            return Ok(());
+        };
+        let Some(request_line) = request.lines().next() else {
+            return Ok(());
+        };
+        let mut fields = request_line.split_whitespace();
+        let Some(method) = fields.next() else {
+            return Ok(());
+        };
+        let Some(request_target) = fields.next() else {
+            return Ok(());
+        };
+        let head = method.eq_ignore_ascii_case("HEAD");
+        if !head && !method.eq_ignore_ascii_case("GET") {
+            return write_fixture_response(
+                stream,
+                "405 Method Not Allowed",
+                "text/plain",
+                b"method not allowed",
+                None,
+                true,
+            );
+        }
+
+        let path = request_target
+            .split_once('?')
+            .map_or(request_target, |(path, _)| path);
+        if path.split('/').any(|part| part == "..") {
+            return write_fixture_response(
+                stream,
+                "403 Forbidden",
+                "text/plain",
+                b"forbidden",
+                None,
+                head,
+            );
+        }
+        if path == "/redirect.m3u8" {
+            return write_fixture_response(
+                stream,
+                "302 Found",
+                "application/vnd.apple.mpegurl",
+                &[],
+                Some(("Location", "/hls-vod/index.m3u8")),
+                head,
+            );
+        }
+
+        let relative_path = path.trim_start_matches('/');
+        let file_path = root.join(relative_path);
+        let body = match fs::read(file_path) {
+            Ok(body) => body,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return write_fixture_response(
+                    stream,
+                    "404 Not Found",
+                    "text/plain",
+                    b"not found",
+                    None,
+                    head,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        let content_type = if path.ends_with(".m3u8") {
+            "application/vnd.apple.mpegurl"
+        } else if path.ends_with(".ts") {
+            "video/mp2t"
+        } else {
+            "application/octet-stream"
+        };
+        let range = match fixture_header(&request, "Range") {
+            Some(value) => match parse_fixture_range(value, body.len()) {
+                Ok(range) => range,
+                Err(()) => {
+                    return write_fixture_response_with_content_range(
+                        stream,
+                        "416 Range Not Satisfiable",
+                        content_type,
+                        &[],
+                        Some(("Content-Range", format!("bytes */{}", body.len()))),
+                        head,
+                    );
+                }
+            },
+            None => None,
+        };
+        let (status, content) = match range {
+            Some((start, end)) => {
+                let Some(content) = body.get(start..=end) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "validated fixture range was out of bounds",
+                    ));
+                };
+                ("206 Partial Content", content)
+            }
+            None => ("200 OK", body.as_slice()),
+        };
+        let content_range = range.map(|(start, end)| {
+            (
+                "Content-Range",
+                format!("bytes {start}-{end}/{}", body.len()),
+            )
+        });
+        write_fixture_response_with_content_range(
+            stream,
+            status,
+            content_type,
+            content,
+            content_range,
+            head,
+        )
+    }
+
+    fn read_fixture_request<S: Read>(stream: &mut S) -> io::Result<Option<String>> {
+        let mut request = Vec::with_capacity(1024);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let Some(chunk) = buffer.get(..count) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fixture request read exceeded buffer",
+                ));
+            };
+            request.extend_from_slice(chunk);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if request.len() > 64 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fixture request headers too large",
+                ));
+            }
+        }
+        if request.is_empty() {
+            return Ok(None);
+        }
+        String::from_utf8(request)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn fixture_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
+    }
+
+    fn parse_fixture_range(value: &str, length: usize) -> Result<Option<(usize, usize)>, ()> {
+        let value = value.strip_prefix("bytes=").ok_or(())?;
+        if value.contains(',') || length == 0 {
+            return Err(());
+        }
+        let (start, end) = value.split_once('-').ok_or(())?;
+        if start.is_empty() {
+            let suffix = end.parse::<usize>().map_err(|_| ())?;
+            if suffix == 0 {
+                return Err(());
+            }
+            let start = length.saturating_sub(suffix);
+            return Ok(Some((start, length - 1)));
+        }
+        let start = start.parse::<usize>().map_err(|_| ())?;
+        if start >= length {
+            return Err(());
+        }
+        let end = if end.is_empty() {
+            length - 1
+        } else {
+            end.parse::<usize>().map_err(|_| ())?.min(length - 1)
+        };
+        if end < start {
+            return Err(());
+        }
+        Ok(Some((start, end)))
+    }
+
+    fn write_fixture_response<S: Write>(
+        stream: &mut S,
+        status: &str,
+        content_type: &str,
+        body: &[u8],
+        extra_header: Option<(&str, &str)>,
+        head: bool,
+    ) -> io::Result<()> {
+        write_fixture_response_with_content_range(
+            stream,
+            status,
+            content_type,
+            body,
+            extra_header.map(|(name, value)| (name, value.to_owned())),
+            head,
+        )
+    }
+
+    fn write_fixture_response_with_content_range<S: Write>(
+        stream: &mut S,
+        status: &str,
+        content_type: &str,
+        body: &[u8],
+        extra_header: Option<(&str, String)>,
+        head: bool,
+    ) -> io::Result<()> {
+        let extra_header = extra_header
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .unwrap_or_default();
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_header}\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes())?;
+        if !head {
+            for chunk in body.chunks(2048) {
+                stream.write_all(chunk)?;
+                stream.flush()?;
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        Ok(())
+    }
+
+    fn fixture_root() -> Option<PathBuf> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generated");
+        if root.join("hls-vod/index.m3u8").is_file() {
+            Some(root)
+        } else {
+            eprintln!(
+                "skipping network VOD integration test: generated fixture missing; run fixtures/generate.sh"
+            );
+            None
+        }
+    }
+
+    struct TestTlsMaterial {
+        config: Arc<rustls::ServerConfig>,
+        ca_file: PathBuf,
+    }
+
+    impl Drop for TestTlsMaterial {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.ca_file);
+        }
+    }
+
+    fn test_tls_material() -> Result<TestTlsMaterial, Box<dyn std::error::Error>> {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let signing_key = rcgen::KeyPair::generate()?;
+        let cert = params.self_signed(&signing_key)?;
+        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
+        );
+        let config = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], private_key)?;
+        let ca_file = std::env::temp_dir().join(format!(
+            "lumina-video-gst-test-ca-{}.pem",
+            std::process::id()
+        ));
+        fs::write(&ca_file, cert.pem())?;
+        Ok(TestTlsMaterial {
+            config: Arc::new(config),
+            ca_file,
+        })
+    }
+
+    fn pump_session_until(
+        session: &mut GstMediaSession,
+        timeout: Duration,
+        mut predicate: impl FnMut(Option<&SessionEventFrame>, &SessionSnapshot) -> bool,
+    ) -> Result<bool, SessionError> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let event = session.try_next_event()?;
+            let snapshot = session.snapshot();
+            if predicate(event.as_ref(), &snapshot) {
+                return Ok(true);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(false)
+    }
+
+    fn is_typed_session_error(
+        event: Option<&SessionEventFrame>,
+        snapshot: &SessionSnapshot,
+        matches_error: impl Fn(&SessionError) -> bool,
+    ) -> bool {
+        event.is_some_and(
+            |event| matches!(event, SessionEvent::Error(error) if matches_error(error)),
+        ) || matches!(&snapshot.state, SessionState::Error(error) if matches_error(error))
+    }
+
+    fn run_vod_session(
+        source: String,
+        ssl_ca_file: Option<String>,
+    ) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+        let mut session = match ssl_ca_file {
+            Some(ca_file) => GstMediaSession::new_for_test_with_ca_file(
+                source,
+                true,
+                GstAudioSinkMode::Fake,
+                Duration::from_secs(5),
+                0,
+                ca_file,
+            ),
+            None => GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                source,
+                true,
+                GstAudioSinkMode::Fake,
+                Duration::from_secs(5),
+                0,
+            ),
+        };
+        let mut buffering_seen = false;
+        let mut metadata_seen = false;
+        let mut frame_seen = false;
+        let mut open_error = None;
+        let opened =
+            pump_session_until(&mut session, Duration::from_secs(20), |event, snapshot| {
+                if let Some(SessionEvent::Error(error)) = event {
+                    open_error = Some(error.clone());
+                }
+                if let SessionState::Error(error) = &snapshot.state {
+                    open_error = Some(error.clone());
+                }
+                if open_error.is_some() {
+                    return true;
+                }
+                buffering_seen |= matches!(
+                    event,
+                    Some(SessionEvent::StateChanged {
+                        state: SessionState::Buffering { .. }
+                    })
+                ) || matches!(&snapshot.state, SessionState::Buffering { .. });
+                metadata_seen |= snapshot.metadata.as_ref().is_some_and(|metadata| {
+                    metadata
+                        .duration
+                        .is_some_and(|duration| duration > Duration::ZERO)
+                });
+                frame_seen |=
+                    event.is_some_and(|event| matches!(event, SessionEvent::Frame { .. }));
+                metadata_seen && frame_seen
+            })?;
+        if let Some(error) = open_error {
+            return Err(error.into());
+        }
+        if !opened {
+            return Ok((false, buffering_seen));
+        }
+        session.command(SessionCommand::Pause)?;
+        let paused =
+            pump_session_until(&mut session, Duration::from_secs(5), |_event, snapshot| {
+                matches!(&snapshot.state, SessionState::Paused { .. })
+            })?;
+        if !paused {
+            return Ok((false, buffering_seen));
+        }
+        let target = Duration::from_millis(750);
+        session.command(SessionCommand::Seek { position: target })?;
+        let sought =
+            pump_session_until(&mut session, Duration::from_secs(5), |_event, snapshot| {
+                matches!(
+                    &snapshot.state,
+                    SessionState::Paused { position }
+                        if *position >= target
+                            && *position <= target + Duration::from_millis(250)
+                )
+            })?;
+        if !sought {
+            return Ok((false, buffering_seen));
+        }
+        session.command(SessionCommand::Play)?;
+        let resumed =
+            pump_session_until(&mut session, Duration::from_secs(5), |_event, snapshot| {
+                matches!(
+                    &snapshot.state,
+                    SessionState::Playing { position }
+                        | SessionState::Buffering { position }
+                        if *position >= target
+                )
+            })?;
+        Ok((resumed, buffering_seen))
+    }
+
+    #[test]
+    fn public_network_vod_handles_redirect_https_and_typed_failures(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(root) = fixture_root() else {
+            return Ok(());
+        };
+        let http_server = ControlledServer::spawn(root.clone(), None)?;
+        let tls_material = test_tls_material()?;
+        let https_server = ControlledServer::spawn(root, Some(Arc::clone(&tls_material.config)))?;
+
+        let (http_ok, http_buffering) =
+            run_vod_session(http_server.url("http", "/redirect.m3u8"), None)?;
+        assert!(http_ok, "HTTP redirect HLS VOD did not complete");
+        let (https_ok, https_buffering) = run_vod_session(
+            https_server.url("https", "/hls-vod/index.m3u8"),
+            Some(tls_material.ca_file.to_string_lossy().into_owned()),
+        )?;
+        assert!(https_ok, "trusted HTTPS HLS VOD did not complete");
+        assert!(
+            http_buffering || https_buffering,
+            "network sessions never published a buffering state"
+        );
+
+        let mut invalid_tls =
+            GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                https_server.url("https", "/hls-vod/index.m3u8"),
+                true,
+                GstAudioSinkMode::Fake,
+                Duration::from_secs(5),
+                0,
+            );
+        let tls_seen = pump_session_until(
+            &mut invalid_tls,
+            Duration::from_secs(10),
+            |event, snapshot| {
+                is_typed_session_error(event, snapshot, |error| {
+                    matches!(error, SessionError::Tls(_))
+                })
+            },
+        )?;
+        assert!(
+            tls_seen,
+            "invalid certificate did not report SessionError::Tls"
+        );
+
+        let unavailable = TcpListener::bind(("127.0.0.1", 0))?;
+        let unavailable_port = unavailable.local_addr()?.port();
+        drop(unavailable);
+        let mut unreachable =
+            GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                format!("http://127.0.0.1:{unavailable_port}/hls-vod/index.m3u8"),
+                true,
+                GstAudioSinkMode::Fake,
+                Duration::from_secs(5),
+                0,
+            );
+        let network_seen = pump_session_until(
+            &mut unreachable,
+            Duration::from_secs(10),
+            |event, snapshot| {
+                is_typed_session_error(event, snapshot, |error| {
+                    matches!(error, SessionError::Network(_))
+                })
+            },
+        )?;
+        assert!(
+            network_seen,
+            "unreachable HTTP endpoint did not report SessionError::Network"
+        );
+        Ok(())
+    }
 
     fn test_frame_with_generation(frame_id: u64, stream_generation: u64) -> Frame {
         match NativeFrameLease::new(
@@ -1475,6 +2107,52 @@ mod tests {
 
     fn test_frame(frame_id: u64) -> Frame {
         test_frame_with_generation(frame_id, 0)
+    }
+
+    #[test]
+    fn playback_state_reports_buffering_without_changing_position() {
+        let buffering = PlaybackState {
+            playing: true,
+            buffering: true,
+            position: Duration::from_millis(750),
+            stream_generation: 3,
+        };
+        assert!(matches!(
+            playback_session_state(&buffering),
+            SessionState::Buffering { position } if position == Duration::from_millis(750)
+        ));
+
+        let playing = PlaybackState {
+            buffering: false,
+            ..buffering
+        };
+        assert!(matches!(
+            playback_session_state(&playing),
+            SessionState::Playing { position } if position == Duration::from_millis(750)
+        ));
+    }
+
+    #[test]
+    fn buffering_edges_are_single_shot_and_keep_paused_intent() {
+        let mut playback = PlaybackState {
+            playing: true,
+            buffering: false,
+            position: Duration::from_millis(750),
+            stream_generation: 3,
+        };
+        assert!(matches!(
+            apply_buffering_state(&mut playback, true),
+            Some(SessionState::Buffering { position })
+                if position == Duration::from_millis(750)
+        ));
+        assert!(apply_buffering_state(&mut playback, true).is_none());
+
+        playback.playing = false;
+        assert!(matches!(
+            apply_buffering_state(&mut playback, false),
+            Some(SessionState::Paused { position })
+                if position == Duration::from_millis(750)
+        ));
     }
 
     #[test]
@@ -1618,6 +2296,7 @@ mod tests {
     fn eos_marks_playback_idle_for_restart() {
         let mut playback = PlaybackState {
             playing: true,
+            buffering: false,
             position: Duration::from_secs(1),
             stream_generation: 0,
         };
