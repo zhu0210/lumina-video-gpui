@@ -1,4 +1,4 @@
-//! Observe fixture playback through lumina-video-core's public seam.
+//! Observe fixture playback through lumina-video-native-frame's public seam.
 
 use std::error::Error;
 use std::io;

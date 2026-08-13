@@ -285,6 +285,8 @@ pub mod macos {
     ///
     /// This verifies that the HAL APIs are accessible for zero-copy import.
     pub fn is_metal_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Metal>().is_some() }
     }
 
@@ -292,6 +294,8 @@ pub mod macos {
     ///
     /// Returns the device name if Metal backend is available, None otherwise.
     pub fn get_metal_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` is live for the duration of the callback, and the
+        // HAL device exposes its raw Metal device only while that borrow lasts.
         unsafe {
             device
                 .as_hal::<wgpu::hal::api::Metal>()
@@ -606,6 +610,8 @@ pub mod linux {
     ///
     /// Returns `false` if using OpenGL, software rendering, or another backend.
     pub fn is_vulkan_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Vulkan>().is_some() }
     }
 
@@ -613,6 +619,9 @@ pub mod linux {
     ///
     /// Returns the device name if Vulkan backend is available, None otherwise.
     pub fn get_vulkan_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` and the HAL instance/physical device are live for
+        // the callback; Vulkan guarantees the fixed device-name field is NUL
+        // terminated before it is viewed as a C string.
         unsafe {
             device.as_hal::<wgpu::hal::api::Vulkan>().map(|d| {
                 let instance = d.shared_instance();
@@ -647,6 +656,8 @@ pub mod linux {
     /// - VK_EXT_external_memory_dma_buf
     /// - VK_EXT_image_drm_format_modifier (for tiled formats)
     pub fn is_dmabuf_import_available(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is live for the callback, and the HAL device's
+        // enabled-extension set is only borrowed while that callback runs.
         unsafe {
             device
                 .as_hal::<wgpu::hal::api::Vulkan>()
@@ -667,6 +678,8 @@ pub mod linux {
         flags_req: vk::MemoryPropertyFlags,
     ) -> Option<u32> {
         let mem_properties =
+            // SAFETY: `physical_device` belongs to `instance` and remains valid
+            // for this raw Vulkan query.
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
         for i in 0..mem_properties.memory_type_count {
@@ -1539,6 +1552,8 @@ pub mod linux {
                     // (import_dmabuf takes ownership on success, but on failure we must clean up)
                     // Note: plane 0 uses the original fd which caller owns, so only close if i > 0
                     if i > 0 {
+                        // SAFETY: `plane_fd` is the duplicated descriptor for this
+                        // plane and import failed, so ownership remains here.
                         unsafe {
                             libc::close(plane_fd);
                         }
@@ -1698,6 +1713,7 @@ pub mod android {
     pub type AHardwareBufferPtr = *mut std::ffi::c_void;
 
     /// VK_ANDROID_external_memory_android_hardware_buffer extension name
+    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
     const VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME: &CStr = unsafe {
         CStr::from_bytes_with_nul_unchecked(b"VK_ANDROID_external_memory_android_hardware_buffer\0")
     };
@@ -1712,6 +1728,8 @@ pub mod android {
     /// (Android 7.0 Nougat) and a compatible GPU. Returns `false` if using
     /// OpenGL ES or software rendering.
     pub fn is_vulkan_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Vulkan>().is_some() }
     }
 
@@ -1720,6 +1738,8 @@ pub mod android {
     /// This checks for VK_ANDROID_external_memory_android_hardware_buffer extension
     /// which is required for zero-copy AHardwareBuffer import.
     pub fn is_ahardwarebuffer_import_available(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is live for the callback, and the HAL extension set
+        // is borrowed only for the callback's duration.
         unsafe {
             device
                 .as_hal::<wgpu::hal::api::Vulkan>()
@@ -1736,6 +1756,8 @@ pub mod android {
     ///
     /// Returns device name and driver version if Vulkan backend is available.
     pub fn get_vulkan_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` and its HAL instance/physical device remain live for
+        // the callback; Vulkan supplies a NUL-terminated device-name field.
         unsafe {
             device.as_hal::<wgpu::hal::api::Vulkan>().map(|d| {
                 let instance = d.shared_instance();
@@ -3928,6 +3950,8 @@ pub mod android {
             impl Drop for FenceFdGuard {
                 fn drop(&mut self) {
                     if self.0 >= 0 {
+                        // SAFETY: This guard owns the non-negative fence fd and
+                        // closes it exactly once unless `take` transferred it.
                         unsafe {
                             libc::close(self.0);
                         }
@@ -4551,6 +4575,8 @@ pub mod android {
             impl Drop for FenceFdGuard {
                 fn drop(&mut self) {
                     if self.0 >= 0 {
+                        // SAFETY: This guard owns the non-negative fence fd and
+                        // closes it exactly once unless `take` transferred it.
                         unsafe {
                             libc::close(self.0);
                         }
@@ -4969,6 +4995,8 @@ pub mod android {
             let device_clone = self.device.clone();
             let drop_callback = Box::new(move || {
                 debug!("Freeing YCbCr→RGBA texture resources");
+                // SAFETY: These Vulkan image and memory handles were allocated
+                // by this conversion and are released once by this callback.
                 unsafe {
                     device_clone.destroy_image(rgba_image, None);
                     device_clone.free_memory(rgba_memory, None);
@@ -6126,6 +6154,8 @@ pub mod android {
 
     impl Drop for VulkanYuvPipeline {
         fn drop(&mut self) {
+            // SAFETY: Every Vulkan handle below was created by this pipeline and
+            // is destroyed in dependency order while `self.device` is alive.
             unsafe {
                 debug!("Destroying VulkanYuvPipeline");
                 self.device.destroy_command_pool(self.command_pool, None);
@@ -6228,6 +6258,8 @@ pub mod windows {
 
     /// Checks if the current wgpu device supports D3D12 backend.
     pub fn is_d3d12_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Dx12>().is_some() }
     }
 
@@ -6235,6 +6267,8 @@ pub mod windows {
     ///
     /// Returns a description if D3D12 backend is available, None otherwise.
     pub fn get_d3d12_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` is live for the callback and the HAL device is only
+        // borrowed while the callback executes.
         unsafe {
             device.as_hal::<wgpu::hal::api::Dx12, _, Option<String>>(|hal_device| {
                 hal_device.map(|_| "D3D12 Device".to_string())

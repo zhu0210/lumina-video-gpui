@@ -6,9 +6,76 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use lumina_video_core::video::{
-    HwAccelType, PixelFormat, VideoError, VideoMetadata, VideoPlayerHandle, VideoState,
-};
+pub use lumina_video_core::video::{VideoError, VideoMetadata, VideoPlayerHandle, VideoState};
+
+/// Pixel format used to describe decoded native frame planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    Yuv420p,
+    Nv12,
+    Rgb24,
+    Rgba,
+    Bgra,
+}
+
+impl PixelFormat {
+    pub fn num_planes(&self) -> usize {
+        match self {
+            Self::Yuv420p => 3,
+            Self::Nv12 => 2,
+            Self::Rgb24 | Self::Rgba | Self::Bgra => 1,
+        }
+    }
+
+    pub fn is_yuv(&self) -> bool {
+        matches!(self, Self::Yuv420p | Self::Nv12)
+    }
+}
+
+/// Hardware acceleration reported by a native decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwAccelType {
+    None,
+    VideoToolbox,
+    Vaapi,
+    Vdpau,
+    D3d11va,
+    Dxva2,
+    MediaCodec,
+}
+
+impl HwAccelType {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn platform_default() -> Self {
+        Self::VideoToolbox
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn platform_default() -> Self {
+        Self::D3d11va
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn platform_default() -> Self {
+        Self::Vaapi
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn platform_default() -> Self {
+        Self::MediaCodec
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    pub fn platform_default() -> Self {
+        Self::None
+    }
+}
 
 // =============================================================================
 // Platform-specific GPU surface types for zero-copy rendering
@@ -145,12 +212,13 @@ impl std::fmt::Debug for MacOSGpuSurface {
     }
 }
 
-// SAFETY: The IOSurface pointer is safe to send/sync because:
-// - The underlying CVPixelBuffer is kept alive by Arc<dyn Any + Send + Sync>
-// - IOSurface is thread-safe (Apple's documentation)
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+// SAFETY: The IOSurface pointer is kept valid by the Send + Sync owner Arc, and
+// IOSurface itself supports cross-thread access according to Apple.
 unsafe impl Send for MacOSGpuSurface {}
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+// SAFETY: The IOSurface pointer is kept valid by the Send + Sync owner Arc, and
+// IOSurface itself supports cross-thread access according to Apple.
 unsafe impl Sync for MacOSGpuSurface {}
 
 /// Windows GPU surface holding a D3D11 shared handle for zero-copy import.
@@ -273,12 +341,13 @@ impl std::fmt::Debug for WindowsGpuSurface {
     }
 }
 
-// SAFETY: The shared HANDLE is safe to send/sync because:
-// - The underlying D3D11 texture is kept alive by Arc<dyn Any + Send + Sync>
-// - NT handles can be used across threads (Windows documentation)
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+// SAFETY: The D3D11 texture owner is retained by a Send + Sync Arc, and the
+// shared NT handle is an OS handle that may be transferred across threads.
 unsafe impl Send for WindowsGpuSurface {}
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+// SAFETY: The D3D11 texture owner is retained by a Send + Sync Arc, and the
+// shared NT handle is an OS handle that may be transferred across threads.
 unsafe impl Sync for WindowsGpuSurface {}
 
 /// Android GPU surface holding an AHardwareBuffer reference for zero-copy import.
@@ -403,12 +472,13 @@ impl std::fmt::Debug for AndroidGpuSurface {
     }
 }
 
-// SAFETY: The AHardwareBuffer pointer is safe to send/sync because:
-// - The underlying AImage is kept alive by Arc<dyn Any + Send + Sync>
-// - AHardwareBuffer is thread-safe (Android NDK documentation)
 #[cfg(target_os = "android")]
+// SAFETY: The AHardwareBuffer owner is retained by a Send + Sync Arc, and the
+// Android NDK documents AHardwareBuffer handles as thread-safe.
 unsafe impl Send for AndroidGpuSurface {}
 #[cfg(target_os = "android")]
+// SAFETY: The AHardwareBuffer owner is retained by a Send + Sync Arc, and the
+// Android NDK documents AHardwareBuffer handles as thread-safe.
 unsafe impl Sync for AndroidGpuSurface {}
 
 /// Metadata for a single DMABuf plane.
@@ -659,12 +729,13 @@ impl LinuxGpuSurface {
     }
 }
 
-// SAFETY: The DMABuf fd is safe to send/sync because:
-// - The underlying GStreamer sample is kept alive by Arc<dyn Any + Send + Sync>
-// - DMABuf fds are kernel handles that can be used from any thread
 #[cfg(target_os = "linux")]
+// SAFETY: The GStreamer sample owner is retained by a Send + Sync Arc, and
+// DMABuf file descriptors are kernel handles usable from any thread.
 unsafe impl Send for LinuxGpuSurface {}
 #[cfg(target_os = "linux")]
+// SAFETY: The GStreamer sample owner is retained by a Send + Sync Arc, and
+// DMABuf file descriptors are kernel handles usable from any thread.
 unsafe impl Sync for LinuxGpuSurface {}
 
 /// A single plane of pixel data.

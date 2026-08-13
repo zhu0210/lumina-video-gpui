@@ -199,6 +199,7 @@ impl NdkImageReaderBridge {
 
         // Acquire our own reference to the HardwareBuffer
         // Use the ndk crate's as_ptr() to get the raw AHardwareBuffer pointer
+        // SAFETY: The Android NDK object or pointer is live for this call and its ownership remains with the surrounding RAII value.
         let ahb_ptr = unsafe {
             let ptr = hardware_buffer.as_ptr();
             // Acquire an additional reference since we're passing this to another consumer
@@ -208,7 +209,9 @@ impl NdkImageReaderBridge {
 
         // Query format from the buffer descriptor
         let format = {
+            // SAFETY: The Android NDK descriptor is an output struct initialized before its fields are read.
             let mut desc: ndk_sys::AHardwareBuffer_Desc = unsafe { std::mem::zeroed() };
+            // SAFETY: The Android NDK object or pointer is live for this call and its ownership remains with the surrounding RAII value.
             unsafe {
                 ndk_sys::AHardwareBuffer_describe(
                     ahb_ptr as *const ndk_sys::AHardwareBuffer,

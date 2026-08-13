@@ -31,13 +31,14 @@ xcrun --sdk iphoneos --show-sdk-path
 │  lumina_player_create/destroy,  │
 │  poll_frame, play/pause/seek    │
 ├─────────────────────────────────┤
-│     lumina-video-core (Rust)    │  crates/lumina-video-core/
+│  lumina-video-native-frame      │  crates/lumina-video-native-frame/
+│  (legacy native decoder/runtime)│
 │  MacOSVideoDecoder (AVPlayer),  │
 │  VideoToolbox HW decode         │
 └─────────────────────────────────┘
 ```
 
-- **Decoding**: AVPlayer + VideoToolbox (hardware-accelerated, same path as macOS)
+- **Decoding**: AVPlayer + VideoToolbox (hardware-accelerated, through the legacy native-frame path)
 - **Audio**: Native AVFoundation (no FFmpeg dependency)
 - **Rendering**: Zero-copy via IOSurface → MTLTexture (no CPU readback)
 - **FFI**: Poll-based C-ABI, no callbacks. See [FFI contract](ios-ffi-contract.md).

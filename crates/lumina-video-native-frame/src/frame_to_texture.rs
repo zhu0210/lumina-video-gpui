@@ -210,6 +210,8 @@ fn import_macos_iosurface_frame(
     surface: &crate::video::MacOSGpuSurface,
     device: &wgpu::Device,
 ) -> Result<GpuFrameTextures, crate::video::VideoError> {
+    // SAFETY: The decoder owns the IOSurface and keeps its CVPixelBuffer owner
+    // alive through `surface`; the import is only attempted for that live frame.
     let texture = unsafe {
         crate::zero_copy::macos::import_iosurface(
             device,
@@ -257,6 +259,8 @@ fn import_linux_dmabuf_frame(
 
     let dmabuf_handle = DmaBufHandle::new(plane_handles, surface.modifier);
 
+    // SAFETY: The plane descriptors reference the live DMABuf owner retained by
+    // `surface`; the import consumes only the duplicated handles it receives.
     let textures = unsafe {
         crate::zero_copy::linux::import_dmabuf_multi_plane(
             device,

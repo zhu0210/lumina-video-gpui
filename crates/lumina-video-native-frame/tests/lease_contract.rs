@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use lumina_video_core::video::PixelFormat;
+use lumina_video_native_frame::video::PixelFormat;
 use lumina_video_native_frame::{
     AcquireSync, CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor, NativeFrameLease,
     NativeMemory,

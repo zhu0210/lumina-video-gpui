@@ -95,6 +95,7 @@ mod real_impl {
         fn new(hw_type: ffi::AVHWDeviceType) -> Option<Self> {
             let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
 
+            // SAFETY: The FFmpeg context or frame pointer is valid for this decoder operation and remains owned until cleanup.
             let ret = unsafe {
                 ffi::av_hwdevice_ctx_create(
                     &mut hw_device_ctx,
@@ -126,6 +127,7 @@ mod real_impl {
     impl Drop for HwDeviceCtx {
         fn drop(&mut self) {
             if !self.ptr.is_null() {
+                // SAFETY: The FFmpeg context or frame pointer is valid for this decoder operation and remains owned until cleanup.
                 unsafe {
                     ffi::av_buffer_unref(&mut self.ptr);
                 }
@@ -376,6 +378,7 @@ mod real_impl {
             // Create hardware device context
             if let Some(hw_ctx) = HwDeviceCtx::new(ffmpeg_hw_type) {
                 // Set the hardware device context on the decoder
+                // SAFETY: The FFmpeg context or frame pointer is valid for this decoder operation and remains owned until cleanup.
                 unsafe {
                     let ctx_ptr = context.as_mut_ptr();
                     // Create a new reference to the hw device ctx for the decoder
@@ -457,6 +460,7 @@ mod real_impl {
             frame: &ffmpeg::frame::Video,
         ) -> Result<ffmpeg::frame::Video, VideoError> {
             // Check if this is a hardware frame by looking at the pixel format
+            // SAFETY: The FFmpeg context or frame pointer is valid for this decoder operation and remains owned until cleanup.
             let is_hw_frame = unsafe {
                 let frame_ptr = frame.as_ptr();
                 let format = (*frame_ptr).format;
@@ -475,6 +479,7 @@ mod real_impl {
             // Create a new frame for the transferred data
             let mut sw_frame = ffmpeg::frame::Video::empty();
 
+            // SAFETY: The FFmpeg context or frame pointer is valid for this decoder operation and remains owned until cleanup.
             let ret = unsafe {
                 let frame_ptr = frame.as_ptr();
                 ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), frame_ptr, 0)
@@ -487,6 +492,7 @@ mod real_impl {
             }
 
             // Copy timing info
+            // SAFETY: The FFmpeg context or frame pointer is valid for this decoder operation and remains owned until cleanup.
             unsafe {
                 let frame_ptr = frame.as_ptr();
                 (*sw_frame.as_mut_ptr()).pts = (*frame_ptr).pts;

@@ -1,4 +1,4 @@
-//! Framework-neutral video state, metadata, and format semantics.
+//! Framework-neutral video state and metadata semantics.
 //!
 //! Native frame storage, decoder backends, and GPU surfaces live in
 //! `lumina-video-native-frame`.  This module contains only values that are
@@ -62,7 +62,7 @@ impl std::fmt::Display for VideoError {
             Self::DecoderInit(message) => write!(f, "Decoder initialization failed: {message}"),
             Self::DecodeFailed(message) => write!(f, "Frame decode failed: {message}"),
             Self::SeekFailed(message) => write!(f, "Seek failed: {message}"),
-            Self::UnsupportedFormat(message) => write!(f, "Unsupported media format: {message}"),
+            Self::UnsupportedFormat(message) => write!(f, "Unsupported format: {message}"),
             Self::Network(message) => write!(f, "Network error: {message}"),
             Self::Generic(message) => write!(f, "Video error: {message}"),
         }
@@ -70,30 +70,6 @@ impl std::fmt::Display for VideoError {
 }
 
 impl std::error::Error for VideoError {}
-
-/// Pixel format used to describe decoded frame planes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PixelFormat {
-    Yuv420p,
-    Nv12,
-    Rgb24,
-    Rgba,
-    Bgra,
-}
-
-impl PixelFormat {
-    pub fn num_planes(&self) -> usize {
-        match self {
-            Self::Yuv420p => 3,
-            Self::Nv12 => 2,
-            Self::Rgb24 | Self::Rgba | Self::Bgra => 1,
-        }
-    }
-
-    pub fn is_yuv(&self) -> bool {
-        matches!(self, Self::Yuv420p | Self::Nv12)
-    }
-}
 
 /// Metadata for one video stream.
 #[derive(Debug, Clone)]
@@ -120,51 +96,6 @@ impl VideoMetadata {
             return Duration::from_millis(33);
         }
         Duration::from_secs_f64(1.0 / self.frame_rate as f64)
-    }
-}
-
-/// Hardware acceleration reported by a native decoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HwAccelType {
-    None,
-    VideoToolbox,
-    Vaapi,
-    Vdpau,
-    D3d11va,
-    Dxva2,
-    MediaCodec,
-}
-
-impl HwAccelType {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    pub fn platform_default() -> Self {
-        Self::VideoToolbox
-    }
-
-    #[cfg(target_os = "windows")]
-    pub fn platform_default() -> Self {
-        Self::D3d11va
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn platform_default() -> Self {
-        Self::Vaapi
-    }
-
-    #[cfg(target_os = "android")]
-    pub fn platform_default() -> Self {
-        Self::MediaCodec
-    }
-
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "windows",
-        target_os = "linux",
-        target_os = "android"
-    )))]
-    pub fn platform_default() -> Self {
-        Self::None
     }
 }
 
@@ -259,13 +190,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_and_format_semantics_remain_stable() {
+    fn state_semantics_remain_stable() {
         let playing = VideoState::Playing {
             position: Duration::from_secs(10),
         };
         assert_eq!(playing.position(), Some(Duration::from_secs(10)));
-        assert_eq!(PixelFormat::Nv12.num_planes(), 2);
-        assert_eq!(PixelFormat::Rgba.num_planes(), 1);
     }
 
     #[test]

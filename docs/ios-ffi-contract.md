@@ -1,7 +1,7 @@
 # iOS FFI Contract
 
 This document defines the C-ABI contract for `lumina-video-ios`, the iOS FFI
-layer over `lumina-video-core`.
+layer over `lumina-video-native-frame`.
 
 ## API Model: Poll-Based
 

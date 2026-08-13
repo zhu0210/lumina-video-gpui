@@ -62,7 +62,8 @@ impl HardwareBufferHandle {
 impl Drop for HardwareBufferHandle {
     fn drop(&mut self) {
         if !self.buffer.is_null() {
-            // Safety: We own this buffer reference and must release it
+            // SAFETY: We own this buffer reference and release exactly the
+            // reference acquired for this handle.
             unsafe {
                 ndk_sys::AHardwareBuffer_release(self.buffer as *mut ndk_sys::AHardwareBuffer);
             }
@@ -70,22 +71,33 @@ impl Drop for HardwareBufferHandle {
     }
 }
 
-// Safety: The buffer handle is just a pointer that can be sent between threads
-// The actual AHardwareBuffer is thread-safe when accessed through the NDK API
+// SAFETY: The opaque handle is reference-counted by the NDK, whose
+// AHardwareBuffer API is thread-safe across threads.
 unsafe impl Send for HardwareBufferHandle {}
+// SAFETY: The opaque handle is reference-counted by the NDK, whose
+// AHardwareBuffer API is thread-safe across threads.
 unsafe impl Sync for HardwareBufferHandle {}
 
 /// Extension name constants for compile-time checking
+// SAFETY: The byte string is a compile-time NUL-terminated extension name.
 const VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME: &std::ffi::CStr = unsafe {
     std::ffi::CStr::from_bytes_with_nul_unchecked(
         b"VK_ANDROID_external_memory_android_hardware_buffer\0",
     )
 };
+// SAFETY: The byte string is a compile-time NUL-terminated extension name.
 const VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME: &std::ffi::CStr =
-    unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_sampler_ycbcr_conversion\0") };
+    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
+    unsafe {
+        std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_sampler_ycbcr_conversion\0")
+    };
+// SAFETY: The byte string is a compile-time NUL-terminated extension name.
 const VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME: &std::ffi::CStr =
+    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
     unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_external_memory\0") };
+// SAFETY: The byte string is a compile-time NUL-terminated extension name.
 const VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME: &std::ffi::CStr =
+    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
     unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_EXT_queue_family_foreign\0") };
 
 /// Result type for Vulkan operations.

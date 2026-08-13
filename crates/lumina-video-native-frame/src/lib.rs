@@ -3,7 +3,10 @@
 //! This crate owns frame resources explicitly.  CPU frames own their bytes;
 //! Linux DMABuf frames own memory-object file descriptors and describe format
 //! planes separately.  Acquire synchronization is also owned by the lease.
-//! No GStreamer, wgpu, or UI type is part of this interface.
+//! During the #4 migration, the legacy GStreamer, wgpu, and runtime modules
+//! temporarily live here.  The final boundary will be closed by later adapter
+//! tickets, so the current public interface still exposes some of those legacy
+//! types; this crate must not be read as the final adapter boundary yet.
 //!
 //! The legacy player and platform decoder modules are intentionally hosted here
 //! during the migration to dedicated native adapters.  The compatibility
@@ -13,9 +16,7 @@
 use std::fmt;
 use std::time::Duration;
 
-pub use lumina_video_core::video::{
-    HwAccelType, PixelFormat, VideoError, VideoMetadata, VideoPlayerHandle, VideoState,
-};
+pub use lumina_video_core::video::{VideoError, VideoMetadata, VideoPlayerHandle, VideoState};
 
 // Legacy runtime modules remain here until their dedicated adapter crates
 // take ownership.  Their public paths are preserved by the compatibility
@@ -281,7 +282,9 @@ impl NativeFrameLease {
     }
 }
 
-pub use video::{CpuFrame, DecodedFrame, Plane, VideoDecoderBackend, VideoFrame};
+pub use video::{
+    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoFrame,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use player::CorePlayer;
