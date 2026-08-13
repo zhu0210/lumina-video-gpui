@@ -181,8 +181,25 @@ fn gst_error_message(error: &gst::glib::Error, debug: Option<&str>) -> String {
     }
 }
 
-fn is_gio_error_domain(error: &gst::glib::Error) -> bool {
-    error.domain() == gst::glib::Quark::from_str("g-io-error-quark")
+fn is_gio_transport_error(error: &gst::glib::Error) -> bool {
+    matches!(
+        error.kind::<gio::IOErrorEnum>(),
+        Some(
+            gio::IOErrorEnum::TimedOut
+                | gio::IOErrorEnum::HostNotFound
+                | gio::IOErrorEnum::HostUnreachable
+                | gio::IOErrorEnum::NetworkUnreachable
+                | gio::IOErrorEnum::ConnectionRefused
+                | gio::IOErrorEnum::ProxyFailed
+                | gio::IOErrorEnum::ProxyAuthFailed
+                | gio::IOErrorEnum::ProxyNeedAuth
+                | gio::IOErrorEnum::ProxyNotAllowed
+                | gio::IOErrorEnum::BrokenPipe
+                | gio::IOErrorEnum::NotConnected
+                | gio::IOErrorEnum::Closed
+                | gio::IOErrorEnum::PartialInput
+        )
+    )
 }
 
 fn is_gst_transport_resource_error(error: &gst::glib::Error) -> bool {
@@ -190,18 +207,12 @@ fn is_gst_transport_resource_error(error: &gst::glib::Error) -> bool {
         error.kind::<gst::ResourceError>(),
         Some(
             gst::ResourceError::Failed
-                | gst::ResourceError::TooLazy
                 | gst::ResourceError::NotFound
-                | gst::ResourceError::Busy
                 | gst::ResourceError::OpenRead
-                | gst::ResourceError::OpenWrite
-                | gst::ResourceError::OpenReadWrite
                 | gst::ResourceError::Close
                 | gst::ResourceError::Read
-                | gst::ResourceError::Write
                 | gst::ResourceError::Seek
                 | gst::ResourceError::Sync
-                | gst::ResourceError::NoSpaceLeft
                 | gst::ResourceError::NotAuthorized
         )
     )
@@ -224,7 +235,7 @@ fn classify_gst_error(
     // generic network fallback is limited to failures before the first byte.
     } else if network_source
         && (is_gst_transport_resource_error(error)
-            || is_gio_error_domain(error)
+            || is_gio_transport_error(error)
             || first_byte_seen.is_some_and(|seen| !seen.load(Ordering::Relaxed)))
     {
         VideoError::Network(message)
@@ -686,6 +697,14 @@ impl GStreamerDecoder {
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
 
+        let tls_ca_file = tls_ca_file
+            .map(|path| {
+                gio::TlsFileDatabase::new(&path).map_err(|error| {
+                    VideoError::DecoderInit(format!("Failed to load TLS CA database: {error}"))
+                })?;
+                Ok(path)
+            })
+            .transpose()?;
         if network_source {
             let certificate_rejected = Arc::clone(&certificate_rejected);
             let first_byte_seen = Arc::clone(&first_byte_seen);
@@ -694,6 +713,15 @@ impl GStreamerDecoder {
                 let Ok(source) = source_value.get::<gst::Element>() else {
                     return None;
                 };
+                if let Some(path) = tls_ca_file.as_deref() {
+                    if source.find_property("tls-database").is_some() {
+                        if let Ok(tls_database) = gio::TlsFileDatabase::new(path) {
+                            // The property retains a strong GObject reference after set;
+                            // only the validated path crosses this thread-safe callback.
+                            source.set_property("tls-database", &tls_database);
+                        }
+                    }
+                }
                 if source
                     .factory()
                     .is_some_and(|factory| factory.name().as_str() == "souphttpsrc")
@@ -714,27 +742,6 @@ impl GStreamerDecoder {
                         certificate_rejected.store(true, Ordering::Release);
                         Some(false.to_value())
                     });
-                }
-                None
-            });
-        }
-
-        let tls_database = tls_ca_file
-            .map(|path| {
-                gio::TlsFileDatabase::new(&path).map_err(|error| {
-                    VideoError::DecoderInit(format!("Failed to load TLS CA database: {error}"))
-                })
-            })
-            .transpose()?;
-        if let Some(tls_database) = tls_database {
-            source.connect_local("source-setup", false, move |values| {
-                let source_value = values.get(1)?;
-                let Ok(source) = source_value.get::<gst::Element>() else {
-                    return None;
-                };
-                if source.find_property("tls-database").is_some() {
-                    // The GObject property owns a strong reference after this set.
-                    source.set_property("tls-database", &tls_database);
                 }
                 None
             });
@@ -2682,7 +2689,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn stable_gstreamer_and_gio_domains_preserve_tls_network_and_parse_errors() {
+    fn stable_gstreamer_and_gio_transport_errors_preserve_tls_network_and_parse_errors() {
         let tls = gst::glib::Error::with_domain(
             gst::glib::Quark::from_str("g-tls-error-quark"),
             2,
@@ -2708,20 +2715,37 @@ mod tests {
             VideoError::DecodeFailed(message) if message == "invalid HLS settings"
         ));
 
-        let gio_error = gst::glib::Error::with_domain(
-            gst::glib::Quark::from_str("g-io-error-quark"),
-            39,
-            "connection refused",
-        );
+        let gio_error =
+            gst::glib::Error::new(gio::IOErrorEnum::ConnectionRefused, "connection refused");
         assert!(matches!(
             classify_gst_error(&gio_error, None, true, None, None, VideoError::DecoderInit),
             VideoError::Network(_)
         ));
 
+        for kind in [
+            gio::IOErrorEnum::InvalidData,
+            gio::IOErrorEnum::InvalidArgument,
+            gio::IOErrorEnum::NotSupported,
+            gio::IOErrorEnum::Cancelled,
+        ] {
+            let error = gst::glib::Error::new(kind, "non-transport error");
+            assert!(matches!(
+                classify_gst_error(&error, None, true, None, None, VideoError::DecoderInit),
+                VideoError::DecoderInit(message) if message == "non-transport error"
+            ));
+        }
+
         let parse = gst::glib::Error::new(gst::CoreError::Negotiation, "bad HLS data");
         assert!(matches!(
             classify_gst_error(&parse, None, true, None, None, VideoError::DecodeFailed),
             VideoError::DecodeFailed(message) if message == "bad HLS data"
+        ));
+
+        let no_space =
+            gst::glib::Error::new(gst::ResourceError::NoSpaceLeft, "no space left on device");
+        assert!(matches!(
+            classify_gst_error(&no_space, None, true, None, None, VideoError::DecodeFailed),
+            VideoError::DecodeFailed(message) if message == "no space left on device"
         ));
     }
 
