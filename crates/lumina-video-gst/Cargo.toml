@@ -7,7 +7,3 @@ repository = "https://github.com/lumina-video/lumina-video"
 license = "MIT OR Apache-2.0"
 keywords = ["gstreamer", "multimedia", "video"]
 categories = ["multimedia"]
-
-[dependencies]
-lumina-video-core = { path = "../lumina-video-core" }
-lumina-video-native-frame = { path = "../lumina-video-native-frame" }

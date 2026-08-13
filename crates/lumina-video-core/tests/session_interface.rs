@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use lumina_video_core::session::{
-    CapabilityTier, FrameRealization, MediaSession, SessionCommand, SessionError, SessionEvent,
-    SessionSnapshot, SessionState,
+    CapabilityTier, MediaSession, SessionCommand, SessionError, SessionEvent, SessionSnapshot,
+    SessionState,
 };
 
 struct FakeSession {
@@ -40,7 +40,6 @@ fn session_adapter_seam_exposes_snapshot_commands_and_nonblocking_events() {
             SessionEvent::Frame {
                 pts: Duration::from_millis(20),
                 frame: 7,
-                realization: FrameRealization::system_memory_upload(),
             },
             SessionEvent::Ended,
         ]),

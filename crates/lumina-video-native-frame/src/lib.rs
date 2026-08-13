@@ -27,6 +27,10 @@ impl FrameExtent {
 }
 
 /// One owned CPU format plane.
+///
+/// [`CpuPlane::new`] takes ownership of the supplied bytes without allocating
+/// or copying them.  The producer is responsible for allocation and pooling;
+/// this type only carries that ownership through the frame lease.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CpuPlane {
     /// Bytes owned by this plane until the containing lease is dropped.
@@ -36,18 +40,25 @@ pub struct CpuPlane {
 }
 
 impl CpuPlane {
+    /// Takes ownership of `bytes` without allocating or copying it.
     pub fn new(bytes: Vec<u8>, stride: usize) -> Self {
         Self { bytes, stride }
     }
 }
 
 /// Owned system-memory planes for one decoded frame.
+///
+/// [`CpuMemory::new`] takes ownership of the supplied plane vector without
+/// allocating or copying it.  Allocation and pooling remain producer
+/// responsibilities, so constructing this wrapper does not imply a per-frame
+/// copy.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CpuMemory {
     pub planes: Vec<CpuPlane>,
 }
 
 impl CpuMemory {
+    /// Takes ownership of `planes` without allocating or copying it.
     pub fn new(planes: Vec<CpuPlane>) -> Self {
         Self { planes }
     }
@@ -97,6 +108,11 @@ pub struct DmaBufPlane {
 }
 
 /// Linux DMABuf memory with memory objects kept separate from format planes.
+///
+/// [`DmaBufMemory::new`] takes ownership of the supplied memory objects and
+/// plane descriptors without allocating or copying them.  It only validates
+/// plane-to-object references; allocation and pooling are producer
+/// responsibilities.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DmaBufMemory {
@@ -110,6 +126,8 @@ pub struct DmaBufMemory {
 
 #[cfg(target_os = "linux")]
 impl DmaBufMemory {
+    /// Takes ownership of DMABuf objects and plane descriptors and validates
+    /// their references without allocating or copying either vector.
     pub fn new(
         objects: Vec<DmaBufObject>,
         planes: Vec<DmaBufPlane>,
@@ -151,7 +169,8 @@ pub enum NativeMemory {
     DmaBuf(DmaBufMemory),
 }
 
-/// Framework-neutral identity, timing, extent, and format for one frame.
+/// Framework-neutral identity, timing, extent, and pixel format for one frame.
+/// This is not a complete color description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeFrameDescriptor {
     pub frame_id: u64,
@@ -165,12 +184,8 @@ pub struct NativeFrameDescriptor {
 /// A decoded frame and every producer resource required to keep it valid.
 #[derive(Debug)]
 pub struct NativeFrameLease {
-    pub frame_id: u64,
-    pub stream_generation: u64,
-    pub pts: MediaTime,
-    pub duration: Option<MediaTime>,
-    pub extent: FrameExtent,
-    pub format: PixelFormat,
+    /// Identity and timing remain grouped with the frame descriptor.
+    pub descriptor: NativeFrameDescriptor,
     pub memory: NativeMemory,
     pub acquire: AcquireSync,
 }
@@ -197,12 +212,7 @@ impl NativeFrameLease {
             });
         }
         Ok(Self {
-            frame_id: descriptor.frame_id,
-            stream_generation: descriptor.stream_generation,
-            pts: descriptor.pts,
-            duration: descriptor.duration,
-            extent: descriptor.extent,
-            format: descriptor.format,
+            descriptor,
             memory,
             acquire,
         })

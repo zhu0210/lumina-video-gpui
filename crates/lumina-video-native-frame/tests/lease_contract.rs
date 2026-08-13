@@ -21,9 +21,9 @@ fn cpu_lease_owns_format_planes_and_timing() -> Result<(), Box<dyn std::error::E
         AcquireSync::None,
     )?;
 
-    assert_eq!(lease.frame_id, 4);
-    assert_eq!(lease.stream_generation, 2);
-    assert_eq!(lease.extent, FrameExtent::new(2, 1));
+    assert_eq!(lease.descriptor.frame_id, 4);
+    assert_eq!(lease.descriptor.stream_generation, 2);
+    assert_eq!(lease.descriptor.extent, FrameExtent::new(2, 1));
     assert!(matches!(lease.memory, NativeMemory::Cpu(_)));
     Ok(())
 }

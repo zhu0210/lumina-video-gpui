@@ -50,8 +50,6 @@ pub enum ConversionMode {
     None,
     YuvShader,
     GpuBlit,
-    Scale,
-    ToneMap,
 }
 
 /// Producer/consumer synchronization observed for a frame.
@@ -71,19 +69,6 @@ pub struct FrameRealization {
     pub import: ImportMode,
     pub conversion: ConversionMode,
     pub synchronization: SynchronizationMode,
-}
-
-impl FrameRealization {
-    /// Describes a software-decoded frame that will be uploaded from CPU memory.
-    pub const fn system_memory_upload() -> Self {
-        Self {
-            decode: DecodeMode::Software,
-            residency: DecodeResidency::SystemMemory,
-            import: ImportMode::CpuUpload,
-            conversion: ConversionMode::None,
-            synchronization: SynchronizationMode::None,
-        }
-    }
 }
 
 /// Current lifecycle state of a media session.
@@ -150,17 +135,9 @@ pub enum SessionCommand {
 /// A framework-neutral event emitted by a media-session adapter.
 #[derive(Debug, Clone)]
 pub enum SessionEvent<F> {
-    Metadata {
-        metadata: SessionMetadata,
-    },
-    StateChanged {
-        state: SessionState,
-    },
-    Frame {
-        pts: MediaTime,
-        frame: F,
-        realization: FrameRealization,
-    },
+    Metadata { metadata: SessionMetadata },
+    StateChanged { state: SessionState },
+    Frame { pts: MediaTime, frame: F },
     Ended,
     Error(SessionError),
 }
@@ -193,7 +170,7 @@ impl SessionSnapshot {
 /// enqueue work and report only immediate validation failures, while
 /// `try_next_event` must return promptly with `None` when no event is ready.
 /// Events are returned in producer order; frame events carry their master-clock
-/// timestamp and realization, and asynchronous failures are reported as
+/// timestamp, and asynchronous failures are reported as
 /// [`SessionEvent::Error`].  Adapters must not silently change capability tier
 /// per frame; renegotiation is requested through [`SessionCommand::Renegotiate`].
 pub trait MediaSession: Send {
