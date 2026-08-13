@@ -142,8 +142,22 @@ pub enum SessionEvent<F> {
     Error(SessionError),
 }
 
-/// Existing framework-neutral video metadata under the session vocabulary.
-pub type SessionMetadata = crate::video::VideoMetadata;
+/// Framework-neutral metadata observed for one media session.
+///
+/// This intentionally owns the session vocabulary instead of aliasing the
+/// legacy decoder-facing video metadata. Native adapters can translate their
+/// metadata into this shape without leaking decoder types through the core
+/// session contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub duration: Option<MediaTime>,
+    pub frame_rate: f32,
+    pub codec: String,
+    pub pixel_aspect_ratio: f32,
+    pub start_time: Option<MediaTime>,
+}
 
 /// Snapshot of session state that can be read without consuming events.
 #[derive(Debug, Clone)]
