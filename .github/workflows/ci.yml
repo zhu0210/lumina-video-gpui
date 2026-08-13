@@ -39,8 +39,7 @@ jobs:
             libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
             libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
             libclang-dev
-      # Exclude lumina-video-android from non-Android builds (ndk-sys only compiles for Android)
-      - run: cargo clippy --package lumina-video --package lumina-video-demo --all-targets -- -D warnings
+      - run: cargo clippy --package lumina-video-core --package lumina-video-native-frame --package lumina-video-gst --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --all-targets -- -D warnings
 
   test-linux:
     name: Test (Linux)
@@ -59,11 +58,14 @@ jobs:
             libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
             libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
             libclang-dev
-      # Exclude lumina-video-android from non-Android builds
       - name: Build
-        run: cargo build --package lumina-video --package lumina-video-demo --verbose
+        run: cargo build --package lumina-video-core --package lumina-video-native-frame --package lumina-video-gst --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
       - name: Run tests
-        run: cargo test --package lumina-video --package lumina-video-demo --verbose
+        run: cargo test --package lumina-video-core --package lumina-video-native-frame --package lumina-video-gst --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
+      - name: Check GPUI MoQ feature
+        run: cargo check --package lumina-video-gpui --features moq
+      - name: Check GPUI vendored runtime feature
+        run: cargo check --package lumina-video-gpui --features vendored-runtime
 
   test-macos:
     name: Test (macOS)
@@ -87,11 +89,10 @@ jobs:
           echo "PKG_CONFIG_PATH=${FFMPEG_PREFIX}/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
           echo "LIBRARY_PATH=${FFMPEG_PREFIX}/lib:$LIBRARY_PATH" >> $GITHUB_ENV
           echo "DYLD_LIBRARY_PATH=${FFMPEG_PREFIX}/lib:$DYLD_LIBRARY_PATH" >> $GITHUB_ENV
-      # Exclude lumina-video-android from non-Android builds
       - name: Build
-        run: cargo build --package lumina-video --package lumina-video-demo --verbose
+        run: cargo build --package lumina-video-core --package lumina-video-native-frame --package lumina-video-gst --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
       - name: Run tests
-        run: cargo test --package lumina-video --package lumina-video-demo --verbose
+        run: cargo test --package lumina-video-core --package lumina-video-native-frame --package lumina-video-gst --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
 
   test-windows:
     name: Test (Windows)
@@ -113,12 +114,10 @@ jobs:
         run: |
           vcpkg install ffmpeg:x64-windows
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-      # Exclude lumina-video-android from non-Android builds
       - name: Build
-        run: cargo build --package lumina-video --package lumina-video-demo --verbose
+        run: cargo build --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
       - name: Run tests
-        run: cargo test --package lumina-video --package lumina-video-demo --verbose
-
+        run: cargo test --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
   check-android:
     name: Check (Android)
     runs-on: ubuntu-latest
@@ -137,9 +136,8 @@ jobs:
         run: rustup target add aarch64-linux-android
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
-      - name: Check Android build
-        # Exclude web-demo (wasm-only) and demo (requires native deps)
-        run: cargo ndk -t arm64-v8a check --package lumina-video --package lumina-video-android
+      - name: Check Android native-frame build
+        run: cargo ndk -t arm64-v8a check --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu
 
   # Summary job for branch protection
   ci-success:

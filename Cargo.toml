@@ -2,16 +2,13 @@
 package.version = "0.2.2"
 resolver = "2"
 members = [
-  "crates/lumina-video",
   "crates/lumina-video-core",
   "crates/lumina-video-native-frame",
   "crates/lumina-video-gst",
   "crates/lumina-video-wgpu",
   "crates/lumina-video-gpui",
   "crates/lumina-video-demo",
-  # "crates/lumina-video-android",    # TODO: port to GPUI
   # "crates/lumina-video-ios",
-  # "crates/lumina-video-web-demo",   # TODO: port to GPUI
 ]
 
 [workspace.dependencies]

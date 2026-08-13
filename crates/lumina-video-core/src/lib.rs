@@ -1,14 +1,14 @@
 //! lumina-video-core: Framework-neutral video and media-session semantics.
 //!
-//! This crate provides the egui-free contracts consumed by native playback
+//! This crate provides framework-neutral contracts consumed by native playback
 //! adapters. It contains:
 //!
 //! - Core semantics: [`video`], [`audio`], [`session`], [`subtitles`]
 //! - Shared timing primitives: [`triple_buffer`], [`sync_metrics`]
 //! - Network utilities: [`network`]
 //!
-//! This crate has **zero egui dependency**. It is consumed by:
-//! - `lumina-video` (egui integration layer)
+//! This crate has no UI framework dependency. It is consumed by:
+//! - `lumina-video-gpui` (GPUI integration layer)
 //! - `lumina-video-ios` (C FFI for iOS/Swift)
 
 // === Universal modules (compile on all targets including wasm32) ===
@@ -18,7 +18,7 @@ pub mod session;
 pub mod subtitles;
 pub mod video;
 
-/// Internal bridge API — public only for cross-crate re-export by lumina-video.
+/// Internal bridge API — public only for cross-crate use by native adapters.
 /// NOT semver-stable. Do not depend on this module directly from external crates.
 /// May change or be removed in any minor version.
 #[doc(hidden)]

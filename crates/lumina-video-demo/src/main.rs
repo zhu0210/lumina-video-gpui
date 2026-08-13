@@ -11,7 +11,7 @@ use gpui::{
     div, px, relative, rgb, rgba, size, App, Bounds, FontWeight, KeyDownEvent, MouseButton,
     SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
-use lumina_video::GpuiVideoPlayer;
+use lumina_video_gpui::GpuiVideoPlayer;
 
 const SAMPLE_VIDEOS: &[(&str, &str)] = &[
     (
@@ -40,7 +40,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("lumina_video=debug".parse().unwrap()),
+                .add_directive("lumina_video_gpui=debug".parse().unwrap()),
         )
         .init();
 
@@ -129,7 +129,7 @@ impl Render for DemoApp {
         };
 
         // Controls bar state
-        let show_controls = self.player.as_ref().map_or(false, |p| p.is_ready());
+        let show_controls = self.player.as_ref().is_some_and(|p| p.is_ready());
         let play_icon = if is_ended {
             "↺"
         } else if is_playing {
@@ -137,7 +137,7 @@ impl Render for DemoApp {
         } else {
             "▶"
         };
-        let is_muted = self.player.as_ref().map_or(false, |p| p.is_muted());
+        let is_muted = self.player.as_ref().is_some_and(|p| p.is_muted());
         let mute_icon = if is_muted { "🔇" } else { "🔊" };
         let position = self
             .player

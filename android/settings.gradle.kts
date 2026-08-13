@@ -1,9 +1,7 @@
 /**
  * lumina-video Android Project
  *
- * Root settings for the lumina-video Android project including:
- * - :app - Demo application for testing lumina-video
- * - :lumina-video-bridge - ExoPlayer bridge library
+ * Root settings for the lumina-video Android bridge used by native-frame.
  */
 
 pluginManagement {
@@ -23,5 +21,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "lumina-video"
-include(":app")
 include(":lumina-video-bridge")

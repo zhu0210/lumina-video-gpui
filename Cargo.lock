@@ -4264,35 +4264,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
-name = "lumina-video"
-version = "0.2.2"
-dependencies = [
- "bytemuck",
- "crossbeam-channel",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "js-sys",
- "lumina-video-core",
- "lumina-video-gpui",
- "lumina-video-gst",
- "lumina-video-native-frame",
- "lumina-video-wgpu",
- "parking_lot",
- "poll-promise",
- "rustls",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "wgpu",
-]
-
-[[package]]
 name = "lumina-video-core"
 version = "0.2.2"
 dependencies = [
@@ -4318,7 +4289,7 @@ dependencies = [
  "gpui_macos",
  "gpui_wgpu",
  "gpui_windows",
- "lumina-video",
+ "lumina-video-gpui",
  "tracing",
  "tracing-subscriber",
 ]

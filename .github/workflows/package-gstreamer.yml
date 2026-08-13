@@ -386,7 +386,7 @@ jobs:
           tag_name: vendor-gstreamer-${{ env.BUNDLE_VERSION }}
           name: "GStreamer Vendor Bundle ${{ env.BUNDLE_VERSION }}"
           body: |
-            Pre-built GStreamer libraries for use with `lumina-video`'s `vendored-runtime` feature.
+            Pre-built GStreamer libraries for use with `lumina-video-gpui`'s `vendored-runtime` feature.
 
             **Platform:** Linux x86_64 (Ubuntu 24.04+, glibc 2.39+)
             **GStreamer:** 1.24.x
@@ -397,7 +397,7 @@ jobs:
 
             ```toml
             [dependencies]
-            lumina-video = { git = "...", features = ["vendored-runtime"] }
+            lumina-video-gpui = { git = "...", features = ["vendored-runtime"] }
             ```
 
             ## LGPL Compliance

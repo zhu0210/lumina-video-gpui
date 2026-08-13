@@ -97,7 +97,7 @@ impl HwAccelType {
 /// ```
 /// # #[cfg(target_os = "macos")]
 /// # fn main() {
-/// use lumina_video::media::video::{MacOSGpuSurface, PixelFormat, CpuFrame};
+/// use lumina_video_native_frame::video::{MacOSGpuSurface, PixelFormat, CpuFrame};
 /// use std::sync::Arc;
 ///
 /// // MacOSGpuSurface::new() is unsafe because it requires valid IOSurface pointers.
@@ -237,7 +237,7 @@ unsafe impl Sync for MacOSGpuSurface {}
 /// ```
 /// # #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 /// # fn main() {
-/// use lumina_video::media::video::{WindowsGpuSurface, PixelFormat};
+/// use lumina_video_native_frame::video::{WindowsGpuSurface, PixelFormat};
 ///
 /// // WindowsGpuSurface::new() is unsafe because it requires valid D3D11 handles.
 /// // In practice, surfaces are created by the decoder, not user code.
@@ -366,7 +366,7 @@ unsafe impl Sync for WindowsGpuSurface {}
 /// ```
 /// # #[cfg(target_os = "android")]
 /// # fn main() {
-/// use lumina_video::media::video::{AndroidGpuSurface, PixelFormat};
+/// use lumina_video_native_frame::video::{AndroidGpuSurface, PixelFormat};
 ///
 /// // AndroidGpuSurface::new() is unsafe because it requires valid AHardwareBuffer pointers.
 /// // In practice, surfaces are created by the decoder (MediaCodec), not user code.

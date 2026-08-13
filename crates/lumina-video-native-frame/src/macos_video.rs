@@ -321,7 +321,7 @@ fn extract_cpu_frame_from_pixel_buffer(
 ///
 /// ```
 /// # fn main() {
-/// use lumina_video::media::macos_video::MacOSZeroCopyStatsSnapshot;
+/// use lumina_video_native_frame::macos_video::MacOSZeroCopyStatsSnapshot;
 ///
 /// // Get stats from a decoder (typically via decoder.zero_copy_stats())
 /// let stats = MacOSZeroCopyStatsSnapshot {

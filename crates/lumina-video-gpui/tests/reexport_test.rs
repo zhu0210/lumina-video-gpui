@@ -2,3 +2,8 @@
 
 #[allow(unused_imports)]
 use lumina_video_gpui::{GpuiVideoPlayer, GpuiVideoPlayerConfig, GpuiVideoPlayerResponse};
+
+#[test]
+fn gpui_entry_point_is_constructible() {
+    let _: fn(String) -> GpuiVideoPlayer = GpuiVideoPlayer::new;
+}

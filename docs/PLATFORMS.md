@@ -21,7 +21,7 @@ Detailed platform requirements, supported codecs, and hardware specifications.
   - Apple Silicon (M1, M2, M3, M4) — native hardware decode
   - Intel Macs with QuickSync (2012 and later)
 - **Codecs**: H.264, HEVC, VP9, AV1 (M3+ for AV1)
-- **Containers**: MP4, MOV, HLS native; MKV/WebM require `ffmpeg` feature
+- **Containers**: MP4, MOV, HLS native; MKV/WebM use the automatic FFmpeg fallback
 
 ## Windows
 
@@ -120,21 +120,11 @@ By default, lumina-video uses **alsasink** for audio output on Linux. This bypas
 | **Binary Size** | Uses system libraries (0 MB) | +15-30 MB for FFmpeg libs |
 | **Codec Updates** | Automatic via OS updates | Must rebuild/redeploy |
 
-## FFmpeg Fallback
+## Platform Fallbacks
 
-When the `ffmpeg` feature is enabled, lumina-video automatically falls back to FFmpeg for unsupported containers:
-
-| Platform | FFmpeg Fallback When |
-|----------|---------------------|
-| **macOS** | MKV, WebM, OGG containers; unsupported codecs |
-| **Linux** | GStreamer init fails; missing plugins |
-| **Windows** | *(FFmpeg primary currently)* |
-| **Android** | *(No FFmpeg on Android)* |
-
-Enable with:
-```toml
-lumina-video = { git = "https://github.com/lumina-video/lumina-video", features = ["ffmpeg"] }
-```
+On macOS, FFmpeg support is included automatically for MKV/WebM fallback
+through native-frame. Linux playback uses GStreamer; applications that need a
+bundled GStreamer runtime can enable `vendored-runtime` on `lumina-video-gpui`.
 
 ## Packaging Recommendations
 

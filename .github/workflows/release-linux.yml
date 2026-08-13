@@ -96,7 +96,7 @@ jobs:
             "Architecture: amd64" \
             "Depends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-vaapi, libvulkan1" \
             "Maintainer: alltheseas <alltheseas@users.noreply.github.com>" \
-            "Description: Hardware-accelerated video player demo for egui" \
+            "Description: Hardware-accelerated GPUI video player demo" \
             " lumina-video-demo demonstrates the lumina-video video player library" \
             " with zero-copy GPU rendering via VA-API and Vulkan." \
             > "${PKG_DIR}/DEBIAN/control"
@@ -144,7 +144,7 @@ jobs:
             "Name:           lumina-video-demo" \
             "Version:        %{_version}" \
             "Release:        1%{?dist}" \
-            "Summary:        Hardware-accelerated video player demo for egui" \
+            "Summary:        Hardware-accelerated GPUI video player demo" \
             "License:        MIT OR Apache-2.0" \
             "URL:            https://github.com/lumina-video/lumina-video" \
             "" \

@@ -1,6 +1,8 @@
-# lumina-video Android Bridge
+# lumina-video Android Native-Frame Bridge
 
-Zero-copy video rendering for Android using ExoPlayer and lumina-video's Rust/Vulkan pipeline.
+The retained Android module is the ExoPlayer bridge used by
+`lumina-video-native-frame`'s Android decoder. The old standalone demo app is no
+longer part of this repository.
 
 ## Overview
 
@@ -17,7 +19,7 @@ LuminaVideo.init(activity)           [one-time, in onCreate()]
                                         |
                                         +--> JNI: nativeSubmitHardwareBuffer()
                                                  |
-                                                 +--> Vulkan import -> wgpu -> egui
+                                                 +--> Vulkan import -> wgpu
 ```
 
 ## Requirements
@@ -53,8 +55,9 @@ class MainActivity : GameActivity() {
 }
 ```
 
-That's it. Rust calls `VideoPlayer::with_wgpu(url, render_state)` and the bridge handles
+That's it. `lumina-video-native-frame` creates the decoder and the bridge handles
 ExoPlayer creation, frame extraction, and HardwareBuffer submission automatically.
+`lumina-video-gpui` consumes the resulting native frames when GPUI rendering is used.
 
 ### Optional: Custom ExoPlayer configuration
 
@@ -163,7 +166,7 @@ Stats (zero-copy vs. CPU-assisted vs. failed frame counts) are co-located with e
 
 - Verify device supports `VK_ANDROID_external_memory_android_hardware_buffer`
 - Check logcat for `ExoPlayerBridge` / `lumina-video` tags
-- The zero-copy debug panel (in the demo app) shows per-frame import results
+- Native-frame import results are available through the Android/Rust logs
 
 ### Performance
 
