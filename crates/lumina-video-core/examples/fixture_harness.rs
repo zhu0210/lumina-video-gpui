@@ -6,11 +6,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumina_video_core::player::CorePlayer;
-use lumina_video_core::video::{DecodedFrame, VideoDecoderBackend, VideoError, VideoState};
+use lumina_video_core::video::{DecodedFrame, VideoError, VideoState};
 use url::Url;
 
 #[cfg(target_os = "linux")]
 use lumina_video_core::linux_video::ZeroCopyGStreamerDecoder;
+#[cfg(target_os = "linux")]
+use lumina_video_core::video::VideoDecoderBackend;
 
 fn source_url(input: &str) -> Result<String, io::Error> {
     if input.contains("://") {

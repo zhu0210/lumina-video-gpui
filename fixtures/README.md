@@ -27,7 +27,8 @@ After generating fixtures, run the high-level example with a local path, for
 example:
 
 ```bash
-cargo run -p lumina-video-core --example fixture_harness -- fixtures/generated/h264-aac.mp4
+# On a headless Linux host, disable the native audio sink for this probe.
+EGUI_VID_FAKE_AUDIO=1 cargo run -p lumina-video-core --example fixture_harness -- fixtures/generated/h264-aac.mp4
 ```
 
 On Linux the example opens the source through the public
