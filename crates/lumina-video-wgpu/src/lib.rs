@@ -19,7 +19,10 @@ mod frame_to_texture;
     target_os = "android",
     target_os = "windows"
 ))]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "raw backends remain private until owned lease adapters land in #15/#16"
+)]
 mod zero_copy;
 
 #[allow(deprecated)]
