@@ -151,9 +151,57 @@ impl GstAudioHandle {
 /// The gap between thresholds prevents rapid state changes on marginal connections.
 const BUFFER_LOW_THRESHOLD: i32 = 10; // Pause when buffer drops below this %
 const BUFFER_HIGH_THRESHOLD: i32 = 100; // Resume when buffer reaches this %
+const LIFECYCLE_POLL: Duration = Duration::from_millis(50);
 
 /// Default bound for one seek/resync or decoder teardown operation.
 pub const DEFAULT_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cancellation shared by a session and its GStreamer worker.
+///
+/// This is deliberately separate from the command mailbox: dropping or
+/// replacing a session must still wake a worker that is opening a pipeline or
+/// waiting for a sample even when the command queue is full.
+#[derive(Clone, Debug)]
+pub struct GstLifecycleControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+impl GstLifecycleControl {
+    /// Creates an active lifecycle control.
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Requests cancellation and records the one absolute cleanup deadline.
+    pub fn cancel(&self, timeout: Duration) {
+        let now = Instant::now();
+        let deadline = now.checked_add(timeout).unwrap_or(now);
+        if let Ok(mut shared_deadline) = self.deadline.lock() {
+            *shared_deadline = Some(deadline);
+        }
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether the owning session has been dropped or replaced.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns the absolute deadline established by [`Self::cancel`].
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline.lock().ok().and_then(|deadline| *deadline)
+    }
+}
+
+impl Default for GstLifecycleControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// GStreamer-based video decoder for Linux.
 ///
@@ -196,13 +244,12 @@ pub struct GStreamerDecoder {
     /// Audio control handle
     audio_handle: GstAudioHandle,
     lifecycle_timeout: Duration,
+    lifecycle_control: GstLifecycleControl,
     cleaned_up: bool,
 }
 
 impl GStreamerDecoder {
-    fn cleanup_pipeline(pipeline: &gst::Pipeline, timeout: Duration) {
-        let now = Instant::now();
-        let deadline = now.checked_add(timeout).unwrap_or(now);
+    fn cleanup_pipeline(pipeline: &gst::Pipeline, deadline: Instant) {
         let _ = pipeline.set_state(gst::State::Null);
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -220,6 +267,7 @@ impl GStreamerDecoder {
             false,
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
+            GstLifecycleControl::new(),
         )
     }
 
@@ -234,6 +282,7 @@ impl GStreamerDecoder {
             true,
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
+            GstLifecycleControl::new(),
         )
     }
 
@@ -260,19 +309,25 @@ impl GStreamerDecoder {
             true,
             audio_sink,
             lifecycle_timeout,
+            GstLifecycleControl::new(),
         )
     }
 
-    /// Creates a decoder with an explicit lifecycle timeout.
-    pub fn new_with_lifecycle_timeout(
+    /// Creates a system-memory decoder using a worker-owned cancellation
+    /// signal. The worker uses this constructor so opening and teardown obey
+    /// the same session lifecycle deadline.
+    pub fn new_system_memory_with_audio_sink_and_timeout_and_control(
         url: &str,
+        audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
+        lifecycle_control: GstLifecycleControl,
     ) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
-            false,
-            GstAudioSinkMode::Auto,
+            true,
+            audio_sink,
             lifecycle_timeout,
+            lifecycle_control,
         )
     }
 
@@ -281,7 +336,14 @@ impl GStreamerDecoder {
         system_memory_only: bool,
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
+        lifecycle_control: GstLifecycleControl,
     ) -> Result<Self, VideoError> {
+        let init_now = Instant::now();
+        let init_deadline = init_now.checked_add(lifecycle_timeout).unwrap_or(init_now);
+        if lifecycle_control.is_cancelled() {
+            return Err(VideoError::DecoderInit("lifecycle cancelled".into()));
+        }
+
         // Initialize vendored runtime environment before GStreamer init
         #[cfg(feature = "vendored-runtime")]
         {
@@ -436,7 +498,7 @@ impl GStreamerDecoder {
 
         // Wait for pipeline to reach paused state (preroll) or error
         let Some(bus) = pipeline.bus() else {
-            Self::cleanup_pipeline(&pipeline, lifecycle_timeout);
+            Self::cleanup_pipeline(&pipeline, init_deadline);
             return Err(VideoError::DecoderInit("Pipeline has no bus".to_string()));
         };
         let mut width = 0u32;
@@ -446,8 +508,29 @@ impl GStreamerDecoder {
         // Track buffering during init (in case 100% is reached before decode loop starts)
         let mut init_buffering_percent = 0i32;
 
-        // Wait for async state change and get metadata
-        for msg in bus.iter_timed(gst::ClockTime::from_seconds(10)) {
+        // Wait for async state change and get metadata. Small polls keep
+        // cancellation observable while a network source is opening.
+        loop {
+            if lifecycle_control.is_cancelled() {
+                Self::cleanup_pipeline(
+                    &pipeline,
+                    lifecycle_control.deadline().unwrap_or(init_deadline),
+                );
+                return Err(VideoError::DecoderInit("lifecycle cancelled".into()));
+            }
+            let remaining = init_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                Self::cleanup_pipeline(&pipeline, init_deadline);
+                return Err(VideoError::DecoderInit(
+                    "pipeline initialization timed out".into(),
+                ));
+            }
+            let timeout = remaining.min(LIFECYCLE_POLL);
+            let Some(msg) = bus.timed_pop(Self::clock_time(timeout)) else {
+                continue;
+            };
             match msg.view() {
                 gst::MessageView::AsyncDone(_) => {
                     // Query duration
@@ -458,7 +541,7 @@ impl GStreamerDecoder {
                 }
                 gst::MessageView::Error(err) => {
                     // Clean up pipeline before returning error
-                    Self::cleanup_pipeline(&pipeline, lifecycle_timeout);
+                    Self::cleanup_pipeline(&pipeline, init_deadline);
                     return Err(VideoError::DecoderInit(format!(
                         "Pipeline error: {} ({:?})",
                         err.error(),
@@ -504,10 +587,29 @@ impl GStreamerDecoder {
             }
         }
 
-        // Try to pull preroll sample - this gives us dimensions AND the first frame
-        // We cache this sample to return on the first decode_next() call
-        // Use generous timeout for slow network streams
-        let preroll_sample = appsink.try_pull_preroll(gst::ClockTime::from_seconds(10));
+        // Try to pull preroll sample - this gives us dimensions AND the first
+        // frame. Small polls keep cancellation observable for slow streams.
+        let preroll_sample = loop {
+            if lifecycle_control.is_cancelled() {
+                Self::cleanup_pipeline(
+                    &pipeline,
+                    lifecycle_control.deadline().unwrap_or(init_deadline),
+                );
+                return Err(VideoError::DecoderInit("lifecycle cancelled".into()));
+            }
+            let remaining = init_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                Self::cleanup_pipeline(&pipeline, init_deadline);
+                return Err(VideoError::DecoderInit("pipeline preroll timed out".into()));
+            }
+            if let Some(sample) =
+                appsink.try_pull_preroll(Self::clock_time(remaining.min(LIFECYCLE_POLL)))
+            {
+                break Some(sample);
+            }
+        };
 
         // If we couldn't get dimensions/framerate from caps, try from preroll sample
         if width == 0 || height == 0 || frame_rate == 30.0 {
@@ -539,7 +641,7 @@ impl GStreamerDecoder {
 
         if width == 0 || height == 0 {
             // Clean up pipeline before returning error
-            Self::cleanup_pipeline(&pipeline, lifecycle_timeout);
+            Self::cleanup_pipeline(&pipeline, init_deadline);
             return Err(VideoError::DecoderInit(
                 "Could not determine video dimensions".to_string(),
             ));
@@ -591,6 +693,7 @@ impl GStreamerDecoder {
             pending_error: None,
             audio_handle,
             lifecycle_timeout,
+            lifecycle_control,
             cleaned_up: false,
         })
     }
@@ -602,7 +705,18 @@ impl GStreamerDecoder {
 
     /// Stops the pipeline with the configured worker-side deadline.
     pub fn shutdown(&mut self) {
-        self.cleanup();
+        let deadline = self
+            .lifecycle_control
+            .deadline()
+            .unwrap_or_else(|| self.deadline_for());
+        self.cleanup_with_deadline(deadline);
+    }
+
+    /// Stops the pipeline without extending an already-started teardown
+    /// deadline.
+    pub fn shutdown_with_deadline(&mut self, deadline: Option<Instant>) {
+        let deadline = deadline.unwrap_or_else(|| self.deadline_for());
+        self.cleanup_with_deadline(deadline);
     }
 
     /// Converts a GStreamer sample to our VideoFrame format.
@@ -1292,17 +1406,17 @@ impl GStreamerDecoder {
         gst::ClockTime::from_nseconds(nanos)
     }
 
-    fn cleanup(&mut self) {
+    fn cleanup_with_deadline(&mut self, deadline: Instant) {
         if self.cleaned_up {
             return;
         }
         self.cleaned_up = true;
-        Self::cleanup_pipeline(&self.pipeline, self.lifecycle_timeout);
+        Self::cleanup_pipeline(&self.pipeline, deadline);
     }
 
     /// Internal seek implementation (may be retried on transient errors).
     fn seek_internal(&mut self, position: Duration, deadline: Instant) -> Result<(), VideoError> {
-        if Self::remaining(deadline).is_zero() {
+        if self.lifecycle_control.is_cancelled() || Self::remaining(deadline).is_zero() {
             return Err(VideoError::SeekFailed("Seek timed out".into()));
         }
         let position_ns = position.as_nanos() as u64;
@@ -1333,22 +1447,29 @@ impl GStreamerDecoder {
             return Err(VideoError::SeekFailed(format!("Seek failed: {e:?}")));
         }
 
-        // Wait for seek completion using filtered pop - only consume ASYNC_DONE or ERROR
-        // This prevents swallowing other messages that decode_next needs
-        // Use generous timeout for slow network streams that need to rebuffer
+        // Wait for seek completion using short filtered polls. This prevents
+        // a state wait from hiding cancellation for the whole operation.
         if let Some(bus) = self.pipeline.bus() {
-            let timeout = Self::remaining(deadline);
-            if timeout.is_zero() {
-                self.seeking = false;
-                self.seek_target = None;
-                return Err(VideoError::SeekFailed("Seek timed out".into()));
-            }
-            let msg = bus.timed_pop_filtered(
-                Self::clock_time(timeout),
-                &[gst::MessageType::AsyncDone, gst::MessageType::Error],
-            );
-            match msg {
-                Some(msg) => match msg.view() {
+            loop {
+                if self.lifecycle_control.is_cancelled() {
+                    self.seeking = false;
+                    self.seek_target = None;
+                    return Err(VideoError::SeekFailed("Seek cancelled".into()));
+                }
+                let timeout = Self::remaining(deadline);
+                if timeout.is_zero() {
+                    self.seeking = false;
+                    self.seek_target = None;
+                    return Err(VideoError::SeekFailed("Seek completion timed out".into()));
+                }
+                let msg = bus.timed_pop_filtered(
+                    Self::clock_time(timeout.min(LIFECYCLE_POLL)),
+                    &[gst::MessageType::AsyncDone, gst::MessageType::Error],
+                );
+                let Some(msg) = msg else {
+                    continue;
+                };
+                match msg.view() {
                     gst::MessageView::AsyncDone(_) => {
                         let direction = if position < self.position {
                             "backward"
@@ -1361,6 +1482,7 @@ impl GStreamerDecoder {
                             self.position,
                             position
                         );
+                        break;
                     }
                     gst::MessageView::Error(err) => {
                         self.seeking = false;
@@ -1372,12 +1494,6 @@ impl GStreamerDecoder {
                         )));
                     }
                     _ => {}
-                },
-                None => {
-                    // Timeout waiting for seek completion
-                    self.seeking = false;
-                    self.seek_target = None;
-                    return Err(VideoError::SeekFailed("Seek timed out".into()));
                 }
             }
         }
@@ -1390,6 +1506,85 @@ impl GStreamerDecoder {
         self.was_fully_buffered = false;
 
         Ok(())
+    }
+
+    /// Pulls and stores the first post-seek frame before the seek deadline is
+    /// released. Paused seeks use preroll directly, so a later Play cannot
+    /// discover that resync expired while the decoder was idle.
+    fn pull_seek_sample(&mut self, deadline: Instant) -> Result<(), VideoError> {
+        let restore_paused = self.user_paused;
+        if restore_paused {
+            // A FLUSH seek while already paused does not reliably enqueue an
+            // appsink sample on every GStreamer source. Let the pipeline
+            // produce one, then restore the user's paused state below.
+            let _ = self.pipeline.set_state(gst::State::Playing);
+            let remaining = Self::remaining(deadline);
+            if !remaining.is_zero() {
+                let _ = self
+                    .pipeline
+                    .state(Self::clock_time(remaining.min(LIFECYCLE_POLL)));
+            }
+        }
+
+        let mut discarded = 0_u32;
+        while discarded <= 5 {
+            if self.lifecycle_control.is_cancelled() {
+                self.seeking = false;
+                self.seek_target = None;
+                self.restore_paused_after_seek(deadline);
+                return Err(VideoError::SeekFailed("Seek cancelled".into()));
+            }
+            let remaining = Self::remaining(deadline);
+            if remaining.is_zero() {
+                self.seeking = false;
+                self.seek_target = None;
+                self.restore_paused_after_seek(deadline);
+                return Err(VideoError::SeekFailed("Seek preroll timed out".into()));
+            }
+            let timeout = Self::clock_time(remaining.min(LIFECYCLE_POLL));
+            let sample = self
+                .appsink
+                .try_pull_sample(timeout)
+                .or_else(|| self.appsink.try_pull_preroll(timeout));
+            let Some(sample) = sample else {
+                continue;
+            };
+            let frame = match self.sample_to_frame(sample.clone()) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.restore_paused_after_seek(deadline);
+                    return Err(error);
+                }
+            };
+            if self.is_stale_frame(frame.pts, discarded, 5) {
+                discarded = discarded.saturating_add(1);
+                continue;
+            }
+            self.preroll_sample = Some(sample);
+            self.seek_deadline = None;
+            self.restore_paused_after_seek(deadline);
+            return Ok(());
+        }
+
+        self.seeking = false;
+        self.seek_target = None;
+        self.restore_paused_after_seek(deadline);
+        Err(VideoError::SeekFailed(
+            "seek produced only stale frames".into(),
+        ))
+    }
+
+    fn restore_paused_after_seek(&self, deadline: Instant) {
+        if !self.user_paused {
+            return;
+        }
+        let _ = self.pipeline.set_state(gst::State::Paused);
+        let remaining = Self::remaining(deadline);
+        if !remaining.is_zero() {
+            let _ = self
+                .pipeline
+                .state(Self::clock_time(remaining.min(LIFECYCLE_POLL)));
+        }
     }
 
     /// Processes a bus message during decode_next.
@@ -1498,7 +1693,13 @@ impl GStreamerDecoder {
 
 impl Drop for GStreamerDecoder {
     fn drop(&mut self) {
-        self.cleanup();
+        // Drop may run after the worker has already lost its session. State
+        // waits belong to explicit worker cleanup; decoder Drop is strictly
+        // fire-and-forget so it cannot extend UI/session teardown.
+        if !self.cleaned_up {
+            let _ = self.pipeline.set_state(gst::State::Null);
+            self.cleaned_up = true;
+        }
     }
 }
 
@@ -1525,6 +1726,10 @@ impl VideoDecoderBackend for GStreamerDecoder {
     }
 
     fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError> {
+        if self.lifecycle_control.is_cancelled() {
+            return Err(VideoError::Generic("lifecycle cancelled".into()));
+        }
+
         // Return any queued error from seek (errors during seek are queued, not dropped)
         if let Some(error) = self.pending_error.take() {
             // Clear seek state so the decoder doesn't use stale flags on next call
@@ -1543,6 +1748,9 @@ impl VideoDecoderBackend for GStreamerDecoder {
             let frame = self.sample_to_frame(sample)?;
             tracing::debug!("Returning cached preroll frame at {:?}", frame.pts);
             self.position = frame.pts;
+            self.seeking = false;
+            self.seek_target = None;
+            self.seek_deadline = None;
             return Ok(Some(frame));
         }
 
@@ -1568,6 +1776,9 @@ impl VideoDecoderBackend for GStreamerDecoder {
         let mut discarded: u32 = 0;
 
         loop {
+            if self.lifecycle_control.is_cancelled() {
+                return Err(VideoError::Generic("lifecycle cancelled".into()));
+            }
             let timeout = if let Some(deadline) = self.seek_deadline {
                 let remaining = Self::remaining(deadline);
                 if remaining.is_zero() {
@@ -1576,10 +1787,15 @@ impl VideoDecoderBackend for GStreamerDecoder {
                     self.seek_deadline = None;
                     return Err(VideoError::SeekFailed("Seek timed out".into()));
                 }
-                remaining.min(Duration::from_millis(timeout_ms as u64))
+                remaining
+                    .min(Duration::from_millis(timeout_ms as u64))
+                    .min(LIFECYCLE_POLL)
             } else {
-                Duration::from_millis(timeout_ms as u64)
+                Duration::from_millis(timeout_ms as u64).min(LIFECYCLE_POLL)
             };
+            if timeout.is_zero() {
+                return Err(VideoError::Generic("lifecycle cancelled".into()));
+            }
             let Some(sample) = self.appsink.try_pull_sample(Self::clock_time(timeout)) else {
                 if self
                     .seek_deadline
@@ -1630,7 +1846,13 @@ impl VideoDecoderBackend for GStreamerDecoder {
                 break;
             }
             match self.seek_internal(position, deadline) {
-                Ok(()) => return Ok(()),
+                Ok(()) => match self.pull_seek_sample(deadline) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                },
                 Err(e) => {
                     if attempt < MAX_RETRIES && !Self::remaining(deadline).is_zero() {
                         tracing::warn!("Seek attempt {} failed, retrying: {}", attempt + 1, e);
@@ -1638,15 +1860,14 @@ impl VideoDecoderBackend for GStreamerDecoder {
                         let was_paused = self.user_paused;
                         // Reset pipeline state before retry - helps recover from HTTP errors
                         let _ = self.pipeline.set_state(gst::State::Paused);
-                        let paused_wait = Self::remaining(deadline).min(Duration::from_millis(500));
+                        let paused_wait = Self::remaining(deadline).min(LIFECYCLE_POLL);
                         if paused_wait.is_zero() {
                             last_error = Some(e);
                             break;
                         }
                         let _ = self.pipeline.state(Self::clock_time(paused_wait));
                         let _ = self.pipeline.set_state(gst::State::Playing);
-                        let playing_wait =
-                            Self::remaining(deadline).min(Duration::from_millis(500));
+                        let playing_wait = Self::remaining(deadline).min(LIFECYCLE_POLL);
                         if playing_wait.is_zero() {
                             last_error = Some(e);
                             break;
@@ -1655,16 +1876,16 @@ impl VideoDecoderBackend for GStreamerDecoder {
                         // Restore paused state if user had paused before seek
                         if was_paused {
                             let _ = self.pipeline.set_state(gst::State::Paused);
-                            let paused_wait =
-                                Self::remaining(deadline).min(Duration::from_millis(100));
+                            let paused_wait = Self::remaining(deadline).min(LIFECYCLE_POLL);
                             if !paused_wait.is_zero() {
                                 let _ = self.pipeline.state(Self::clock_time(paused_wait));
                             }
                         }
                         // Longer delay for HTTP reconnection
-                        let delay = Self::remaining(deadline).min(Duration::from_millis(500));
-                        if !delay.is_zero() {
+                        let mut delay = Self::remaining(deadline).min(LIFECYCLE_POLL);
+                        while !delay.is_zero() && !self.lifecycle_control.is_cancelled() {
                             std::thread::sleep(delay);
+                            delay = Self::remaining(deadline).min(LIFECYCLE_POLL);
                         }
                     }
                     last_error = Some(e);
@@ -1725,5 +1946,27 @@ impl VideoDecoderBackend for GStreamerDecoder {
         // GStreamer handles HW accel internally via uridecodebin auto-selection.
         // We can't know at runtime which decoder (VA-API, software, etc.) is in use.
         HwAccelType::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GstLifecycleControl;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn lifecycle_cancellation_shares_one_absolute_deadline() {
+        let control = GstLifecycleControl::new();
+        let worker_control = control.clone();
+        let before = Instant::now();
+
+        control.cancel(Duration::from_millis(100));
+
+        assert!(worker_control.is_cancelled());
+        let Some(deadline) = worker_control.deadline() else {
+            panic!("cancellation must record a cleanup deadline");
+        };
+        assert!(deadline >= before);
+        assert!(deadline <= before + Duration::from_secs(1));
     }
 }

@@ -20,7 +20,9 @@ use lumina_video_core::session::{
     SessionSnapshot, SessionState,
 };
 pub use lumina_video_native_frame::linux_video_gst::GstAudioSinkMode;
-use lumina_video_native_frame::linux_video_gst::{GStreamerDecoder, DEFAULT_LIFECYCLE_TIMEOUT};
+use lumina_video_native_frame::linux_video_gst::{
+    GStreamerDecoder, GstLifecycleControl, DEFAULT_LIFECYCLE_TIMEOUT,
+};
 use lumina_video_native_frame::video::{
     CpuFrame, DecodedFrame, VideoDecoderBackend, VideoError, VideoFrame,
 };
@@ -206,7 +208,7 @@ fn owned_cpu_lease(
 }
 
 fn send_control(sender: &Sender<SequencedEvent>, event: SequencedEvent) -> bool {
-    sender.send(event).is_ok()
+    sender.try_send(event).is_ok()
 }
 
 fn send_frame(
@@ -405,6 +407,29 @@ struct WorkerIo {
     dropped_frames: Arc<AtomicU64>,
     audio_handle: AudioHandle,
     audio_sink: GstAudioSinkMode,
+    lifecycle_control: GstLifecycleControl,
+}
+
+fn shutdown_worker(decoder: &mut GStreamerDecoder, lifecycle: &GstLifecycleControl) {
+    if lifecycle.is_cancelled() {
+        decoder.shutdown_with_deadline(lifecycle.deadline());
+    } else {
+        decoder.shutdown();
+    }
+}
+
+fn lifecycle_cancelled(lifecycle: &GstLifecycleControl) -> bool {
+    lifecycle.is_cancelled()
+}
+
+fn seed_worker_spawn_failure(state: &Arc<SnapshotState>, control_sender: &Sender<SequencedEvent>) {
+    let mut sequence = 0_u64;
+    let _ = publish_error(
+        state,
+        control_sender,
+        &mut sequence,
+        SessionError::Open("failed to spawn GStreamer worker".into()),
+    );
 }
 
 fn run_worker(
@@ -423,30 +448,48 @@ fn run_worker(
         dropped_frames,
         audio_handle,
         audio_sink,
+        lifecycle_control,
     } = io;
     let mut sequence = 0_u64;
+    if lifecycle_cancelled(&lifecycle_control) {
+        return;
+    }
     let source = match local_source_url(&source) {
         Ok(source) => source,
         Err(error) => {
-            let _ = publish_error(&state, &control_sender, &mut sequence, error);
+            if !lifecycle_cancelled(&lifecycle_control) {
+                let _ = publish_error(&state, &control_sender, &mut sequence, error);
+            }
             return;
         }
     };
-    let mut decoder = match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeout(
-        &source,
-        audio_sink,
-        lifecycle_timeout,
-    ) {
-        Ok(decoder) => decoder,
-        Err(error) => {
-            let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
-            return;
-        }
-    };
+    let mut decoder =
+        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeout_and_control(
+            &source,
+            audio_sink,
+            lifecycle_timeout,
+            lifecycle_control.clone(),
+        ) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                if !lifecycle_cancelled(&lifecycle_control) {
+                    let _ =
+                        publish_error(&state, &control_sender, &mut sequence, session_error(error));
+                }
+                return;
+            }
+        };
+    if lifecycle_cancelled(&lifecycle_control) {
+        shutdown_worker(&mut decoder, &lifecycle_control);
+        return;
+    }
 
     let mut last_applied_audio = None;
     if let Err(error) = sync_audio_controls(&audio_handle, &mut decoder, &mut last_applied_audio) {
-        let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
+        if !lifecycle_cancelled(&lifecycle_control) {
+            let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
+        }
+        shutdown_worker(&mut decoder, &lifecycle_control);
         return;
     }
     update_audio_observation(&state, &audio_handle, &decoder, Duration::ZERO);
@@ -460,10 +503,12 @@ fn run_worker(
             event: SessionEvent::Metadata { metadata },
         },
     ) {
+        shutdown_worker(&mut decoder, &lifecycle_control);
         return;
     }
     sequence = sequence.saturating_add(1);
     if !publish_state(&state, &control_sender, &mut sequence, SessionState::Ready) {
+        shutdown_worker(&mut decoder, &lifecycle_control);
         return;
     }
 
@@ -487,18 +532,30 @@ fn run_worker(
                         position: playback.position,
                     },
                 ) {
+                    shutdown_worker(&mut decoder, &lifecycle_control);
                     return;
                 }
             }
             Err(error) => {
-                let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
+                if !lifecycle_cancelled(&lifecycle_control) {
+                    let _ =
+                        publish_error(&state, &control_sender, &mut sequence, session_error(error));
+                }
+                shutdown_worker(&mut decoder, &lifecycle_control);
                 return;
             }
         }
     }
 
     loop {
-        while let Ok(command) = commands.try_recv() {
+        if lifecycle_cancelled(&lifecycle_control) {
+            shutdown_worker(&mut decoder, &lifecycle_control);
+            return;
+        }
+        while !lifecycle_cancelled(&lifecycle_control) {
+            let Ok(command) = commands.try_recv() else {
+                break;
+            };
             if !process_command(
                 command,
                 &mut decoder,
@@ -508,14 +565,22 @@ fn run_worker(
                 &control_sender,
                 &mut sequence,
             ) {
+                shutdown_worker(&mut decoder, &lifecycle_control);
                 return;
             }
+        }
+        if lifecycle_cancelled(&lifecycle_control) {
+            shutdown_worker(&mut decoder, &lifecycle_control);
+            return;
         }
 
         if let Err(error) =
             sync_audio_controls(&audio_handle, &mut decoder, &mut last_applied_audio)
         {
-            let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
+            if !lifecycle_cancelled(&lifecycle_control) {
+                let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
+            }
+            shutdown_worker(&mut decoder, &lifecycle_control);
             return;
         }
         update_audio_observation(&state, &audio_handle, &decoder, playback.position);
@@ -532,10 +597,14 @@ fn run_worker(
                         &control_sender,
                         &mut sequence,
                     ) {
+                        shutdown_worker(&mut decoder, &lifecycle_control);
                         return;
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    shutdown_worker(&mut decoder, &lifecycle_control);
+                    return;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             }
             continue;
@@ -543,6 +612,10 @@ fn run_worker(
 
         match decoder.decode_next() {
             Ok(Some(frame)) => {
+                if lifecycle_cancelled(&lifecycle_control) {
+                    shutdown_worker(&mut decoder, &lifecycle_control);
+                    return;
+                }
                 playback.position = frame.pts;
                 state
                     .position_us
@@ -556,7 +629,10 @@ fn run_worker(
                 ) {
                     Ok(lease) => lease,
                     Err(error) => {
-                        let _ = publish_error(&state, &control_sender, &mut sequence, error);
+                        if !lifecycle_cancelled(&lifecycle_control) {
+                            let _ = publish_error(&state, &control_sender, &mut sequence, error);
+                        }
+                        shutdown_worker(&mut decoder, &lifecycle_control);
                         return;
                     }
                 };
@@ -573,6 +649,7 @@ fn run_worker(
                     },
                     &dropped_frames,
                 ) {
+                    shutdown_worker(&mut decoder, &lifecycle_control);
                     return;
                 }
                 sequence = sequence.saturating_add(1);
@@ -580,6 +657,7 @@ fn run_worker(
             Ok(None) if decoder.is_eof() => {
                 mark_eos(&mut playback);
                 if !publish_state(&state, &control_sender, &mut sequence, SessionState::Ended) {
+                    shutdown_worker(&mut decoder, &lifecycle_control);
                     return;
                 }
                 if !send_control(
@@ -589,13 +667,18 @@ fn run_worker(
                         event: SessionEvent::Ended,
                     },
                 ) {
+                    shutdown_worker(&mut decoder, &lifecycle_control);
                     return;
                 }
                 continue;
             }
             Ok(None) => {}
             Err(error) => {
-                let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
+                if !lifecycle_cancelled(&lifecycle_control) {
+                    let _ =
+                        publish_error(&state, &control_sender, &mut sequence, session_error(error));
+                }
+                shutdown_worker(&mut decoder, &lifecycle_control);
                 return;
             }
         }
@@ -616,6 +699,7 @@ pub struct GstMediaSession {
     worker: Option<JoinHandle<()>>,
     worker_disconnected: bool,
     lifecycle_timeout: Duration,
+    lifecycle_control: GstLifecycleControl,
     stream_generation: u64,
     replay_pending: bool,
 }
@@ -644,40 +728,6 @@ impl GstMediaSession {
         )
     }
 
-    /// Starts a session with an explicit lifecycle timeout.
-    pub fn new_with_lifecycle_timeout(
-        source: impl Into<String>,
-        lifecycle_timeout: Duration,
-    ) -> Self {
-        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
-            source,
-            false,
-            GstAudioSinkMode::Auto,
-            lifecycle_timeout,
-            0,
-        )
-    }
-
-    /// Alias for [`Self::new_with_lifecycle_timeout`].
-    pub fn new_with_timeout(source: impl Into<String>, lifecycle_timeout: Duration) -> Self {
-        Self::new_with_lifecycle_timeout(source, lifecycle_timeout)
-    }
-
-    /// Starts a session with autoplay and an explicit lifecycle timeout.
-    pub fn new_with_autoplay_and_lifecycle_timeout(
-        source: impl Into<String>,
-        autoplay: bool,
-        lifecycle_timeout: Duration,
-    ) -> Self {
-        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
-            source,
-            autoplay,
-            GstAudioSinkMode::Auto,
-            lifecycle_timeout,
-            0,
-        )
-    }
-
     /// Starts a session with an explicit GStreamer audio sink policy.
     pub fn new_with_autoplay_and_audio_sink(
         source: impl Into<String>,
@@ -689,22 +739,6 @@ impl GstMediaSession {
             autoplay,
             audio_sink,
             DEFAULT_LIFECYCLE_TIMEOUT,
-            0,
-        )
-    }
-
-    /// Starts a session with explicit autoplay, sink, and lifecycle timeout.
-    pub fn new_with_autoplay_and_audio_sink_and_timeout(
-        source: impl Into<String>,
-        autoplay: bool,
-        audio_sink: GstAudioSinkMode,
-        lifecycle_timeout: Duration,
-    ) -> Self {
-        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
-            source,
-            autoplay,
-            audio_sink,
-            lifecycle_timeout,
             0,
         )
     }
@@ -726,9 +760,12 @@ impl GstMediaSession {
         let state = Arc::new(SnapshotState::new());
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
+        let lifecycle_control = GstLifecycleControl::new();
         let worker_state = Arc::clone(&state);
         let worker_dropped_frames = Arc::clone(&dropped_frames);
         let worker_audio_handle = audio_handle.clone();
+        let worker_lifecycle_control = lifecycle_control.clone();
+        let spawn_failure_sender = control_sender.clone();
         let worker = thread::Builder::new()
             .name("lumina-gst-session".into())
             .spawn(move || {
@@ -746,11 +783,15 @@ impl GstMediaSession {
                         dropped_frames: worker_dropped_frames,
                         audio_handle: worker_audio_handle,
                         audio_sink,
+                        lifecycle_control: worker_lifecycle_control,
                     },
                 )
             })
             .ok();
         let worker_disconnected = worker.is_none();
+        if worker_disconnected {
+            seed_worker_spawn_failure(&state, &spawn_failure_sender);
+        }
 
         Self {
             commands,
@@ -765,6 +806,7 @@ impl GstMediaSession {
             worker,
             worker_disconnected,
             lifecycle_timeout,
+            lifecycle_control,
             stream_generation,
             replay_pending: false,
         }
@@ -836,7 +878,9 @@ impl GstMediaSession {
                     if generation > self.stream_generation {
                         self.stream_generation = generation;
                     }
-                    self.replay_pending = false;
+                    if self.replay_pending && generation >= self.stream_generation {
+                        self.replay_pending = false;
+                    }
                     if self.pending_frame.replace(event).is_some() {
                         self.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     }
@@ -903,7 +947,7 @@ impl MediaSession for GstMediaSession {
         } else if is_replay {
             self.stream_generation = self.stream_generation.saturating_add(1);
             self.replay_pending = true;
-        } else if is_play {
+        } else if is_play && !self.replay_pending {
             self.replay_pending = false;
         }
         Ok(())
@@ -932,10 +976,10 @@ impl MediaSession for GstMediaSession {
 
 impl Drop for GstMediaSession {
     fn drop(&mut self) {
-        // The worker owns all potentially blocking GStreamer calls. A UI drop
-        // only makes one nonblocking stop attempt and detaches the worker;
-        // dropping the receivers lets it exit when its current call returns.
-        let _ = self.commands.try_send(SessionCommand::Stop);
+        // The worker owns all potentially blocking GStreamer calls. The
+        // cancellation flag bypasses the command FIFO and starts the one
+        // teardown deadline immediately; the worker handle is detached.
+        self.lifecycle_control.cancel(self.lifecycle_timeout);
         self.worker.take();
     }
 }
@@ -1043,6 +1087,7 @@ mod tests {
             worker: None,
             worker_disconnected: false,
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
+            lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 0,
             replay_pending: false,
         };
@@ -1121,6 +1166,7 @@ mod tests {
             worker: None,
             worker_disconnected: false,
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
+            lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 1,
             replay_pending: false,
         };
@@ -1172,6 +1218,7 @@ mod tests {
             worker: None,
             worker_disconnected: false,
             lifecycle_timeout: Duration::from_millis(50),
+            lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 4,
             replay_pending: false,
         };
@@ -1182,5 +1229,60 @@ mod tests {
             })
             .is_ok());
         assert_eq!(session.stream_generation(), 5);
+    }
+
+    #[test]
+    fn duplicate_play_while_ended_keeps_one_replay_generation_pending() {
+        let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let (_control_sender, control_receiver) =
+            crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+        let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
+        let state = Arc::new(SnapshotState::new());
+        state.snapshot.write().state = SessionState::Ended;
+        let mut session = GstMediaSession {
+            commands,
+            control_receiver,
+            frame_receiver,
+            state,
+            audio_handle: AudioHandle::new(),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            pending_control: None,
+            pending_frame: None,
+            has_presented_frame: false,
+            worker: None,
+            worker_disconnected: false,
+            lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
+            lifecycle_control: GstLifecycleControl::new(),
+            stream_generation: 7,
+            replay_pending: false,
+        };
+
+        assert!(session.command(SessionCommand::Play).is_ok());
+        assert_eq!(session.stream_generation(), 8);
+        assert!(session.replay_pending);
+
+        assert!(session.command(SessionCommand::Play).is_ok());
+        assert_eq!(session.stream_generation(), 8);
+        assert!(session.replay_pending);
+    }
+
+    #[test]
+    fn worker_spawn_failure_is_observable_as_open_error() {
+        let state = Arc::new(SnapshotState::new());
+        let (sender, receiver) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+
+        seed_worker_spawn_failure(&state, &sender);
+
+        assert!(matches!(
+            &state.snapshot.read().state,
+            SessionState::Error(SessionError::Open(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(SequencedEvent {
+                event: SessionEvent::Error(SessionError::Open(_)),
+                ..
+            })
+        ));
     }
 }

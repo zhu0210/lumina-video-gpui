@@ -296,6 +296,19 @@ impl GpuiVideoPlayer {
             .as_ref()
             .map_or(1, |session| session.stream_generation().saturating_add(1));
 
+        // Signal old backends before constructing the replacement. CorePlayer
+        // and GstMediaSession drops detach their workers, so this never joins
+        // a decoder on the GPUI thread and gives GStreamer its full teardown
+        // budget from the open call.
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        let old_core = self.core.take();
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        drop(old_core);
+        #[cfg(target_os = "linux")]
+        let old_session = self.session.take();
+        #[cfg(target_os = "linux")]
+        drop(old_session);
+
         #[cfg(target_os = "linux")]
         let route = linux_playback_route(&url);
         #[cfg(all(target_os = "linux", feature = "moq"))]
@@ -402,6 +415,9 @@ impl GpuiVideoPlayer {
                 .session
                 .as_ref()
                 .map_or(0, GstMediaSession::stream_generation);
+            let old_session = self.session.take();
+            drop(old_session);
+            self.pending_frame = None;
             self.session = Some(
                 GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
                     self.url.clone(),
@@ -870,33 +886,6 @@ impl GpuiVideoPlayer {
                     }
                 }
             }
-        }
-
-        if let Some(session) = self.session.as_ref() {
-            let snapshot = session.snapshot();
-            if let Some(metadata) = snapshot.metadata {
-                self.duration = metadata.duration;
-                self.metadata = Some(video_metadata(&metadata));
-            }
-            match &snapshot.state {
-                CoreSessionState::Playing { position }
-                | CoreSessionState::Paused { position }
-                | CoreSessionState::Buffering { position } => {
-                    self.position = *position;
-                }
-                _ => {}
-            }
-            if matches!(
-                &snapshot.state,
-                CoreSessionState::Ready
-                    | CoreSessionState::Playing { .. }
-                    | CoreSessionState::Paused { .. }
-                    | CoreSessionState::Buffering { .. }
-                    | CoreSessionState::Ended
-            ) {
-                self.initialized = true;
-            }
-            self.state = video_state(&snapshot.state);
         }
 
         if matches!(self.state, VideoState::Ended) && self.config.looping && !self.loop_seek_pending
