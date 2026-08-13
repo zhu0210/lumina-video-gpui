@@ -377,6 +377,36 @@ impl GStreamerDecoder {
         first_video_id
     }
 
+    fn video_selection_id<'a>(
+        video_stream_ids: &'a [String],
+        selected_video_stream_ids: &[String],
+        preferred_video_stream_id: Option<&'a str>,
+    ) -> Option<&'a str> {
+        selected_video_stream_ids
+            .iter()
+            .find_map(|selected_id| {
+                video_stream_ids
+                    .iter()
+                    .find(|video_id| video_id.as_str() == selected_id)
+                    .map(String::as_str)
+            })
+            .or_else(|| {
+                preferred_video_stream_id.filter(|preferred_id| {
+                    video_stream_ids
+                        .iter()
+                        .any(|video_id| video_id.as_str() == *preferred_id)
+                })
+            })
+            .or_else(|| video_stream_ids.first().map(String::as_str))
+    }
+
+    fn selection_message_matches(
+        expected_seqnum: gst::Seqnum,
+        selected: &gst::message::StreamsSelected,
+    ) -> bool {
+        selected.message().seqnum() == expected_seqnum
+    }
+
     fn selected_audio_id(message: &gst::message::StreamsSelected) -> Option<String> {
         message.streams().find_map(|stream| {
             if stream.stream_type().contains(gst::StreamType::AUDIO) {
@@ -1681,38 +1711,36 @@ impl GStreamerDecoder {
         gst::ClockTime::from_nseconds(nanos)
     }
 
-    fn send_audio_selection(&self, audio_id: Option<&str>) -> bool {
-        let mut stream_ids = self
-            .selected_video_stream_ids
-            .iter()
-            .filter(|selected_id| self.video_stream_ids.iter().any(|id| id == *selected_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        if stream_ids.is_empty() {
-            if let Some(video_id) = self
-                .preferred_video_stream_id
-                .as_ref()
-                .filter(|id| {
-                    self.video_stream_ids
-                        .iter()
-                        .any(|candidate| candidate == *id)
-                })
-                .or_else(|| self.video_stream_ids.first())
-            {
-                stream_ids.push(video_id.clone());
-            }
+    fn send_audio_selection(
+        &self,
+        audio_id: Option<&str>,
+    ) -> Result<gst::Seqnum, AudioSelectionAttemptError> {
+        let mut stream_ids = Vec::with_capacity(2);
+        if let Some(video_id) = Self::video_selection_id(
+            &self.video_stream_ids,
+            &self.selected_video_stream_ids,
+            self.preferred_video_stream_id.as_deref(),
+        ) {
+            stream_ids.push(video_id);
         }
         if let Some(audio_id) = audio_id {
-            stream_ids.push(audio_id.to_string());
+            stream_ids.push(audio_id);
         }
-        self.pipeline.send_event(gst::event::SelectStreams::new(
-            stream_ids.iter().map(String::as_str),
-        ))
+        let event = gst::event::SelectStreams::new(stream_ids);
+        let seqnum = event.seqnum();
+        if self.pipeline.send_event(event) {
+            Ok(seqnum)
+        } else {
+            Err(AudioSelectionAttemptError::Failed(
+                "pipeline rejected SELECT_STREAMS".into(),
+            ))
+        }
     }
 
     fn wait_for_audio_selection(
         &mut self,
         requested_id: Option<&str>,
+        expected_seqnum: gst::Seqnum,
         deadline: Instant,
     ) -> Result<(), AudioSelectionAttemptError> {
         let Some(bus) = self.pipeline.bus() else {
@@ -1741,6 +1769,9 @@ impl GStreamerDecoder {
                 }
                 gst::MessageView::StreamsSelected(selected) => {
                     self.capture_selected_streams(selected);
+                    if !Self::selection_message_matches(expected_seqnum, selected) {
+                        continue;
+                    }
                     let selected_id = self.selected_audio_stream_id.as_deref();
                     let confirmed = match requested_id {
                         Some(requested_id) => selected_id == Some(requested_id),
@@ -1886,12 +1917,8 @@ impl GStreamerDecoder {
             requested_id,
             deadline,
             |audio_id, attempt_deadline| {
-                if !self.send_audio_selection(audio_id) {
-                    return Err(AudioSelectionAttemptError::Failed(
-                        "pipeline rejected SELECT_STREAMS".into(),
-                    ));
-                }
-                self.wait_for_audio_selection(audio_id, attempt_deadline)
+                let seqnum = self.send_audio_selection(audio_id)?;
+                self.wait_for_audio_selection(audio_id, seqnum, attempt_deadline)
                     .map(|_| {
                         self.audio_tracks
                             .iter()
@@ -2712,5 +2739,71 @@ mod tests {
             tracks.first().map(|track| track.codec.as_str()),
             Some("AAC")
         );
+    }
+
+    #[test]
+    fn audio_selection_keeps_one_confirmed_video_id() {
+        let available = vec!["video-a".into(), "video-b".into()];
+        let confirmed = vec!["stale-video".into(), "video-b".into(), "video-a".into()];
+
+        assert_eq!(
+            GStreamerDecoder::video_selection_id(&available, &confirmed, Some("video-a"),),
+            Some("video-b")
+        );
+        assert_eq!(
+            GStreamerDecoder::video_selection_id(&available, &[], Some("video-b")),
+            Some("video-b")
+        );
+        assert_eq!(
+            GStreamerDecoder::video_selection_id(&available, &[], Some("stale-video")),
+            Some("video-a")
+        );
+    }
+
+    #[test]
+    fn selection_confirmation_rejects_stale_seqnum() {
+        if gst::init().is_err() {
+            return;
+        }
+        let video = gst::Stream::new(
+            Some("video-id"),
+            None,
+            gst::StreamType::VIDEO,
+            gst::StreamFlags::SELECT,
+        );
+        let audio = gst::Stream::new(
+            Some("audio-id"),
+            None,
+            gst::StreamType::AUDIO,
+            gst::StreamFlags::empty(),
+        );
+        let collection = gst::StreamCollection::builder(None)
+            .streams([video.clone(), audio.clone()])
+            .build();
+        let expected = gst::Seqnum::next();
+        let stale = gst::Seqnum::next();
+        let stale_message = gst::message::StreamsSelected::builder(&collection)
+            .streams([video.clone(), audio.clone()])
+            .seqnum(stale)
+            .build();
+        let matching_message = gst::message::StreamsSelected::builder(&collection)
+            .streams([video, audio])
+            .seqnum(expected)
+            .build();
+
+        if let gst::MessageView::StreamsSelected(selected) = stale_message.view() {
+            assert!(!GStreamerDecoder::selection_message_matches(
+                expected, selected
+            ));
+        } else {
+            panic!("expected StreamsSelected message");
+        }
+        if let gst::MessageView::StreamsSelected(selected) = matching_message.view() {
+            assert!(GStreamerDecoder::selection_message_matches(
+                expected, selected
+            ));
+        } else {
+            panic!("expected StreamsSelected message");
+        }
     }
 }
