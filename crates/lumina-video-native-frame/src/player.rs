@@ -6,8 +6,8 @@
 //! - `lumina-video::VideoPlayer` (egui widget wrapper)
 //! - `lumina-video-ios` (C FFI for iOS/Swift)
 //!
-//! CorePlayer is MoQ-agnostic: callers choose the decoder (platform default
-//! or MoqDecoder) and pass it via [`CorePlayer::with_decoder`].
+//! CorePlayer selects the platform decoder, including the native MoQ decoder
+//! when the `moq` feature is enabled and the source uses a MoQ URL.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +24,8 @@ use crate::frame_queue::{DecodeThread, FrameQueue, FrameScheduler};
 use crate::linux_video::ZeroCopyGStreamerDecoder;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use crate::macos_video::MacOSVideoDecoder;
+#[cfg(feature = "moq")]
+use crate::moq_decoder::MoqDecoder;
 use crate::sync_metrics::{SyncMetrics, SyncMetricsSnapshot};
 use crate::video::{VideoDecoderBackend, VideoError, VideoFrame, VideoMetadata, VideoState};
 
@@ -173,6 +175,17 @@ impl CorePlayer {
         let url = self.url.clone();
         let (sender, promise) = Promise::new();
         self.init_promise = Some(promise);
+
+        #[cfg(feature = "moq")]
+        if MoqDecoder::is_moq_url(&url) {
+            let handle = std::thread::spawn(move || {
+                let result = MoqDecoder::new(&url)
+                    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoderBackend + Send>);
+                sender.send(result);
+            });
+            self.init_thread = Some(handle);
+            return;
+        }
 
         #[cfg(target_os = "macos")]
         let macos_decoder_result: Option<Result<MacOSVideoDecoder, VideoError>> = {
@@ -794,5 +807,26 @@ impl CorePlayer {
 impl Drop for CorePlayer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(all(test, feature = "moq"))]
+mod tests {
+    use super::MoqDecoder;
+
+    #[test]
+    fn moq_source_routing_only_matches_moq_schemes() {
+        assert!(MoqDecoder::is_moq_url("moq://localhost/live/stream"));
+        assert!(MoqDecoder::is_moq_url("moqs://relay.example/live/stream"));
+        for source in [
+            "file:///tmp/video.mp4",
+            "https://example.com/video.mp4",
+            "https://example.com/live/index.m3u8",
+        ] {
+            assert!(
+                !MoqDecoder::is_moq_url(source),
+                "unexpected MoQ route: {source}"
+            );
+        }
     }
 }

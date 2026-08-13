@@ -27,6 +27,27 @@ poll-promise = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
 
+# MoQ (Media over QUIC) transport and Nostr discovery.
+async-channel = { version = "2.0", optional = true }
+bytes = { version = "1.5", optional = true }
+hang = {
+  git = "https://github.com/kixelated/moq",
+  rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca",
+  optional = true,
+}
+moq-lite = {
+  git = "https://github.com/kixelated/moq",
+  rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca",
+  optional = true,
+}
+moq-native = {
+  git = "https://github.com/kixelated/moq",
+  rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca",
+  optional = true,
+}
+nostr-sdk = { version = "0.37", optional = true }
+quinn = { version = "0.11", optional = true }
+
 # Android native decoder + zero-copy
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["game-activity"] }
@@ -131,11 +152,20 @@ vendored-runtime = []
 windows-native-video = ["profiling", "rodio", "windows"]
 zero-copy = []
 android-zero-copy = []
+moq = [
+  "async-channel",
+  "bytes",
+  "hang",
+  "moq-lite",
+  "moq-native",
+  "nostr-sdk",
+  "quinn",
+]
 
 [lints.rust]
 unexpected_cfgs = {
   level = "warn",
   check-cfg = [
-    "cfg(feature, values(\"android-zero-copy\", \"cargo-clippy\", \"vendored-runtime\", \"zero-copy\", \"windows-native-video\"))"
+    "cfg(feature, values(\"android-zero-copy\", \"cargo-clippy\", \"moq\", \"vendored-runtime\", \"zero-copy\", \"windows-native-video\"))"
   ]
 }
