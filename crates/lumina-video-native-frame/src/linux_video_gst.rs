@@ -211,13 +211,21 @@ fn classify_gst_error(
     error: &gst::glib::Error,
     debug: Option<&str>,
     network_source: bool,
+    certificate_rejected: Option<&AtomicBool>,
+    first_byte_seen: Option<&AtomicBool>,
     fallback: fn(String) -> VideoError,
 ) -> VideoError {
     let message = gst_error_message(error, debug);
-    if error.domain() == gst::glib::Quark::from_str("g-tls-error-quark") {
+    if certificate_rejected.is_some_and(|rejected| rejected.swap(false, Ordering::AcqRel))
+        || error.domain() == gst::glib::Quark::from_str("g-tls-error-quark")
+    {
         VideoError::Tls(message)
+    // Stable Resource/GIO domains cover transport failures midstream; the
+    // generic network fallback is limited to failures before the first byte.
     } else if network_source
-        && (is_gst_transport_resource_error(error) || is_gio_error_domain(error))
+        && (is_gst_transport_resource_error(error)
+            || is_gio_error_domain(error)
+            || first_byte_seen.is_some_and(|seen| !seen.load(Ordering::Relaxed)))
     {
         VideoError::Network(message)
     } else {
@@ -304,6 +312,10 @@ pub struct GStreamerDecoder {
     pipeline: gst::Pipeline,
     appsink: gst_app::AppSink,
     network_source: bool,
+    certificate_rejected: Arc<AtomicBool>,
+    /// Records whether the network source delivered any data; only pre-first-byte
+    /// failures use this as a transport classification fallback.
+    first_byte_seen: Arc<AtomicBool>,
     /// Keep the #7 session on the owned system-memory path.
     system_memory_only: bool,
     metadata: VideoMetadata,
@@ -600,12 +612,12 @@ impl GStreamerDecoder {
     /// Test-only instance-scoped CA configuration used by the public session
     /// integration tests. Production constructors keep the system trust store.
     #[doc(hidden)]
-    pub fn new_system_memory_with_audio_sink_and_timeout_and_control_and_ca_file(
+    pub fn new_system_memory_with_audio_sink_and_timeout_and_control_and_tls_ca_file(
         url: &str,
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
         lifecycle_control: GstLifecycleControl,
-        ssl_ca_file: Option<String>,
+        tls_ca_file: Option<String>,
     ) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
@@ -613,7 +625,7 @@ impl GStreamerDecoder {
             audio_sink,
             lifecycle_timeout,
             lifecycle_control,
-            ssl_ca_file,
+            tls_ca_file,
         )
     }
 
@@ -642,7 +654,7 @@ impl GStreamerDecoder {
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
         lifecycle_control: GstLifecycleControl,
-        ssl_ca_file: Option<String>,
+        tls_ca_file: Option<String>,
     ) -> Result<Self, VideoError> {
         let init_now = Instant::now();
         let init_deadline = init_now.checked_add(lifecycle_timeout).unwrap_or(init_now);
@@ -664,6 +676,9 @@ impl GStreamerDecoder {
 
         // Build the pipeline
         let pipeline = gst::Pipeline::new();
+        let network_source = url.starts_with("http://") || url.starts_with("https://");
+        let certificate_rejected = Arc::new(AtomicBool::new(false));
+        let first_byte_seen = Arc::new(AtomicBool::new(false));
 
         // Source element - handles HTTP, HTTPS, file://
         let source = gst::ElementFactory::make("uridecodebin3")
@@ -671,14 +686,55 @@ impl GStreamerDecoder {
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
 
-        if let Some(ssl_ca_file) = ssl_ca_file {
+        if network_source {
+            let certificate_rejected = Arc::clone(&certificate_rejected);
+            let first_byte_seen = Arc::clone(&first_byte_seen);
             source.connect("source-setup", false, move |values| {
                 let source_value = values.get(1)?;
                 let Ok(source) = source_value.get::<gst::Element>() else {
                     return None;
                 };
-                if source.find_property("ssl-ca-file").is_some() {
-                    source.set_property("ssl-ca-file", ssl_ca_file.as_str());
+                if source
+                    .factory()
+                    .is_some_and(|factory| factory.name().as_str() == "souphttpsrc")
+                {
+                    if let Some(src_pad) = source.static_pad("src") {
+                        let first_byte_seen = Arc::clone(&first_byte_seen);
+                        let _ = src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                            first_byte_seen.store(true, Ordering::Relaxed);
+                            gst::PadProbeReturn::Remove
+                        });
+                    }
+                }
+                if gst::glib::subclass::SignalId::lookup("accept-certificate", source.type_())
+                    .is_some()
+                {
+                    let certificate_rejected = Arc::clone(&certificate_rejected);
+                    source.connect("accept-certificate", false, move |_values| {
+                        certificate_rejected.store(true, Ordering::Release);
+                        Some(false.to_value())
+                    });
+                }
+                None
+            });
+        }
+
+        let tls_database = tls_ca_file
+            .map(|path| {
+                gio::TlsFileDatabase::new(&path).map_err(|error| {
+                    VideoError::DecoderInit(format!("Failed to load TLS CA database: {error}"))
+                })
+            })
+            .transpose()?;
+        if let Some(tls_database) = tls_database {
+            source.connect_local("source-setup", false, move |values| {
+                let source_value = values.get(1)?;
+                let Ok(source) = source_value.get::<gst::Element>() else {
+                    return None;
+                };
+                if source.find_property("tls-database").is_some() {
+                    // The GObject property owns a strong reference after this set.
+                    source.set_property("tls-database", &tls_database);
                 }
                 None
             });
@@ -894,7 +950,9 @@ impl GStreamerDecoder {
                     return Err(classify_gst_error(
                         &error,
                         debug.as_deref(),
-                        url.starts_with("http://") || url.starts_with("https://"),
+                        network_source,
+                        Some(&certificate_rejected),
+                        Some(&first_byte_seen),
                         VideoError::DecoderInit,
                     ));
                 }
@@ -1044,7 +1102,9 @@ impl GStreamerDecoder {
         Ok(Self {
             pipeline,
             appsink,
-            network_source: url.starts_with("http://") || url.starts_with("https://"),
+            network_source,
+            certificate_rejected,
+            first_byte_seen,
             system_memory_only,
             metadata,
             position: Duration::ZERO,
@@ -2122,6 +2182,8 @@ impl GStreamerDecoder {
                             &error,
                             debug.as_deref(),
                             self.network_source,
+                            Some(&self.certificate_rejected),
+                            Some(&self.first_byte_seen),
                             VideoError::SeekFailed,
                         ));
                     }
@@ -2242,6 +2304,8 @@ impl GStreamerDecoder {
                     &error_value,
                     debug.as_deref(),
                     self.network_source,
+                    Some(&self.certificate_rejected),
+                    Some(&self.first_byte_seen),
                     VideoError::DecodeFailed,
                 );
                 if self.seeking {
@@ -2614,6 +2678,7 @@ mod tests {
     use crate::video::VideoError;
     use gstreamer as gst;
     use lumina_video_core::session::AudioTrack;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2624,22 +2689,22 @@ mod tests {
             "certificate rejected",
         );
         assert!(matches!(
-            classify_gst_error(&tls, None, true, VideoError::DecoderInit),
+            classify_gst_error(&tls, None, true, None, None, VideoError::DecoderInit),
             VideoError::Tls(message) if message == "certificate rejected"
         ));
 
         let resource = gst::glib::Error::new(gst::ResourceError::OpenRead, "connection refused");
         assert!(matches!(
-            classify_gst_error(&resource, None, true, VideoError::DecodeFailed),
+            classify_gst_error(&resource, None, true, None, None, VideoError::DecodeFailed),
             VideoError::Network(message) if message == "connection refused"
         ));
         assert!(matches!(
-            classify_gst_error(&resource, None, false, VideoError::DecodeFailed),
+            classify_gst_error(&resource, None, false, None, None, VideoError::DecodeFailed),
             VideoError::DecodeFailed(message) if message == "connection refused"
         ));
         let settings = gst::glib::Error::new(gst::ResourceError::Settings, "invalid HLS settings");
         assert!(matches!(
-            classify_gst_error(&settings, None, true, VideoError::DecodeFailed),
+            classify_gst_error(&settings, None, true, None, None, VideoError::DecodeFailed),
             VideoError::DecodeFailed(message) if message == "invalid HLS settings"
         ));
 
@@ -2649,14 +2714,75 @@ mod tests {
             "connection refused",
         );
         assert!(matches!(
-            classify_gst_error(&gio_error, None, true, VideoError::DecoderInit),
+            classify_gst_error(&gio_error, None, true, None, None, VideoError::DecoderInit),
             VideoError::Network(_)
         ));
 
         let parse = gst::glib::Error::new(gst::CoreError::Negotiation, "bad HLS data");
         assert!(matches!(
-            classify_gst_error(&parse, None, true, VideoError::DecodeFailed),
+            classify_gst_error(&parse, None, true, None, None, VideoError::DecodeFailed),
             VideoError::DecodeFailed(message) if message == "bad HLS data"
+        ));
+    }
+
+    #[test]
+    fn certificate_rejection_precedes_transport_and_is_consumed() {
+        let rejected = AtomicBool::new(true);
+        let resource = gst::glib::Error::new(gst::ResourceError::OpenRead, "connection refused");
+
+        assert!(matches!(
+            classify_gst_error(
+                &resource,
+                None,
+                true,
+                Some(&rejected),
+                None,
+                VideoError::DecodeFailed
+            ),
+            VideoError::Tls(message) if message == "connection refused"
+        ));
+        assert!(!rejected.load(Ordering::Acquire));
+        assert!(matches!(
+            classify_gst_error(
+                &resource,
+                None,
+                true,
+                Some(&rejected),
+                None,
+                VideoError::DecodeFailed
+            ),
+            VideoError::Network(message) if message == "connection refused"
+        ));
+    }
+
+    #[test]
+    fn pre_first_byte_network_fallback_does_not_relabel_midstream_errors() {
+        let first_byte_seen = AtomicBool::new(false);
+        let generic = gst::glib::Error::new(gst::CoreError::Failed, "connection failed");
+
+        assert!(matches!(
+            classify_gst_error(
+                &generic,
+                None,
+                true,
+                None,
+                Some(&first_byte_seen),
+                VideoError::DecoderInit
+            ),
+            VideoError::Network(message) if message == "connection failed"
+        ));
+
+        first_byte_seen.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            classify_gst_error(
+                &generic,
+                None,
+                true,
+                None,
+                Some(&first_byte_seen),
+                VideoError::DecoderInit
+            ),
+            VideoError::DecoderInit(message) if message == "connection failed"
         ));
     }
 

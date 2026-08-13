@@ -2718,6 +2718,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "gio"
+version = "0.21.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5ff48bf600c68b476e61dc6b7c762f2f4eb91deef66583ba8bb815c30b5811a"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-util",
+ "gio-sys",
+ "glib",
+ "libc",
+ "pin-project-lite",
+ "smallvec",
+]
+
+[[package]]
 name = "gio-sys"
 version = "0.21.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4336,6 +4353,7 @@ dependencies = [
  "dispatch2",
  "drm-fourcc",
  "ffmpeg-next",
+ "gio",
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-app",

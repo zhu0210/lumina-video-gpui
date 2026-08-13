@@ -700,7 +700,7 @@ struct WorkerIo {
     dropped_frames: Arc<AtomicU64>,
     audio_handle: AudioHandle,
     audio_sink: GstAudioSinkMode,
-    ssl_ca_file: Option<String>,
+    tls_ca_file: Option<String>,
     lifecycle_control: GstLifecycleControl,
 }
 
@@ -757,7 +757,7 @@ fn run_worker(
         dropped_frames,
         audio_handle,
         audio_sink,
-        ssl_ca_file,
+        tls_ca_file,
         lifecycle_control,
     } = io;
     let mut sequence = 0_u64;
@@ -779,12 +779,12 @@ fn run_worker(
         }
     };
     let mut decoder =
-        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeout_and_control_and_ca_file(
+        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeout_and_control_and_tls_ca_file(
             &source,
             audio_sink,
             lifecycle_timeout,
             lifecycle_control.clone(),
-            ssl_ca_file,
+            tls_ca_file,
         ) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -1150,7 +1150,7 @@ impl GstMediaSession {
         lifecycle_timeout: Duration,
         stream_generation: u64,
     ) -> Self {
-        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_ca_file(
+        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file(
             source,
             autoplay,
             audio_sink,
@@ -1161,31 +1161,31 @@ impl GstMediaSession {
     }
 
     #[cfg(test)]
-    fn new_for_test_with_ca_file(
+    fn new_for_test_with_tls_ca_file(
         source: impl Into<String>,
         autoplay: bool,
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
         stream_generation: u64,
-        ssl_ca_file: String,
+        tls_ca_file: String,
     ) -> Self {
-        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_ca_file(
+        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file(
             source,
             autoplay,
             audio_sink,
             lifecycle_timeout,
             stream_generation,
-            Some(ssl_ca_file),
+            Some(tls_ca_file),
         )
     }
 
-    fn new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_ca_file(
+    fn new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file(
         source: impl Into<String>,
         autoplay: bool,
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
         stream_generation: u64,
-        ssl_ca_file: Option<String>,
+        tls_ca_file: Option<String>,
     ) -> Self {
         let source = source.into();
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
@@ -1223,7 +1223,7 @@ impl GstMediaSession {
                         dropped_frames: worker_dropped_frames,
                         audio_handle: worker_audio_handle,
                         audio_sink,
-                        ssl_ca_file,
+                        tls_ca_file,
                         lifecycle_control: worker_lifecycle_control,
                     },
                 )
@@ -1871,25 +1871,43 @@ mod tests {
     }
 
     fn test_tls_material() -> Result<TestTlsMaterial, Box<dyn std::error::Error>> {
-        let mut params =
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["lumina-video-gst-test-ca".to_owned()])?;
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = rcgen::KeyPair::generate()?;
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let ca_issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
+        let mut leaf_params =
             rcgen::CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let signing_key = rcgen::KeyPair::generate()?;
-        let cert = params.self_signed(&signing_key)?;
+        leaf_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = rcgen::KeyPair::generate()?;
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer)?;
         let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()),
         );
         let config = rustls::ServerConfig::builder_with_provider(
             rustls::crypto::ring::default_provider().into(),
         )
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
-        .with_single_cert(vec![cert.der().clone()], private_key)?;
+        .with_single_cert(
+            vec![leaf_cert.der().clone(), ca_cert.der().clone()],
+            private_key,
+        )?;
         let ca_file = std::env::temp_dir().join(format!(
             "lumina-video-gst-test-ca-{}.pem",
             std::process::id()
         ));
-        fs::write(&ca_file, cert.pem())?;
+        fs::write(&ca_file, ca_cert.pem())?;
         Ok(TestTlsMaterial {
             config: Arc::new(config),
             ca_file,
@@ -1925,10 +1943,10 @@ mod tests {
 
     fn run_vod_session(
         source: String,
-        ssl_ca_file: Option<String>,
+        tls_ca_file: Option<String>,
     ) -> Result<(bool, bool), Box<dyn std::error::Error>> {
-        let mut session = match ssl_ca_file {
-            Some(ca_file) => GstMediaSession::new_for_test_with_ca_file(
+        let mut session = match tls_ca_file {
+            Some(ca_file) => GstMediaSession::new_for_test_with_tls_ca_file(
                 source,
                 true,
                 GstAudioSinkMode::Fake,
@@ -2004,7 +2022,13 @@ mod tests {
         }
         session.command(SessionCommand::Play)?;
         let resumed =
-            pump_session_until(&mut session, Duration::from_secs(5), |_event, snapshot| {
+            pump_session_until(&mut session, Duration::from_secs(5), |event, snapshot| {
+                buffering_seen |= matches!(
+                    event,
+                    Some(SessionEvent::StateChanged {
+                        state: SessionState::Buffering { .. }
+                    })
+                ) || matches!(&snapshot.state, SessionState::Buffering { .. });
                 matches!(
                     &snapshot.state,
                     SessionState::Playing { position }
@@ -2028,15 +2052,6 @@ mod tests {
         let (http_ok, http_buffering) =
             run_vod_session(http_server.url("http", "/redirect.m3u8"), None)?;
         assert!(http_ok, "HTTP redirect HLS VOD did not complete");
-        let (https_ok, https_buffering) = run_vod_session(
-            https_server.url("https", "/hls-vod/index.m3u8"),
-            Some(tls_material.ca_file.to_string_lossy().into_owned()),
-        )?;
-        assert!(https_ok, "trusted HTTPS HLS VOD did not complete");
-        assert!(
-            http_buffering || https_buffering,
-            "network sessions never published a buffering state"
-        );
 
         let mut invalid_tls =
             GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
@@ -2055,9 +2070,20 @@ mod tests {
                 })
             },
         )?;
+        let invalid_state = invalid_tls.snapshot().state;
         assert!(
             tls_seen,
-            "invalid certificate did not report SessionError::Tls"
+            "invalid certificate did not report SessionError::Tls; final state: {invalid_state:?}"
+        );
+
+        let (https_ok, https_buffering) = run_vod_session(
+            https_server.url("https", "/hls-vod/index.m3u8"),
+            Some(tls_material.ca_file.to_string_lossy().into_owned()),
+        )?;
+        assert!(https_ok, "trusted HTTPS HLS VOD did not complete");
+        assert!(
+            http_buffering || https_buffering,
+            "network sessions never published a buffering state"
         );
 
         let unavailable = TcpListener::bind(("127.0.0.1", 0))?;
@@ -2080,9 +2106,10 @@ mod tests {
                 })
             },
         )?;
+        let unreachable_state = unreachable.snapshot().state;
         assert!(
             network_seen,
-            "unreachable HTTP endpoint did not report SessionError::Network"
+            "unreachable HTTP endpoint did not report SessionError::Network; final state: {unreachable_state:?}"
         );
         Ok(())
     }

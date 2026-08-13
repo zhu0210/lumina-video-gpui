@@ -82,6 +82,7 @@ profiling = { version = "1.0" }
 # Linux GStreamer-based video decoder + zero-copy
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = { version = "0.38" }
+gio = { workspace = true }
 drm-fourcc = { version = "2.2" }
 gstreamer = { version = "0.24" }
 gstreamer-allocators = { version = "0.24" }

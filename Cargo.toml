@@ -37,6 +37,7 @@ poll-promise = { version = "0.3.0", features = ["tokio"] }
 
 http-body-util = "0.1.3"
 # HTTP streaming
+gio = "0.21"
 hyper = { version = "1.7.0", features = ["full"] }
 hyper-rustls = {
   version = "0.27.7",
