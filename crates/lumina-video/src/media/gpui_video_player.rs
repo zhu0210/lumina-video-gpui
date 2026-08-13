@@ -25,12 +25,12 @@ use std::time::Duration;
 use gpui::*;
 use gpui_wgpu::wgpu;
 
-use lumina_video_core::frame_to_texture::{self, GpuFrameTextures};
-use lumina_video_core::player::CorePlayer;
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
+use lumina_video_native_frame::frame_to_texture::{self, GpuFrameTextures};
+use lumina_video_native_frame::player::CorePlayer;
 #[cfg(feature = "moq")]
-use lumina_video_core::video::VideoDecoderBackend;
-use lumina_video_core::video::{VideoMetadata, VideoState};
+use lumina_video_native_frame::video::VideoDecoderBackend;
+use lumina_video_native_frame::video::{VideoMetadata, VideoState};
 
 #[cfg(feature = "moq")]
 use super::moq_decoder::MoqDecoder;
@@ -121,7 +121,10 @@ pub struct GpuiVideoPlayer {
     #[cfg(feature = "moq")]
     moq_init_promise: Option<
         poll_promise::Promise<
-            Result<Box<dyn VideoDecoderBackend + Send>, lumina_video_core::video::VideoError>,
+            Result<
+                Box<dyn VideoDecoderBackend + Send>,
+                lumina_video_native_frame::video::VideoError,
+            >,
         >,
     >,
     #[cfg(feature = "moq")]
@@ -412,7 +415,10 @@ impl GpuiVideoPlayer {
         if self.core.is_playback_requested() {
             let qlen = self.core.frame_queue().len();
             if qlen > 0 {
-                tracing::debug!("update: playback_requested, queue_len={qlen}, state={:?}", self.state);
+                tracing::debug!(
+                    "update: playback_requested, queue_len={qlen}, state={:?}",
+                    self.state
+                );
             }
             self.poll_and_upload_frames();
         } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
@@ -675,7 +681,7 @@ impl GpuiVideoPlayer {
                 tracing::info!("MoQ decoder init: {url}");
                 let result: Result<
                     Box<dyn VideoDecoderBackend + Send>,
-                    lumina_video_core::video::VideoError,
+                    lumina_video_native_frame::video::VideoError,
                 > = match MoqDecoder::new(&url) {
                     Ok(decoder) => {
                         // Stats stored via moq_stats field
@@ -723,7 +729,7 @@ impl GpuiVideoPlayer {
                     }
                     Err(_) => {
                         self.core.set_state(VideoState::Error(
-                            lumina_video_core::video::VideoError::Generic(
+                            lumina_video_native_frame::video::VideoError::Generic(
                                 "MoQ init thread crashed".into(),
                             ),
                         ));

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use lumina_video_core::player::CorePlayer;
-use lumina_video_core::video::VideoFrame;
+use lumina_video_native_frame::player::CorePlayer;
+use lumina_video_native_frame::video::VideoFrame;
 
 /// Opaque player handle exposed via FFI.
 ///

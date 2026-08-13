@@ -1,4 +1,4 @@
-//! C FFI layer for lumina-video-core (iOS/Swift integration).
+//! C FFI layer for lumina-video-native-frame (iOS/Swift integration).
 //!
 //! Provides `#[no_mangle] pub extern "C"` entry points matching
 //! `include/LuminaVideo.h`. All functions are thread-safe.
@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use lumina_video_core::player::CorePlayer;
-use lumina_video_core::video::VideoState;
+use lumina_video_native_frame::player::CorePlayer;
+use lumina_video_native_frame::video::VideoState;
 
 use crate::error::LuminaError;
 use crate::handle::{LuminaFrame, LuminaPlayer};

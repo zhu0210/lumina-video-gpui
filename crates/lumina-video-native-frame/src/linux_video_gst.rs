@@ -664,6 +664,8 @@ impl GStreamerDecoder {
             let fd: RawFd = if is_single_fd {
                 if plane_idx == 0 {
                     // First plane: dup and save for reuse
+                    // SAFETY: `gst_fd` is a live GStreamer DMABuf descriptor;
+                    // `dup` creates the owned descriptor passed to Vulkan.
                     let dup_fd = unsafe { libc::dup(gst_fd) };
                     if dup_fd < 0 {
                         tracing::warn!(
@@ -683,6 +685,8 @@ impl GStreamerDecoder {
                 }
             } else {
                 // Multi-FD: each plane gets its own dup'd fd
+                // SAFETY: `gst_fd` is a live GStreamer DMABuf descriptor;
+                // `dup` creates the owned descriptor passed to Vulkan.
                 let dup_fd = unsafe { libc::dup(gst_fd) };
                 if dup_fd < 0 {
                     tracing::warn!(
@@ -693,6 +697,8 @@ impl GStreamerDecoder {
                     );
                     // Close any already-dup'd fds before returning
                     for plane in &planes {
+                        // SAFETY: Each plane fd was duplicated and remains
+                        // owned by this error path.
                         unsafe { libc::close(plane.fd) };
                     }
                     return Ok(None);
@@ -707,14 +713,20 @@ impl GStreamerDecoder {
                     if is_single {
                         // Single-FD: all planes share the same fd, close once
                         if current_fd >= 0 {
+                            // SAFETY: `current_fd` is the duplicated descriptor
+                            // owned by this cleanup path.
                             unsafe { libc::close(current_fd) };
                         }
                     } else {
                         // Multi-FD: close all unique plane fds plus current
                         for plane in planes {
+                            // SAFETY: Each plane fd is a duplicated descriptor
+                            // still owned by this cleanup path.
                             unsafe { libc::close(plane.fd) };
                         }
                         if current_fd >= 0 {
+                            // SAFETY: `current_fd` is the duplicated descriptor
+                            // owned by this cleanup path.
                             unsafe { libc::close(current_fd) };
                         }
                     }

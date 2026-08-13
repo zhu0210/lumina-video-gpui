@@ -149,9 +149,11 @@ define_class!(
     struct VideoOutputDelegate;
 
     // Implement NSObjectProtocol (required for all ObjC classes)
+    // SAFETY: The wrapper contains only retained, thread-safe platform objects and copied metadata.
     unsafe impl NSObjectProtocol for VideoOutputDelegate {}
 
     // Implement AVPlayerItemOutputPullDelegate protocol
+    // SAFETY: The wrapper contains only retained, thread-safe platform objects and copied metadata.
     unsafe impl AVPlayerItemOutputPullDelegate for VideoOutputDelegate {
         /// Called by AVFoundation when media data becomes available.
         /// This signals that hasNewPixelBufferForItemTime should now return true.
@@ -171,6 +173,7 @@ impl VideoOutputDelegate {
     /// Creates a new delegate with the given shared state.
     fn new_with_state(state: Arc<VideoOutputDelegateState>) -> Retained<Self> {
         let this = Self::alloc().set_ivars(VideoOutputDelegateIvars { state });
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -197,6 +200,7 @@ impl std::fmt::Debug for PixelBufferWrapper {
 // - CoreFoundation reference counting is thread-safe
 // - The IOSurface backing (if any) is also thread-safe
 unsafe impl Send for PixelBufferWrapper {}
+// SAFETY: The wrapper contains only retained, thread-safe platform objects and copied metadata.
 unsafe impl Sync for PixelBufferWrapper {}
 
 /// Extracts CPU frame data from a CVPixelBuffer.
@@ -210,6 +214,7 @@ fn extract_cpu_frame_from_pixel_buffer(
 ) -> Result<CpuFrame, VideoError> {
     // Lock the pixel buffer for reading
     let lock_result =
+// SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly) };
     if lock_result != 0 {
         return Err(VideoError::DecodeFailed(format!(
@@ -222,6 +227,7 @@ fn extract_cpu_frame_from_pixel_buffer(
     let base_address = CVPixelBufferGetBaseAddress(pixel_buffer);
 
     if base_address.is_null() {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe {
             CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
         }
@@ -231,6 +237,7 @@ fn extract_cpu_frame_from_pixel_buffer(
     }
 
     let Some(data_size) = bytes_per_row.checked_mul(height) else {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe {
             CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
         }
@@ -247,6 +254,7 @@ fn extract_cpu_frame_from_pixel_buffer(
     let bgra_data = unsafe { std::slice::from_raw_parts(base_address as *const u8, data_size) };
 
     let Some(row_bytes) = width.checked_mul(4) else {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe {
             CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
         }
@@ -266,6 +274,7 @@ fn extract_cpu_frame_from_pixel_buffer(
     } else {
         // Has padding — strip it unconditionally
         if bytes_per_row < row_bytes {
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             unsafe {
                 CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
             }
@@ -279,6 +288,7 @@ fn extract_cpu_frame_from_pixel_buffer(
             let row_start = y * bytes_per_row;
             let row_end = row_start + row_bytes;
             if row_end > bgra_data.len() {
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 unsafe {
                     CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
                 }
@@ -289,6 +299,7 @@ fn extract_cpu_frame_from_pixel_buffer(
         (compact, row_bytes)
     };
 
+    // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
     unsafe {
         CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
     }
@@ -460,6 +471,7 @@ pub struct MacOSVideoDecoder {
 // methods, but GCD-based dispatch and common usage patterns suggest background-thread
 // access is safe for the operations used here.
 unsafe impl Send for MacOSVideoDecoder {}
+// SAFETY: The wrapper contains only retained, thread-safe platform objects and copied metadata.
 unsafe impl Sync for MacOSVideoDecoder {}
 
 impl MacOSVideoDecoder {
@@ -514,6 +526,7 @@ impl MacOSVideoDecoder {
         };
 
         // Create AVPlayerItem
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let player_item = unsafe { AVPlayerItem::playerItemWithURL(&ns_url, mtm) };
 
         // Create video output with BGRA settings + IOSurface/Metal compatibility
@@ -521,8 +534,10 @@ impl MacOSVideoDecoder {
         let settings_ptr = Retained::as_ptr(&output_settings)
             as *const objc2_foundation::NSDictionary<NSString, AnyObject>;
         let settings: &objc2_foundation::NSDictionary<NSString, AnyObject> =
+// SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             unsafe { &*settings_ptr };
 
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let video_output = unsafe {
             use objc2::AllocAnyThread;
             AVPlayerItemVideoOutput::initWithPixelBufferAttributes(
@@ -532,6 +547,7 @@ impl MacOSVideoDecoder {
         };
 
         // Add output to player item
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { player_item.addOutput(&video_output) };
 
         // Create output delegate state and delegate for seek rebuffer notifications
@@ -541,6 +557,7 @@ impl MacOSVideoDecoder {
         // Set delegate on video output with main dispatch queue
         // The delegate will receive outputMediaDataWillChange: callbacks when
         // new frames become available after a seek or rebuffer
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe {
             let delegate_proto = ProtocolObject::from_ref(&*output_delegate);
             // Use main queue for delegate callbacks (nil = main queue in Apple's API)
@@ -550,16 +567,19 @@ impl MacOSVideoDecoder {
         // Request notification when media data becomes available.
         // This helps calibrate the itemTimeForMachAbsoluteTime timing from the start.
         // Without this, frame delivery can be very low (4-5 fps) until a seek triggers it.
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe {
             video_output.requestNotificationOfMediaDataChangeWithAdvanceInterval(0.033);
         }
         tracing::debug!("MacOSVideoDecoder: requested media data change notification at init");
 
         // Create player
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let player = unsafe { AVPlayer::playerWithPlayerItem(Some(&player_item), mtm) };
 
         // Mute initially to prevent audio during preview extraction
         // Will be unmuted when user clicks play
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { player.setMuted(true) };
 
         // Use placeholder metadata - will be updated when video is ready
@@ -586,10 +606,12 @@ impl MacOSVideoDecoder {
         // app startup, so AVPlayer may stay in Unknown status indefinitely.
         // We pump here to give AVFoundation time to load the media.
         {
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             let run_loop = unsafe { NSRunLoop::currentRunLoop() };
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut interval = NSDate::dateWithTimeIntervalSinceNow(0.01);
             loop {
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let status = unsafe { player_item.status() };
                 if status == AVPlayerItemStatus::ReadyToPlay
                     || status == AVPlayerItemStatus::Failed
@@ -603,6 +625,7 @@ impl MacOSVideoDecoder {
                     );
                     break;
                 }
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 unsafe {
                     run_loop.runUntilDate(&interval);
                 }
@@ -648,21 +671,26 @@ impl MacOSVideoDecoder {
             return;
         }
 
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let status = unsafe { self.player_item.status() };
         match status {
             AVPlayerItemStatus::ReadyToPlay => {
                 // Extract real metadata now
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let duration_cm = unsafe { self.player_item.duration() };
                 let duration = cmtime_to_duration(duration_cm);
                 let duration_secs = cmtime_to_seconds(duration_cm);
 
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let asset = unsafe { self.player_item.asset() };
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let media_type = match unsafe { AVMediaTypeVideo } {
                     Some(mt) => mt,
                     None => return,
                 };
 
                 #[allow(deprecated)]
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let video_tracks = unsafe { asset.tracksWithMediaType(media_type) };
 
                 if video_tracks.is_empty() {
@@ -670,6 +698,7 @@ impl MacOSVideoDecoder {
                 }
 
                 let video_track = video_tracks.objectAtIndex(0);
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let natural_size = unsafe { video_track.naturalSize() };
                 let w = natural_size.width as u32;
                 let h = natural_size.height as u32;
@@ -678,6 +707,7 @@ impl MacOSVideoDecoder {
                     return;
                 }
 
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let fps = unsafe { video_track.nominalFrameRate() };
                 let fps = if fps <= 0.0 { 30.0 } else { fps };
 
@@ -703,6 +733,7 @@ impl MacOSVideoDecoder {
                 );
             }
             AVPlayerItemStatus::Failed => {
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let error = unsafe { self.player_item.error() };
                 let error_msg = error
                     .map(|e| e.localizedDescription().to_string())
@@ -720,6 +751,7 @@ impl MacOSVideoDecoder {
     /// Configures output to use 32-bit BGRA pixel format with IOSurface and Metal
     /// compatibility for zero-copy GPU rendering.
     fn create_output_settings() -> Retained<NSMutableDictionary<NSString, AnyObject>> {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe {
             let dict: Retained<NSMutableDictionary<NSString, AnyObject>> =
                 NSMutableDictionary::new();
@@ -777,6 +809,7 @@ impl MacOSVideoDecoder {
     fn has_iosurface(pixel_buffer: &objc2_core_video::CVPixelBuffer) -> bool {
         // Get raw pointer to the CVPixelBuffer object (not the Retained wrapper)
         let pb_ptr = std::ptr::from_ref(pixel_buffer) as *const std::ffi::c_void;
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let io_surface = unsafe { CVPixelBufferGetIOSurface(pb_ptr) };
         !io_surface.is_null()
     }
@@ -837,6 +870,7 @@ impl MacOSVideoDecoder {
 impl Drop for MacOSVideoDecoder {
     fn drop(&mut self) {
         // Pause playback before dropping
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { self.player.pause() };
 
         // Log final zero-copy stats
@@ -873,6 +907,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         // See: https://developer.apple.com/forums/thread/27589
         // The completion handler sets this flag, and we perform the reset here in decode_next.
         if self.needs_output_reset.swap(false, Ordering::AcqRel) {
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             unsafe {
                 self.player_item.removeOutput(&self.video_output);
                 self.player_item.addOutput(&self.video_output);
@@ -882,6 +917,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
             );
 
             // Request notification when new frames are ready
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             unsafe {
                 self.video_output
                     .requestNotificationOfMediaDataChangeWithAdvanceInterval(0.033);
@@ -955,10 +991,13 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
 
         let item_time = if USE_CURRENT_TIME_TIMEBASE {
             // Use player.currentTime() directly - should be more accurate post-seek
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             unsafe { self.player.currentTime() }
         } else {
             // Original: Use mach_absolute_time + itemTimeForMachAbsoluteTime
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             let host_time = unsafe { mach_absolute_time() };
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             unsafe {
                 self.video_output
                     .itemTimeForMachAbsoluteTime(host_time as i64)
@@ -966,30 +1005,40 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         };
 
         // Timebase diagnostic: compare item_time vs current_time (throttled to 1/sec in main log)
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let current_time = unsafe { self.player.currentTime() };
         let item_time_dur = cmtime_to_duration(item_time);
         let current_time_dur = cmtime_to_duration(current_time);
 
         // Debug: check player state and output attachment
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let player_rate = unsafe { self.player.rate() };
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let item_status = unsafe { self.player_item.status() };
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let _time_control = unsafe { self.player.timeControlStatus() };
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let outputs = unsafe { self.player_item.outputs() };
         let _output_attached = !outputs.is_empty();
 
         // Check for errors
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let error = unsafe { self.player_item.error() };
         let error_msg = error.as_ref().map(|e| e.localizedDescription().to_string());
 
         // Also check player error
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let player_error = unsafe { self.player.error() };
         let player_error_msg = player_error
             .as_ref()
             .map(|e| e.localizedDescription().to_string());
 
         // Check buffering status
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let _buffer_empty = unsafe { self.player_item.isPlaybackBufferEmpty() };
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let _buffer_full = unsafe { self.player_item.isPlaybackBufferFull() };
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let _likely_keep_up = unsafe { self.player_item.isPlaybackLikelyToKeepUp() };
 
         // Log once per second to avoid spam (per-instance throttling)
@@ -1036,13 +1085,16 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         }
 
         // Check if there's a new frame available at this time
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let mut has_new = unsafe { self.video_output.hasNewPixelBufferForItemTime(item_time) };
         let is_seeking = self.seeking.load(Ordering::Relaxed);
 
         // After seeking, itemTimeForMachAbsoluteTime may return a time far from where AVPlayer
         // actually is. Fall back to player.currentTime() to get frames at the actual position.
         let item_time = if !has_new {
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             let current_time = unsafe { self.player.currentTime() };
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             has_new = unsafe { self.video_output.hasNewPixelBufferForItemTime(current_time) };
             if has_new {
                 current_time
@@ -1068,6 +1120,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
 
         // Copy pixel buffer (thread-safe operation)
         let mut actual_time = item_time;
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let pixel_buffer = unsafe {
             self.video_output
                 .copyPixelBufferForItemTime_itemTimeForDisplay(
@@ -1167,6 +1220,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         let is_seeking = self.seeking.load(Ordering::Relaxed);
         if is_seeking {
             let warmup = self.warmup_frames.fetch_add(1, Ordering::Relaxed) + 1;
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             let likely_to_keep_up = unsafe { self.player_item.isPlaybackLikelyToKeepUp() };
 
             // Check elapsed time since seek started
@@ -1219,6 +1273,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         if iosurface_available {
             // Get raw pointer to the CVPixelBuffer object (Retained auto-derefs)
             let pb_ptr = std::ptr::from_ref(&*pixel_buffer) as *const std::ffi::c_void;
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             let io_surface = unsafe { CVPixelBufferGetIOSurface(pb_ptr) };
 
             if !io_surface.is_null() {
@@ -1232,6 +1287,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
                 // frame_to_texture::import_macos_iosurface_frame() → zero_copy::macos::import_iosurface().
                 // No CPU fallback is provided — IOSurface memory layout is GPU-optimized
                 // and cannot be reliably CPU-mapped.
+                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
                 let gpu_surface = unsafe {
                     MacOSGpuSurface::new(
                         io_surface,
@@ -1260,6 +1316,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
 
     fn seek(&mut self, position: Duration) -> Result<(), VideoError> {
         // Cancel any pending seeks to prevent queue buildup
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { self.player_item.cancelPendingSeeks() };
 
         // Mark as seeking to trigger buffering UI until frames arrive
@@ -1344,6 +1401,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
             }
         });
 
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe {
             self.player_item
                 .seekToTime_toleranceBefore_toleranceAfter_completionHandler(
@@ -1370,6 +1428,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
     ///
     /// The first pause marks the end of preview extraction phase.
     fn pause(&mut self) -> Result<(), VideoError> {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { self.player.pause() };
         // First pause marks end of preview - subsequent resumes will unmute
         self.preview_done.store(true, Ordering::Relaxed);
@@ -1381,6 +1440,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
     ///
     /// Mute state is preserved - callers should use set_muted() to control audio.
     fn resume(&mut self) -> Result<(), VideoError> {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { self.player.play() };
         tracing::debug!("MacOSVideoDecoder: resumed/playing");
         Ok(())
@@ -1388,6 +1448,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
 
     /// Set muted state for AVPlayer audio.
     fn set_muted(&mut self, muted: bool) -> Result<(), VideoError> {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { self.player.setMuted(muted) };
         tracing::debug!("MacOSVideoDecoder: muted={}", muted);
         Ok(())
@@ -1396,6 +1457,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
     /// Set volume for AVPlayer audio (0.0 = silent, 1.0 = full).
     fn set_volume(&mut self, volume: f32) -> Result<(), VideoError> {
         let clamped = volume.clamp(0.0, 1.0);
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { self.player.setVolume(clamped) };
         tracing::debug!("MacOSVideoDecoder: volume={}", clamped);
         Ok(())
@@ -1423,6 +1485,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         // If not seeking and AVPlayer says playback is likely to keep up, we're good
         // Don't trust isPlaybackLikelyToKeepUp during seeking - it can be premature
         if !is_seeking {
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             let likely_to_keep_up = unsafe { self.player_item.isPlaybackLikelyToKeepUp() };
             if likely_to_keep_up {
                 return 100;
@@ -1434,6 +1497,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         let current_secs = if self.seek_target_gen.load(Ordering::Acquire) > 0 {
             self.seek_target_pts_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
         } else {
+            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             let current_time = unsafe { self.player.currentTime() };
             if current_time.timescale > 0 {
                 (current_time.value as f64 / current_time.timescale as f64).max(0.0)
@@ -1445,6 +1509,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         // Get loaded time ranges to calculate actual buffer amount
         // Use firstObject to safely get the first range (returns None if empty)
         // This avoids potential panics from objectAtIndex on a mutable array
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let loaded_ranges = unsafe { self.player_item.loadedTimeRanges() };
 
         let Some(range_value) = loaded_ranges.firstObject() else {
@@ -1453,6 +1518,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
 
         // NSValue containing CMTimeRange - extract using objc runtime
         let range: objc2_core_media::CMTimeRange =
+// SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
             unsafe { objc2::msg_send![&*range_value, CMTimeRangeValue] };
 
         let start_secs = if range.start.timescale > 0 {
@@ -1514,6 +1580,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
             return false;
         }
 
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let likely_to_keep_up = unsafe { self.player_item.isPlaybackLikelyToKeepUp() };
 
         // Check elapsed time since seek started
@@ -1566,6 +1633,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         // store in try_update_metadata(), ensuring we see the complete write.
         // If called before metadata_ready is true, returns default/zeroed metadata.
         let _ = self.metadata_ready.load(Ordering::Acquire);
+        // SAFETY: The metadata pointer belongs to this decoder and is accessed only after its initialization synchronization.
         unsafe { &*self.metadata.get() }
     }
 
@@ -1578,6 +1646,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
     /// This queries AVPlayer's `currentTime()` and converts it to a Duration.
     /// Returns None if the time is invalid (e.g., before playback starts).
     fn current_time(&self) -> Option<Duration> {
+        // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         let time = unsafe { self.player.currentTime() };
         cmtime_to_duration(time)
     }

@@ -285,6 +285,8 @@ pub mod macos {
     ///
     /// This verifies that the HAL APIs are accessible for zero-copy import.
     pub fn is_metal_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Metal>().is_some() }
     }
 
@@ -292,10 +294,12 @@ pub mod macos {
     ///
     /// Returns the device name if Metal backend is available, None otherwise.
     pub fn get_metal_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` is live for the duration of the callback, and the
+        // HAL device exposes its raw Metal device only while that borrow lasts.
         unsafe {
-            device.as_hal::<wgpu::hal::api::Metal>().map(|d| {
-                d.raw_device().lock().name().to_string()
-            })
+            device
+                .as_hal::<wgpu::hal::api::Metal>()
+                .map(|d| d.raw_device().lock().name().to_string())
         }
     }
 
@@ -335,13 +339,9 @@ pub mod macos {
         }
 
         // Access the Metal HAL device
-        let hal_device = device
-            .as_hal::<wgpu::hal::api::Metal>()
-            .ok_or_else(|| {
-                ZeroCopyError::HalAccessFailed(
-                    "wgpu not using Metal backend".to_string(),
-                )
-            })?;
+        let hal_device = device.as_hal::<wgpu::hal::api::Metal>().ok_or_else(|| {
+            ZeroCopyError::HalAccessFailed("wgpu not using Metal backend".to_string())
+        })?;
 
         // Get the raw Metal device
         let metal_device = hal_device.raw_device();
@@ -387,8 +387,7 @@ pub mod macos {
         }
 
         // Wrap the raw pointer as a metal::Texture
-        let metal_texture =
-            metal::Texture::from_ptr(texture_ptr as *mut metal::MTLTexture);
+        let metal_texture = metal::Texture::from_ptr(texture_ptr as *mut metal::MTLTexture);
 
         info!(
             "Created Metal texture from IOSurface: {}x{} {:?}",
@@ -611,6 +610,8 @@ pub mod linux {
     ///
     /// Returns `false` if using OpenGL, software rendering, or another backend.
     pub fn is_vulkan_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Vulkan>().is_some() }
     }
 
@@ -618,6 +619,9 @@ pub mod linux {
     ///
     /// Returns the device name if Vulkan backend is available, None otherwise.
     pub fn get_vulkan_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` and the HAL instance/physical device are live for
+        // the callback; Vulkan guarantees the fixed device-name field is NUL
+        // terminated before it is viewed as a C string.
         unsafe {
             device.as_hal::<wgpu::hal::api::Vulkan>().map(|d| {
                 let instance = d.shared_instance();
@@ -652,13 +656,17 @@ pub mod linux {
     /// - VK_EXT_external_memory_dma_buf
     /// - VK_EXT_image_drm_format_modifier (for tiled formats)
     pub fn is_dmabuf_import_available(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is live for the callback, and the HAL device's
+        // enabled-extension set is only borrowed while that callback runs.
         unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan>().map_or(false, |hal_device| {
-                let extensions = hal_device.enabled_device_extensions();
-                let has_dma_buf = extensions.contains(&EXT_EXTERNAL_MEMORY_DMA_BUF);
-                let has_fd = extensions.contains(&KHR_EXTERNAL_MEMORY_FD);
-                has_dma_buf && has_fd
-            })
+            device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .is_some_and(|hal_device| {
+                    let extensions = hal_device.enabled_device_extensions();
+                    let has_dma_buf = extensions.contains(&EXT_EXTERNAL_MEMORY_DMA_BUF);
+                    let has_fd = extensions.contains(&KHR_EXTERNAL_MEMORY_FD);
+                    has_dma_buf && has_fd
+                })
         }
     }
 
@@ -670,6 +678,8 @@ pub mod linux {
         flags_req: vk::MemoryPropertyFlags,
     ) -> Option<u32> {
         let mem_properties =
+            // SAFETY: `physical_device` belongs to `instance` and remains valid
+            // for this raw Vulkan query.
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
         for i in 0..mem_properties.memory_type_count {
@@ -926,254 +936,242 @@ pub mod linux {
         }
 
         // Access the Vulkan HAL device
-        let hal_device = device
-            .as_hal::<wgpu::hal::api::Vulkan>()
-            .ok_or_else(|| {
-                ZeroCopyError::HalAccessFailed(
-                    "wgpu not using Vulkan backend".to_string(),
-                )
-            })?;
+        let hal_device = device.as_hal::<wgpu::hal::api::Vulkan>().ok_or_else(|| {
+            ZeroCopyError::HalAccessFailed("wgpu not using Vulkan backend".to_string())
+        })?;
 
         // Check for required extensions
-                    let extensions = hal_device.enabled_device_extensions();
-                    let has_dma_buf = extensions.contains(&EXT_EXTERNAL_MEMORY_DMA_BUF);
-                    let has_fd = extensions.contains(&KHR_EXTERNAL_MEMORY_FD);
-                    let has_drm_modifier = extensions.contains(&EXT_IMAGE_DRM_FORMAT_MODIFIER);
+        let extensions = hal_device.enabled_device_extensions();
+        let has_dma_buf = extensions.contains(&EXT_EXTERNAL_MEMORY_DMA_BUF);
+        let has_fd = extensions.contains(&KHR_EXTERNAL_MEMORY_FD);
+        let has_drm_modifier = extensions.contains(&EXT_IMAGE_DRM_FORMAT_MODIFIER);
 
-                    if !has_dma_buf || !has_fd {
-                        return Err(ZeroCopyError::NotAvailable(
-                            "VK_EXT_external_memory_dma_buf or VK_KHR_external_memory_fd not available".to_string(),
-                        ));
-                    }
+        if !has_dma_buf || !has_fd {
+            return Err(ZeroCopyError::NotAvailable(
+                "VK_EXT_external_memory_dma_buf or VK_KHR_external_memory_fd not available"
+                    .to_string(),
+            ));
+        }
 
-                    // Use DRM modifier extension when:
-                    // 1. Non-linear modifier (always needs the extension), OR
-                    // 2. Non-zero offset (linear tiling without extension can't specify offsets)
-                    //
-                    // For single-FD multi-plane layouts, each plane has a different offset.
-                    // Without explicit plane layout, Vulkan binds memory at offset 0, causing
-                    // planes to read wrong data (e.g., UV plane reading Y data → color corruption).
-                    let has_nonzero_offset = dmabuf.offset() != 0;
-                    let use_drm_modifier = has_drm_modifier
-                        && (dmabuf.modifier != drm_modifiers::DRM_FORMAT_MOD_LINEAR
-                            || has_nonzero_offset);
+        // Use DRM modifier extension when:
+        // 1. Non-linear modifier (always needs the extension), OR
+        // 2. Non-zero offset (linear tiling without extension can't specify offsets)
+        //
+        // For single-FD multi-plane layouts, each plane has a different offset.
+        // Without explicit plane layout, Vulkan binds memory at offset 0, causing
+        // planes to read wrong data (e.g., UV plane reading Y data → color corruption).
+        let has_nonzero_offset = dmabuf.offset() != 0;
+        let use_drm_modifier = has_drm_modifier
+            && (dmabuf.modifier != drm_modifiers::DRM_FORMAT_MOD_LINEAR || has_nonzero_offset);
 
-                    debug!(
+        debug!(
                         "Importing DMABuf fd={} ({}x{} {:?}, modifier=0x{:x}, offset={}, use_drm={}) into Vulkan",
                         dmabuf.fd(), width, height, format, dmabuf.modifier, dmabuf.offset(), use_drm_modifier
                     );
 
-                    let vk_device = hal_device.raw_device();
-                    let physical_device = hal_device.raw_physical_device();
-                    let instance = hal_device.shared_instance().raw_instance();
-                    let vk_queue = hal_device.raw_queue();
-                    let queue_family_index = hal_device.queue_family_index();
-                    let vk_format = wgpu_format_to_vulkan(format)?;
+        let vk_device = hal_device.raw_device();
+        let physical_device = hal_device.raw_physical_device();
+        let instance = hal_device.shared_instance().raw_instance();
+        let vk_queue = hal_device.raw_queue();
+        let queue_family_index = hal_device.queue_family_index();
+        let vk_format = wgpu_format_to_vulkan(format)?;
 
-                    // Step 1: Create VkImage with external memory info
-                    let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
-                        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        // Step 1: Create VkImage with external memory info
+        let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
-                    // For tiled formats, specify the DRM format modifier
-                    let plane_layout;
-                    let mut drm_modifier_info;
-                    let mut drm_modifier_list_info;
-                    let modifiers;
+        // For tiled formats, specify the DRM format modifier
+        let plane_layout;
+        let mut drm_modifier_info;
+        let mut drm_modifier_list_info;
+        let modifiers;
 
-                    let mut image_create_info = vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk_format)
-                        .extent(vk::Extent3D {
-                            width,
-                            height,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .initial_layout(vk::ImageLayout::UNDEFINED)
-                        .push_next(&mut external_memory_info);
+        let mut image_create_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_memory_info);
 
-                    if use_drm_modifier {
-                        // Use explicit DRM format modifier
-                        plane_layout = vk::SubresourceLayout {
-                            offset: dmabuf.offset(),
-                            size: dmabuf.size(),
-                            row_pitch: dmabuf.stride() as u64,
-                            array_pitch: 0,
-                            depth_pitch: 0,
-                        };
+        if use_drm_modifier {
+            // Use explicit DRM format modifier
+            plane_layout = vk::SubresourceLayout {
+                offset: dmabuf.offset(),
+                size: dmabuf.size(),
+                row_pitch: dmabuf.stride() as u64,
+                array_pitch: 0,
+                depth_pitch: 0,
+            };
 
-                        drm_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-                            .drm_format_modifier(dmabuf.modifier)
-                            .plane_layouts(std::slice::from_ref(&plane_layout));
+            drm_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(dmabuf.modifier)
+                .plane_layouts(std::slice::from_ref(&plane_layout));
 
-                        image_create_info = image_create_info
-                            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                            .push_next(&mut drm_modifier_info);
-                    } else if dmabuf.modifier == drm_modifiers::DRM_FORMAT_MOD_LINEAR {
-                        // Linear format - use LINEAR tiling
-                        // IMPORTANT: Linear tiling without DRM modifier extension cannot honor
-                        // non-zero offsets. If we have an offset, we reach this branch because
-                        // has_drm_modifier is false, and we must fail fast to avoid color corruption.
-                        if has_nonzero_offset {
-                            return Err(ZeroCopyError::NotAvailable(format!(
+            image_create_info = image_create_info
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .push_next(&mut drm_modifier_info);
+        } else if dmabuf.modifier == drm_modifiers::DRM_FORMAT_MOD_LINEAR {
+            // Linear format - use LINEAR tiling
+            // IMPORTANT: Linear tiling without DRM modifier extension cannot honor
+            // non-zero offsets. If we have an offset, we reach this branch because
+            // has_drm_modifier is false, and we must fail fast to avoid color corruption.
+            if has_nonzero_offset {
+                return Err(ZeroCopyError::NotAvailable(format!(
                                 "DMABuf with non-zero offset ({}) requires VK_EXT_image_drm_format_modifier extension \
                                  for correct plane binding. Without it, planes would read from wrong memory locations.",
                                 dmabuf.offset()
                             )));
-                        }
-                        image_create_info = image_create_info.tiling(vk::ImageTiling::LINEAR);
-                    } else {
-                        // Non-linear modifier requires DRM modifier extension
-                        // Falling back to OPTIMAL tiling would silently corrupt sampling
-                        if !has_drm_modifier {
-                            return Err(ZeroCopyError::NotAvailable(format!(
+            }
+            image_create_info = image_create_info.tiling(vk::ImageTiling::LINEAR);
+        } else {
+            // Non-linear modifier requires DRM modifier extension
+            // Falling back to OPTIMAL tiling would silently corrupt sampling
+            if !has_drm_modifier {
+                return Err(ZeroCopyError::NotAvailable(format!(
                                 "Non-linear DMABuf modifier 0x{:x} requires VK_EXT_image_drm_format_modifier extension",
                                 dmabuf.modifier
                             )));
-                        }
+            }
 
-                        // Store modifier in outer-scoped variable so the slice lives until create_image
-                        modifiers = [dmabuf.modifier];
-                        drm_modifier_list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-                            .drm_format_modifiers(&modifiers);
+            // Store modifier in outer-scoped variable so the slice lives until create_image
+            modifiers = [dmabuf.modifier];
+            drm_modifier_list_info = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
+                .drm_format_modifiers(&modifiers);
 
-                        image_create_info = image_create_info
-                            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                            .push_next(&mut drm_modifier_list_info);
-                    }
+            image_create_info = image_create_info
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .push_next(&mut drm_modifier_list_info);
+        }
 
-                    let vk_image = vk_device
-                        .create_image(&image_create_info, None)
-                        .map_err(|e| {
-                            ZeroCopyError::TextureCreationFailed(format!(
-                                "vkCreateImage failed: {:?}",
-                                e
-                            ))
-                        })?;
+        let vk_image = vk_device
+            .create_image(&image_create_info, None)
+            .map_err(|e| {
+                ZeroCopyError::TextureCreationFailed(format!("vkCreateImage failed: {:?}", e))
+            })?;
 
-                    // Step 2: Get memory requirements
-                    let mem_requirements = vk_device.get_image_memory_requirements(vk_image);
+        // Step 2: Get memory requirements
+        let mem_requirements = vk_device.get_image_memory_requirements(vk_image);
 
-                    // Step 3: Import external memory from DMABuf fd
-                    let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
-                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                        .fd(dmabuf.fd());
+        // Step 3: Import external memory from DMABuf fd
+        let mut import_memory_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(dmabuf.fd());
 
-                    // Find suitable memory type (device local preferred)
-                    let memory_type_index = find_memory_type_index(
-                        instance,
-                        physical_device,
-                        mem_requirements.memory_type_bits,
-                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    )
-                    .or_else(|| {
-                        // Fallback: try without device local requirement
-                        find_memory_type_index(
-                            instance,
-                            physical_device,
-                            mem_requirements.memory_type_bits,
-                            vk::MemoryPropertyFlags::empty(),
-                        )
-                    })
-                    .ok_or_else(|| {
-                        // Clean up the image before returning error
-                        vk_device.destroy_image(vk_image, None);
-                        ZeroCopyError::TextureCreationFailed(
-                            "No suitable memory type for DMABuf import".to_string(),
-                        )
-                    })?;
+        // Find suitable memory type (device local preferred)
+        let memory_type_index = find_memory_type_index(
+            instance,
+            physical_device,
+            mem_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| {
+            // Fallback: try without device local requirement
+            find_memory_type_index(
+                instance,
+                physical_device,
+                mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+            )
+        })
+        .ok_or_else(|| {
+            // Clean up the image before returning error
+            vk_device.destroy_image(vk_image, None);
+            ZeroCopyError::TextureCreationFailed(
+                "No suitable memory type for DMABuf import".to_string(),
+            )
+        })?;
 
-                    let memory_allocate_info = vk::MemoryAllocateInfo::default()
-                        .allocation_size(mem_requirements.size)
-                        .memory_type_index(memory_type_index)
-                        .push_next(&mut import_memory_info);
+        let memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_requirements.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import_memory_info);
 
-                    let device_memory = vk_device
-                        .allocate_memory(&memory_allocate_info, None)
-                        .map_err(|e| {
-                            vk_device.destroy_image(vk_image, None);
-                            ZeroCopyError::TextureCreationFailed(format!(
-                                "vkAllocateMemory (DMABuf import) failed: {:?}",
-                                e
-                            ))
-                        })?;
+        let device_memory = vk_device
+            .allocate_memory(&memory_allocate_info, None)
+            .map_err(|e| {
+                vk_device.destroy_image(vk_image, None);
+                ZeroCopyError::TextureCreationFailed(format!(
+                    "vkAllocateMemory (DMABuf import) failed: {:?}",
+                    e
+                ))
+            })?;
 
-                    // Step 4: Bind memory to image
-                    vk_device
-                        .bind_image_memory(vk_image, device_memory, 0)
-                        .map_err(|e| {
-                            vk_device.free_memory(device_memory, None);
-                            vk_device.destroy_image(vk_image, None);
-                            ZeroCopyError::TextureCreationFailed(format!(
-                                "vkBindImageMemory failed: {:?}",
-                                e
-                            ))
-                        })?;
+        // Step 4: Bind memory to image
+        vk_device
+            .bind_image_memory(vk_image, device_memory, 0)
+            .map_err(|e| {
+                vk_device.free_memory(device_memory, None);
+                vk_device.destroy_image(vk_image, None);
+                ZeroCopyError::TextureCreationFailed(format!("vkBindImageMemory failed: {:?}", e))
+            })?;
 
-                    info!(
-                        "Successfully created Vulkan image from DMABuf fd={} ({}x{} {:?})",
-                        dmabuf.fd(), width, height, format
-                    );
+        info!(
+            "Successfully created Vulkan image from DMABuf fd={} ({}x{} {:?})",
+            dmabuf.fd(),
+            width,
+            height,
+            format
+        );
 
-                    // Step 5: Transition image layout and acquire queue ownership
-                    // External memory requires explicit layout transition from UNDEFINED
-                    // to SHADER_READ_ONLY_OPTIMAL and queue family ownership transfer
-                    // from VK_QUEUE_FAMILY_EXTERNAL to our graphics queue family.
-                    transition_image_layout_external(
-                        vk_device,
-                        vk_queue,
-                        queue_family_index,
-                        vk_image,
-                    )
-                    .inspect_err(|_| {
-                        vk_device.free_memory(device_memory, None);
-                        vk_device.destroy_image(vk_image, None);
-                    })?;
+        // Step 5: Transition image layout and acquire queue ownership
+        // External memory requires explicit layout transition from UNDEFINED
+        // to SHADER_READ_ONLY_OPTIMAL and queue family ownership transfer
+        // from VK_QUEUE_FAMILY_EXTERNAL to our graphics queue family.
+        transition_image_layout_external(vk_device, vk_queue, queue_family_index, vk_image)
+            .inspect_err(|_| {
+                vk_device.free_memory(device_memory, None);
+                vk_device.destroy_image(vk_image, None);
+            })?;
 
-                    // Step 6: Wrap as wgpu-hal Texture
-                    // Create a TextureDescriptor for texture_from_raw
-                    let texture_desc = wgpu::hal::TextureDescriptor {
-                        label: Some("zero-copy DMABuf texture"),
-                        size: wgpu::Extent3d {
-                            width,
-                            height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format,
-                        usage: wgpu::TextureUses::RESOURCE,
-                        memory_flags: wgpu::hal::MemoryFlags::empty(),
-                        view_formats: vec![],
-                    };
+        // Step 6: Wrap as wgpu-hal Texture
+        // Create a TextureDescriptor for texture_from_raw
+        let texture_desc = wgpu::hal::TextureDescriptor {
+            label: Some("zero-copy DMABuf texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
 
-                    // Create a drop callback to free imported Vulkan resources when
-                    // the texture is destroyed. Clone the device handle for the callback.
-                    let device_clone = vk_device.clone();
-                    let drop_callback = Box::new(move || {
-                        debug!("Freeing imported DMABuf Vulkan resources");
-                        // SAFETY: vk_image and device_memory were allocated by us and are valid
-                        // until this callback is invoked when the texture is dropped.
-                        // destroy_image must be called before free_memory.
-                        unsafe {
-                            device_clone.destroy_image(vk_image, None);
-                            device_clone.free_memory(device_memory, None);
-                        }
-                    });
+        // Create a drop callback to free imported Vulkan resources when
+        // the texture is destroyed. Clone the device handle for the callback.
+        let device_clone = vk_device.clone();
+        let drop_callback = Box::new(move || {
+            debug!("Freeing imported DMABuf Vulkan resources");
+            // SAFETY: vk_image and device_memory were allocated by us and are valid
+            // until this callback is invoked when the texture is dropped.
+            // destroy_image must be called before free_memory.
+            unsafe {
+                device_clone.destroy_image(vk_image, None);
+                device_clone.free_memory(device_memory, None);
+            }
+        });
 
-                    // drop_callback is called when wgpu is done with the texture,
-                    // allowing us to free the externally managed VkDeviceMemory
-                    let hal_texture = hal_device.texture_from_raw(
-                        vk_image,
-                        &texture_desc,
-                        Some(drop_callback),
-                        wgpu::hal::vulkan::TextureMemory::External,
-                    );
+        // drop_callback is called when wgpu is done with the texture,
+        // allowing us to free the externally managed VkDeviceMemory
+        let hal_texture = hal_device.texture_from_raw(
+            vk_image,
+            &texture_desc,
+            Some(drop_callback),
+            wgpu::hal::vulkan::TextureMemory::External,
+        );
 
         // Create wgpu texture descriptor
         let texture_desc = wgpu::TextureDescriptor {
@@ -1554,6 +1552,8 @@ pub mod linux {
                     // (import_dmabuf takes ownership on success, but on failure we must clean up)
                     // Note: plane 0 uses the original fd which caller owns, so only close if i > 0
                     if i > 0 {
+                        // SAFETY: `plane_fd` is the duplicated descriptor for this
+                        // plane and import failed, so ownership remains here.
                         unsafe {
                             libc::close(plane_fd);
                         }
@@ -1713,6 +1713,7 @@ pub mod android {
     pub type AHardwareBufferPtr = *mut std::ffi::c_void;
 
     /// VK_ANDROID_external_memory_android_hardware_buffer extension name
+    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
     const VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME: &CStr = unsafe {
         CStr::from_bytes_with_nul_unchecked(b"VK_ANDROID_external_memory_android_hardware_buffer\0")
     };
@@ -1727,6 +1728,8 @@ pub mod android {
     /// (Android 7.0 Nougat) and a compatible GPU. Returns `false` if using
     /// OpenGL ES or software rendering.
     pub fn is_vulkan_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Vulkan>().is_some() }
     }
 
@@ -1735,12 +1738,17 @@ pub mod android {
     /// This checks for VK_ANDROID_external_memory_android_hardware_buffer extension
     /// which is required for zero-copy AHardwareBuffer import.
     pub fn is_ahardwarebuffer_import_available(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is live for the callback, and the HAL extension set
+        // is borrowed only for the callback's duration.
         unsafe {
-            device.as_hal::<wgpu::hal::api::Vulkan>().map_or(false, |hal_device| {
-                let enabled_extensions = hal_device.enabled_device_extensions();
-                enabled_extensions
-                    .contains(&VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME)
-            })
+            device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .map_or(false, |hal_device| {
+                    let enabled_extensions = hal_device.enabled_device_extensions();
+                    enabled_extensions.contains(
+                        &VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
+                    )
+                })
         }
     }
 
@@ -1748,6 +1756,8 @@ pub mod android {
     ///
     /// Returns device name and driver version if Vulkan backend is available.
     pub fn get_vulkan_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` and its HAL instance/physical device remain live for
+        // the callback; Vulkan supplies a NUL-terminated device-name field.
         unsafe {
             device.as_hal::<wgpu::hal::api::Vulkan>().map(|d| {
                 let instance = d.shared_instance();
@@ -3940,6 +3950,8 @@ pub mod android {
             impl Drop for FenceFdGuard {
                 fn drop(&mut self) {
                     if self.0 >= 0 {
+                        // SAFETY: This guard owns the non-negative fence fd and
+                        // closes it exactly once unless `take` transferred it.
                         unsafe {
                             libc::close(self.0);
                         }
@@ -4563,6 +4575,8 @@ pub mod android {
             impl Drop for FenceFdGuard {
                 fn drop(&mut self) {
                     if self.0 >= 0 {
+                        // SAFETY: This guard owns the non-negative fence fd and
+                        // closes it exactly once unless `take` transferred it.
                         unsafe {
                             libc::close(self.0);
                         }
@@ -4981,6 +4995,8 @@ pub mod android {
             let device_clone = self.device.clone();
             let drop_callback = Box::new(move || {
                 debug!("Freeing YCbCr→RGBA texture resources");
+                // SAFETY: These Vulkan image and memory handles were allocated
+                // by this conversion and are released once by this callback.
                 unsafe {
                     device_clone.destroy_image(rgba_image, None);
                     device_clone.free_memory(rgba_memory, None);
@@ -6138,6 +6154,8 @@ pub mod android {
 
     impl Drop for VulkanYuvPipeline {
         fn drop(&mut self) {
+            // SAFETY: Every Vulkan handle below was created by this pipeline and
+            // is destroyed in dependency order while `self.device` is alive.
             unsafe {
                 debug!("Destroying VulkanYuvPipeline");
                 self.device.destroy_command_pool(self.command_pool, None);
@@ -6240,6 +6258,8 @@ pub mod windows {
 
     /// Checks if the current wgpu device supports D3D12 backend.
     pub fn is_d3d12_backend(device: &wgpu::Device) -> bool {
+        // SAFETY: `device` is a live wgpu device borrowed for this call; the
+        // HAL query only inspects its backend and does not retain raw handles.
         unsafe { device.as_hal::<wgpu::hal::api::Dx12>().is_some() }
     }
 
@@ -6247,6 +6267,8 @@ pub mod windows {
     ///
     /// Returns a description if D3D12 backend is available, None otherwise.
     pub fn get_d3d12_device_info(device: &wgpu::Device) -> Option<String> {
+        // SAFETY: `device` is live for the callback and the HAL device is only
+        // borrowed while the callback executes.
         unsafe {
             device.as_hal::<wgpu::hal::api::Dx12, _, Option<String>>(|hal_device| {
                 hal_device.map(|_| "D3D12 Device".to_string())

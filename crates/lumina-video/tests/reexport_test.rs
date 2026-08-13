@@ -1,7 +1,7 @@
 //! Compile-time regression test for the lumina-video public API surface.
 //!
-//! Verifies that types moved to lumina-video-core remain accessible through
-//! the original lumina-video paths. If this file compiles, the re-exports work.
+//! Verifies that native player/frame types remain accessible through the
+//! original lumina-video paths. If this file compiles, the re-exports work.
 
 // Core types accessible via lumina_video:: (compile-time import check)
 #[allow(unused_imports)]

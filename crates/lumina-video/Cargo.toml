@@ -20,7 +20,8 @@ targets = [
 ]
 
 [dependencies]
-# Core decode + zero-copy pipeline (egui-free, uses same wgpu as GPUI)
+# Legacy native player/frame/backend implementation.
+lumina-video-native-frame = { path = "../lumina-video-native-frame" }
 lumina-video-core = { path = "../lumina-video-core" }
 
 # GPUI — the UI framework (replaces egui)
@@ -129,13 +130,16 @@ wgpu = { workspace = true }
 default = []
 
 # Windows: Native Media Foundation + DXVA2/D3D11VA hardware acceleration
-windows-native-video = ["lumina-video-core/windows-native-video"]
+windows-native-video = ["lumina-video-native-frame/windows-native-video"]
 
 # Vendored runtime: Bundle GStreamer libraries with the binary (Linux only)
 # This eliminates the need for users to install GStreamer system packages.
 # The vendored libraries are loaded from `vendor/linux-x86_64/lib/` relative to the executable.
 # LGPL compliance: See vendor/README.md for source availability and relinking instructions.
-vendored-runtime = ["lumina-video-core/vendored-runtime"]
+vendored-runtime = ["lumina-video-native-frame/vendored-runtime"]
+
+# Android: opt-in NDK ImageReader zero-copy bridge.
+android-zero-copy = ["lumina-video-native-frame/android-zero-copy"]
 
 # MoQ: Media over QUIC live streaming transport
 moq = [

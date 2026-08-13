@@ -1694,6 +1694,8 @@ impl ZeroCopyGStreamerDecoder {
         // CRITICAL: Vulkan import takes ownership and will close the FD.
         // GStreamer also closes the FD when the sample drops.
         // We must dup() to avoid double-close.
+        // SAFETY: `dmabuf_info.fd` is a live GStreamer DMABuf descriptor owned
+        // by `sample`; `dup` creates an independent descriptor for import.
         let dup_fd = unsafe { libc::dup(dmabuf_info.fd) };
         if dup_fd < 0 {
             return Err(VideoError::DecodeFailed(format!(
@@ -1710,6 +1712,8 @@ impl ZeroCopyGStreamerDecoder {
         let n_planes = dmabuf_info.n_planes as usize;
         if dmabuf_info.strides.len() < n_planes {
             // Close the dup'd FD before returning error
+            // SAFETY: `dup_fd` is the descriptor created above and is still
+            // owned by this error path.
             unsafe { libc::close(dup_fd) };
             return Err(VideoError::DecodeFailed(format!(
                 "DMABuf has {} planes but only {} strides",
@@ -1719,6 +1723,8 @@ impl ZeroCopyGStreamerDecoder {
         }
         if dmabuf_info.offsets.len() < n_planes {
             // Close the dup'd FD before returning error
+            // SAFETY: `dup_fd` is the descriptor created above and is still
+            // owned by this error path.
             unsafe { libc::close(dup_fd) };
             return Err(VideoError::DecodeFailed(format!(
                 "DMABuf has {} planes but only {} offsets",
@@ -1730,6 +1736,8 @@ impl ZeroCopyGStreamerDecoder {
         for i in 0..n_planes {
             // Bounds-checked access per AGENTS.md
             let Some(&stride) = dmabuf_info.strides.get(i) else {
+                // SAFETY: `dup_fd` remains owned by this error path and is
+                // closed exactly once before returning.
                 unsafe { libc::close(dup_fd) };
                 return Err(VideoError::DecodeFailed(format!(
                     "Missing stride for plane {} (strides.len()={})",
@@ -1738,6 +1746,8 @@ impl ZeroCopyGStreamerDecoder {
                 )));
             };
             let Some(&offset) = dmabuf_info.offsets.get(i) else {
+                // SAFETY: `dup_fd` remains owned by this error path and is
+                // closed exactly once before returning.
                 unsafe { libc::close(dup_fd) };
                 return Err(VideoError::DecodeFailed(format!(
                     "Missing offset for plane {} (offsets.len()={})",
@@ -1749,6 +1759,8 @@ impl ZeroCopyGStreamerDecoder {
 
             // Validate stride is non-zero (a zero stride would produce invalid planes)
             if stride == 0 {
+                // SAFETY: `dup_fd` remains owned by this error path and is
+                // closed exactly once before returning.
                 unsafe { libc::close(dup_fd) };
                 return Err(VideoError::DecodeFailed(format!(
                     "DMABuf plane {} has zero stride",
@@ -1788,7 +1800,7 @@ impl ZeroCopyGStreamerDecoder {
         // for Vulkan DMABuf → wgpu texture import instead.
 
         // Create the LinuxGpuSurface
-        // Safety:
+        // SAFETY:
         // - All FDs in `planes` are valid DMABuf FDs obtained from gst_dmabuf_memory_get_fd()
         // - `owner` keeps the GStreamer sample alive, ensuring DMABuf FDs remain valid
         // - `width`, `height`, `format`, and `modifier` are validated from GStreamer video_info

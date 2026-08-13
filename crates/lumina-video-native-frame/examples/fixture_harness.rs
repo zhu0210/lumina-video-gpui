@@ -1,18 +1,18 @@
-//! Observe fixture playback through lumina-video-core's public seam.
+//! Observe fixture playback through lumina-video-native-frame's public seam.
 
 use std::error::Error;
 use std::io;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lumina_video_core::player::CorePlayer;
-use lumina_video_core::video::{DecodedFrame, VideoError, VideoState};
+use lumina_video_native_frame::player::CorePlayer;
+use lumina_video_native_frame::video::{DecodedFrame, VideoError, VideoState};
 use url::Url;
 
 #[cfg(target_os = "linux")]
-use lumina_video_core::linux_video::ZeroCopyGStreamerDecoder;
+use lumina_video_native_frame::linux_video::ZeroCopyGStreamerDecoder;
 #[cfg(target_os = "linux")]
-use lumina_video_core::video::VideoDecoderBackend;
+use lumina_video_native_frame::video::VideoDecoderBackend;
 
 fn source_url(input: &str) -> Result<String, io::Error> {
     if input.contains("://") {

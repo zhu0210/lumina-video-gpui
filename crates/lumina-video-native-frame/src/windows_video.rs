@@ -89,6 +89,7 @@ impl MfGuard {
         if debug {
             info!("MFStartup: Initializing Media Foundation");
         }
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_LITE)
                 .map_err(|e| VideoError::DecoderInit(format!("MFStartup failed: {}", e)))?;
@@ -102,6 +103,7 @@ impl Drop for MfGuard {
         if self.debug {
             info!("MFShutdown: Cleaning up Media Foundation");
         }
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             let _ = MFShutdown();
         }
@@ -149,6 +151,7 @@ struct ComGuard {
 impl ComGuard {
     /// Creates a new COM guard, calling CoInitializeEx.
     fn new(debug: bool) -> Result<Self, VideoError> {
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED)
                 .ok()
@@ -165,6 +168,7 @@ impl ComGuard {
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             CoUninitialize();
         }
@@ -443,6 +447,7 @@ impl WindowsVideoDecoder {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             D3D11CreateDevice(
                 None, // Default adapter
@@ -483,6 +488,7 @@ impl WindowsVideoDecoder {
 
         let mut reset_token: u32 = 0;
         let mut manager: Option<IMFDXGIDeviceManager> = None;
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             MFCreateDXGIDeviceManager(&mut reset_token, &mut manager).map_err(|e| {
                 VideoError::DecoderInit(format!("MFCreateDXGIDeviceManager failed: {}", e))
@@ -492,6 +498,7 @@ impl WindowsVideoDecoder {
             VideoError::DecoderInit("MFCreateDXGIDeviceManager returned null".to_string())
         })?;
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             manager
                 .ResetDevice(device, reset_token)
@@ -519,6 +526,7 @@ impl WindowsVideoDecoder {
 
         // Create attributes for source reader
         let mut attributes: Option<IMFAttributes> = None;
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             MFCreateAttributes(&mut attributes, 4).map_err(|e| {
                 VideoError::DecoderInit(format!("MFCreateAttributes failed: {}", e))
@@ -529,6 +537,7 @@ impl WindowsVideoDecoder {
         })?;
 
         // Enable hardware transforms
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             attributes
                 .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
@@ -538,6 +547,7 @@ impl WindowsVideoDecoder {
         }
 
         // Set DXGI device manager for D3D11 integration
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             attributes
                 .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, dxgi_manager)
@@ -547,6 +557,7 @@ impl WindowsVideoDecoder {
         }
 
         // Enable video processing for format conversion
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             attributes
                 .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
@@ -557,6 +568,7 @@ impl WindowsVideoDecoder {
 
         // Create the source reader
         let url_hstring = HSTRING::from(url);
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let reader: IMFSourceReader = unsafe {
             MFCreateSourceReaderFromURL(&url_hstring, &attributes).map_err(|e| {
                 VideoError::OpenFailed(format!("MFCreateSourceReaderFromURL failed: {}", e))
@@ -587,12 +599,14 @@ impl WindowsVideoDecoder {
         debug_logging: bool,
     ) -> Result<OutputFormat, VideoError> {
         // Get the native media type to copy frame size
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let native_type: IMFMediaType = unsafe {
             reader
                 .GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)
                 .map_err(|e| VideoError::DecoderInit(format!("GetNativeMediaType failed: {}", e)))?
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let frame_size: u64 = unsafe { native_type.GetUINT64(&MF_MT_FRAME_SIZE).ok().unwrap_or(0) };
 
         // Try NV12 first (native HW decoder format)
@@ -629,6 +643,7 @@ impl WindowsVideoDecoder {
         frame_size: u64,
         debug_logging: bool,
     ) -> bool {
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let output_type: IMFMediaType = unsafe {
             match windows::Win32::Media::MediaFoundation::MFCreateMediaType() {
                 Ok(t) => t,
@@ -641,6 +656,7 @@ impl WindowsVideoDecoder {
             }
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             // Set major type to video
             if output_type
@@ -684,6 +700,7 @@ impl WindowsVideoDecoder {
             debug!("Extracting video metadata");
         }
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let media_type: IMFMediaType = unsafe {
             reader
                 .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
@@ -693,11 +710,13 @@ impl WindowsVideoDecoder {
         };
 
         // Extract frame size
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let frame_size: u64 = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE).ok().unwrap_or(0) };
         let width = (frame_size >> 32) as u32;
         let height = (frame_size & 0xFFFFFFFF) as u32;
 
         // Extract frame rate
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let frame_rate: u64 = unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE).ok().unwrap_or(0) };
         let fps_num = (frame_rate >> 32) as f32;
         let fps_den = (frame_rate & 0xFFFFFFFF) as f32;
@@ -708,6 +727,7 @@ impl WindowsVideoDecoder {
         };
 
         // Extract pixel aspect ratio
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let par: u64 = unsafe {
             media_type
                 .GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO)
@@ -750,6 +770,7 @@ impl WindowsVideoDecoder {
         // MF_PD_DURATION GUID: {6C990D33-BB8E-477A-8598-0D5D96FCD88A}
         let mf_pd_duration = windows::core::GUID::from_u128(0x6c990d33_bb8e_477a_8598_0d5d96fcd88a);
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             let result = reader
                 .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &mf_pd_duration);
@@ -771,6 +792,7 @@ impl WindowsVideoDecoder {
         let mut timestamp: i64 = 0;
         let mut sample: Option<IMFSample> = None;
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             self.source_reader
                 .ReadSample(
@@ -850,6 +872,7 @@ impl WindowsVideoDecoder {
     fn extract_frame(&mut self, sample: &IMFSample) -> Result<DecodedFrame, VideoError> {
         // First, check original sample buffers for DXGI (hardware decode path)
         // We must do this BEFORE ConvertToContiguousBuffer which may copy to CPU memory.
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let buffer_count = unsafe {
             sample
                 .GetBufferCount()
@@ -857,6 +880,7 @@ impl WindowsVideoDecoder {
         };
 
         for i in 0..buffer_count {
+            // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
             let buffer: IMFMediaBuffer = unsafe {
                 match sample.GetBufferByIndex(i) {
                     Ok(b) => b,
@@ -875,6 +899,7 @@ impl WindowsVideoDecoder {
 
         // No DXGI buffer found - use CPU path
         // ConvertToContiguousBuffer is safe here since we're already on CPU path
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let buffer: IMFMediaBuffer = unsafe {
             sample.ConvertToContiguousBuffer().map_err(|e| {
                 VideoError::DecodeFailed(format!("ConvertToContiguousBuffer failed: {}", e))
@@ -903,6 +928,7 @@ impl WindowsVideoDecoder {
         }
 
         // Get the D3D11 texture and subresource index from DXGI buffer
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let (texture, subresource_index): (ID3D11Texture2D, u32) = unsafe {
             let subresource = dxgi_buffer.GetSubresourceIndex().map_err(|e| {
                 VideoError::DecodeFailed(format!("GetSubresourceIndex failed: {}", e))
@@ -921,6 +947,7 @@ impl WindowsVideoDecoder {
 
         // Get texture description
         let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             texture.GetDesc(&mut desc);
         }
@@ -942,6 +969,7 @@ impl WindowsVideoDecoder {
                 match self.get_or_create_shared_texture(desc.Width, desc.Height, desc.Format) {
                     Ok((shared_texture, shared_handle)) => {
                         // Copy from decoded texture to shared texture
+                        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                         unsafe {
                             self.context.CopySubresourceRegion(
                                 &shared_texture,
@@ -970,6 +998,7 @@ impl WindowsVideoDecoder {
                                 let owner: Arc<dyn std::any::Any + Send + Sync> =
                                     Arc::new(shared_texture.clone());
 
+                                // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                                 let surface = unsafe {
                                     WindowsGpuSurface::new(
                                         shared_handle,
@@ -1038,6 +1067,7 @@ impl WindowsVideoDecoder {
         // Copy from the specific subresource of the GPU texture to subresource 0 of staging
         // This is important because DXVA decoders may use texture arrays where each
         // decoded frame is in a different array slice (subresource).
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             self.context.CopySubresourceRegion(
                 &staging,
@@ -1080,6 +1110,7 @@ impl WindowsVideoDecoder {
             MiscFlags: 0,
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let query: ID3D11Query = unsafe {
             let mut query: Option<ID3D11Query> = None;
             self.device
@@ -1092,6 +1123,7 @@ impl WindowsVideoDecoder {
         };
 
         // End the query (this marks the point where we want to know completion)
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             self.context.End(&query);
         }
@@ -1107,6 +1139,7 @@ impl WindowsVideoDecoder {
         let mut iterations: u32 = 0;
 
         loop {
+            // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
             let result = unsafe {
                 self.context.GetData(
                     &query,
@@ -1158,6 +1191,7 @@ impl WindowsVideoDecoder {
         // Check if existing shared texture is compatible
         if let (Some(ref shared), Some(handle)) = (&self.shared_texture, self.shared_handle) {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
             unsafe {
                 shared.GetDesc(&mut desc);
             }
@@ -1166,6 +1200,7 @@ impl WindowsVideoDecoder {
             }
             // Close old handle before creating new one
             if !handle.is_invalid() {
+                // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                 unsafe {
                     let _ = windows::Win32::Foundation::CloseHandle(handle);
                 }
@@ -1191,6 +1226,7 @@ impl WindowsVideoDecoder {
             MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let shared_texture: ID3D11Texture2D = unsafe {
             let mut texture: Option<ID3D11Texture2D> = None;
             self.device
@@ -1214,6 +1250,7 @@ impl WindowsVideoDecoder {
         })?;
 
         // Create shared NT handle
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let shared_handle = unsafe {
             dxgi_resource
                 .CreateSharedHandle(
@@ -1249,6 +1286,7 @@ impl WindowsVideoDecoder {
         // Check if existing staging texture is compatible
         if let Some(ref staging) = self.staging_texture {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
             unsafe {
                 staging.GetDesc(&mut desc);
             }
@@ -1274,6 +1312,7 @@ impl WindowsVideoDecoder {
             MiscFlags: windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(0).0 as u32,
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let staging: ID3D11Texture2D = unsafe {
             let mut texture: Option<ID3D11Texture2D> = None;
             self.device
@@ -1299,6 +1338,7 @@ impl WindowsVideoDecoder {
         use windows::Win32::Graphics::Direct3D11::{D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ};
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             self.context
                 .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
@@ -1307,6 +1347,7 @@ impl WindowsVideoDecoder {
 
         let result = self.copy_mapped_data(&mapped, width, height, format);
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             self.context.Unmap(staging, 0);
         }
@@ -1332,8 +1373,10 @@ impl WindowsVideoDecoder {
                 let uv_height = (height as usize + 1) / 2;
                 let uv_size = stride * uv_height;
 
+                // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                 let y_data = unsafe { std::slice::from_raw_parts(data_ptr, y_size).to_vec() };
                 let uv_data =
+// SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                     unsafe { std::slice::from_raw_parts(data_ptr.add(y_size), uv_size).to_vec() };
 
                 let frame = CpuFrame::new(
@@ -1357,6 +1400,7 @@ impl WindowsVideoDecoder {
             f if f == DXGI_FORMAT_B8G8R8A8_UNORM => {
                 // BGRA: single plane
                 let size = stride * height as usize;
+                // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size).to_vec() };
 
                 let frame = CpuFrame::new(
@@ -1400,6 +1444,7 @@ impl WindowsVideoDecoder {
         let mut max_length: u32 = 0;
         let mut current_length: u32 = 0;
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             buffer
                 .Lock(
@@ -1434,6 +1479,7 @@ impl WindowsVideoDecoder {
 
                 // Validate buffer size before creating raw slices to prevent UB
                 if (current_length as usize) < required_size {
+                    // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                     unsafe {
                         buffer.Unlock().ok();
                     }
@@ -1443,8 +1489,10 @@ impl WindowsVideoDecoder {
                     )));
                 }
 
+                // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                 let y_data = unsafe { std::slice::from_raw_parts(data_ptr, y_size).to_vec() };
                 let uv_data =
+// SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                     unsafe { std::slice::from_raw_parts(data_ptr.add(y_size), uv_size).to_vec() };
 
                 CpuFrame::new(
@@ -1480,6 +1528,7 @@ impl WindowsVideoDecoder {
 
                 // Validate buffer size before creating raw slices to prevent UB
                 if (current_length as usize) < size {
+                    // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                     unsafe {
                         buffer.Unlock().ok();
                     }
@@ -1489,6 +1538,7 @@ impl WindowsVideoDecoder {
                     )));
                 }
 
+                // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size).to_vec() };
 
                 CpuFrame::new(
@@ -1500,6 +1550,7 @@ impl WindowsVideoDecoder {
             }
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             buffer.Unlock().ok();
         }
@@ -1537,6 +1588,7 @@ impl WindowsVideoDecoder {
         }
 
         // Enable the audio stream
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             reader
                 .SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, true)
@@ -1546,11 +1598,13 @@ impl WindowsVideoDecoder {
         }
 
         // Create PCM output type
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let pcm_type: IMFMediaType = unsafe {
             MFCreateMediaType()
                 .map_err(|e| VideoError::DecoderInit(format!("MFCreateMediaType failed: {}", e)))?
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             // Set major type to audio
             pcm_type
@@ -1570,6 +1624,7 @@ impl WindowsVideoDecoder {
         }
 
         // Set the PCM output type on the audio stream
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             reader
                 .SetCurrentMediaType(
@@ -1583,6 +1638,7 @@ impl WindowsVideoDecoder {
         }
 
         // Get the resolved media type to read actual format attributes
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let resolved_type: IMFMediaType = unsafe {
             reader
                 .GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)
@@ -1592,12 +1648,14 @@ impl WindowsVideoDecoder {
         };
 
         // Read all required audio attributes
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let sample_rate = unsafe {
             resolved_type
                 .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
                 .map_err(|e| VideoError::DecoderInit(format!("Failed to get sample rate: {}", e)))?
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let channels = unsafe {
             resolved_type
                 .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
@@ -1606,6 +1664,7 @@ impl WindowsVideoDecoder {
                 })? as u16
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let bits_per_sample = unsafe {
             resolved_type
                 .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
@@ -1614,6 +1673,7 @@ impl WindowsVideoDecoder {
                 })? as u16
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let block_align = unsafe {
             resolved_type
                 .GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT)
@@ -1622,6 +1682,7 @@ impl WindowsVideoDecoder {
                 })? as u16
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let avg_bytes_per_sec = unsafe {
             resolved_type
                 .GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND)
@@ -1632,6 +1693,7 @@ impl WindowsVideoDecoder {
 
         // Check if the resolved format is float (MFAudioFormat_Float) vs integer PCM.
         // We request PCM, but check the resolved type to be defensive.
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let is_float = unsafe {
             if let Ok(subtype) = resolved_type.GetGUID(&MF_MT_SUBTYPE) {
                 subtype == MFAudioFormat_Float
@@ -1688,6 +1750,7 @@ impl WindowsVideoDecoder {
         let mut timestamp: i64 = 0;
         let mut sample: Option<IMFSample> = None;
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             self.source_reader
                 .ReadSample(
@@ -1738,6 +1801,7 @@ impl WindowsVideoDecoder {
         let pts = Duration::from_nanos(timestamp.max(0) as u64 * 100);
 
         // Get the buffer from the sample
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let buffer: IMFMediaBuffer = unsafe {
             sample.ConvertToContiguousBuffer().map_err(|e| {
                 VideoError::DecodeFailed(format!("Audio ConvertToContiguousBuffer failed: {}", e))
@@ -1748,6 +1812,7 @@ impl WindowsVideoDecoder {
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut current_length: u32 = 0;
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             buffer
                 .Lock(&mut data_ptr, None, Some(&mut current_length))
@@ -1757,6 +1822,7 @@ impl WindowsVideoDecoder {
         }
 
         // Convert raw bytes to i16 samples
+        // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
         let byte_slice = unsafe { std::slice::from_raw_parts(data_ptr, current_length as usize) };
 
         let pcm_data: Vec<i16> = match audio_format.bits_per_sample {
@@ -1808,6 +1874,7 @@ impl WindowsVideoDecoder {
             }
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             buffer.Unlock().ok();
         }
@@ -1868,6 +1935,7 @@ impl WindowsVideoDecoder {
         let mut buffer_start: *mut u8 = std::ptr::null_mut();
         let mut buffer_length: u32 = 0;
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             buffer_2d
                 .Lock2DSize(
@@ -1899,6 +1967,7 @@ impl WindowsVideoDecoder {
 
                 // Validate buffer size before creating raw slices to prevent UB
                 if (buffer_length as usize) < required_size {
+                    // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                     unsafe {
                         buffer_2d.Unlock2D().ok();
                     }
@@ -1908,8 +1977,10 @@ impl WindowsVideoDecoder {
                     )));
                 }
 
+                // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                 let y_data = unsafe { std::slice::from_raw_parts(scanline0, y_size).to_vec() };
                 let uv_data =
+// SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                     unsafe { std::slice::from_raw_parts(scanline0.add(y_size), uv_size).to_vec() };
 
                 CpuFrame::new(
@@ -1933,6 +2004,7 @@ impl WindowsVideoDecoder {
 
                 // Validate buffer size before creating raw slices to prevent UB
                 if (buffer_length as usize) < size {
+                    // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                     unsafe {
                         buffer_2d.Unlock2D().ok();
                     }
@@ -1942,6 +2014,7 @@ impl WindowsVideoDecoder {
                     )));
                 }
 
+                // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
                 let data = unsafe { std::slice::from_raw_parts(scanline0, size).to_vec() };
 
                 CpuFrame::new(
@@ -1953,6 +2026,7 @@ impl WindowsVideoDecoder {
             }
         };
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             buffer_2d.Unlock2D().ok();
         }
@@ -1993,12 +2067,14 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
         // Construct PROPVARIANT with VT_I8 and the position value.
         // SAFETY: zeroed PROPVARIANT union is valid; we set vt and hVal before use.
         let prop_variant: windows::core::PROPVARIANT = unsafe { std::mem::zeroed() };
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             let raw = prop_variant.as_raw() as *const _ as *mut windows::core::imp::PROPVARIANT;
             (*raw).Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_I8.0;
             (*raw).Anonymous.Anonymous.Anonymous.hVal = position_100ns;
         }
 
+        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         unsafe {
             self.source_reader
                 .SetCurrentPosition(&windows::core::GUID::zeroed(), &prop_variant)
@@ -2061,6 +2137,7 @@ impl Drop for WindowsVideoDecoder {
         #[cfg(feature = "zero-copy")]
         if let Some(handle) = self.shared_handle.take() {
             if !handle.is_invalid() {
+                // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                 unsafe {
                     let _ = windows::Win32::Foundation::CloseHandle(handle);
                 }

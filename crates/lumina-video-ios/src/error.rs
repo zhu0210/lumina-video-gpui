@@ -1,6 +1,6 @@
 //! Error types for the FFI boundary.
 
-use lumina_video_core::video::VideoError;
+use lumina_video_native_frame::video::VideoError;
 
 /// FFI error codes matching `include/LuminaVideo.h`.
 #[repr(i32)]

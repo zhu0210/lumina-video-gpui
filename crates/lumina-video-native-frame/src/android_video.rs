@@ -62,7 +62,7 @@ use crate::video::{
 /// This function uses ndk_context which must be initialized by the Android activity
 /// before calling this function.
 fn get_jvm() -> Result<JavaVM, VideoError> {
-    // Safety: ndk_context::android_context() returns a valid pointer when called
+    // SAFETY: ndk_context::android_context() returns a valid pointer when called
     // from an Android app that has been properly initialized by android-activity.
     unsafe { JavaVM::from_raw(ndk_context::android_context().vm().cast()) }
         .map_err(|e| VideoError::DecoderInit(format!("Failed to get JavaVM: {}", e)))
@@ -190,6 +190,8 @@ fn release_native_handle(handle: i64) {
     }
     // Convert back to Arc and let it drop (decrements refcount)
     let ptr = handle as *const Mutex<SharedState>;
+    // SAFETY: `handle` was created by `create_native_handle` and has not been
+    // released, so it is exactly one live Arc allocation.
     unsafe {
         let _ = Arc::from_raw(ptr);
     }
@@ -205,6 +207,8 @@ fn get_native_state(handle: i64) -> Option<Arc<Mutex<SharedState>>> {
     }
     let ptr = handle as *const Mutex<SharedState>;
     // Reconstruct Arc, clone it, then forget the original to avoid double-free
+    // SAFETY: `handle` was created by `create_native_handle` and has not been
+    // released, so `ptr` points to a live Arc allocation.
     let arc = unsafe { Arc::from_raw(ptr) };
     let cloned = Arc::clone(&arc);
     std::mem::forget(arc);
@@ -221,6 +225,8 @@ impl AndroidVideoDecoder {
             .map_err(|e| VideoError::DecoderInit(format!("Failed to attach JNI thread: {}", e)))?;
 
         // Get Android context
+        // SAFETY: The Android activity initialized ndk_context and returned a
+        // valid local context reference for this JNI call.
         let context = unsafe { JObject::from_raw(ndk_context::android_context().context().cast()) };
 
         // Create shared state for JNI callbacks
@@ -1172,6 +1178,8 @@ pub struct AndroidVideoFrame {
 // - All other fields (width, height, timestamp_ns, format, player_id) are Copy types.
 // - The pointer is not mutated after creation; only Drop reads it.
 unsafe impl Send for AndroidVideoFrame {}
+// SAFETY: AndroidVideoFrame's opaque buffer handle and copied metadata are
+// thread-safe according to the Android NDK; its lifetime is reference-counted.
 unsafe impl Sync for AndroidVideoFrame {}
 
 impl Drop for AndroidVideoFrame {
@@ -1181,6 +1189,8 @@ impl Drop for AndroidVideoFrame {
             extern "C" {
                 fn AHardwareBuffer_release(buffer: *mut std::ffi::c_void);
             }
+            // SAFETY: `self.buffer` is a live owned AHardwareBuffer reference
+            // and this Drop implementation releases it exactly once.
             unsafe {
                 AHardwareBuffer_release(self.buffer);
             }
@@ -1192,6 +1202,8 @@ impl Drop for AndroidVideoFrame {
             extern "C" {
                 fn close(fd: i32) -> i32;
             }
+            // SAFETY: `self.fence_fd` is a non-negative descriptor owned by the
+            // frame and is closed exactly once on drop.
             unsafe {
                 close(self.fence_fd);
             }
@@ -1467,6 +1479,8 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
         rfu1: u64,
     }
 
+    // SAFETY: JNI returned this AHardwareBuffer pointer for the live Java
+    // buffer; the pointer is checked for null before any further use.
     let ahb = unsafe {
         let env_ptr = env.get_raw() as *mut std::ffi::c_void;
         let buffer_ptr = buffer.as_raw() as *mut std::ffi::c_void;
@@ -1481,6 +1495,8 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
     }
 
     // Query the buffer format using AHardwareBuffer_describe
+    // SAFETY: `ahb` is the non-null pointer returned above and `desc` points to
+    // a valid stack descriptor for the NDK to fill.
     let format = unsafe {
         let mut desc = std::mem::zeroed::<AHardwareBufferDesc>();
         AHardwareBuffer_describe(ahb, &mut desc);
@@ -1489,6 +1505,8 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
 
     // Acquire a reference to keep the buffer alive
     // Rust now owns this reference and will release it when AndroidVideoFrame is dropped
+    // SAFETY: `ahb` is non-null and this call acquires one matching NDK
+    // reference, which `AndroidVideoFrame::drop` releases.
     unsafe {
         AHardwareBuffer_acquire(ahb);
     }
