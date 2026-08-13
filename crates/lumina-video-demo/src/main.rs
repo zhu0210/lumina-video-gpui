@@ -11,7 +11,7 @@ use gpui::{
     div, px, relative, rgb, rgba, size, App, Bounds, FontWeight, KeyDownEvent, MouseButton,
     SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
-use lumina_video::GpuiVideoPlayer;
+use lumina_video_gpui::GpuiVideoPlayer;
 
 const SAMPLE_VIDEOS: &[(&str, &str)] = &[
     (
@@ -40,7 +40,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("lumina_video=debug".parse().unwrap()),
+                .add_directive("lumina_video_gpui=debug".parse().unwrap()),
         )
         .init();
 

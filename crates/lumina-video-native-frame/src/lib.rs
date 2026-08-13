@@ -8,10 +8,9 @@
 //! tickets, so the current public interface still exposes some of those legacy
 //! types; this crate must not be read as the final adapter boundary yet.
 //!
-//! The legacy player and platform decoder modules are intentionally hosted here
-//! during the migration to dedicated native adapters.  The compatibility
-//! `lumina-video` facade re-exports these paths; framework-neutral semantics
-//! remain owned by `lumina-video-core`.
+//! The native player and platform decoder modules are hosted here while
+//! dedicated adapters consume the shared frame contracts. Framework-neutral
+//! semantics remain owned by `lumina-video-core`.
 
 use std::fmt;
 use std::mem::ManuallyDrop;
@@ -19,9 +18,8 @@ use std::time::Duration;
 
 pub use lumina_video_core::video::{VideoError, VideoMetadata, VideoPlayerHandle, VideoState};
 
-// Legacy runtime modules remain here until their dedicated adapter crates
-// take ownership.  Their public paths are preserved by the compatibility
-// facade, while framework-neutral semantics stay in lumina-video-core.
+// Shared runtime modules remain here until dedicated adapter crates take
+// ownership, while framework-neutral semantics stay in lumina-video-core.
 pub use lumina_video_core::audio;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 pub use lumina_video_core::audio_ring_buffer;

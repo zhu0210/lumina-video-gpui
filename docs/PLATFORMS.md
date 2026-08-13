@@ -133,7 +133,7 @@ When the `ffmpeg` feature is enabled, lumina-video automatically falls back to F
 
 Enable with:
 ```toml
-lumina-video = { git = "https://github.com/lumina-video/lumina-video", features = ["ffmpeg"] }
+lumina-video-gpui = { git = "https://github.com/lumina-video/lumina-video", features = ["vendored-runtime"] }
 ```
 
 ## Packaging Recommendations

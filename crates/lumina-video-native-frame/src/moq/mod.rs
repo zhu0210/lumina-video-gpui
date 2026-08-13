@@ -24,7 +24,7 @@
 //! Enable with the `moq` feature in Cargo.toml:
 //!
 //! ```toml
-//! lumina-video = { version = "...", features = ["moq"] }
+//! lumina-video-gpui = { version = "...", features = ["moq"] }
 //! ```
 //!
 //! # Live Streaming Considerations

@@ -14,7 +14,7 @@ gpui_wgpu = {
   git = "https://github.com/zhu0210/zed.git",
   rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2"
 }
-lumina-video = { path = "../lumina-video" }
+lumina-video-gpui = { path = "../lumina-video-gpui" }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -88,4 +88,6 @@ gpui_windows = {
 
 [features]
 # Windows still requires explicit feature flag
-windows-native-video = ["lumina-video/windows-native-video"]
+windows-native-video = ["lumina-video-gpui/windows-native-video"]
+vendored-runtime = ["lumina-video-gpui/vendored-runtime"]
+moq = ["lumina-video-gpui/moq"]

@@ -10,7 +10,7 @@ Be respectful and constructive. We're all here to build great software.
 
 ### Prerequisites
 
-- Rust 1.83+ (stable) — required by egui 0.31 and wgpu 24
+- Rust 1.83+ (stable) — required by GPUI and wgpu
 - Platform-specific dependencies (see below)
 
 ### Setting Up Development Environment
@@ -61,33 +61,30 @@ Be respectful and constructive. We're all here to build great software.
 3. **Build and test:**
    ```bash
    # Platform-specific native decoders (recommended)
-   cargo build --features macos-native-video    # macOS - VideoToolbox
-   cargo build --features linux-gstreamer-video # Linux - GStreamer
-   cargo build --features windows-native-video  # Windows - Media Foundation
-
-   # FFmpeg fallback (optional, requires FFmpeg installed)
-   cargo build --features ffmpeg
+   cargo build --package lumina-video-gpui                    # GPUI entry point
+   cargo build --package lumina-video-gpui --features vendored-runtime # Linux bundle
+   cargo build --package lumina-video-gpui --features windows-native-video
 
    # Run tests
    cargo test
    ```
 
-   **Android** - Cross-compilation (no explicit feature flag needed):
+   **Android native decoder** - Cross-compilation (no explicit feature flag needed):
    ```bash
    # Install Android target
    rustup target add aarch64-linux-android
 
-   # Build for Android (MediaCodec decoder is auto-included)
-   cargo build --target aarch64-linux-android
+   # Check the native MediaCodec decoder and frame contracts
+   cargo check --package lumina-video-native-frame --target aarch64-linux-android
    ```
 
-   > **Note**: No features are enabled by default. You must explicitly enable a platform feature (except Android, which is target-based).
+   > **Note**: No UI demo is provided for Android in this workspace; the Android decoder lives in `lumina-video-native-frame`.
 
 ## Technical Resources
 
 ### Zero-Copy Video Architecture
 - **High-level overview**: See `docs/ZERO-COPY.md` for platform-specific implementations
-- **Platform guides**: `docs/ANDROID.md`, `docs/PLATFORMS.md`
+- **Platform guides**: `docs/PLATFORMS.md`
 - **A/V sync details**: `docs/AV-SYNC.md`
 
 ### Vulkan Development (Android/Linux Zero-Copy)
@@ -218,29 +215,20 @@ cargo test -- --nocapture
 ### Module Structure
 
 ```
-crates/lumina-video/src/media/
-├── video.rs             # Core types and traits
-├── video_player.rs      # egui widget implementation
-├── video_texture.rs     # GPU texture and shader management
-├── frame_queue.rs       # Frame buffering and decode thread
-├── triple_buffer.rs     # Lock-free triple buffering
-├── network.rs           # HTTP streaming
-├── audio.rs             # Audio playback
-│
-├── macos_video.rs       # macOS AVFoundation/VideoToolbox (native)
-├── linux_video_gst.rs   # Linux GStreamer/VA-API (native)
-├── windows_video.rs     # Windows Media Foundation (native)
-├── android_video.rs     # Android MediaCodec (native)
-│
-└── video_decoder.rs     # FFmpeg decoder (optional fallback)
+crates/lumina-video-core/          # Framework-neutral media contracts
+crates/lumina-video-native-frame/  # Native decoders and owned frame leases
+crates/lumina-video-gst/           # Linux GStreamer session adapter
+crates/lumina-video-wgpu/          # GPU frame-import boundary
+crates/lumina-video-gpui/          # GPUI player entry point
+crates/lumina-video-demo/          # Desktop demo application
 ```
 
 ### Key Abstractions
 
 1. **`VideoDecoderBackend` trait** - Platform-agnostic decoder interface
 2. **`FrameQueue`** - Thread-safe frame buffer
-3. **`VideoPlayer`** - Main egui widget
-4. **`VideoTexture`** - GPU texture management
+3. **`GpuiVideoPlayer`** - Main GPUI widget
+4. **`GpuFrameTextures`** - GPU texture management
 
 ### Threading Model
 

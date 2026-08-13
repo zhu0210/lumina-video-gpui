@@ -3,7 +3,7 @@
 //! [`CorePlayer`] encapsulates the decode pipeline, frame queue, A/V sync,
 //! and playback state machine. It is consumed by:
 //!
-//! - `lumina-video::VideoPlayer` (egui widget wrapper)
+//! - `lumina-video-gpui::GpuiVideoPlayer` (GPUI widget wrapper)
 //! - `lumina-video-ios` (C FFI for iOS/Swift)
 //!
 //! CorePlayer selects the platform decoder, including the native MoQ decoder
@@ -48,7 +48,7 @@ fn is_avfoundation_supported_container(url: &str) -> bool {
 ///
 /// Manages the decode pipeline, frame queue, A/V synchronization, and
 /// playback state machine. Does NOT handle GPU texture upload or UI —
-/// that belongs in the egui layer (`VideoPlayer`).
+/// that belongs in a framework integration such as `lumina-video-gpui`.
 ///
 /// # State Machine
 ///

@@ -37,7 +37,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lumina-video = { version = "..." }
+//! lumina-video-gpui = { version = "..." }
 //! ```
 //!
 //! To disable zero-copy (e.g., for unsupported platforms like WASM),
@@ -45,7 +45,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lumina-video = { version = "...", default-features = false, features = ["macos-native-video"] }
+//! lumina-video-gpui = { version = "...", default-features = false }
 //! ```
 //!
 //! **Note:** On unsupported platforms (WASM, etc.), compilation will fail
@@ -131,7 +131,7 @@ pub const fn is_platform_supported() -> bool {
 /// # Example
 ///
 /// ```ignore
-/// use lumina_video::media::zero_copy::ZeroCopyError;
+/// use crate::zero_copy::ZeroCopyError;
 ///
 /// fn handle_import_error(err: ZeroCopyError) {
 ///     match err {
@@ -192,7 +192,7 @@ impl std::error::Error for ZeroCopyError {}
 /// # Example
 ///
 /// ```ignore
-/// use lumina_video::media::zero_copy::ZeroCopyStats;
+/// use crate::zero_copy::ZeroCopyStats;
 ///
 /// let stats = ZeroCopyStats {
 ///     total_frames: 1000,
@@ -258,7 +258,7 @@ impl ZeroCopyStats {
 /// # Example
 ///
 /// ```ignore
-/// use lumina_video::media::zero_copy::macos;
+/// use crate::zero_copy::macos;
 ///
 /// // Check if Metal backend is available
 /// if macos::is_metal_backend(&device) {
@@ -487,7 +487,7 @@ pub mod macos {
 /// # Example
 ///
 /// ```ignore
-/// use lumina_video::media::zero_copy::linux::{self, DmaBufHandle, drm_modifiers};
+/// use crate::zero_copy::linux::{self, DmaBufHandle, drm_modifiers};
 ///
 /// let dmabuf = DmaBufHandle {
 ///     fd: va_surface_fd,
@@ -1241,8 +1241,8 @@ pub mod linux {
     /// # Example
     ///
     /// ```ignore
-    /// use lumina_video::media::zero_copy::linux::{self, DmaBufHandle, DmaBufPlaneHandle};
-    /// use lumina_video::media::video::PixelFormat;
+    /// use crate::zero_copy::linux::{self, DmaBufHandle, DmaBufPlaneHandle};
+    /// use lumina_video_native_frame::video::PixelFormat;
     ///
     /// let planes = vec![
     ///     DmaBufPlaneHandle { fd: y_fd, offset: 0, stride: 1920, size: 1920 * 1080 },
@@ -1684,7 +1684,7 @@ pub mod linux {
 /// # Example
 ///
 /// ```ignore
-/// use lumina_video::media::zero_copy::android;
+/// use crate::zero_copy::android;
 ///
 /// // From MediaCodec: AImage_getHardwareBuffer()
 /// let ahb = get_hardware_buffer_from_media_codec();
@@ -6150,7 +6150,7 @@ pub mod android {
 /// # Example
 ///
 /// ```ignore
-/// use lumina_video::media::zero_copy::windows;
+/// use crate::zero_copy::windows;
 ///
 /// // D3D11 side: Create shared texture
 /// let shared_handle = device11.CreateSharedHandle(&d3d11_texture, ...)?;

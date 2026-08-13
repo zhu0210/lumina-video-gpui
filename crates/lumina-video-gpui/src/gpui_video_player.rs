@@ -22,7 +22,7 @@
 //! GPUI's `surface()` supports NV12 natively with a built-in shader, so
 //! YUV frames (NV12, YUV420p) avoid the CPU YUV→RGB conversion entirely.
 //! Linux GStreamer frames use the owned lease API; borrowed native GPU
-//! surfaces remain rejected at the legacy non-Linux seam.
+//! surfaces remain rejected at the non-Linux compatibility seam.
 
 use std::sync::Arc;
 use std::time::Duration;

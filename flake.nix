@@ -1,5 +1,5 @@
 {
-  description = "lumina-video - Hardware-accelerated video player for egui with zero-copy GPU rendering";
+  description = "lumina-video - Hardware-accelerated GPUI video player with zero-copy GPU rendering";
 
   inputs = {
     # NixOS 24.11 stable - has GStreamer 1.24 for zero-copy DMABuf support

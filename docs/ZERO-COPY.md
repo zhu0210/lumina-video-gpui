@@ -9,12 +9,12 @@ Zero-copy rendering eliminates the CPU→GPU memory copy by importing hardware d
 ```toml
 [dependencies]
 # Zero-copy enabled by default
-lumina-video = { git = "https://github.com/lumina-video/lumina-video" }
+lumina-video-gpui = { git = "https://github.com/lumina-video/lumina-video" }
 ```
 
 To disable (e.g., for iOS or WASM):
 ```toml
-lumina-video = { git = "https://github.com/lumina-video/lumina-video", default-features = false, features = ["macos-native-video"] }
+lumina-video-gpui = { git = "https://github.com/lumina-video/lumina-video", default-features = false }
 ```
 
 ## Platform Implementation

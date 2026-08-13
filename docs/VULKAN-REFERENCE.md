@@ -18,7 +18,7 @@ lumina-video uses **direct Vulkan APIs** (via the `ash` crate) to bypass wgpu li
 
 **Official Spec**: [VK_ANDROID_external_memory_android_hardware_buffer](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_ANDROID_external_memory_android_hardware_buffer.html)
 
-**Implementation**: `crates/lumina-video/src/media/android_vulkan.rs`
+**Implementation**: `crates/lumina-video-native-frame/src/android_vulkan.rs`
 
 **Key Functions**:
 - [`vkGetAndroidHardwareBufferPropertiesANDROID`](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/vkGetAndroidHardwareBufferPropertiesANDROID.html) - Query buffer format, memory requirements, and YCbCr properties
@@ -53,7 +53,7 @@ VkMemoryAllocateInfo {
 
 **Official Spec**: [VK_KHR_sampler_ycbcr_conversion](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_sampler_ycbcr_conversion.html)
 
-**Implementation**: `crates/lumina-video/src/media/android_vulkan.rs:404-451`
+**Implementation**: `crates/lumina-video-native-frame/src/android_vulkan.rs:404-451`
 
 **Key Types**:
 - `VkSamplerYcbcrConversion` - Conversion object
@@ -108,7 +108,7 @@ VkSamplerCreateInfo { pNext: VkSamplerYcbcrConversionInfo { conversion } }
 
 **Official Spec**: [VK_EXT_external_memory_dma_buf](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_external_memory_dma_buf.html)
 
-**Implementation**: `crates/lumina-video/src/media/linux_video.rs`
+**Implementation**: `crates/lumina-video-native-frame/src/linux_video.rs`
 
 **Key Types**:
 - `VkImportMemoryFdInfoKHR` - Import DMABuf FD
@@ -135,7 +135,7 @@ VkImportMemoryFdInfoKHR {
 
 **Official Spec**: [VK_EXT_image_drm_format_modifier](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_image_drm_format_modifier.html)
 
-**Implementation**: `crates/lumina-video/src/media/linux_video.rs:77-81`
+**Implementation**: `crates/lumina-video-native-frame/src/linux_video.rs:77-81`
 
 **Why Critical**: VA-API outputs single-FD DMABuf with plane offsets encoded in DRM modifier. Without this extension, multi-plane imports fail.
 
@@ -242,5 +242,5 @@ export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT
 ---
 
 **Questions?** See `docs/ZERO-COPY.md` for high-level architecture or dive into the source:
-- Android: `crates/lumina-video/src/media/android_vulkan.rs`
-- Linux: `crates/lumina-video/src/media/linux_video.rs`
+- Android: `crates/lumina-video-native-frame/src/android_vulkan.rs`
+- Linux: `crates/lumina-video-native-frame/src/linux_video.rs`
