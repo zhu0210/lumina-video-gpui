@@ -14,6 +14,7 @@
 //! remain owned by `lumina-video-core`.
 
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::time::Duration;
 
 pub use lumina_video_core::video::{VideoError, VideoMetadata, VideoPlayerHandle, VideoState};
@@ -94,8 +95,9 @@ impl FrameExtent {
 /// One owned CPU format plane.
 ///
 /// [`CpuPlane::new`] takes ownership of the supplied bytes without allocating
-/// or copying them.  The producer is responsible for allocation and pooling;
+/// or copying them. The producer is responsible for allocation and pooling;
 /// this type only carries that ownership through the frame lease.
+#[repr(C)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct CpuPlane {
     /// Bytes owned by this plane until the containing lease is dropped.
@@ -109,6 +111,24 @@ impl CpuPlane {
     pub fn new(bytes: Vec<u8>, stride: usize) -> Self {
         Self { bytes, stride }
     }
+}
+
+/// Transfers decoder planes into the owned lease representation without a
+/// second plane-vector allocation. This narrow bridge is public only because
+/// the GStreamer adapter lives in a separate crate.
+#[doc(hidden)]
+pub fn into_cpu_planes(planes: Vec<video::Plane>) -> Vec<CpuPlane> {
+    let planes = ManuallyDrop::new(planes);
+    let pointer = planes.as_ptr() as *mut CpuPlane;
+    let length = planes.len();
+    let capacity = planes.capacity();
+
+    // SAFETY: `Plane` and `CpuPlane` are both `#[repr(C)]` with the identical
+    // field sequence `(Vec<u8>, usize)`, and their size/alignment are asserted
+    // below. The allocation, length, and capacity came from this same Vec, so
+    // the returned Vec owns exactly the original elements. `ManuallyDrop`
+    // prevents the source Vec from freeing or dropping those elements twice.
+    unsafe { Vec::from_raw_parts(pointer, length, capacity) }
 }
 
 /// Owned system-memory planes for one decoded frame.
@@ -126,6 +146,38 @@ impl CpuMemory {
     /// Takes ownership of `planes` without allocating or copying it.
     pub fn new(planes: Vec<CpuPlane>) -> Self {
         Self { planes }
+    }
+}
+
+#[cfg(test)]
+mod plane_layout_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_and_lease_plane_layouts_match() {
+        assert_eq!(
+            std::mem::size_of::<video::Plane>(),
+            std::mem::size_of::<CpuPlane>()
+        );
+        assert_eq!(
+            std::mem::align_of::<video::Plane>(),
+            std::mem::align_of::<CpuPlane>()
+        );
+    }
+
+    #[test]
+    fn decoder_planes_transfer_without_reallocation() {
+        let planes = vec![video::Plane::new(vec![1, 2, 3, 4], 4)];
+        let pointer = planes.as_ptr();
+        let capacity = planes.capacity();
+        let planes = into_cpu_planes(planes);
+        assert_eq!(planes.as_ptr() as *const video::Plane, pointer);
+        assert_eq!(planes.capacity(), capacity);
+        assert_eq!(
+            planes.first().map(|plane| plane.bytes.as_slice()),
+            Some([1, 2, 3, 4].as_slice())
+        );
+        assert_eq!(planes.first().map(|plane| plane.stride), Some(4));
     }
 }
 

@@ -159,6 +159,15 @@ pub struct SessionMetadata {
     pub start_time: Option<MediaTime>,
 }
 
+/// Audio output observed by a media session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioObservation {
+    /// A source audio branch has connected to the session's sink.
+    pub connected: bool,
+    /// Number of buffers observed on that branch.
+    pub buffers_seen: u64,
+}
+
 /// Snapshot of session state that can be read without consuming events.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {

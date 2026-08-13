@@ -4276,6 +4276,7 @@ dependencies = [
  "js-sys",
  "lumina-video-core",
  "lumina-video-gpui",
+ "lumina-video-gst",
  "lumina-video-native-frame",
  "lumina-video-wgpu",
  "parking_lot",
@@ -4329,6 +4330,7 @@ dependencies = [
  "gpui",
  "gpui_wgpu",
  "lumina-video-core",
+ "lumina-video-gst",
  "lumina-video-native-frame",
  "lumina-video-wgpu",
  "tracing",
@@ -4337,6 +4339,14 @@ dependencies = [
 [[package]]
 name = "lumina-video-gst"
 version = "0.2.2"
+dependencies = [
+ "crossbeam-channel",
+ "lumina-video-core",
+ "lumina-video-native-frame",
+ "parking_lot",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "lumina-video-native-frame"

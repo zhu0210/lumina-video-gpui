@@ -28,19 +28,11 @@ example:
 
 ```bash
 # On a headless Linux host, disable the native audio sink for this probe.
-EGUI_VID_FAKE_AUDIO=1 cargo run -p lumina-video-core --example fixture_harness -- fixtures/generated/h264-aac.mp4
+LUMINA_GST_AUDIO_SINK=fakesink cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/h264-aac.mp4
 ```
 
-On Linux the example opens the source through the public
-`ZeroCopyGStreamerDecoder` implementation of the public
-`VideoDecoderBackend` trait and gives it to `CorePlayer::with_decoder`. Other
-platforms use `CorePlayer::new` so platform decoder selection remains inside
-the crate. The output observes only public behavior: state, metadata, frame
-PTS/dimensions/format, playback and audio controls, initialization errors, and
-the public CPU/native-surface distinction exposed by `DecodedFrame`.
-
-The future `MediaSession`, `CapabilityTier`, and complete `FrameRealization`
-contracts are not present in this checkout. The harness therefore reports
-native-surface realization as a partial public observation and labels complete
-realization unavailable; it does not invent those APIs or use private
-GStreamer elements.
+On Linux the example opens the source through the public `GstMediaSession`
+seam. It polls exactly one event per tick, checks metadata and autoplay state,
+asserts that frames are owned CPU memory, observes the bounded drop-oldest
+counter, and verifies that GStreamer owns the audio path. No GPU or private
+GStreamer element is required.

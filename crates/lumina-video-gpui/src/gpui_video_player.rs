@@ -6,10 +6,13 @@
 //! # Architecture
 //!
 //! ```text
-//! CorePlayer (decode + A/V sync)
-//!   │ poll_frame()
+//! Linux: GstMediaSession (GStreamer decode + A/V timing)
+//!   │ one try_next_event() per animation tick
 //!   ▼
-//! decoded_frame_to_textures()  ← lumina-video-wgpu
+//! native_frame_lease_to_textures()  ← lumina-video-wgpu
+//!   │
+//!   ├─ non-Linux: CorePlayer → decoded_frame_to_textures()
+//!   ▼
 //!   │ NV12: Y(R8) + CbCr(RG8)  →  surface((y, cbcr, size))  [GPU YUV→RGB]
 //!   │ RGBA: single RGBA8        →  surface((tex, desc))      [passthrough]
 //!   ▼
@@ -18,8 +21,8 @@
 //!
 //! GPUI's `surface()` supports NV12 natively with a built-in shader, so
 //! YUV frames (NV12, YUV420p) avoid the CPU YUV→RGB conversion entirely.
-//! Borrowed native GPU surfaces are rejected at this legacy seam until #7
-//! connects producers to `lumina_video_wgpu`'s owned lease API.
+//! Linux GStreamer frames use the owned lease API; borrowed native GPU
+//! surfaces remain rejected at the legacy non-Linux seam.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,10 +30,23 @@ use std::time::Duration;
 use gpui::*;
 use gpui_wgpu::wgpu;
 
+#[cfg(target_os = "linux")]
+use lumina_video_core::session::{
+    MediaSession, SessionError, SessionEvent, SessionState as CoreSessionState,
+};
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
+#[cfg(target_os = "linux")]
+use lumina_video_gst::{GstMediaSession, PresentationDecision};
+#[cfg(not(target_os = "linux"))]
 use lumina_video_native_frame::player::CorePlayer;
 use lumina_video_native_frame::video::{VideoMetadata, VideoState};
-use lumina_video_wgpu::{decoded_frame_to_textures, GpuFrameTextures, LegacyFrameIngestionError};
+#[cfg(not(target_os = "linux"))]
+use lumina_video_wgpu::decoded_frame_to_textures;
+use lumina_video_wgpu::GpuFrameTextures;
+#[cfg(not(target_os = "linux"))]
+use lumina_video_wgpu::LegacyFrameIngestionError;
+#[cfg(target_os = "linux")]
+use lumina_video_wgpu::{native_frame_lease_to_textures, NativeFrameIngestionError};
 
 // ---------------------------------------------------------------------------
 // Configuration & response types
@@ -69,16 +85,74 @@ impl Default for GpuiVideoPlayerConfig {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn video_metadata(metadata: &lumina_video_core::session::SessionMetadata) -> VideoMetadata {
+    VideoMetadata {
+        width: metadata.width,
+        height: metadata.height,
+        duration: metadata.duration,
+        frame_rate: metadata.frame_rate,
+        codec: metadata.codec.clone(),
+        pixel_aspect_ratio: metadata.pixel_aspect_ratio,
+        start_time: metadata.start_time,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn video_error(error: &SessionError) -> lumina_video_native_frame::video::VideoError {
+    use lumina_video_native_frame::video::VideoError;
+
+    match error {
+        SessionError::InvalidCommand(message) | SessionError::Fatal(message) => {
+            VideoError::Generic(message.clone())
+        }
+        SessionError::Open(message) => VideoError::OpenFailed(message.clone()),
+        SessionError::Decode(message) => VideoError::DecodeFailed(message.clone()),
+        SessionError::Seek(message) => VideoError::SeekFailed(message.clone()),
+        SessionError::Network(message) => VideoError::Network(message.clone()),
+        SessionError::Unsupported(message) => VideoError::UnsupportedFormat(message.clone()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn video_state(state: &CoreSessionState) -> VideoState {
+    match state {
+        CoreSessionState::Loading => VideoState::Loading,
+        CoreSessionState::Ready => VideoState::Ready,
+        CoreSessionState::Playing { position } => VideoState::Playing {
+            position: *position,
+        },
+        CoreSessionState::Paused { position } => VideoState::Paused {
+            position: *position,
+        },
+        CoreSessionState::Buffering { position } => VideoState::Buffering {
+            position: *position,
+        },
+        CoreSessionState::Error(error) => VideoState::Error(video_error(error)),
+        CoreSessionState::Ended => VideoState::Ended,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Player state
 // ---------------------------------------------------------------------------
 
 /// A GPU-accelerated video player for GPUI.
 ///
-/// Wraps [`CorePlayer`] for decode/audio/sync and manages GPU texture
-/// upload for GPUI's `surface()` element.
+/// Wraps the Linux [`GstMediaSession`] or non-Linux [`CorePlayer`] for
+/// decode/audio/sync and manages GPU texture upload for GPUI's `surface()`
+/// element.
 pub struct GpuiVideoPlayer {
+    #[cfg(not(target_os = "linux"))]
     core: CorePlayer,
+    #[cfg(target_os = "linux")]
+    session: GstMediaSession,
+    #[cfg(target_os = "linux")]
+    url: String,
+    #[cfg(target_os = "linux")]
+    pending_frame: Option<lumina_video_native_frame::NativeFrameLease>,
+    #[cfg(target_os = "linux")]
+    has_presented_frame: bool,
     config: GpuiVideoPlayerConfig,
 
     // GPU state
@@ -90,7 +164,7 @@ pub struct GpuiVideoPlayer {
     cbcr_cache: Option<Arc<wgpu::Texture>>,
     rgba_cache: Option<Arc<wgpu::Texture>>,
 
-    // Playback state (synced from CorePlayer each update)
+    // Playback state (synced from the platform session each update)
     position: Duration,
     duration: Option<Duration>,
     metadata: Option<VideoMetadata>,
@@ -121,11 +195,25 @@ impl GpuiVideoPlayer {
     }
 
     pub fn with_config(url: impl Into<String>, config: GpuiVideoPlayerConfig) -> Self {
+        let url = url.into();
+        #[cfg(not(target_os = "linux"))]
         let core = CorePlayer::new(url);
+        #[cfg(target_os = "linux")]
+        let session = GstMediaSession::new(url.clone());
         let muted = config.muted;
         let volume = config.volume;
+        #[allow(unused_mut)]
         let mut player = Self {
+            #[cfg(not(target_os = "linux"))]
             core,
+            #[cfg(target_os = "linux")]
+            session,
+            #[cfg(target_os = "linux")]
+            url,
+            #[cfg(target_os = "linux")]
+            pending_frame: None,
+            #[cfg(target_os = "linux")]
+            has_presented_frame: false,
             config,
             gpu_context: None,
             frame_textures: None,
@@ -145,8 +233,16 @@ impl GpuiVideoPlayer {
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
         };
+        #[cfg(not(target_os = "linux"))]
         player.core.set_muted(muted);
+        #[cfg(not(target_os = "linux"))]
         player.core.set_volume((volume * 100.0) as u32);
+        #[cfg(target_os = "linux")]
+        {
+            let audio = player.session.audio_handle();
+            audio.set_muted(muted);
+            audio.set_volume((volume.clamp(0.0, 1.0) * 100.0) as u32);
+        }
         player
     }
 
@@ -171,13 +267,21 @@ impl GpuiVideoPlayer {
 
     pub fn with_muted(mut self, muted: bool) -> Self {
         self.config.muted = muted;
+        #[cfg(not(target_os = "linux"))]
         self.core.set_muted(muted);
+        #[cfg(target_os = "linux")]
+        self.session.audio_handle().set_muted(muted);
         self
     }
 
     pub fn with_volume(mut self, volume: f32) -> Self {
         self.config.volume = volume.clamp(0.0, 1.0);
+        #[cfg(not(target_os = "linux"))]
         self.core.set_volume((self.config.volume * 100.0) as u32);
+        #[cfg(target_os = "linux")]
+        self.session
+            .audio_handle()
+            .set_volume((self.config.volume * 100.0) as u32);
         self
     }
 
@@ -186,11 +290,25 @@ impl GpuiVideoPlayer {
     // -----------------------------------------------------------------------
 
     pub fn play(&mut self) {
+        #[cfg(not(target_os = "linux"))]
         self.core.play();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self
+                .session
+                .command(lumina_video_core::session::SessionCommand::Play);
+        }
     }
 
     pub fn pause(&mut self) {
+        #[cfg(not(target_os = "linux"))]
         self.core.pause();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self
+                .session
+                .command(lumina_video_core::session::SessionCommand::Pause);
+        }
     }
 
     pub fn toggle_playback(&mut self) {
@@ -202,17 +320,32 @@ impl GpuiVideoPlayer {
     }
 
     pub fn seek(&mut self, position: Duration) {
+        #[cfg(not(target_os = "linux"))]
         self.core.seek(position);
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self
+                .session
+                .command(lumina_video_core::session::SessionCommand::Seek { position });
+        }
     }
 
     pub fn toggle_mute(&mut self) {
         self.config.muted = !self.config.muted;
+        #[cfg(not(target_os = "linux"))]
         self.core.set_muted(self.config.muted);
+        #[cfg(target_os = "linux")]
+        self.session.audio_handle().set_muted(self.config.muted);
     }
 
     pub fn set_volume(&mut self, volume: f32) {
         self.config.volume = volume.clamp(0.0, 1.0);
+        #[cfg(not(target_os = "linux"))]
         self.core.set_volume((self.config.volume * 100.0) as u32);
+        #[cfg(target_os = "linux")]
+        self.session
+            .audio_handle()
+            .set_volume((self.config.volume * 100.0) as u32);
     }
 
     // -----------------------------------------------------------------------
@@ -297,7 +430,11 @@ impl GpuiVideoPlayer {
     }
 
     pub fn url(&self) -> &str {
-        self.core.url()
+        #[cfg(target_os = "linux")]
+        let url = self.url.as_str();
+        #[cfg(not(target_os = "linux"))]
+        let url = self.core.url();
+        url
     }
 
     pub fn buffering_percent(&self) -> i32 {
@@ -305,11 +442,22 @@ impl GpuiVideoPlayer {
     }
 
     pub fn dimensions(&self) -> Option<(u32, u32)> {
-        self.core.dimensions()
+        #[cfg(target_os = "linux")]
+        let dimensions = self
+            .metadata
+            .as_ref()
+            .map(|metadata| (metadata.width, metadata.height));
+        #[cfg(not(target_os = "linux"))]
+        let dimensions = self.core.dimensions();
+        dimensions
     }
 
     pub fn frame_rate(&self) -> Option<f32> {
-        self.core.frame_rate()
+        #[cfg(target_os = "linux")]
+        let frame_rate = self.metadata.as_ref().map(|metadata| metadata.frame_rate);
+        #[cfg(not(target_os = "linux"))]
+        let frame_rate = self.core.frame_rate();
+        frame_rate
     }
 
     /// Returns the seek bar progress as a 0.0–1.0 fraction.
@@ -324,7 +472,14 @@ impl GpuiVideoPlayer {
 
     /// Returns the audio handle for external volume/mute control.
     pub fn audio_handle(&self) -> &lumina_video_core::audio::AudioHandle {
-        self.core.audio_handle()
+        #[cfg(target_os = "linux")]
+        {
+            self.session.audio_handle()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.core.audio_handle()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -340,7 +495,8 @@ impl GpuiVideoPlayer {
     // -----------------------------------------------------------------------
 
     /// Must be called every frame. Polls the decode pipeline, uploads textures,
-    /// and syncs playback state from `CorePlayer`.
+    /// and syncs playback state from the Linux GStreamer session or the
+    /// non-Linux CorePlayer.
     pub fn update(&mut self, window: &mut Window, _cx: &mut App) {
         // Lazy GPU context init — retry every frame until available.
         if self.gpu_context.is_none() {
@@ -360,74 +516,193 @@ impl GpuiVideoPlayer {
             }
         }
 
-        // Start async decoder init
-        if !self.loading_started {
-            self.loading_started = true;
-            self.start_async_init();
+        #[cfg(target_os = "linux")]
+        {
+            self.update_linux();
         }
 
-        // Check init completion
-        if !self.initialized {
-            self.check_init_complete();
-            if self.initialized {
-                tracing::info!("Decoder initialization complete, playback ready");
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Start async decoder init
+            if !self.loading_started {
+                self.loading_started = true;
+                self.start_async_init();
             }
-        }
 
-        // Sync metadata from decode thread (lazy metadata like macOS AVPlayer)
-        self.core.sync_metadata_from_decode_thread();
-
-        // Poll frames and upload to GPU
-        if self.core.is_playback_requested() {
-            let qlen = self.core.frame_queue().len();
-            if qlen > 0 {
-                tracing::debug!(
-                    "update: playback_requested, queue_len={qlen}, state={:?}",
-                    self.state
-                );
-            }
-            self.poll_and_upload_frames();
-        } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
-            // Peek at first frame for preview (don't advance queue)
-            if self.frame_textures.is_none() {
-                self.try_preview_frame();
-            }
-        } else {
-            // Neither playing nor ready — log why
+            // Check init completion
             if !self.initialized {
-                // Still initializing — expected
-            } else {
-                tracing::debug!(
-                    "update: skipping poll — not playing/ready, state={:?}, qlen={}",
-                    self.state,
-                    self.core.frame_queue().len()
-                );
-            }
-        }
-
-        // Handle end-of-stream / looping
-        if self.core.is_eos() && self.core.is_queue_empty() {
-            if self.config.looping && !self.loop_seek_pending {
-                tracing::debug!("Loop: seeking to start");
-                self.loop_seek_pending = true;
-                self.seek(Duration::ZERO);
-                self.play();
-            } else if !self.config.looping || self.loop_seek_pending {
-                if self.loop_seek_pending {
-                    tracing::debug!("Loop seek failed (EOS reappeared), ending");
-                    self.loop_seek_pending = false;
+                self.check_init_complete();
+                if self.initialized {
+                    tracing::info!("Decoder initialization complete, playback ready");
                 }
-                self.core.set_state(VideoState::Ended);
+            }
+
+            // Sync metadata from decode thread (lazy metadata like macOS AVPlayer)
+            self.core.sync_metadata_from_decode_thread();
+
+            // Poll frames and upload to GPU
+            if self.core.is_playback_requested() {
+                let qlen = self.core.frame_queue().len();
+                if qlen > 0 {
+                    tracing::debug!(
+                        "update: playback_requested, queue_len={qlen}, state={:?}",
+                        self.state
+                    );
+                }
+                self.poll_and_upload_frames();
+            } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
+                // Peek at first frame for preview (don't advance queue)
+                if self.frame_textures.is_none() {
+                    self.try_preview_frame();
+                }
+            } else {
+                // Neither playing nor ready — log why
+                if !self.initialized {
+                    // Still initializing — expected
+                } else {
+                    tracing::debug!(
+                        "update: skipping poll — not playing/ready, state={:?}, qlen={}",
+                        self.state,
+                        self.core.frame_queue().len()
+                    );
+                }
+            }
+
+            // Handle end-of-stream / looping
+            if self.core.is_eos() && self.core.is_queue_empty() {
+                if self.config.looping && !self.loop_seek_pending {
+                    tracing::debug!("Loop: seeking to start");
+                    self.loop_seek_pending = true;
+                    self.seek(Duration::ZERO);
+                    self.play();
+                } else if !self.config.looping || self.loop_seek_pending {
+                    if self.loop_seek_pending {
+                        tracing::debug!("Loop seek failed (EOS reappeared), ending");
+                        self.loop_seek_pending = false;
+                    }
+                    self.core.set_state(VideoState::Ended);
+                }
+            }
+
+            // Sync state from core
+            self.state = self.core.state().clone();
+            self.position = self.core.position();
+            self.duration = self.core.duration();
+            self.buffering_percent = self.core.buffering_percent();
+            if let Some(m) = self.core.metadata() {
+                self.metadata = Some(m.clone());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_linux(&mut self) {
+        self.loading_started = true;
+
+        // Exactly one session poll belongs to one GPUI animation tick. The
+        // session's frame mailbox already drops stale frames, so draining
+        // here would create a second presentation clock.
+        let decision = match self.session.try_next_event() {
+            Ok(event) => {
+                if let Some(event) = event {
+                    match event {
+                        SessionEvent::Metadata { metadata } => {
+                            self.metadata = Some(video_metadata(&metadata));
+                            self.duration = metadata.duration;
+                            self.buffering_percent = 100;
+                            if self.has_presented_frame {
+                                PresentationDecision::Hold
+                            } else {
+                                PresentationDecision::Empty
+                            }
+                        }
+                        SessionEvent::StateChanged { state } => {
+                            self.state = video_state(&state);
+                            if !self.initialized && matches!(state, CoreSessionState::Ready) {
+                                self.initialized = true;
+                                if self.config.autoplay {
+                                    self.play();
+                                }
+                            }
+                            if self.has_presented_frame {
+                                PresentationDecision::Hold
+                            } else {
+                                PresentationDecision::Empty
+                            }
+                        }
+                        SessionEvent::Frame { pts, frame } => {
+                            self.position = pts;
+                            self.has_presented_frame = true;
+                            self.loop_seek_pending = false;
+                            PresentationDecision::Advanced(frame)
+                        }
+                        SessionEvent::Ended => {
+                            self.state = VideoState::Ended;
+                            if self.has_presented_frame {
+                                PresentationDecision::Hold
+                            } else {
+                                PresentationDecision::Empty
+                            }
+                        }
+                        SessionEvent::Error(error) => {
+                            self.state = VideoState::Error(video_error(&error));
+                            if self.has_presented_frame {
+                                PresentationDecision::Hold
+                            } else {
+                                PresentationDecision::Empty
+                            }
+                        }
+                    }
+                } else {
+                    if self.has_presented_frame {
+                        PresentationDecision::Hold
+                    } else {
+                        PresentationDecision::Empty
+                    }
+                }
+            }
+            Err(error) => {
+                self.state = VideoState::Error(video_error(&error));
+                if self.has_presented_frame {
+                    PresentationDecision::Hold
+                } else {
+                    PresentationDecision::Empty
+                }
+            }
+        };
+
+        if let PresentationDecision::Advanced(frame) = decision {
+            self.pending_frame = Some(frame);
+        }
+
+        if let Some(gpu) = self.gpu_context.as_ref() {
+            if let Some(frame) = self.pending_frame.take() {
+                match native_frame_lease_to_textures(
+                    frame,
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut self.y_cache,
+                    &mut self.cbcr_cache,
+                    &mut self.rgba_cache,
+                ) {
+                    Ok(textures) => self.frame_textures = Some(textures),
+                    Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease))
+                    | Err(NativeFrameIngestionError::UnsupportedDmaBuf(lease))
+                    | Err(NativeFrameIngestionError::UnsupportedCpuFormat(lease)) => {
+                        let _ = lease;
+                        tracing::warn!(
+                            "GStreamer session frame was unsupported by the GPU upload seam; keeping previous texture"
+                        );
+                    }
+                }
             }
         }
 
-        // Sync state from core
-        self.state = self.core.state().clone();
-        self.position = self.core.position();
-        self.duration = self.core.duration();
-        self.buffering_percent = self.core.buffering_percent();
-        if let Some(m) = self.core.metadata() {
-            self.metadata = Some(m.clone());
+        if matches!(self.state, VideoState::Ended) && self.config.looping && !self.loop_seek_pending
+        {
+            self.loop_seek_pending = true;
+            self.seek(Duration::ZERO);
+            self.play();
         }
     }
 
@@ -555,7 +830,10 @@ impl GpuiVideoPlayer {
     /// Returns a buffering overlay element (shown when playing but buffering < 100%).
     pub fn buffering_overlay(&self) -> Option<impl IntoElement> {
         let pct = self.buffering_percent;
+        #[cfg(not(target_os = "linux"))]
         let is_audio_stall = self.core.is_audio_stall();
+        #[cfg(target_os = "linux")]
+        let is_audio_stall = false;
         if (pct >= 100 && !is_audio_stall) || !self.is_playing() {
             return None;
         }
@@ -629,6 +907,7 @@ impl GpuiVideoPlayer {
     // Private methods
     // -----------------------------------------------------------------------
 
+    #[cfg(not(target_os = "linux"))]
     fn start_async_init(&mut self) {
         if self.core.is_initialized() || self.core.is_init_pending() {
             return;
@@ -637,6 +916,7 @@ impl GpuiVideoPlayer {
         self.core.init_decoder();
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn check_init_complete(&mut self) {
         if self.core.is_initialized() {
             self.initialized = true;
@@ -652,6 +932,7 @@ impl GpuiVideoPlayer {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn poll_and_upload_frames(&mut self) {
         let gpu = match self.gpu_context.as_ref() {
             Some(g) => g,
@@ -710,6 +991,7 @@ impl GpuiVideoPlayer {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn try_preview_frame(&mut self) {
         if self.frame_textures.is_some() {
             return;
