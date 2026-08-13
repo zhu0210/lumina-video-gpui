@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         source,
         true,
         GstAudioSinkMode::Fake,
-        Duration::from_secs(10),
+        Duration::from_secs(2),
         0,
     );
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -262,8 +262,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("GStreamer audio path is not enabled").into());
     }
 
+    let audio_switch_evidence = if source_kind.contains("dual-aac") {
+        if audio_selection_seen {
+            "confirmed"
+        } else {
+            "missing"
+        }
+    } else {
+        "not-applicable"
+    };
+    let invalid_id_evidence = if source_kind.contains("dual-aac") {
+        if missing_selection_failed {
+            "nonterminal-preflight-failure"
+        } else {
+            "missing"
+        }
+    } else {
+        "not-applicable"
+    };
+
     println!(
-        "metadata={} playing={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload",
+        "metadata={} playing={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload audio_switch={} invalid_id={} invalid_id_prior={:?}",
         metadata_seen,
         playing_seen,
         frames,
@@ -281,6 +300,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         session.dropped_frame_count(),
         audio_connected_seen,
         audio_buffers_seen,
+        audio_switch_evidence,
+        invalid_id_evidence,
+        missing_selection_prior_id,
     );
     Ok(())
 }

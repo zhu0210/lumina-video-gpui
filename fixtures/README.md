@@ -16,10 +16,13 @@ records the tool versions, stream probes, and SHA-256 for every generated file.
 | `generated/hls-vod/index.m3u8` | H.264/AAC VOD playlist with `#EXT-X-ENDLIST` |
 | `generated/hls-live/index.m3u8` | H.264/AAC EVENT snapshot with no `#EXT-X-ENDLIST` |
 
-The dual-track file checks container/stream discovery and in-session audio
-selection by stable GStreamer stream id. The EVENT directory is a deterministic
-finite snapshot, not a network service or an assertion of live reconnect
-semantics.
+The dual-track file checks container/stream discovery and a successful public
+in-session audio switch by stable GStreamer stream id. The harness then requests
+a missing id and verifies an explicit nonterminal preflight failure, the prior
+selection, and frame continuity. Sent-selection failure plus confirmed rollback
+is covered by the deterministic native-frame unit seam, not by this fixture.
+The EVENT directory is a deterministic finite snapshot, not a network service
+or an assertion of live reconnect semantics.
 
 ## Public harness seam
 
@@ -36,5 +39,6 @@ On Linux the example opens the source through the public `GstMediaSession`
 seam. It polls exactly one event per tick, checks metadata and autoplay state,
 asserts that frames are owned CPU memory, observes the bounded drop-oldest
 counter, exercises pause/play, mute/volume, seek, and EOS replay, and verifies
-that GStreamer owns the audio path. No GPU or private GStreamer element is
+that GStreamer owns the audio path. The harness keeps the adapter's default
+two-second worker operation bound. No GPU or private GStreamer element is
 required.
