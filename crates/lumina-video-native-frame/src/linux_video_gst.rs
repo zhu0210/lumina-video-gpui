@@ -291,24 +291,11 @@ impl GStreamerDecoder {
         url: &str,
         audio_sink: GstAudioSinkMode,
     ) -> Result<Self, VideoError> {
-        Self::new_system_memory_with_audio_sink_and_timeout(
-            url,
-            audio_sink,
-            DEFAULT_LIFECYCLE_TIMEOUT,
-        )
-    }
-
-    /// Creates a system-memory decoder with explicit sink and lifecycle policy.
-    pub fn new_system_memory_with_audio_sink_and_timeout(
-        url: &str,
-        audio_sink: GstAudioSinkMode,
-        lifecycle_timeout: Duration,
-    ) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
             true,
             audio_sink,
-            lifecycle_timeout,
+            DEFAULT_LIFECYCLE_TIMEOUT,
             GstLifecycleControl::new(),
         )
     }
