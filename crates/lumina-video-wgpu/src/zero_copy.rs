@@ -425,8 +425,11 @@ pub mod macos {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Metal>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported IOSurface as wgpu texture (zero-copy)");
 
@@ -1190,8 +1193,11 @@ pub mod linux {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported DMABuf as wgpu texture (zero-copy)");
 
@@ -1254,9 +1260,9 @@ pub mod linux {
         dmabuf: DmaBufHandle,
         width: u32,
         height: u32,
-        format: super::super::video::PixelFormat,
+        format: lumina_video_native_frame::video::PixelFormat,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use super::super::video::PixelFormat;
+        use lumina_video_native_frame::video::PixelFormat;
 
         // Validate plane count matches format
         let expected_planes = match format {
@@ -1292,7 +1298,12 @@ pub mod linux {
         // Check for single-FD multi-plane layout (not supported due to offset handling)
         if dmabuf.planes.len() > 1 {
             // Check if all planes share the same FD (single-FD layout)
-            let first_fd = dmabuf.planes[0].fd;
+            let Some(first_plane) = dmabuf.planes.first() else {
+                return Err(ZeroCopyError::InvalidResource(
+                    "DMABuf has no planes".to_string(),
+                ));
+            };
+            let first_fd = first_plane.fd;
             let is_single_fd = dmabuf.planes.iter().all(|p| p.fd == first_fd);
             if is_single_fd {
                 warn!(
@@ -1432,10 +1443,10 @@ pub mod linux {
         planes: &[DmaBufPlaneHandle],
         width: u32,
         height: u32,
-        format: super::super::video::PixelFormat,
+        format: lumina_video_native_frame::video::PixelFormat,
         modifier: u64,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use super::super::video::PixelFormat;
+        use lumina_video_native_frame::video::PixelFormat;
 
         // Validate FD
         if fd < 0 {
@@ -1967,7 +1978,7 @@ pub mod android {
                             ahb_external_format
                         );
                         return Err(ZeroCopyError::NotAvailable(
-                            "External-format AHardwareBuffers are not supported in RGBA import; use import_ahardwarebuffer_yuv_zero_copy".to_string(),
+                            "External-format AHardwareBuffers are not supported in RGBA import at this boundary".to_string(),
                         ));
                     }
 
@@ -2163,162 +2174,15 @@ pub mod android {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported AHardwareBuffer as wgpu texture (zero-copy)");
 
         Ok(wgpu_texture)
-    }
-
-    /// Thread-local cache for the VulkanYuvPipeline, keyed by device handle.
-    ///
-    /// This is created once per device when first needed and reused for all
-    /// subsequent YUV→RGBA conversions. Using thread_local to avoid synchronization.
-    ///
-    /// The cache stores (device_handle, pipeline) to detect device changes.
-    /// If the wgpu device is dropped and recreated, the old pipeline becomes invalid
-    /// and must be replaced. We detect this by comparing raw device handles.
-    use std::cell::RefCell;
-    thread_local! {
-        /// Cache stores (device_handle, pipeline) - cleared on device mismatch
-        static YUV_PIPELINE_CACHE: RefCell<Option<(u64, VulkanYuvPipeline)>> = const { RefCell::new(None) };
-    }
-
-    /// Imports a YUV AHardwareBuffer as a single RGBA texture (true zero-copy).
-    ///
-    /// This uses raw Vulkan to bypass wgpu's TextureAspect limitation and perform
-    /// true zero-copy YUV→RGBA conversion on the GPU. The AHardwareBuffer memory
-    /// is directly imported into Vulkan without any CPU copies.
-    ///
-    /// # Advantages over `import_ahardwarebuffer_yuv`
-    ///
-    /// - **True zero-copy**: No CPU memory reads/writes
-    /// - **~186 MB/s bandwidth saved** at 1080p60 (1.5x pixel data not copied)
-    /// - **Lower latency**: GPU does YUV→RGB conversion directly
-    ///
-    /// # Implementation
-    ///
-    /// 1. Creates a disjoint VkImage with `VK_IMAGE_CREATE_DISJOINT_BIT`
-    /// 2. Imports AHardwareBuffer memory to each plane via `VkBindImagePlaneMemoryInfo`
-    /// 3. Creates plane-specific VkImageViews (`PLANE_0`/`PLANE_1` aspects)
-    /// 4. Runs a custom Vulkan render pass for YUV→RGB conversion
-    /// 5. Returns the RGBA result as a wgpu texture
-    ///
-    /// # Safety
-    ///
-    /// - `ahardware_buffer` must be a valid YUV AHardwareBuffer
-    /// - The AHardwareBuffer must remain valid until conversion completes
-    ///
-    /// # Returns
-    ///
-    /// A single RGBA texture containing the converted video frame.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Not using Vulkan backend
-    /// - The AHardwareBuffer is not a YUV format
-    /// - Vulkan resource creation fails
-    /// - The conversion render pass fails
-    /// Imports a YUV AHardwareBuffer with true zero-copy GPU rendering.
-    ///
-    /// # Arguments
-    /// * `device` - The wgpu device
-    /// * `ahardware_buffer` - Raw AHardwareBuffer pointer from MediaCodec
-    /// * `width` - Frame width in pixels
-    /// * `height` - Frame height in pixels
-    /// * `color_space` - Optional YUV color space hint
-    /// * `fence_fd` - Sync fence FD from producer (-1 if none/already signaled).
-    ///   When >= 0, the fence is imported as a VkSemaphore and waited on before
-    ///   sampling the AHB. This is critical for correct synchronization with
-    ///   hardware video decoders. The FD is closed after import.
-    pub unsafe fn import_ahardwarebuffer_yuv_zero_copy(
-        device: &wgpu::Device,
-        ahardware_buffer: AHardwareBufferPtr,
-        width: u32,
-        height: u32,
-        color_space: Option<YuvColorSpace>,
-        fence_fd: i32,
-    ) -> Result<wgpu::Texture, ZeroCopyError> {
-        if ahardware_buffer.is_null() {
-            return Err(ZeroCopyError::InvalidResource(
-                "AHardwareBuffer is null".to_string(),
-            ));
-        }
-
-        // Access Vulkan HAL device
-        let result = device
-            .as_hal::<wgpu::hal::api::Vulkan, _, Result<wgpu::Texture, ZeroCopyError>>(
-                |hal_device| {
-                    let Some(hal_device) = hal_device else {
-                        warn!("Failed to get Vulkan HAL device");
-                        return Err(ZeroCopyError::HalAccessFailed(
-                            "wgpu not using Vulkan backend".to_string(),
-                        ));
-                    };
-
-                    let raw_device = hal_device.raw_device();
-                    let instance = hal_device.shared_instance();
-                    let raw_instance = instance.raw_instance();
-                    let physical_device = hal_device.raw_physical_device();
-                    let vk_queue = hal_device.raw_queue();
-                    let queue_family_index = hal_device.queue_family_index();
-
-                    // Get or create the YUV pipeline (cached per thread, keyed by device)
-                    let current_device_handle = raw_device.handle().as_raw();
-                    YUV_PIPELINE_CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
-
-                        // Check if cached pipeline is for a different device (stale)
-                        if let Some((cached_handle, _)) = cache.as_ref() {
-                            if *cached_handle != current_device_handle {
-                                debug!(
-                                    "Device changed (0x{:x} -> 0x{:x}), clearing stale pipeline cache",
-                                    cached_handle, current_device_handle
-                                );
-                                *cache = None;
-                            }
-                        }
-
-                        // Create pipeline if not cached or was cleared
-                        if cache.is_none() {
-                            debug!("Creating VulkanYuvPipeline for device 0x{:x}", current_device_handle);
-                            match VulkanYuvPipeline::new(raw_device.clone(), raw_instance, physical_device, queue_family_index) {
-                                Ok(pipeline) => {
-                                    *cache = Some((current_device_handle, pipeline));
-                                }
-                                Err(e) => {
-                                    warn!("Failed to create VulkanYuvPipeline: {:?}", e);
-                                    return Err(e);
-                                }
-                            }
-                        }
-
-                        let Some((_, pipeline)) = cache.as_ref() else {
-                            // This should never happen - cache was just populated above
-                            return Err(ZeroCopyError::ImportFailed(
-                                "VulkanYuvPipeline cache unexpectedly empty".into(),
-                            ));
-                        };
-
-                        // Perform the conversion
-                        pipeline.convert_yuv_ahardwarebuffer(
-                            device,
-                            ahardware_buffer,
-                            raw_instance,
-                            physical_device,
-                            vk_queue,
-                            width,
-                            height,
-                            color_space,
-                            fence_fd,
-                        )
-                    })
-                },
-            );
-
-        result
     }
 
     /// Imports a YUV AHardwareBuffer as separate plane textures for shader-based conversion.
@@ -2361,7 +2225,7 @@ pub mod android {
         height: u32,
         hw_buffer_format: u32,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use crate::android_video::AHARDWAREBUFFER_FORMAT_YV12;
+        use lumina_video_native_frame::android_video::AHARDWAREBUFFER_FORMAT_YV12;
         let is_yv12 = hw_buffer_format == AHARDWAREBUFFER_FORMAT_YV12;
         if ahardware_buffer.is_null() {
             return Err(ZeroCopyError::InvalidResource(
@@ -2472,7 +2336,12 @@ pub mod android {
             )));
         }
 
-        let y_plane = &planes_info.planes[0];
+        let Some(y_plane) = planes_info.planes.first() else {
+            AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
+            return Err(ZeroCopyError::InvalidResource(
+                "YUV buffer has no Y plane".to_string(),
+            ));
+        };
 
         // Validate Y plane pointer
         if y_plane.data.is_null() {
@@ -2485,7 +2354,19 @@ pub mod android {
         // Validate chroma plane pointers based on format
         if is_yv12 {
             // YV12: planes 1 (V) and 2 (U) must be valid
-            if planes_info.planes[1].data.is_null() || planes_info.planes[2].data.is_null() {
+            let Some(v_plane) = planes_info.planes.get(1) else {
+                AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
+                return Err(ZeroCopyError::InvalidResource(
+                    "YV12 V plane is missing".to_string(),
+                ));
+            };
+            let Some(u_plane) = planes_info.planes.get(2) else {
+                AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
+                return Err(ZeroCopyError::InvalidResource(
+                    "YV12 U plane is missing".to_string(),
+                ));
+            };
+            if v_plane.data.is_null() || u_plane.data.is_null() {
                 AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
                 return Err(ZeroCopyError::InvalidResource(
                     "YV12 chroma plane data pointer is null".to_string(),
@@ -2493,7 +2374,13 @@ pub mod android {
             }
         } else {
             // NV12: plane 1 (UV interleaved) must be valid
-            if planes_info.planes[1].data.is_null() {
+            let Some(uv_plane) = planes_info.planes.get(1) else {
+                AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
+                return Err(ZeroCopyError::InvalidResource(
+                    "NV12 UV plane is missing".to_string(),
+                ));
+            };
+            if uv_plane.data.is_null() {
                 AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
                 return Err(ZeroCopyError::InvalidResource(
                     "NV12 UV plane data pointer is null".to_string(),
@@ -2525,8 +2412,18 @@ pub mod android {
             // YV12: 3-plane format with separate V and U planes
             // Plane order in buffer: Y, V, U
             // We extract and will return as [Y, U, V] to match Yuv420p shader expectations
-            let v_plane = &planes_info.planes[1]; // V comes first in YV12
-            let u_plane = &planes_info.planes[2]; // U comes second
+            let Some(v_plane) = planes_info.planes.get(1) else {
+                AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
+                return Err(ZeroCopyError::InvalidResource(
+                    "YV12 V plane is missing".to_string(),
+                ));
+            }; // V comes first in YV12
+            let Some(u_plane) = planes_info.planes.get(2) else {
+                AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
+                return Err(ZeroCopyError::InvalidResource(
+                    "YV12 U plane is missing".to_string(),
+                ));
+            }; // U comes second
 
             let v_row_stride = v_plane.row_stride as usize;
             let u_row_stride = u_plane.row_stride as usize;
@@ -2548,7 +2445,12 @@ pub mod android {
             (Some(u_data), Some(v_data), None)
         } else {
             // NV12: 2-plane format with interleaved UV
-            let uv_plane = &planes_info.planes[1];
+            let Some(uv_plane) = planes_info.planes.get(1) else {
+                AHardwareBuffer_unlock(ahardware_buffer, std::ptr::null_mut());
+                return Err(ZeroCopyError::InvalidResource(
+                    "NV12 UV plane is missing".to_string(),
+                ));
+            };
             let uv_row_stride = uv_plane.row_stride as usize;
             let uv_copy_width = width as usize; // UV plane has width/2 pixels, but each is 2 bytes (RG)
 
@@ -3581,7 +3483,12 @@ pub mod android {
             // The embedded SPIR-V as &[u8] isn't guaranteed to be 4-byte aligned.
             let mut code: Vec<u32> = vec![0u32; spirv.len() / 4];
             for (i, chunk) in spirv.chunks_exact(4).enumerate() {
-                code[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let Ok(bytes) = <&[u8; 4]>::try_from(chunk) else {
+                    continue;
+                };
+                if let Some(word) = code.get_mut(i) {
+                    *word = u32::from_le_bytes(*bytes);
+                }
             }
 
             let shader_info = vk::ShaderModuleCreateInfo::default().code(&code);
@@ -4522,8 +4429,11 @@ pub mod android {
                 view_formats: &[],
             };
 
-            let wgpu_texture = wgpu_device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc);
+            let wgpu_texture = wgpu_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu_desc,
+                wgpu::TextureUses::RESOURCE,
+            );
 
             info!(
                 "Successfully converted YUV AHardwareBuffer to RGBA ({}x{})",
@@ -5024,8 +4934,11 @@ pub mod android {
                 view_formats: &[],
             };
 
-            let wgpu_texture = wgpu_device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc);
+            let wgpu_texture = wgpu_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu_desc,
+                wgpu::TextureUses::RESOURCE,
+            );
 
             info!(
                 "Successfully imported AHB via YCbCr conversion ({}x{})",
@@ -5596,12 +5509,20 @@ pub mod android {
 
             let vert_code: Vec<u32> = VERT_SPIRV
                 .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .filter_map(|chunk| {
+                    <&[u8; 4]>::try_from(chunk)
+                        .ok()
+                        .map(|bytes| u32::from_le_bytes(*bytes))
+                })
                 .collect();
 
             let frag_code: Vec<u32> = FRAG_SPIRV
                 .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .filter_map(|chunk| {
+                    <&[u8; 4]>::try_from(chunk)
+                        .ok()
+                        .map(|bytes| u32::from_le_bytes(*bytes))
+                })
                 .collect();
 
             let vert_info = vk::ShaderModuleCreateInfo::default().code(&vert_code);
@@ -6438,8 +6359,11 @@ pub mod windows {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Dx12>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Dx12>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported D3D11 shared handle as wgpu texture (zero-copy)");
 

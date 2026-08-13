@@ -54,7 +54,11 @@ pub use lumina_video_native_frame::{
 pub use lumina_video_core::sync_metrics::{
     SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS,
 };
-pub use lumina_video_native_frame::frame_to_texture::{self, GpuFrameTextures};
+pub use lumina_video_wgpu as frame_to_texture;
+pub use lumina_video_wgpu::{
+    self, native_frame_lease_to_textures, GpuFrameTextures, LegacyFrameIngestionError,
+    NativeFrameIngestionError,
+};
 
 // macOS/iOS FFmpeg decoder (when available)
 #[cfg(any(target_os = "macos", target_os = "ios"))]

@@ -9,7 +9,7 @@
 //! CorePlayer (decode + A/V sync)
 //!   │ poll_frame()
 //!   ▼
-//! decoded_frame_to_textures()  ← frame_to_texture.rs
+//! decoded_frame_to_textures()  ← lumina-video-wgpu
 //!   │ NV12: Y(R8) + CbCr(RG8)  →  surface((y, cbcr, size))  [GPU YUV→RGB]
 //!   │ RGBA: single RGBA8        →  surface((tex, desc))      [passthrough]
 //!   ▼
@@ -18,6 +18,8 @@
 //!
 //! GPUI's `surface()` supports NV12 natively with a built-in shader, so
 //! YUV frames (NV12, YUV420p) avoid the CPU YUV→RGB conversion entirely.
+//! Borrowed native GPU surfaces are rejected at this legacy seam until #7
+//! connects producers to `lumina_video_wgpu`'s owned lease API.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,9 +28,9 @@ use gpui::*;
 use gpui_wgpu::wgpu;
 
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
-use lumina_video_native_frame::frame_to_texture::{self, GpuFrameTextures};
 use lumina_video_native_frame::player::CorePlayer;
 use lumina_video_native_frame::video::{VideoMetadata, VideoState};
+use lumina_video_wgpu::{decoded_frame_to_textures, GpuFrameTextures, LegacyFrameIngestionError};
 
 // ---------------------------------------------------------------------------
 // Configuration & response types
@@ -683,7 +685,7 @@ impl GpuiVideoPlayer {
         }
 
         if let Some(video_frame) = last_frame {
-            let textures = frame_to_texture::decoded_frame_to_textures(
+            let textures = decoded_frame_to_textures(
                 &video_frame.frame,
                 &gpu.device,
                 &gpu.queue,
@@ -692,17 +694,18 @@ impl GpuiVideoPlayer {
                 &mut self.rgba_cache,
             );
 
-            // Only replace textures if we got a valid upload (don't clear on None)
-            if let Some(tex) = textures {
-                if self.frame_textures.is_none() {
-                    tracing::info!("First video frame uploaded to GPU");
+            match textures {
+                Ok(tex) => {
+                    if self.frame_textures.is_none() {
+                        tracing::info!("First video frame uploaded to GPU");
+                    }
+                    self.frame_textures = Some(tex);
                 }
-                self.frame_textures = Some(tex);
-            } else {
-                tracing::warn!(
-                    "Frame upload returned None — decoded frame could not be \
-                     converted to GPU textures (missing CPU fallback?)"
-                );
+                Err(LegacyFrameIngestionError::UnsupportedNativeSurface) => {
+                    tracing::warn!(
+                        "Frame upload rejected borrowed native GPU surface; keeping previous texture"
+                    );
+                }
             }
         }
     }
@@ -721,7 +724,7 @@ impl GpuiVideoPlayer {
             return;
         };
 
-        let textures = frame_to_texture::decoded_frame_to_textures(
+        let textures = decoded_frame_to_textures(
             &frame.frame,
             &gpu.device,
             &gpu.queue,
@@ -730,11 +733,16 @@ impl GpuiVideoPlayer {
             &mut self.rgba_cache,
         );
 
-        if let Some(tex) = textures {
-            tracing::debug!("Preview frame uploaded to GPU");
-            self.frame_textures = Some(tex);
-        } else {
-            tracing::warn!("Preview frame upload returned None — missing CPU fallback?");
+        match textures {
+            Ok(tex) => {
+                tracing::debug!("Preview frame uploaded to GPU");
+                self.frame_textures = Some(tex);
+            }
+            Err(LegacyFrameIngestionError::UnsupportedNativeSurface) => {
+                tracing::warn!(
+                    "Preview rejected borrowed native GPU surface; keeping previous texture"
+                );
+            }
         }
     }
 }

@@ -26,9 +26,9 @@ pub use lumina_video_core::triple_buffer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_native_frame::frame_queue;
 #[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_native_frame::frame_to_texture;
-#[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_native_frame::player;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_wgpu as frame_to_texture;
 
 // Platform-specific re-exports
 #[cfg(any(target_os = "macos", target_os = "ios"))]
