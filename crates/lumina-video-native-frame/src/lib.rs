@@ -151,6 +151,17 @@ pub enum NativeMemory {
     DmaBuf(DmaBufMemory),
 }
 
+/// Framework-neutral identity, timing, extent, and format for one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFrameDescriptor {
+    pub frame_id: u64,
+    pub stream_generation: u64,
+    pub pts: MediaTime,
+    pub duration: Option<MediaTime>,
+    pub extent: FrameExtent,
+    pub format: PixelFormat,
+}
+
 /// A decoded frame and every producer resource required to keep it valid.
 #[derive(Debug)]
 pub struct NativeFrameLease {
@@ -166,16 +177,11 @@ pub struct NativeFrameLease {
 
 impl NativeFrameLease {
     pub fn new(
-        frame_id: u64,
-        stream_generation: u64,
-        pts: MediaTime,
-        duration: Option<MediaTime>,
-        extent: FrameExtent,
-        format: PixelFormat,
+        descriptor: NativeFrameDescriptor,
         memory: NativeMemory,
         acquire: AcquireSync,
     ) -> Result<Self, NativeFrameError> {
-        if extent.width == 0 || extent.height == 0 {
+        if descriptor.extent.width == 0 || descriptor.extent.height == 0 {
             return Err(NativeFrameError::InvalidExtent);
         }
         let plane_count = match &memory {
@@ -183,7 +189,7 @@ impl NativeFrameLease {
             #[cfg(target_os = "linux")]
             NativeMemory::DmaBuf(dmabuf) => dmabuf.planes.len(),
         };
-        let expected = format.num_planes();
+        let expected = descriptor.format.num_planes();
         if plane_count != expected {
             return Err(NativeFrameError::PlaneCount {
                 expected,
@@ -191,12 +197,12 @@ impl NativeFrameLease {
             });
         }
         Ok(Self {
-            frame_id,
-            stream_generation,
-            pts,
-            duration,
-            extent,
-            format,
+            frame_id: descriptor.frame_id,
+            stream_generation: descriptor.stream_generation,
+            pts: descriptor.pts,
+            duration: descriptor.duration,
+            extent: descriptor.extent,
+            format: descriptor.format,
             memory,
             acquire,
         })

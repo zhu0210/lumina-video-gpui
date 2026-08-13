@@ -2,18 +2,21 @@ use std::time::Duration;
 
 use lumina_video_core::video::PixelFormat;
 use lumina_video_native_frame::{
-    AcquireSync, CpuMemory, CpuPlane, FrameExtent, NativeFrameLease, NativeMemory,
+    AcquireSync, CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor, NativeFrameLease,
+    NativeMemory,
 };
 
 #[test]
 fn cpu_lease_owns_format_planes_and_timing() -> Result<(), Box<dyn std::error::Error>> {
     let lease = NativeFrameLease::new(
-        4,
-        2,
-        Duration::from_millis(40),
-        Some(Duration::from_millis(33)),
-        FrameExtent::new(2, 1),
-        PixelFormat::Rgba,
+        NativeFrameDescriptor {
+            frame_id: 4,
+            stream_generation: 2,
+            pts: Duration::from_millis(40),
+            duration: Some(Duration::from_millis(33)),
+            extent: FrameExtent::new(2, 1),
+            format: PixelFormat::Rgba,
+        },
         NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(vec![1, 2, 3, 4], 8)])),
         AcquireSync::None,
     )?;
