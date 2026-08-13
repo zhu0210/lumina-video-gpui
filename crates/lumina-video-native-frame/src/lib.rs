@@ -10,6 +10,61 @@ use std::time::Duration;
 
 use lumina_video_core::video::PixelFormat;
 
+// Legacy runtime modules remain here until their dedicated adapter crates
+// take ownership.  Their public paths are preserved by the compatibility
+// facade, while framework-neutral semantics stay in lumina-video-core.
+pub use lumina_video_core::audio;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+pub use lumina_video_core::audio_ring_buffer;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_core::sync_metrics;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod frame_queue;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod player;
+
+pub mod video;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod audio_decoder;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod macos_video;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod video_decoder;
+
+#[cfg(target_os = "linux")]
+pub mod linux_video;
+#[cfg(target_os = "linux")]
+pub mod linux_video_gst;
+
+#[cfg(target_os = "android")]
+pub mod android_video;
+#[cfg(target_os = "android")]
+pub mod android_vulkan;
+#[cfg(target_os = "android")]
+pub mod ndk_image_reader;
+
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub mod windows_audio;
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+pub mod windows_video;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "windows", feature = "windows-native-video")
+))]
+pub mod zero_copy;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod frame_to_texture;
+
+#[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
+pub mod vendored_runtime;
+
 /// A media timestamp in the session master-clock time base.
 pub type MediaTime = Duration;
 
@@ -218,3 +273,9 @@ impl NativeFrameLease {
         })
     }
 }
+
+pub use lumina_video_core::video::VideoPlayerHandle;
+pub use video::{CpuFrame, DecodedFrame, Plane, VideoDecoderBackend, VideoFrame};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use player::CorePlayer;

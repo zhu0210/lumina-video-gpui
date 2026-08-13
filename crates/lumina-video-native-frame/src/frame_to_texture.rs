@@ -36,8 +36,8 @@ fn safe_write_texture(
     layout: wgpu::TexelCopyBufferLayout,
     extent: wgpu::Extent3d,
 ) {
-    let required = layout.bytes_per_row.unwrap_or(0) as usize
-        * layout.rows_per_image.unwrap_or(1) as usize;
+    let required =
+        layout.bytes_per_row.unwrap_or(0) as usize * layout.rows_per_image.unwrap_or(1) as usize;
     if data.len() < required {
         tracing::warn!(
             "write_texture skipped: buffer {} bytes < needed {} bytes \
@@ -141,7 +141,9 @@ pub fn decoded_frame_to_textures(
                 // IOSurface-backed textures cannot be reliably CPU-mapped.
                 tracing::debug!(
                     "macOS IOSurface frame: {}x{} fmt={:?}, attempting zero-copy import",
-                    surface.width, surface.height, surface.format
+                    surface.width,
+                    surface.height,
+                    surface.format
                 );
                 match import_macos_iosurface_frame(surface, device) {
                     Ok(textures) => {
@@ -167,7 +169,10 @@ pub fn decoded_frame_to_textures(
                 // DMABuf memory is GPU-only and cannot be CPU-mapped.
                 tracing::debug!(
                     "Linux DMABuf frame: {}x{} fmt={:?}, {} planes, attempting zero-copy import",
-                    surface.width, surface.height, surface.format, surface.planes.len()
+                    surface.width,
+                    surface.height,
+                    surface.format,
+                    surface.planes.len()
                 );
                 match import_linux_dmabuf_frame(surface, device) {
                     Ok(textures) => {
@@ -227,9 +232,7 @@ fn import_macos_iosurface_frame(
         )
     }
     .map_err(|e| {
-        crate::video::VideoError::DecodeFailed(format!(
-            "IOSurface zero-copy import failed: {e}"
-        ))
+        crate::video::VideoError::DecodeFailed(format!("IOSurface zero-copy import failed: {e}"))
     })?;
 
     // IOSurface textures are always BGRA8Unorm
@@ -276,9 +279,7 @@ fn import_linux_dmabuf_frame(
         )
     }
     .map_err(|e| {
-        crate::video::VideoError::DecodeFailed(format!(
-            "DMABuf zero-copy import failed: {e}"
-        ))
+        crate::video::VideoError::DecodeFailed(format!("DMABuf zero-copy import failed: {e}"))
     })?;
 
     match surface.format {
