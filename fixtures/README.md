@@ -16,8 +16,8 @@ records the tool versions, stream probes, and SHA-256 for every generated file.
 | `generated/hls-vod/index.m3u8` | H.264/AAC VOD playlist with `#EXT-X-ENDLIST` |
 | `generated/hls-live/index.m3u8` | H.264/AAC EVENT snapshot with no `#EXT-X-ENDLIST` |
 
-The dual-track file checks container/stream discovery only: this revision has
-no public audio-track selection API. The EVENT directory is a deterministic
+The dual-track file checks container/stream discovery and in-session audio
+selection by stable GStreamer stream id. The EVENT directory is a deterministic
 finite snapshot, not a network service or an assertion of live reconnect
 semantics.
 
@@ -28,7 +28,8 @@ example:
 
 ```bash
 # The harness uses GStreamer's deterministic fake audio sink.
-cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/h264-aac.mp4
+cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/vp9-opus.mkv
+cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/dual-aac.mkv
 ```
 
 On Linux the example opens the source through the public `GstMediaSession`

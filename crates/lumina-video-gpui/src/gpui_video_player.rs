@@ -827,6 +827,11 @@ impl GpuiVideoPlayer {
                                 PresentationDecision::Empty
                             }
                         }
+                        SessionEvent::AudioTracks { .. }
+                        | SessionEvent::AudioTrackSelected { .. }
+                        | SessionEvent::AudioTrackSelectionFailed { .. } => {
+                            PresentationDecision::Hold
+                        }
                         SessionEvent::StateChanged { state } => {
                             self.state = video_state(&state);
                             if !self.initialized && matches!(state, CoreSessionState::Ready) {

@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use lumina_video_core::session::{
-    CapabilityTier, MediaSession, SessionCommand, SessionError, SessionEvent, SessionSnapshot,
-    SessionState,
+    AudioTrack, CapabilityTier, MediaSession, SessionCommand, SessionError, SessionEvent,
+    SessionSnapshot, SessionState,
 };
 
 struct FakeSession {
@@ -60,5 +60,39 @@ fn session_adapter_seam_exposes_snapshot_commands_and_nonblocking_events() {
     assert!(matches!(
         session.snapshot().state,
         SessionState::Playing { .. }
+    ));
+}
+
+#[test]
+fn audio_track_contract_keeps_stable_id_and_nonterminal_failure_fields() {
+    let track = AudioTrack {
+        id: "audio-raw-id".into(),
+        language: Some("eng".into()),
+        title: Some("English".into()),
+        codec: "AAC".into(),
+    };
+    let event = SessionEvent::<u8>::AudioTracks {
+        tracks: vec![track.clone()],
+        selected_id: Some(track.id.clone()),
+    };
+    assert!(matches!(
+        event,
+        SessionEvent::AudioTracks { tracks, selected_id }
+            if tracks.first() == Some(&track)
+                && selected_id.as_deref() == Some("audio-raw-id")
+    ));
+
+    let failure = SessionEvent::<u8>::AudioTrackSelectionFailed {
+        requested_id: "missing".into(),
+        prior_restored_id: Some(track.id),
+        reason: "selection rejected".into(),
+    };
+    assert!(matches!(
+        failure,
+        SessionEvent::AudioTrackSelectionFailed {
+            requested_id,
+            prior_restored_id: Some(_),
+            reason,
+        } if requested_id == "missing" && reason == "selection rejected"
     ));
 }

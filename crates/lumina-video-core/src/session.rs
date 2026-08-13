@@ -126,6 +126,11 @@ pub enum SessionCommand {
     SetVolume {
         volume: f32,
     },
+    /// Selects one of the source's discovered audio streams by its stable
+    /// GStreamer stream id.
+    SelectAudioTrack {
+        id: String,
+    },
     /// Request a session-level capability renegotiation.
     Renegotiate {
         tier: CapabilityTier,
@@ -135,11 +140,46 @@ pub enum SessionCommand {
 /// A framework-neutral event emitted by a media-session adapter.
 #[derive(Debug, Clone)]
 pub enum SessionEvent<F> {
-    Metadata { metadata: SessionMetadata },
-    StateChanged { state: SessionState },
-    Frame { pts: MediaTime, frame: F },
+    Metadata {
+        metadata: SessionMetadata,
+    },
+    /// The complete discoverable audio-track set, with the currently
+    /// selected stream id when one is known.
+    AudioTracks {
+        tracks: Vec<AudioTrack>,
+        selected_id: Option<String>,
+    },
+    /// Confirms an audio-track selection, including the selected metadata.
+    AudioTrackSelected {
+        track: AudioTrack,
+    },
+    /// Reports a rejected selection without terminating the session.
+    AudioTrackSelectionFailed {
+        requested_id: String,
+        prior_restored_id: Option<String>,
+        reason: String,
+    },
+    StateChanged {
+        state: SessionState,
+    },
+    Frame {
+        pts: MediaTime,
+        frame: F,
+    },
     Ended,
     Error(SessionError),
+}
+
+/// Metadata for one source audio stream.
+///
+/// `id` is the raw source stream id. It is intentionally not an index or a
+/// value derived from the order in a stream collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioTrack {
+    pub id: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub codec: String,
 }
 
 /// Framework-neutral metadata observed for one media session.
@@ -174,6 +214,8 @@ pub struct SessionSnapshot {
     pub state: SessionState,
     pub metadata: Option<SessionMetadata>,
     pub capability: CapabilityTier,
+    pub audio_tracks: Vec<AudioTrack>,
+    pub selected_audio_track_id: Option<String>,
 }
 
 impl SessionSnapshot {
@@ -183,6 +225,8 @@ impl SessionSnapshot {
             state: SessionState::Loading,
             metadata: None,
             capability,
+            audio_tracks: Vec::new(),
+            selected_audio_track_id: None,
         }
     }
 }
