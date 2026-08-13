@@ -100,10 +100,10 @@ impl DemoApp {
         }
     }
 
-    fn load_video(&mut self, url: &str) {
+    fn load_video(&mut self, url: &str, cx: &App) {
         tracing::info!("Loading: {url}");
         self.status = format!("Loading: {url}...");
-        let player = GpuiVideoPlayer::new(url.to_string())
+        let player = GpuiVideoPlayer::new(url.to_string(), cx)
             .with_autoplay(true)
             .with_controls(true)
             .with_looping(false);
@@ -219,7 +219,7 @@ impl Render for DemoApp {
                         }
                         "enter" | "return" => {
                             let url = SAMPLE_VIDEOS[this.selected_sample].1.to_string();
-                            this.load_video(&url);
+                            this.load_video(&url, cx);
                             cx.notify();
                         }
                         "space" => {
@@ -328,7 +328,7 @@ impl Render for DemoApp {
                                 MouseButton::Left,
                                 cx.listener(move |this, _e, _w, cx| {
                                     let url = SAMPLE_VIDEOS[this.selected_sample].1.to_string();
-                                    this.load_video(&url);
+                                    this.load_video(&url, cx);
                                     cx.notify();
                                 }),
                             )

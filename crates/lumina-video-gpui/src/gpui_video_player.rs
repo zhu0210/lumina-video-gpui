@@ -72,6 +72,7 @@ pub struct GpuiVideoPlayerConfig {
     pub looping: bool,
     pub muted: bool,
     pub volume: f32,
+    pub lifecycle_timeout: Duration,
 }
 
 impl Default for GpuiVideoPlayerConfig {
@@ -82,6 +83,7 @@ impl Default for GpuiVideoPlayerConfig {
             looping: false,
             muted: false,
             volume: 1.0,
+            lifecycle_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -164,6 +166,8 @@ fn linux_playback_route(url: &str) -> LinuxPlaybackRoute {
 /// element.
 pub struct GpuiVideoPlayer {
     #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    background_executor: BackgroundExecutor,
+    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
     core: Option<CorePlayer>,
     #[cfg(target_os = "linux")]
     session: Option<GstMediaSession>,
@@ -209,12 +213,16 @@ impl GpuiVideoPlayer {
     // Constructors
     // -----------------------------------------------------------------------
 
-    pub fn new(url: impl Into<String>) -> Self {
-        Self::with_config(url, GpuiVideoPlayerConfig::default())
+    pub fn new(url: impl Into<String>, cx: &App) -> Self {
+        Self::with_config(url, GpuiVideoPlayerConfig::default(), cx)
     }
 
-    pub fn with_config(url: impl Into<String>, config: GpuiVideoPlayerConfig) -> Self {
+    pub fn with_config(url: impl Into<String>, config: GpuiVideoPlayerConfig, cx: &App) -> Self {
         let url = url.into();
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        let background_executor = cx.background_executor().clone();
+        #[cfg(all(target_os = "linux", not(feature = "moq")))]
+        let _ = cx;
         #[cfg(target_os = "linux")]
         let route = linux_playback_route(&url);
         #[cfg(not(target_os = "linux"))]
@@ -226,7 +234,15 @@ impl GpuiVideoPlayer {
         };
         #[cfg(target_os = "linux")]
         let session = match route {
-            LinuxPlaybackRoute::Gst => Some(GstMediaSession::new(url.clone())),
+            LinuxPlaybackRoute::Gst => Some(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                    url.clone(),
+                    false,
+                    lumina_video_gst::GstAudioSinkMode::Auto,
+                    config.lifecycle_timeout,
+                    0,
+                ),
+            ),
             #[cfg(feature = "moq")]
             LinuxPlaybackRoute::Core => None,
         };
@@ -234,6 +250,8 @@ impl GpuiVideoPlayer {
         let volume = config.volume;
         #[allow(unused_mut)]
         let mut player = Self {
+            #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+            background_executor,
             #[cfg(any(not(target_os = "linux"), feature = "moq"))]
             core,
             #[cfg(target_os = "linux")]
@@ -274,6 +292,88 @@ impl GpuiVideoPlayer {
             audio.set_volume((volume.clamp(0.0, 1.0) * 100.0) as u32);
         }
         player
+    }
+
+    /// Asynchronously replaces the current source while retaining the last
+    /// uploaded GPU texture until the new session presents a frame.
+    pub fn open(&mut self, url: impl Into<String>, _cx: &App) {
+        let url = url.into();
+        #[cfg(target_os = "linux")]
+        let next_generation = self
+            .session
+            .as_ref()
+            .map_or(1, |session| session.stream_generation().saturating_add(1));
+
+        // CorePlayer teardown retains its join semantics, so move the old
+        // backend to GPUI's background executor before replacing it. The
+        // GStreamer session drop is already fire-and-forget.
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        let old_core = self.core.take();
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        if let Some(old_core) = old_core {
+            self.background_executor
+                .spawn(async move { drop(old_core) })
+                .detach();
+        }
+        #[cfg(target_os = "linux")]
+        let old_session = self.session.take();
+        #[cfg(target_os = "linux")]
+        drop(old_session);
+
+        #[cfg(target_os = "linux")]
+        let route = linux_playback_route(&url);
+        #[cfg(all(target_os = "linux", feature = "moq"))]
+        {
+            self.core = match route {
+                LinuxPlaybackRoute::Core => Some(CorePlayer::new(url.clone())),
+                LinuxPlaybackRoute::Gst => None,
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.core = Some(CorePlayer::new(url.clone()));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.session = match route {
+                LinuxPlaybackRoute::Gst => Some(
+                    GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                        url.clone(),
+                        false,
+                        lumina_video_gst::GstAudioSinkMode::Auto,
+                        self.config.lifecycle_timeout,
+                        next_generation,
+                    ),
+                ),
+                #[cfg(feature = "moq")]
+                LinuxPlaybackRoute::Core => None,
+            };
+            if let Some(session) = self.session.as_ref() {
+                let audio = session.audio_handle();
+                audio.set_muted(self.config.muted);
+                audio.set_volume((self.config.volume.clamp(0.0, 1.0) * 100.0) as u32);
+            }
+        }
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        if let Some(core) = self.core.as_mut() {
+            core.set_muted(self.config.muted);
+            core.set_volume((self.config.volume * 100.0) as u32);
+        }
+
+        self.url = url;
+        self.loading_started = false;
+        self.initialized = false;
+        self.loop_seek_pending = false;
+        self.position = Duration::ZERO;
+        self.duration = None;
+        self.metadata = None;
+        self.state = VideoState::Loading;
+        self.buffering_percent = 0;
+        #[cfg(target_os = "linux")]
+        {
+            self.pending_frame = None;
+            self.has_presented_frame = false;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -319,6 +419,35 @@ impl GpuiVideoPlayer {
             session
                 .audio_handle()
                 .set_volume((self.config.volume * 100.0) as u32);
+        }
+        self
+    }
+
+    pub fn with_lifecycle_timeout(mut self, timeout: Duration) -> Self {
+        self.config.lifecycle_timeout = timeout;
+        #[cfg(target_os = "linux")]
+        if self.session.is_some() {
+            let generation = self
+                .session
+                .as_ref()
+                .map_or(0, GstMediaSession::stream_generation);
+            let old_session = self.session.take();
+            drop(old_session);
+            self.pending_frame = None;
+            self.session = Some(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                    self.url.clone(),
+                    false,
+                    lumina_video_gst::GstAudioSinkMode::Auto,
+                    timeout,
+                    generation,
+                ),
+            );
+            if let Some(session) = self.session.as_ref() {
+                let audio = session.audio_handle();
+                audio.set_muted(self.config.muted);
+                audio.set_volume((self.config.volume.clamp(0.0, 1.0) * 100.0) as u32);
+            }
         }
         self
     }
@@ -1118,6 +1247,17 @@ impl GpuiVideoPlayer {
                     "Preview rejected borrowed native GPU surface; keeping previous texture"
                 );
             }
+        }
+    }
+}
+
+impl Drop for GpuiVideoPlayer {
+    fn drop(&mut self) {
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        if let Some(core) = self.core.take() {
+            self.background_executor
+                .spawn(async move { drop(core) })
+                .detach();
         }
     }
 }

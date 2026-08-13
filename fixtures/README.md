@@ -27,12 +27,13 @@ After generating fixtures, run the high-level example with a local path, for
 example:
 
 ```bash
-# On a headless Linux host, disable the native audio sink for this probe.
-LUMINA_GST_AUDIO_SINK=fakesink cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/h264-aac.mp4
+# The harness uses GStreamer's deterministic fake audio sink.
+cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/h264-aac.mp4
 ```
 
 On Linux the example opens the source through the public `GstMediaSession`
 seam. It polls exactly one event per tick, checks metadata and autoplay state,
 asserts that frames are owned CPU memory, observes the bounded drop-oldest
-counter, and verifies that GStreamer owns the audio path. No GPU or private
-GStreamer element is required.
+counter, exercises pause/play, mute/volume, seek, and EOS replay, and verifies
+that GStreamer owns the audio path. No GPU or private GStreamer element is
+required.
