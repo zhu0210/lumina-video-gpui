@@ -91,6 +91,7 @@ pub enum SessionError {
     Decode(String),
     Seek(String),
     Network(String),
+    Tls(String),
     Unsupported(String),
     Fatal(String),
 }
@@ -103,6 +104,7 @@ impl fmt::Display for SessionError {
             Self::Decode(message) => write!(f, "media decode failed: {message}"),
             Self::Seek(message) => write!(f, "media seek failed: {message}"),
             Self::Network(message) => write!(f, "media network error: {message}"),
+            Self::Tls(message) => write!(f, "media TLS error: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported media: {message}"),
             Self::Fatal(message) => write!(f, "fatal media-session error: {message}"),
         }

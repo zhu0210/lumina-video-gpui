@@ -113,6 +113,7 @@ fn video_error(error: &SessionError) -> lumina_video_native_frame::video::VideoE
         SessionError::Decode(message) => VideoError::DecodeFailed(message.clone()),
         SessionError::Seek(message) => VideoError::SeekFailed(message.clone()),
         SessionError::Network(message) => VideoError::Network(message.clone()),
+        SessionError::Tls(message) => VideoError::Tls(message.clone()),
         SessionError::Unsupported(message) => VideoError::UnsupportedFormat(message.clone()),
     }
 }
