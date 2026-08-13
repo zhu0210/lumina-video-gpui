@@ -53,7 +53,7 @@
             </intent-filter>
 
             <!-- Metadata for GameActivity native library -->
-            <!-- This points to liblumina_video_android.so built from lumina-video-android crate -->
+            <!-- Legacy Android demo library name retained for app compatibility. -->
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="lumina_video_android" />

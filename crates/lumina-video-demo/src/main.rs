@@ -129,7 +129,7 @@ impl Render for DemoApp {
         };
 
         // Controls bar state
-        let show_controls = self.player.as_ref().map_or(false, |p| p.is_ready());
+        let show_controls = self.player.as_ref().is_some_and(|p| p.is_ready());
         let play_icon = if is_ended {
             "↺"
         } else if is_playing {
@@ -137,7 +137,7 @@ impl Render for DemoApp {
         } else {
             "▶"
         };
-        let is_muted = self.player.as_ref().map_or(false, |p| p.is_muted());
+        let is_muted = self.player.as_ref().is_some_and(|p| p.is_muted());
         let mute_icon = if is_muted { "🔇" } else { "🔊" };
         let position = self
             .player
