@@ -650,7 +650,7 @@ pub mod linux {
         unsafe {
             device
                 .as_hal::<wgpu::hal::api::Vulkan>()
-                .map_or(false, |hal_device| {
+                .is_some_and(|hal_device| {
                     let extensions = hal_device.enabled_device_extensions();
                     let has_dma_buf = extensions.contains(&EXT_EXTERNAL_MEMORY_DMA_BUF);
                     let has_fd = extensions.contains(&KHR_EXTERNAL_MEMORY_FD);
