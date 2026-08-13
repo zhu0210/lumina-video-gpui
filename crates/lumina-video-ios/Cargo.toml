@@ -2,13 +2,13 @@
 name = "lumina-video-ios"
 version = "0.2.2"
 edition = "2021"
-description = "C FFI layer for lumina-video-core (iOS/Swift integration)"
+description = "C FFI layer for lumina-video-native-frame (iOS/Swift integration)"
 publish = false
 
 [lib]
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
-lumina-video-core = { path = "../lumina-video-core" }
+lumina-video-native-frame = { path = "../lumina-video-native-frame" }
 parking_lot = { workspace = true }
 tracing = { workspace = true }

@@ -1,7 +1,9 @@
 //! Video and audio playback modules for lumina-video (GPUI integration layer).
 //!
 //! - [`GpuiVideoPlayer`] — Main video player for GPUI, using `surface()` for GPU compositing
-//! - Core types re-exported from `lumina-video-core`: decoders, audio, A/V sync, etc.
+//! - Native player and decoder paths re-exported from `lumina-video-native-frame`
+//! - Framework-neutral audio, network, subtitle, and A/V-sync semantics from
+//!   `lumina-video-core`
 
 // =============================================================================
 // Re-export from lumina-video-core
@@ -9,49 +11,49 @@
 
 pub use lumina_video_core::audio;
 pub use lumina_video_core::subtitles;
-pub use lumina_video_core::video;
+pub use lumina_video_native_frame::video;
 
 #[allow(unused_imports)]
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 pub(crate) use lumina_video_core::audio_ring_buffer;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::frame_queue;
-#[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::frame_to_texture;
-#[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::network;
-#[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::player;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::sync_metrics;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_core::triple_buffer;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_native_frame::frame_queue;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_native_frame::frame_to_texture;
+#[cfg(not(target_arch = "wasm32"))]
+pub use lumina_video_native_frame::player;
 
 // Platform-specific re-exports
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use lumina_video_core::audio_decoder;
+pub use lumina_video_native_frame::audio_decoder;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use lumina_video_core::macos_video;
+pub use lumina_video_native_frame::macos_video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use lumina_video_core::video_decoder;
+pub use lumina_video_native_frame::video_decoder;
 
 #[cfg(target_os = "linux")]
-pub use lumina_video_core::linux_video;
+pub use lumina_video_native_frame::linux_video;
 #[cfg(target_os = "linux")]
-pub use lumina_video_core::linux_video_gst;
+pub use lumina_video_native_frame::linux_video_gst;
 
 #[cfg(target_os = "android")]
-pub use lumina_video_core::android_video;
+pub use lumina_video_native_frame::android_video;
 #[cfg(target_os = "android")]
-pub use lumina_video_core::android_vulkan;
+pub use lumina_video_native_frame::android_vulkan;
 #[cfg(all(target_os = "android", feature = "android-zero-copy"))]
-pub use lumina_video_core::ndk_image_reader;
+pub use lumina_video_native_frame::ndk_image_reader;
 
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-pub use lumina_video_core::windows_audio;
+pub use lumina_video_native_frame::windows_audio;
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-pub use lumina_video_core::windows_video;
+pub use lumina_video_native_frame::windows_video;
 
 // =============================================================================
 // GPUI video player (replaces egui VideoPlayer)

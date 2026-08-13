@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use lumina_video_core::video::{
-    HwAccelType, PixelFormat, VideoError, VideoMetadata, VideoState,
+    HwAccelType, PixelFormat, VideoError, VideoMetadata, VideoPlayerHandle, VideoState,
 };
 
 // =============================================================================
@@ -465,7 +465,7 @@ pub struct DmaBufPlane {
 /// ```
 /// # #[cfg(target_os = "linux")]
 /// # fn main() {
-/// use lumina_video_core::video::{LinuxGpuSurface, DmaBufPlane, PixelFormat};
+/// use lumina_video_native_frame::video::{LinuxGpuSurface, DmaBufPlane, PixelFormat};
 ///
 /// // LinuxGpuSurface::new() is unsafe because it requires valid DMABuf file descriptors.
 /// // In practice, surfaces are created by the decoder (GStreamer/VA-API), not user code.

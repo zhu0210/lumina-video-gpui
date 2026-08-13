@@ -1,7 +1,7 @@
-//! lumina-video-core: Core video decode and zero-copy pipeline.
+//! lumina-video-core: Framework-neutral video and media-session semantics.
 //!
-//! This crate provides the egui-free foundation for hardware-accelerated video
-//! playback. It contains:
+//! This crate provides the egui-free contracts consumed by native playback
+//! adapters. It contains:
 //!
 //! - Core semantics: [`video`], [`audio`], [`session`], [`subtitles`]
 //! - Shared timing primitives: [`triple_buffer`], [`sync_metrics`]

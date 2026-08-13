@@ -41,28 +41,30 @@ pub use media::{
 };
 
 // Re-export video core types
-pub use lumina_video_core::{
-    audio::{AudioConfig, AudioHandle, AudioPlayer, AudioSamples, AudioState, AudioSync},
-    video::{
-        CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
-        VideoFrame, VideoMetadata, VideoState,
-    },
+pub use lumina_video_core::audio::{
+    AudioConfig, AudioHandle, AudioPlayer, AudioSamples, AudioState, AudioSync,
+};
+pub use lumina_video_native_frame::{
+    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
+    VideoFrame, VideoMetadata, VideoState,
 };
 
 // Native-only exports
 #[cfg(not(target_arch = "wasm32"))]
-pub use lumina_video_core::{
-    frame_to_texture::{self, GpuFrameTextures},
-    sync_metrics::{SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS},
+pub use lumina_video_core::sync_metrics::{
+    SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS,
 };
+pub use lumina_video_native_frame::frame_to_texture::{self, GpuFrameTextures};
 
 // macOS/iOS FFmpeg decoder (when available)
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use lumina_video_core::video_decoder::{FfmpegDecoder, FfmpegDecoderBuilder, HwAccelConfig};
+pub use lumina_video_native_frame::video_decoder::{
+    FfmpegDecoder, FfmpegDecoderBuilder, HwAccelConfig,
+};
 
 // Android decoder
 #[cfg(target_os = "android")]
-pub use lumina_video_core::android_video::{
+pub use lumina_video_native_frame::android_video::{
     android_zero_copy_snapshot, AndroidZeroCopySnapshot, ZeroCopyStatus,
 };
 #[cfg(target_os = "android")]

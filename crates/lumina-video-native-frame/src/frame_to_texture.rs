@@ -65,18 +65,6 @@ fn safe_write_texture(
     );
 }
 
-/// Helper: calls safe_write_texture on a cached texture reference.
-/// Avoids repeating the texture dereference pattern.
-fn safe_write_cached(
-    queue: &wgpu::Queue,
-    texture: &Arc<wgpu::Texture>,
-    data: &[u8],
-    layout: wgpu::TexelCopyBufferLayout,
-    extent: wgpu::Extent3d,
-) {
-    safe_write_texture(queue, texture.as_ref(), data, layout, extent)
-}
-
 // ---------------------------------------------------------------------------
 // GPU frame textures — the output of frame upload (fed to GPUI surface())
 // ---------------------------------------------------------------------------

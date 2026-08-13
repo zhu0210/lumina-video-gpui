@@ -4,11 +4,18 @@
 //! Linux DMABuf frames own memory-object file descriptors and describe format
 //! planes separately.  Acquire synchronization is also owned by the lease.
 //! No GStreamer, wgpu, or UI type is part of this interface.
+//!
+//! The legacy player and platform decoder modules are intentionally hosted here
+//! during the migration to dedicated native adapters.  The compatibility
+//! `lumina-video` facade re-exports these paths; framework-neutral semantics
+//! remain owned by `lumina-video-core`.
 
 use std::fmt;
 use std::time::Duration;
 
-use lumina_video_core::video::PixelFormat;
+pub use lumina_video_core::video::{
+    HwAccelType, PixelFormat, VideoError, VideoMetadata, VideoPlayerHandle, VideoState,
+};
 
 // Legacy runtime modules remain here until their dedicated adapter crates
 // take ownership.  Their public paths are preserved by the compatibility
@@ -274,7 +281,6 @@ impl NativeFrameLease {
     }
 }
 
-pub use lumina_video_core::video::VideoPlayerHandle;
 pub use video::{CpuFrame, DecodedFrame, Plane, VideoDecoderBackend, VideoFrame};
 
 #[cfg(not(target_arch = "wasm32"))]

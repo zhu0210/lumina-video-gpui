@@ -2,7 +2,7 @@
 name = "lumina-video-core"
 version = { workspace = true }
 edition = "2021"
-description = "Core video decode and zero-copy pipeline for lumina-video (egui-free)"
+description = "Framework-neutral video and media-session semantics"
 repository = "https://github.com/lumina-video/lumina-video"
 license = "MIT OR Apache-2.0"
 keywords = ["hardware-acceleration", "multimedia", "video", "zero-copy"]
@@ -31,11 +31,3 @@ cpal = { workspace = true }
 
 [features]
 default = []
-
-[lints.rust]
-unexpected_cfgs = {
-  level = "warn",
-  check-cfg = [
-    "cfg(feature, values(\"cargo-clippy\", \"vendored-runtime\", \"zero-copy\"))"
-  ]
-}
