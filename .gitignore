@@ -47,6 +47,9 @@ vendor/linux-x86_64/COPYING
 # Build artifacts
 *.apk
 
+# Reproducible media fixtures are generated locally and kept out of git.
+/fixtures/generated/
+
 # Scratch docs / notes
 MOQ_AV_SYNC_PROBLEM.md
 MOQ_VT_CORRUPTION.md
