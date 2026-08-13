@@ -516,6 +516,7 @@ fn process_command(
 
 struct WorkerIo {
     commands: Receiver<SessionCommand>,
+    generation_commands: Receiver<SessionCommand>,
     control_sender: ControlSender,
     frame_sender: Sender<SequencedEvent>,
     frame_drop_receiver: Receiver<SequencedEvent>,
@@ -571,6 +572,7 @@ fn run_worker(
 ) {
     let WorkerIo {
         commands,
+        generation_commands,
         control_sender,
         frame_sender,
         frame_drop_receiver,
@@ -699,10 +701,11 @@ fn run_worker(
             shutdown_worker(&mut decoder, &lifecycle_control);
             return;
         }
-        while !lifecycle_cancelled(&lifecycle_control) {
-            let Ok(command) = commands.try_recv() else {
-                break;
-            };
+        let command = match generation_commands.try_recv() {
+            Ok(command) => Some(command),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => commands.try_recv().ok(),
+        };
+        if let Some(command) = command {
             if !process_command(
                 command,
                 &mut decoder,
@@ -848,6 +851,8 @@ fn run_worker(
 pub struct GstMediaSession {
     commands: Sender<SessionCommand>,
     command_drop_receiver: Receiver<SessionCommand>,
+    generation_commands: Sender<SessionCommand>,
+    generation_drop_receiver: Receiver<SessionCommand>,
     control_receiver: ControlReceiver,
     pending_metadata: Option<SequencedEvent>,
     pending_state: Option<SequencedEvent>,
@@ -920,6 +925,8 @@ impl GstMediaSession {
         let source = source.into();
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
+        let generation_drop_receiver = generation_receiver.clone();
         let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let frame_drop_receiver = frame_receiver.clone();
@@ -943,6 +950,7 @@ impl GstMediaSession {
                     stream_generation,
                     WorkerIo {
                         commands: command_receiver,
+                        generation_commands: generation_receiver,
                         control_sender: worker_control_sender,
                         frame_sender,
                         frame_drop_receiver,
@@ -963,6 +971,8 @@ impl GstMediaSession {
         Self {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver,
             control_receiver,
             pending_metadata: None,
             pending_state: None,
@@ -1049,21 +1059,17 @@ impl GstMediaSession {
             &mut self.pending_transient,
             &self.control_receiver.transient,
         );
-        loop {
-            match self.frame_receiver.try_recv() {
-                Ok(event) => {
-                    let generation = match &event.event {
-                        SessionEvent::Frame { frame, .. } => frame.descriptor.stream_generation,
-                        _ => self.stream_generation,
-                    };
-                    if generation < self.stream_generation {
-                        self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    if self.seek_pending && generation == self.stream_generation {
-                        self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
+        match self.frame_receiver.try_recv() {
+            Ok(event) => {
+                let generation = match &event.event {
+                    SessionEvent::Frame { frame, .. } => frame.descriptor.stream_generation,
+                    _ => self.stream_generation,
+                };
+                if generation < self.stream_generation
+                    || (self.seek_pending && generation == self.stream_generation)
+                {
+                    self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                } else {
                     if generation > self.stream_generation {
                         self.stream_generation = generation;
                         self.seek_pending = false;
@@ -1072,14 +1078,10 @@ impl GstMediaSession {
                     if self.pending_frame.replace(event).is_some() {
                         self.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     }
-                    break;
                 }
-                Err(TryRecvError::Disconnected) => {
-                    self.worker_disconnected = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
             }
+            Err(TryRecvError::Disconnected) => self.worker_disconnected = true,
+            Err(TryRecvError::Empty) => {}
         }
         if self.pending_frame.as_ref().is_some_and(|event| {
             matches!(
@@ -1153,7 +1155,15 @@ impl MediaSession for GstMediaSession {
         let is_play = matches!(&command, SessionCommand::Play);
         let was_ended = matches!(self.snapshot().state, SessionState::Ended);
         let is_replay = is_play && was_ended && !self.replay_pending;
-        enqueue_latest_command(&self.commands, &self.command_drop_receiver, command)?;
+        if is_seek || is_replay {
+            enqueue_latest_command(
+                &self.generation_commands,
+                &self.generation_drop_receiver,
+                command,
+            )?;
+        } else {
+            enqueue_latest_command(&self.commands, &self.command_drop_receiver, command)?;
+        }
         if is_seek {
             self.seek_pending = true;
             self.pending_frame = None;
@@ -1321,6 +1331,7 @@ mod tests {
     fn pending_frame_refresh_keeps_latest_after_control_event() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let state = Arc::new(SnapshotState::new());
@@ -1329,6 +1340,8 @@ mod tests {
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             frame_receiver,
             state,
@@ -1410,11 +1423,14 @@ mod tests {
     fn stale_frames_are_dropped_after_generation_advance() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (_control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             frame_receiver,
             state: Arc::new(SnapshotState::new()),
@@ -1465,14 +1481,17 @@ mod tests {
     }
 
     #[test]
-    fn queued_seek_advances_generation_without_waiting_for_worker() {
+    fn queued_seek_arms_generation_without_waiting_for_worker() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (_control_sender, control_receiver) = control_channels();
         let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             frame_receiver,
             state: Arc::new(SnapshotState::new()),
@@ -1507,6 +1526,7 @@ mod tests {
     fn duplicate_play_while_ended_keeps_one_replay_generation_pending() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (_control_sender, control_receiver) = control_channels();
         let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let state = Arc::new(SnapshotState::new());
@@ -1514,6 +1534,8 @@ mod tests {
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             frame_receiver,
             state,
@@ -1549,6 +1571,7 @@ mod tests {
     fn full_command_queue_drops_oldest_and_keeps_latest_command() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (_control_sender, control_receiver) = control_channels();
         for _ in 0..COMMAND_QUEUE_CAPACITY {
             assert!(commands.send(SessionCommand::Pause).is_ok());
@@ -1556,6 +1579,8 @@ mod tests {
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
             pending_state: None,
@@ -1577,25 +1602,20 @@ mod tests {
             replay_pending: false,
         };
 
-        assert!(session
-            .command(SessionCommand::Seek {
-                position: Duration::from_millis(750),
-            })
-            .is_ok());
+        assert!(session.command(SessionCommand::Play).is_ok());
         let mut queued = Vec::new();
         while let Ok(command) = command_receiver.try_recv() {
             queued.push(command);
         }
         assert_eq!(queued.len(), COMMAND_QUEUE_CAPACITY);
-        assert!(
-            matches!(queued.last(), Some(SessionCommand::Seek { position }) if *position == Duration::from_millis(750))
-        );
+        assert!(matches!(queued.last(), Some(SessionCommand::Play)));
     }
 
     #[test]
     fn stop_cancels_without_waiting_for_a_full_command_queue() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (_control_sender, control_receiver) = control_channels();
         for _ in 0..COMMAND_QUEUE_CAPACITY {
             assert!(commands.send(SessionCommand::Pause).is_ok());
@@ -1604,6 +1624,8 @@ mod tests {
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
             pending_state: None,
@@ -1753,9 +1775,12 @@ mod tests {
         }
 
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver: command_receiver.clone(),
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
             pending_state: None,
@@ -1794,14 +1819,17 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_seeks_accept_worker_generation_without_eager_advance() {
+    fn seek_lane_survives_unrelated_command_pressure_and_accepts_new_generation() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
             control_receiver,
             pending_metadata: None,
             pending_state: None,
@@ -1823,15 +1851,26 @@ mod tests {
             replay_pending: false,
         };
 
-        for target in 0..(COMMAND_QUEUE_CAPACITY + 8) {
-            assert!(session
-                .command(SessionCommand::Seek {
-                    position: Duration::from_millis(target as u64),
-                })
-                .is_ok());
+        assert!(session
+            .command(SessionCommand::Seek {
+                position: Duration::from_millis(750),
+            })
+            .is_ok());
+        for _ in 0..(COMMAND_QUEUE_CAPACITY + 8) {
+            assert!(session.command(SessionCommand::Pause).is_ok());
         }
         assert_eq!(session.stream_generation(), 0);
         assert!(session.seek_pending);
+        assert!(matches!(
+            generation_receiver.try_recv(),
+            Ok(SessionCommand::Seek { position })
+                if position == Duration::from_millis(750)
+        ));
+        let mut ordinary_count = 0;
+        while let Ok(SessionCommand::Pause) = command_receiver.try_recv() {
+            ordinary_count += 1;
+        }
+        assert_eq!(ordinary_count, COMMAND_QUEUE_CAPACITY);
 
         assert!(frame_sender
             .send(SequencedEvent {
