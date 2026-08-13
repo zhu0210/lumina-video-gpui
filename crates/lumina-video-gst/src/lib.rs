@@ -47,6 +47,17 @@ struct SequencedEvent {
     event: Event,
 }
 
+#[derive(Debug)]
+struct GenerationIntent {
+    command: SessionCommand,
+    target_generation: u64,
+}
+
+enum WorkerCommand {
+    Ordinary(SessionCommand),
+    Generation(GenerationIntent),
+}
+
 const CONTROL_LANE_CAPACITY: usize = 1;
 
 /// A bounded latest-value lane for one class of worker-to-session events.
@@ -394,7 +405,7 @@ fn mark_eos(playback: &mut PlaybackState) {
 }
 
 fn process_command(
-    command: SessionCommand,
+    worker_command: WorkerCommand,
     decoder: &mut GStreamerDecoder,
     playback: &mut PlaybackState,
     audio_handle: &AudioHandle,
@@ -402,9 +413,22 @@ fn process_command(
     control_sender: &ControlSender,
     sequence: &mut u64,
 ) -> bool {
+    let (command, target_generation) = match worker_command {
+        WorkerCommand::Ordinary(command) => (command, None),
+        WorkerCommand::Generation(intent) => (intent.command, Some(intent.target_generation)),
+    };
     match command {
         SessionCommand::Play => {
             if decoder.is_eof() {
+                let Some(target_generation) = target_generation else {
+                    let _ = publish_error(
+                        state,
+                        control_sender,
+                        sequence,
+                        SessionError::Fatal("replay missing generation token".into()),
+                    );
+                    return false;
+                };
                 // Produce a paused preroll during replay, then explicitly
                 // resume below. This keeps one seek deadline and avoids
                 // duplicate replay intent advancing generations.
@@ -414,7 +438,7 @@ fn process_command(
                     return false;
                 }
                 playback.position = Duration::ZERO;
-                playback.stream_generation = playback.stream_generation.saturating_add(1);
+                playback.stream_generation = target_generation;
             }
             match decoder.resume() {
                 Ok(()) => {
@@ -468,10 +492,19 @@ fn process_command(
             false
         }
         SessionCommand::Seek { position: target } => {
+            let Some(target_generation) = target_generation else {
+                let _ = publish_error(
+                    state,
+                    control_sender,
+                    sequence,
+                    SessionError::Fatal("seek missing generation token".into()),
+                );
+                return false;
+            };
             decoder.set_paused_intent(!playback.playing);
             match decoder.seek(target) {
                 Ok(()) => {
-                    playback.stream_generation = playback.stream_generation.saturating_add(1);
+                    playback.stream_generation = target_generation;
                     playback.position = target;
                     audio_handle.set_native_position(target);
                     let next_state = if playback.playing {
@@ -516,7 +549,7 @@ fn process_command(
 
 struct WorkerIo {
     commands: Receiver<SessionCommand>,
-    generation_commands: Receiver<SessionCommand>,
+    generation_commands: Receiver<GenerationIntent>,
     control_sender: ControlSender,
     frame_sender: Sender<SequencedEvent>,
     frame_drop_receiver: Receiver<SequencedEvent>,
@@ -702,8 +735,10 @@ fn run_worker(
             return;
         }
         let command = match generation_commands.try_recv() {
-            Ok(command) => Some(command),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => commands.try_recv().ok(),
+            Ok(intent) => Some(WorkerCommand::Generation(intent)),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                commands.try_recv().ok().map(WorkerCommand::Ordinary)
+            }
         };
         if let Some(command) = command {
             if !process_command(
@@ -744,7 +779,7 @@ fn run_worker(
             match commands.recv_timeout(Duration::from_millis(25)) {
                 Ok(command) => {
                     if !process_command(
-                        command,
+                        WorkerCommand::Ordinary(command),
                         &mut decoder,
                         &mut playback,
                         &audio_handle,
@@ -851,8 +886,8 @@ fn run_worker(
 pub struct GstMediaSession {
     commands: Sender<SessionCommand>,
     command_drop_receiver: Receiver<SessionCommand>,
-    generation_commands: Sender<SessionCommand>,
-    generation_drop_receiver: Receiver<SessionCommand>,
+    generation_commands: Sender<GenerationIntent>,
+    generation_drop_receiver: Receiver<GenerationIntent>,
     control_receiver: ControlReceiver,
     pending_metadata: Option<SequencedEvent>,
     pending_state: Option<SequencedEvent>,
@@ -870,7 +905,7 @@ pub struct GstMediaSession {
     lifecycle_timeout: Duration,
     lifecycle_control: GstLifecycleControl,
     stream_generation: u64,
-    seek_pending: bool,
+    latest_requested_generation: u64,
     replay_pending: bool,
 }
 
@@ -990,7 +1025,7 @@ impl GstMediaSession {
             lifecycle_timeout,
             lifecycle_control,
             stream_generation,
-            seek_pending: false,
+            latest_requested_generation: stream_generation,
             replay_pending: false,
         }
     }
@@ -1065,16 +1100,11 @@ impl GstMediaSession {
                     SessionEvent::Frame { frame, .. } => frame.descriptor.stream_generation,
                     _ => self.stream_generation,
                 };
-                if generation < self.stream_generation
-                    || (self.seek_pending && generation == self.stream_generation)
-                {
+                if generation != self.latest_requested_generation {
                     self.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    if generation > self.stream_generation {
-                        self.stream_generation = generation;
-                        self.seek_pending = false;
-                        self.replay_pending = false;
-                    }
+                    self.stream_generation = generation;
+                    self.replay_pending = false;
                     if self.pending_frame.replace(event).is_some() {
                         self.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1087,7 +1117,7 @@ impl GstMediaSession {
             matches!(
                 &event.event,
                 SessionEvent::Frame { frame, .. }
-                    if frame.descriptor.stream_generation < self.stream_generation
+                    if frame.descriptor.stream_generation != self.latest_requested_generation
             )
         }) {
             self.pending_frame = None;
@@ -1095,10 +1125,10 @@ impl GstMediaSession {
     }
 }
 
-fn enqueue_latest_command(
-    commands: &Sender<SessionCommand>,
-    command_drop_receiver: &Receiver<SessionCommand>,
-    mut command: SessionCommand,
+fn enqueue_latest<T: Send>(
+    commands: &Sender<T>,
+    command_drop_receiver: &Receiver<T>,
+    mut command: T,
 ) -> Result<(), SessionError> {
     loop {
         match commands.try_send(command) {
@@ -1156,20 +1186,23 @@ impl MediaSession for GstMediaSession {
         let was_ended = matches!(self.snapshot().state, SessionState::Ended);
         let is_replay = is_play && was_ended && !self.replay_pending;
         if is_seek || is_replay {
-            enqueue_latest_command(
+            let target_generation = self.latest_requested_generation.wrapping_add(1);
+            enqueue_latest(
                 &self.generation_commands,
                 &self.generation_drop_receiver,
-                command,
+                GenerationIntent {
+                    command,
+                    target_generation,
+                },
             )?;
+            self.latest_requested_generation = target_generation;
+            self.pending_frame = None;
         } else {
-            enqueue_latest_command(&self.commands, &self.command_drop_receiver, command)?;
+            enqueue_latest(&self.commands, &self.command_drop_receiver, command)?;
         }
         if is_seek {
-            self.seek_pending = true;
-            self.pending_frame = None;
             self.replay_pending = was_ended;
         } else if is_replay {
-            self.seek_pending = true;
             self.replay_pending = true;
         }
         Ok(())
@@ -1223,7 +1256,7 @@ impl MediaSession for GstMediaSession {
                         state: SessionState::Error(_)
                     }
             ) {
-                self.seek_pending = false;
+                self.latest_requested_generation = self.stream_generation;
                 self.replay_pending = false;
             }
             return Ok(Some(event.event));
@@ -1359,7 +1392,7 @@ mod tests {
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
             lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 0,
-            seek_pending: false,
+            latest_requested_generation: 0,
             replay_pending: false,
         };
 
@@ -1448,7 +1481,7 @@ mod tests {
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
             lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 1,
-            seek_pending: false,
+            latest_requested_generation: 1,
             replay_pending: false,
         };
 
@@ -1509,7 +1542,7 @@ mod tests {
             lifecycle_timeout: Duration::from_millis(50),
             lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 4,
-            seek_pending: false,
+            latest_requested_generation: 4,
             replay_pending: false,
         };
 
@@ -1519,7 +1552,14 @@ mod tests {
             })
             .is_ok());
         assert_eq!(session.stream_generation(), 4);
-        assert!(session.seek_pending);
+        assert_eq!(session.latest_requested_generation, 5);
+        assert!(matches!(
+            generation_receiver.try_recv(),
+            Ok(GenerationIntent {
+                command: SessionCommand::Seek { position },
+                target_generation: 5,
+            }) if position == Duration::from_secs(1)
+        ));
     }
 
     #[test]
@@ -1553,13 +1593,13 @@ mod tests {
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
             lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 7,
-            seek_pending: false,
+            latest_requested_generation: 7,
             replay_pending: false,
         };
 
         assert!(session.command(SessionCommand::Play).is_ok());
         assert_eq!(session.stream_generation(), 7);
-        assert!(session.seek_pending);
+        assert_eq!(session.latest_requested_generation, 8);
         assert!(session.replay_pending);
 
         assert!(session.command(SessionCommand::Play).is_ok());
@@ -1598,7 +1638,7 @@ mod tests {
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
             lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 0,
-            seek_pending: false,
+            latest_requested_generation: 0,
             replay_pending: false,
         };
 
@@ -1643,7 +1683,7 @@ mod tests {
             lifecycle_timeout: Duration::from_secs(2),
             lifecycle_control: lifecycle_control.clone(),
             stream_generation: 0,
-            seek_pending: false,
+            latest_requested_generation: 0,
             replay_pending: false,
         };
 
@@ -1798,7 +1838,7 @@ mod tests {
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
             lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 0,
-            seek_pending: false,
+            latest_requested_generation: 0,
             replay_pending: false,
         };
         assert!(matches!(
@@ -1847,7 +1887,7 @@ mod tests {
             lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
             lifecycle_control: GstLifecycleControl::new(),
             stream_generation: 0,
-            seek_pending: false,
+            latest_requested_generation: 0,
             replay_pending: false,
         };
 
@@ -1860,11 +1900,13 @@ mod tests {
             assert!(session.command(SessionCommand::Pause).is_ok());
         }
         assert_eq!(session.stream_generation(), 0);
-        assert!(session.seek_pending);
+        assert_eq!(session.latest_requested_generation, 1);
         assert!(matches!(
             generation_receiver.try_recv(),
-            Ok(SessionCommand::Seek { position })
-                if position == Duration::from_millis(750)
+            Ok(GenerationIntent {
+                command: SessionCommand::Seek { position },
+                target_generation: 1,
+            }) if position == Duration::from_millis(750)
         ));
         let mut ordinary_count = 0;
         while let Ok(SessionCommand::Pause) = command_receiver.try_recv() {
@@ -1899,9 +1941,9 @@ mod tests {
                 if frame.descriptor.stream_generation == 1
         ));
         assert_eq!(session.stream_generation(), 1);
-        assert!(!session.seek_pending);
+        assert_eq!(session.latest_requested_generation, 1);
 
-        session.seek_pending = true;
+        session.latest_requested_generation = session.stream_generation.wrapping_add(1);
         assert!(send_control(
             &control_sender,
             SequencedEvent {
@@ -1914,7 +1956,99 @@ mod tests {
             Ok(Some(SessionEvent::Error(SessionError::Seek(message))))
                 if message == "timeout"
         ));
-        assert!(!session.seek_pending);
+        assert_eq!(
+            session.latest_requested_generation,
+            session.stream_generation
+        );
+    }
+
+    #[test]
+    fn newer_seek_token_rejects_an_inflight_older_frame() {
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
+        let (_control_sender, control_receiver) = control_channels();
+        let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
+        let mut session = GstMediaSession {
+            commands,
+            command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
+            control_receiver,
+            pending_metadata: None,
+            pending_state: None,
+            pending_error: None,
+            pending_terminal: None,
+            pending_transient: None,
+            frame_receiver,
+            state: Arc::new(SnapshotState::new()),
+            audio_handle: AudioHandle::new(),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            pending_frame: None,
+            has_presented_frame: false,
+            worker: None,
+            worker_disconnected: false,
+            lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
+            lifecycle_control: GstLifecycleControl::new(),
+            stream_generation: 0,
+            latest_requested_generation: 0,
+            replay_pending: false,
+        };
+
+        assert!(session
+            .command(SessionCommand::Seek {
+                position: Duration::from_millis(100),
+            })
+            .is_ok());
+        assert!(matches!(
+            generation_receiver.try_recv(),
+            Ok(GenerationIntent {
+                command: SessionCommand::Seek { position },
+                target_generation: 1,
+            }) if position == Duration::from_millis(100)
+        ));
+
+        assert!(session
+            .command(SessionCommand::Seek {
+                position: Duration::from_millis(200),
+            })
+            .is_ok());
+        assert_eq!(session.latest_requested_generation, 2);
+
+        assert!(frame_sender
+            .send(SequencedEvent {
+                sequence: 0,
+                event: SessionEvent::Frame {
+                    pts: Duration::from_millis(100),
+                    frame: test_frame_with_generation(1, 1),
+                },
+            })
+            .is_ok());
+        assert!(matches!(session.try_next_event(), Ok(None)));
+        assert_eq!(session.dropped_frame_count(), 1);
+
+        assert!(matches!(
+            generation_receiver.try_recv(),
+            Ok(GenerationIntent {
+                command: SessionCommand::Seek { position },
+                target_generation: 2,
+            }) if position == Duration::from_millis(200)
+        ));
+        assert!(frame_sender
+            .send(SequencedEvent {
+                sequence: 1,
+                event: SessionEvent::Frame {
+                    pts: Duration::from_millis(200),
+                    frame: test_frame_with_generation(2, 2),
+                },
+            })
+            .is_ok());
+        assert!(matches!(
+            session.try_next_event(),
+            Ok(Some(SessionEvent::Frame { frame, .. }))
+                if frame.descriptor.stream_generation == 2
+        ));
+        assert_eq!(session.stream_generation(), 2);
     }
 
     #[test]
