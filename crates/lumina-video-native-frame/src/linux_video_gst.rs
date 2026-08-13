@@ -319,7 +319,7 @@ impl GStreamerDecoder {
 
     fn caps_audio_codec(caps: gst::Caps) -> Option<String> {
         let structure = caps.structure(0)?;
-        let name = structure.name();
+        let name = structure.name().as_str();
         match name {
             "audio/mpeg" => match structure.get::<i32>("mpegversion").ok() {
                 Some(4) => Some("AAC".into()),
@@ -1705,76 +1705,81 @@ impl GStreamerDecoder {
         }
     }
 
-    /// Selects one audio stream without rebuilding the pipeline or player.
-    ///
-    /// The selection confirmation and best-effort rollback use one absolute
-    /// operation deadline. A failed rollback deliberately reports that the
-    /// current selection is unknown rather than guessing.
-    pub fn select_audio_track(&mut self, requested_id: &str) -> AudioTrackSelectionResult {
-        let requested_id = requested_id.to_string();
-        let deadline = self.begin_operation_deadline();
-        let prior_id = self.selected_audio_stream_id.clone();
-        let requested_exists = self
-            .audio_tracks
-            .iter()
-            .any(|track| track.id == requested_id);
-
-        if !requested_exists {
-            self.active_operation_deadline = None;
+    fn resolve_audio_selection<F>(
+        tracks: &[AudioTrack],
+        prior_id: Option<String>,
+        requested_id: &str,
+        deadline: Instant,
+        mut attempt: F,
+    ) -> AudioTrackSelectionResult
+    where
+        F: FnMut(Option<&str>, Instant) -> Result<Option<AudioTrack>, String>,
+    {
+        if !tracks.iter().any(|track| track.id == requested_id) {
             return AudioTrackSelectionResult::Failed {
-                requested_id,
+                requested_id: requested_id.to_string(),
                 prior_restored_id: prior_id,
                 reason: "requested audio stream id is not in the latest StreamCollection; prior audio selection unchanged".into(),
             };
         }
 
-        let selection_sent = self.send_audio_selection(Some(requested_id.as_str()));
-        let primary = if selection_sent {
-            self.wait_for_audio_selection(Some(requested_id.as_str()), deadline)
-        } else {
-            Err("pipeline rejected SELECT_STREAMS".into())
-        };
-
-        if primary.is_ok() {
-            if let Some(track) = self
-                .audio_tracks
-                .iter()
-                .find(|track| track.id == requested_id)
-                .cloned()
-            {
-                self.active_operation_deadline = None;
-                return AudioTrackSelectionResult::Selected(track);
+        let primary_reason = match attempt(Some(requested_id), deadline) {
+            Ok(Some(track)) => return AudioTrackSelectionResult::Selected(track),
+            Ok(None) => {
+                "confirmed audio stream is no longer present in the latest StreamCollection".into()
             }
-        }
-
-        let primary_reason = primary
-            .err()
-            .unwrap_or_else(|| "audio stream selection failed".into());
-        let rollback_confirmed = if !Self::remaining(deadline).is_zero()
-            && self.send_audio_selection(prior_id.as_deref())
-        {
-            self.wait_for_audio_selection(prior_id.as_deref(), deadline)
-                .is_ok()
-        } else {
-            false
+            Err(reason) => reason,
         };
-        self.active_operation_deadline = None;
+
+        let rollback_confirmed =
+            !Self::remaining(deadline).is_zero() && attempt(prior_id.as_deref(), deadline).is_ok();
 
         if rollback_confirmed {
             AudioTrackSelectionResult::Failed {
-                requested_id,
+                requested_id: requested_id.to_string(),
                 prior_restored_id: prior_id,
                 reason: format!("{primary_reason}; prior audio selection restored"),
             }
         } else {
             AudioTrackSelectionResult::Failed {
-                requested_id,
+                requested_id: requested_id.to_string(),
                 prior_restored_id: None,
                 reason: format!(
                     "{primary_reason}; rollback failed or timed out; current selection unknown"
                 ),
             }
         }
+    }
+
+    /// Selects one audio stream without rebuilding the pipeline or player.
+    ///
+    /// The selection confirmation and best-effort rollback use one absolute
+    /// operation deadline. A failed rollback deliberately reports that the
+    /// current selection is unknown rather than guessing.
+    pub fn select_audio_track(&mut self, requested_id: &str) -> AudioTrackSelectionResult {
+        let tracks = self.audio_tracks.clone();
+        let deadline = self.begin_operation_deadline();
+        let prior_id = self.selected_audio_stream_id.clone();
+        let result = Self::resolve_audio_selection(
+            &tracks,
+            prior_id,
+            requested_id,
+            deadline,
+            |audio_id, attempt_deadline| {
+                if !self.send_audio_selection(audio_id) {
+                    return Err("pipeline rejected SELECT_STREAMS".into());
+                }
+                self.wait_for_audio_selection(audio_id, attempt_deadline)
+                    .map(|_| {
+                        self.audio_tracks
+                            .iter()
+                            .find(|track| Some(track.id.as_str()) == audio_id)
+                            .cloned()
+                    })
+            },
+        );
+        self.active_operation_deadline = None;
+        result
     }
 
     fn cleanup_with_deadline(&mut self, deadline: Instant) {
@@ -2339,7 +2344,9 @@ impl VideoDecoderBackend for GStreamerDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{GStreamerDecoder, GstLifecycleControl};
+    use super::{AudioTrackSelectionResult, GStreamerDecoder, GstLifecycleControl};
+    use gstreamer as gst;
+    use lumina_video_core::session::AudioTrack;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -2370,6 +2377,61 @@ mod tests {
         assert_eq!(
             GStreamerDecoder::earliest_deadline(Some(operation), Some(lifecycle)),
             Some(lifecycle)
+        );
+    }
+
+    #[test]
+    fn sent_selection_failure_confirms_rollback_on_the_same_deadline() {
+        let tracks = vec![
+            AudioTrack {
+                id: "audio-eng".into(),
+                language: Some("eng".into()),
+                title: Some("English".into()),
+                codec: "AAC".into(),
+            },
+            AudioTrack {
+                id: "audio-spa".into(),
+                language: Some("spa".into()),
+                title: Some("Spanish".into()),
+                codec: "AAC".into(),
+            },
+        ];
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut attempts = Vec::new();
+        let mut attempt_deadlines = Vec::new();
+        let mut selected_id = Some("audio-eng".to_string());
+
+        let result = GStreamerDecoder::resolve_audio_selection(
+            &tracks,
+            selected_id.clone(),
+            "audio-spa",
+            deadline,
+            |requested_id, attempt_deadline| {
+                attempts.push(requested_id.map(str::to_owned));
+                attempt_deadlines.push(attempt_deadline);
+                if attempts.len() == 1 {
+                    Err("StreamsSelected rejected requested stream".into())
+                } else {
+                    selected_id = requested_id.map(str::to_owned);
+                    Ok(None)
+                }
+            },
+        );
+
+        assert_eq!(
+            attempts,
+            vec![Some("audio-spa".into()), Some("audio-eng".into())]
+        );
+        assert_eq!(attempt_deadlines, vec![deadline, deadline]);
+        assert_eq!(selected_id.as_deref(), Some("audio-eng"));
+        assert_eq!(
+            result,
+            AudioTrackSelectionResult::Failed {
+                requested_id: "audio-spa".into(),
+                prior_restored_id: Some("audio-eng".into()),
+                reason: "StreamsSelected rejected requested stream; prior audio selection restored"
+                    .into(),
+            }
         );
     }
 
