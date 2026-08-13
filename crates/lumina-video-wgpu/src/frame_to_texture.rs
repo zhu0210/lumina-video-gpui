@@ -142,15 +142,15 @@ impl<'a> CpuFrameRef<'a> {
             height,
             planes: [
                 memory.planes.first().map(|p| PlaneRef {
-                    data: &p.data,
+                    data: &p.bytes,
                     stride: p.stride,
                 }),
                 memory.planes.get(1).map(|p| PlaneRef {
-                    data: &p.data,
+                    data: &p.bytes,
                     stride: p.stride,
                 }),
                 memory.planes.get(2).map(|p| PlaneRef {
-                    data: &p.data,
+                    data: &p.bytes,
                     stride: p.stride,
                 }),
             ],
@@ -1181,7 +1181,7 @@ mod tests {
                 return Err("expected CPU memory".into());
             };
             let first_plane = memory.planes.first().ok_or("missing CPU plane")?;
-            assert_eq!(first_plane.data.as_ptr(), first_bytes_ptr);
+            assert_eq!(first_plane.bytes.as_ptr(), first_bytes_ptr);
         }
         Ok(())
     }

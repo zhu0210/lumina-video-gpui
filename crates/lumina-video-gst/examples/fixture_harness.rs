@@ -61,8 +61,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         metadata_seen |= snapshot.metadata.is_some();
         playing_seen |= matches!(snapshot.state, SessionState::Playing { .. });
         ended_seen = matches!(snapshot.state, SessionState::Ended);
-        audio_connected_seen |= snapshot.audio.connected;
-        audio_buffers_seen = audio_buffers_seen.max(snapshot.audio.buffers_seen);
+        let audio = session.audio_observation();
+        audio_connected_seen |= audio.connected;
+        audio_buffers_seen = audio_buffers_seen.max(audio.buffers_seen);
         if !metadata_seen || !playing_seen || !ended_seen {
             thread::sleep(Duration::from_millis(5));
         }

@@ -174,7 +174,6 @@ pub struct SessionSnapshot {
     pub state: SessionState,
     pub metadata: Option<SessionMetadata>,
     pub capability: CapabilityTier,
-    pub audio: AudioObservation,
 }
 
 impl SessionSnapshot {
@@ -184,10 +183,6 @@ impl SessionSnapshot {
             state: SessionState::Loading,
             metadata: None,
             capability,
-            audio: AudioObservation {
-                connected: false,
-                buffers_seen: 0,
-            },
         }
     }
 }

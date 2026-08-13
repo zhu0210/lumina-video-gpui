@@ -25,7 +25,8 @@ use lumina_video_native_frame::video::{
     CpuFrame, DecodedFrame, VideoDecoderBackend, VideoError, VideoFrame,
 };
 use lumina_video_native_frame::{
-    AcquireSync, CpuMemory, FrameExtent, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
+    into_cpu_planes, AcquireSync, CpuMemory, FrameExtent, NativeFrameDescriptor, NativeFrameLease,
+    NativeMemory,
 };
 use parking_lot::RwLock;
 use url::Url;
@@ -71,7 +72,7 @@ impl PresentationDecision {
 
 #[derive(Debug)]
 struct SnapshotState {
-    snapshot: SessionSnapshot,
+    snapshot: RwLock<SessionSnapshot>,
     position_us: AtomicU64,
     audio_connected: AtomicBool,
     audio_buffers_seen: AtomicU64,
@@ -80,7 +81,7 @@ struct SnapshotState {
 impl SnapshotState {
     fn new() -> Self {
         Self {
-            snapshot: SessionSnapshot::new(CapabilityTier::SystemMemoryUpload),
+            snapshot: RwLock::new(SessionSnapshot::new(CapabilityTier::SystemMemoryUpload)),
             position_us: AtomicU64::new(0),
             audio_connected: AtomicBool::new(false),
             audio_buffers_seen: AtomicU64::new(0),
@@ -98,7 +99,7 @@ fn state_position(state: &SessionState) -> Option<Duration> {
 }
 
 fn update_audio_observation(
-    state: &Arc<RwLock<SnapshotState>>,
+    state: &Arc<SnapshotState>,
     audio_handle: &AudioHandle,
     decoder: &GStreamerDecoder,
     position: Duration,
@@ -106,12 +107,8 @@ fn update_audio_observation(
     let native_audio = decoder.audio_handle();
     let connected = native_audio.has_audio();
     let buffers_seen = native_audio.audio_buffers_seen();
+    state.audio_connected.store(connected, Ordering::Relaxed);
     state
-        .read()
-        .audio_connected
-        .store(connected, Ordering::Relaxed);
-    state
-        .read()
         .audio_buffers_seen
         .store(buffers_seen, Ordering::Relaxed);
     audio_handle.set_available(connected);
@@ -121,9 +118,19 @@ fn update_audio_observation(
 fn sync_audio_controls(
     audio_handle: &AudioHandle,
     decoder: &mut GStreamerDecoder,
+    last_applied: &mut Option<(bool, u32)>,
 ) -> Result<(), VideoError> {
-    decoder.set_muted(audio_handle.is_muted())?;
-    decoder.set_volume(audio_handle.effective_volume())
+    let muted = audio_handle.is_muted();
+    let volume = audio_handle.volume();
+    let previous = *last_applied;
+    if previous.map(|values| values.0) != Some(muted) {
+        decoder.set_muted(muted)?;
+    }
+    if previous.map(|values| values.1) != Some(volume) {
+        decoder.set_volume(volume as f32 / 100.0)?;
+    }
+    *last_applied = Some((muted, volume));
+    Ok(())
 }
 
 fn local_source_url(source: &str) -> Result<String, SessionError> {
@@ -192,7 +199,7 @@ fn owned_cpu_lease(
     };
     NativeFrameLease::new(
         descriptor,
-        NativeMemory::Cpu(CpuMemory::new(planes)),
+        NativeMemory::Cpu(CpuMemory::new(into_cpu_planes(planes))),
         AcquireSync::None,
     )
     .map_err(|error| SessionError::Decode(error.to_string()))
@@ -229,18 +236,17 @@ fn send_frame(
 }
 
 fn publish_state(
-    state: &Arc<RwLock<SnapshotState>>,
+    state: &Arc<SnapshotState>,
     control_sender: &Sender<SequencedEvent>,
     sequence: &mut u64,
     next_state: SessionState,
 ) -> bool {
     if let Some(position) = state_position(&next_state) {
         state
-            .read()
             .position_us
             .store(position.as_micros() as u64, Ordering::Relaxed);
     }
-    state.write().snapshot.state = next_state.clone();
+    state.snapshot.write().state = next_state.clone();
     let event = SequencedEvent {
         sequence: *sequence,
         event: SessionEvent::StateChanged { state: next_state },
@@ -250,7 +256,7 @@ fn publish_state(
 }
 
 fn publish_error(
-    state: &Arc<RwLock<SnapshotState>>,
+    state: &Arc<SnapshotState>,
     control_sender: &Sender<SequencedEvent>,
     sequence: &mut u64,
     error: SessionError,
@@ -271,12 +277,16 @@ struct PlaybackState {
     position: Duration,
 }
 
+fn mark_eos(playback: &mut PlaybackState) {
+    playback.playing = false;
+}
+
 fn process_command(
     command: SessionCommand,
     decoder: &mut GStreamerDecoder,
     playback: &mut PlaybackState,
     audio_handle: &AudioHandle,
-    state: &Arc<RwLock<SnapshotState>>,
+    state: &Arc<SnapshotState>,
     control_sender: &Sender<SequencedEvent>,
     sequence: &mut u64,
 ) -> bool {
@@ -352,24 +362,12 @@ fn process_command(
         },
         SessionCommand::SetMuted { muted } => {
             audio_handle.set_muted(muted);
-            match decoder.set_muted(muted) {
-                Ok(()) => true,
-                Err(error) => {
-                    let _ = publish_error(state, control_sender, sequence, session_error(error));
-                    false
-                }
-            }
+            true
         }
         SessionCommand::SetVolume { volume } => {
             let volume = volume.clamp(0.0, 1.0);
             audio_handle.set_volume((volume * 100.0) as u32);
-            match decoder.set_volume(volume) {
-                Ok(()) => true,
-                Err(error) => {
-                    let _ = publish_error(state, control_sender, sequence, session_error(error));
-                    false
-                }
-            }
+            true
         }
         SessionCommand::Renegotiate { .. } => {
             let _ = publish_error(
@@ -390,7 +388,7 @@ struct WorkerIo {
     control_sender: Sender<SequencedEvent>,
     frame_sender: Sender<SequencedEvent>,
     frame_drop_receiver: Receiver<SequencedEvent>,
-    state: Arc<RwLock<SnapshotState>>,
+    state: Arc<SnapshotState>,
     dropped_frames: Arc<AtomicU64>,
     audio_handle: AudioHandle,
     audio_sink: GstAudioSinkMode,
@@ -424,14 +422,15 @@ fn run_worker(source: String, autoplay: bool, io: WorkerIo) {
         }
     };
 
-    if let Err(error) = sync_audio_controls(&audio_handle, &mut decoder) {
+    let mut last_applied_audio = None;
+    if let Err(error) = sync_audio_controls(&audio_handle, &mut decoder, &mut last_applied_audio) {
         let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
         return;
     }
     update_audio_observation(&state, &audio_handle, &decoder, Duration::ZERO);
 
     let metadata = session_metadata(decoder.metadata());
-    state.write().snapshot.metadata = Some(metadata.clone());
+    state.snapshot.write().metadata = Some(metadata.clone());
     if !send_control(
         &control_sender,
         SequencedEvent {
@@ -477,12 +476,6 @@ fn run_worker(source: String, autoplay: bool, io: WorkerIo) {
     }
 
     loop {
-        if let Err(error) = sync_audio_controls(&audio_handle, &mut decoder) {
-            let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
-            return;
-        }
-        update_audio_observation(&state, &audio_handle, &decoder, playback.position);
-
         while let Ok(command) = commands.try_recv() {
             if !process_command(
                 command,
@@ -496,6 +489,14 @@ fn run_worker(source: String, autoplay: bool, io: WorkerIo) {
                 return;
             }
         }
+
+        if let Err(error) =
+            sync_audio_controls(&audio_handle, &mut decoder, &mut last_applied_audio)
+        {
+            let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
+            return;
+        }
+        update_audio_observation(&state, &audio_handle, &decoder, playback.position);
 
         if !playback.playing {
             match commands.recv_timeout(Duration::from_millis(25)) {
@@ -522,7 +523,6 @@ fn run_worker(source: String, autoplay: bool, io: WorkerIo) {
             Ok(Some(frame)) => {
                 playback.position = frame.pts;
                 state
-                    .read()
                     .position_us
                     .store(playback.position.as_micros() as u64, Ordering::Relaxed);
                 update_audio_observation(&state, &audio_handle, &decoder, playback.position);
@@ -556,6 +556,7 @@ fn run_worker(source: String, autoplay: bool, io: WorkerIo) {
                 sequence = sequence.saturating_add(1);
             }
             Ok(None) if decoder.is_eof() => {
+                mark_eos(&mut playback);
                 if !publish_state(&state, &control_sender, &mut sequence, SessionState::Ended) {
                     return;
                 }
@@ -568,7 +569,7 @@ fn run_worker(source: String, autoplay: bool, io: WorkerIo) {
                 ) {
                     return;
                 }
-                return;
+                continue;
             }
             Ok(None) => {}
             Err(error) => {
@@ -584,7 +585,7 @@ pub struct GstMediaSession {
     commands: Sender<SessionCommand>,
     control_receiver: Receiver<SequencedEvent>,
     frame_receiver: Receiver<SequencedEvent>,
-    state: Arc<RwLock<SnapshotState>>,
+    state: Arc<SnapshotState>,
     audio_handle: AudioHandle,
     dropped_frames: Arc<AtomicU64>,
     pending_control: Option<SequencedEvent>,
@@ -617,7 +618,7 @@ impl GstMediaSession {
         let (control_sender, control_receiver) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let frame_drop_receiver = frame_receiver.clone();
-        let state = Arc::new(RwLock::new(SnapshotState::new()));
+        let state = Arc::new(SnapshotState::new());
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
         let worker_state = Arc::clone(&state);
@@ -677,7 +678,10 @@ impl GstMediaSession {
 
     /// Returns framework-neutral observations from the GStreamer audio branch.
     pub fn audio_observation(&self) -> AudioObservation {
-        self.snapshot().audio
+        AudioObservation {
+            connected: self.state.audio_connected.load(Ordering::Relaxed),
+            buffers_seen: self.state.audio_buffers_seen.load(Ordering::Relaxed),
+        }
     }
 
     /// Polls one event and maps it to the GPUI presentation decision.
@@ -698,19 +702,14 @@ impl GstMediaSession {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        loop {
-            match self.frame_receiver.try_recv() {
-                Ok(event) => {
-                    if self.pending_frame.replace(event).is_some() {
-                        self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    }
+        match self.frame_receiver.try_recv() {
+            Ok(event) => {
+                if self.pending_frame.replace(event).is_some() {
+                    self.dropped_frames.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(TryRecvError::Disconnected) => {
-                    self.worker_disconnected = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
             }
+            Err(TryRecvError::Disconnected) => self.worker_disconnected = true,
+            Err(TryRecvError::Empty) => {}
         }
     }
 }
@@ -719,18 +718,13 @@ impl MediaSession for GstMediaSession {
     type Frame = Frame;
 
     fn snapshot(&self) -> SessionSnapshot {
-        let state = self.state.read();
-        let mut snapshot = state.snapshot.clone();
-        let position = Duration::from_micros(state.position_us.load(Ordering::Relaxed));
+        let mut snapshot = self.state.snapshot.read().clone();
+        let position = Duration::from_micros(self.state.position_us.load(Ordering::Relaxed));
         snapshot.state = match snapshot.state {
             SessionState::Playing { .. } => SessionState::Playing { position },
             SessionState::Paused { .. } => SessionState::Paused { position },
             SessionState::Buffering { .. } => SessionState::Buffering { position },
             state => state,
-        };
-        snapshot.audio = AudioObservation {
-            connected: state.audio_connected.load(Ordering::Relaxed),
-            buffers_seen: state.audio_buffers_seen.load(Ordering::Relaxed),
         };
         snapshot
     }
@@ -868,7 +862,7 @@ mod tests {
         let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let (control_sender, control_receiver) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
-        let state = Arc::new(RwLock::new(SnapshotState::new()));
+        let state = Arc::new(SnapshotState::new());
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
         let mut session = GstMediaSession {
@@ -926,5 +920,16 @@ mod tests {
             Ok(Some(SessionEvent::Frame { frame, .. })) if frame.descriptor.frame_id == 2
         ));
         assert_eq!(dropped_frames.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn eos_marks_playback_idle_for_restart() {
+        let mut playback = PlaybackState {
+            playing: true,
+            position: Duration::from_secs(1),
+        };
+        mark_eos(&mut playback);
+        assert!(!playback.playing);
+        assert_eq!(playback.position, Duration::from_secs(1));
     }
 }

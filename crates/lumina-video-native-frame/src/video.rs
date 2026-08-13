@@ -739,6 +739,7 @@ unsafe impl Send for LinuxGpuSurface {}
 unsafe impl Sync for LinuxGpuSurface {}
 
 /// A single plane of pixel data.
+#[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plane {
     /// Raw pixel data
