@@ -24,10 +24,15 @@ tracing = { workspace = true }
 
 [features]
 default = []
+windows-native-video = ["lumina-video-native-frame/windows-native-video"]
+vendored-runtime = ["lumina-video-native-frame/vendored-runtime"]
+android-zero-copy = ["lumina-video-native-frame/android-zero-copy"]
 moq = ["lumina-video-native-frame/moq"]
 
 [lints.rust]
 unexpected_cfgs = {
   level = "warn",
-  check-cfg = ["cfg(feature, values(\"cargo-clippy\", \"moq\"))"]
+  check-cfg = [
+    "cfg(feature, values(\"android-zero-copy\", \"cargo-clippy\", \"moq\", \"vendored-runtime\", \"windows-native-video\"))"
+  ]
 }
