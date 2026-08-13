@@ -1,0 +1,15 @@
+[package]
+name = "lumina-video-gpui"
+version = { workspace = true }
+edition = "2021"
+description = "GPUI composition boundary for lumina-video"
+repository = "https://github.com/lumina-video/lumina-video"
+license = "MIT OR Apache-2.0"
+keywords = ["gpui", "multimedia", "video"]
+categories = ["gui", "multimedia"]
+
+[dependencies]
+lumina-video-core = { path = "../lumina-video-core" }
+lumina-video-gst = { path = "../lumina-video-gst" }
+lumina-video-native-frame = { path = "../lumina-video-native-frame" }
+lumina-video-wgpu = { path = "../lumina-video-wgpu" }

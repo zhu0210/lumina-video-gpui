@@ -16,6 +16,7 @@
 // === Universal modules (compile on all targets including wasm32) ===
 
 pub mod audio;
+pub mod session;
 pub mod subtitles;
 pub mod video;
 

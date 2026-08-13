@@ -1,0 +1,12 @@
+[package]
+name = "lumina-video-native-frame"
+version = { workspace = true }
+edition = "2021"
+description = "Owned native video frame leases for lumina-video"
+repository = "https://github.com/lumina-video/lumina-video"
+license = "MIT OR Apache-2.0"
+keywords = ["multimedia", "video", "zero-copy"]
+categories = ["multimedia", "rendering"]
+
+[dependencies]
+lumina-video-core = { path = "../lumina-video-core" }

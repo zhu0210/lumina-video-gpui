@@ -4387,6 +4387,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumina-video-gpui"
+version = "0.2.2"
+dependencies = [
+ "lumina-video-core",
+ "lumina-video-gst",
+ "lumina-video-native-frame",
+ "lumina-video-wgpu",
+]
+
+[[package]]
+name = "lumina-video-gst"
+version = "0.2.2"
+dependencies = [
+ "lumina-video-core",
+ "lumina-video-native-frame",
+]
+
+[[package]]
+name = "lumina-video-native-frame"
+version = "0.2.2"
+dependencies = [
+ "lumina-video-core",
+]
+
+[[package]]
+name = "lumina-video-wgpu"
+version = "0.2.2"
+dependencies = [
+ "lumina-video-core",
+ "lumina-video-native-frame",
+ "wgpu",
+]
+
+[[package]]
 name = "lyon"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
