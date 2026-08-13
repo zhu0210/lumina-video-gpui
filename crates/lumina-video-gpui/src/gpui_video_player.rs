@@ -28,12 +28,7 @@ use gpui_wgpu::wgpu;
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 use lumina_video_native_frame::frame_to_texture::{self, GpuFrameTextures};
 use lumina_video_native_frame::player::CorePlayer;
-#[cfg(feature = "moq")]
-use lumina_video_native_frame::video::VideoDecoderBackend;
 use lumina_video_native_frame::video::{VideoMetadata, VideoState};
-
-#[cfg(feature = "moq")]
-use super::moq_decoder::MoqDecoder;
 
 // ---------------------------------------------------------------------------
 // Configuration & response types
@@ -112,23 +107,6 @@ pub struct GpuiVideoPlayer {
     subtitle_track: Option<SubtitleTrack>,
     show_subtitles: bool,
     subtitle_style: SubtitleStyle,
-
-    // MoQ state
-    #[cfg(feature = "moq")]
-    moq_stats: Option<super::moq_decoder::MoqStatsHandle>,
-    #[cfg(feature = "moq")]
-    moq_audio_bound: bool,
-    #[cfg(feature = "moq")]
-    moq_init_promise: Option<
-        poll_promise::Promise<
-            Result<
-                Box<dyn VideoDecoderBackend + Send>,
-                lumina_video_native_frame::video::VideoError,
-            >,
-        >,
-    >,
-    #[cfg(feature = "moq")]
-    moq_init_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl GpuiVideoPlayer {
@@ -164,14 +142,6 @@ impl GpuiVideoPlayer {
             subtitle_track: None,
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
-            #[cfg(feature = "moq")]
-            moq_stats: None,
-            #[cfg(feature = "moq")]
-            moq_audio_bound: false,
-            #[cfg(feature = "moq")]
-            moq_init_promise: None,
-            #[cfg(feature = "moq")]
-            moq_init_thread: None,
         };
         player.core.set_muted(muted);
         player.core.set_volume((volume * 100.0) as u32);
@@ -404,12 +374,6 @@ impl GpuiVideoPlayer {
 
         // Sync metadata from decode thread (lazy metadata like macOS AVPlayer)
         self.core.sync_metadata_from_decode_thread();
-
-        // Late-bind MoQ audio handle
-        #[cfg(feature = "moq")]
-        if self.initialized {
-            self.poll_moq_audio_handle();
-        }
 
         // Poll frames and upload to GPU
         if self.core.is_playback_requested() {
@@ -668,76 +632,12 @@ impl GpuiVideoPlayer {
             return;
         }
 
-        #[cfg(feature = "moq")]
-        if self.moq_init_promise.is_some() {
-            return;
-        }
-
-        #[cfg(feature = "moq")]
-        if MoqDecoder::is_moq_url(self.core.url()) {
-            let url = self.core.url().to_string();
-            let (sender, promise) = poll_promise::Promise::new();
-            let handle = std::thread::spawn(move || {
-                tracing::info!("MoQ decoder init: {url}");
-                let result: Result<
-                    Box<dyn VideoDecoderBackend + Send>,
-                    lumina_video_native_frame::video::VideoError,
-                > = match MoqDecoder::new(&url) {
-                    Ok(decoder) => {
-                        // Stats stored via moq_stats field
-                        Ok(Box::new(decoder) as Box<dyn VideoDecoderBackend + Send>)
-                    }
-                    Err(e) => Err(e),
-                };
-                sender.send(result);
-            });
-            self.moq_init_promise = Some(promise);
-            self.moq_init_thread = Some(handle);
-            return;
-        }
-
         self.core.init_decoder();
     }
 
     fn check_init_complete(&mut self) {
         if self.core.is_initialized() {
             self.initialized = true;
-            return;
-        }
-
-        #[cfg(feature = "moq")]
-        if let Some(ref promise) = self.moq_init_promise {
-            if promise.ready().is_some() {
-                let Some(promise) = self.moq_init_promise.take() else {
-                    return;
-                };
-                self.moq_init_thread = None;
-                match promise.try_take() {
-                    Ok(Ok(decoder)) => {
-                        let url = self.core.url().to_string();
-                        self.core = CorePlayer::with_decoder(url, decoder);
-                        if self.config.autoplay {
-                            self.core.play_with_muted(self.config.muted);
-                        }
-                        self.initialized = true;
-                        return;
-                    }
-                    Ok(Err(e)) => {
-                        self.core.set_state(VideoState::Error(e));
-                        self.initialized = true;
-                        return;
-                    }
-                    Err(_) => {
-                        self.core.set_state(VideoState::Error(
-                            lumina_video_native_frame::video::VideoError::Generic(
-                                "MoQ init thread crashed".into(),
-                            ),
-                        ));
-                        self.initialized = true;
-                        return;
-                    }
-                }
-            }
             return;
         }
 
@@ -748,18 +648,6 @@ impl GpuiVideoPlayer {
                 self.core.play_with_muted(self.config.muted);
             }
         }
-    }
-
-    #[cfg(feature = "moq")]
-    fn poll_moq_audio_handle(&mut self) {
-        // Simplified MoQ audio binding — full implementation in the egui
-        // version has more detailed state management.
-        if self.moq_audio_bound {
-            return;
-        }
-        // The MoqDecoder creates its own audio handle internally via CorePlayer.
-        // For now, just mark as bound after init — CorePlayer manages this.
-        self.moq_audio_bound = true;
     }
 
     fn poll_and_upload_frames(&mut self) {
