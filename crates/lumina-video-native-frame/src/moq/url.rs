@@ -13,7 +13,7 @@
 //! # Examples
 //!
 //! ```
-//! use lumina_video::media::moq::url::MoqUrl;
+//! use lumina_video_native_frame::moq::url::MoqUrl;
 //!
 //! let url = MoqUrl::parse("moqs://relay.example.com:4443/live/stream").unwrap();
 //! assert_eq!(url.host(), "relay.example.com");
@@ -62,7 +62,7 @@ impl MoqUrl {
     /// # Examples
     ///
     /// ```
-    /// use lumina_video::media::moq::url::MoqUrl;
+    /// use lumina_video_native_frame::moq::url::MoqUrl;
     ///
     /// // Basic URL with namespace and track
     /// let url = MoqUrl::parse("moqs://relay.example.com/live/stream").unwrap();

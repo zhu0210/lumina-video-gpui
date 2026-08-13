@@ -7,3 +7,32 @@ repository = "https://github.com/lumina-video/lumina-video"
 license = "MIT OR Apache-2.0"
 keywords = ["gpui", "multimedia", "video"]
 categories = ["gui", "multimedia"]
+
+[dependencies]
+lumina-video-core = { path = "../lumina-video-core" }
+lumina-video-native-frame = { path = "../lumina-video-native-frame" }
+gpui = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend",
+  features = ["wgpu"]
+}
+gpui_wgpu = {
+  git = "https://github.com/zhu0210/zed.git",
+  branch = "gpui_wgpu_backend"
+}
+tracing = { workspace = true }
+
+[features]
+default = []
+windows-native-video = ["lumina-video-native-frame/windows-native-video"]
+vendored-runtime = ["lumina-video-native-frame/vendored-runtime"]
+android-zero-copy = ["lumina-video-native-frame/android-zero-copy"]
+moq = ["lumina-video-native-frame/moq"]
+
+[lints.rust]
+unexpected_cfgs = {
+  level = "warn",
+  check-cfg = [
+    "cfg(feature, values(\"android-zero-copy\", \"cargo-clippy\", \"moq\", \"vendored-runtime\", \"windows-native-video\"))"
+  ]
+}

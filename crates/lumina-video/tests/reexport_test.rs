@@ -15,6 +15,10 @@ use lumina_video::{
 #[allow(unused_imports)]
 use lumina_video::{GpuiVideoPlayer, GpuiVideoPlayerConfig, GpuiVideoPlayerResponse};
 
+#[cfg(feature = "moq")]
+#[allow(unused_imports)]
+use lumina_video::media::{MoqDecoder, MoqUrl};
+
 // Native-only types (not wasm32) — compile-time import check
 #[allow(unused_imports)]
 use lumina_video::{SyncMetrics, SyncMetricsSnapshot, SYNC_DRIFT_THRESHOLD_MS};

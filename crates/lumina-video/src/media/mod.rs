@@ -60,25 +60,20 @@ pub use lumina_video_native_frame::windows_video;
 // =============================================================================
 
 #[cfg(not(target_arch = "wasm32"))]
-pub mod gpui_video_player;
+pub use lumina_video_gpui::gpui_video_player;
 #[cfg(not(target_arch = "wasm32"))]
-pub use gpui_video_player::{GpuiVideoPlayer, GpuiVideoPlayerConfig, GpuiVideoPlayerResponse};
+pub use lumina_video_gpui::{GpuiVideoPlayer, GpuiVideoPlayerConfig, GpuiVideoPlayerResponse};
 
 // =============================================================================
 // MoQ modules
 // =============================================================================
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
-pub mod moq;
-#[cfg(all(
-    feature = "moq",
-    any(target_os = "macos", target_os = "linux", target_os = "android")
-))]
-pub(crate) mod moq_audio;
+pub use lumina_video_native_frame::moq;
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
-pub mod moq_decoder;
+pub use lumina_video_native_frame::moq_decoder;
 #[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
-pub mod nostr_discovery;
+pub use lumina_video_native_frame::nostr_discovery;
 
 // =============================================================================
 // Web/WASM modules (browser APIs — preserved, not GPUI-dependent)

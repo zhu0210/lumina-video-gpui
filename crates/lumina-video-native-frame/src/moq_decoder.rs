@@ -3313,10 +3313,10 @@ mod macos_vt {
 #[cfg(target_os = "android")]
 pub mod android {
     use super::*;
-    use crate::media::android_video::{
+    use crate::android_video::{
         generate_player_id, try_receive_hardware_buffer_for_player, AndroidVideoFrame,
     };
-    use crate::media::video::AndroidGpuSurface;
+    use crate::video::AndroidGpuSurface;
     use jni::objects::{GlobalRef, JClass, JObject, JValue};
     use jni::sys::{jint, jlong};
     use jni::JNIEnv;
@@ -3489,7 +3489,7 @@ pub mod android {
             config: MoqDecoderConfig,
             nal_tx: Sender<MoqVideoFrame>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            crate::media::moq::worker::run_moq_worker(shared, url, config, nal_tx, "Android").await
+            crate::moq::worker::run_moq_worker(shared, url, config, nal_tx, "Android").await
         }
 
         /// Initializes the MediaCodec decoder via JNI.
@@ -3688,12 +3688,12 @@ pub mod android {
             });
 
             // Determine pixel format from AHardwareBuffer format
-            let pixel_format =
-                if crate::media::android_video::is_yuv_hardware_buffer_format(frame.format) {
-                    PixelFormat::Nv12 // Most common YUV format from MediaCodec
-                } else {
-                    PixelFormat::Rgba
-                };
+            let pixel_format = if crate::android_video::is_yuv_hardware_buffer_format(frame.format)
+            {
+                PixelFormat::Nv12 // Most common YUV format from MediaCodec
+            } else {
+                PixelFormat::Rgba
+            };
 
             let surface = unsafe {
                 AndroidGpuSurface::new(
@@ -3747,7 +3747,7 @@ pub mod android {
             }
 
             // Release player's frame queue
-            crate::media::android_video::release_player_queue(self.player_id);
+            crate::android_video::release_player_queue(self.player_id);
 
             tracing::info!("MoqAndroidDecoder: Released player_id={}", self.player_id);
         }
@@ -3889,7 +3889,7 @@ pub mod android {
     ) {
         // Delegate to the existing ExoPlayerBridge implementation
         // This reuses all the HardwareBuffer acquisition and queue logic
-        crate::media::android_video::Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwareBuffer(
+        crate::android_video::Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwareBuffer(
             env,
             class,
             buffer,

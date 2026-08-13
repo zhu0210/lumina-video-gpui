@@ -1,6 +1,7 @@
-//! GPUI presentation composition boundary.
-//!
-//! GPUI owns presentation and repaint integration.  It must not decode media,
-//! import native memory, or block while polling a session.  The concrete entry
-//! point is added when the GStreamer and wgpu adapters migrate; this ticket
-//! intentionally adds no player or constructor stub.
+//! GPUI presentation boundary for lumina-video.
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gpui_video_player;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use gpui_video_player::{GpuiVideoPlayer, GpuiVideoPlayerConfig, GpuiVideoPlayerResponse};

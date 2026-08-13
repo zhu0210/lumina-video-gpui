@@ -6,8 +6,8 @@
 //! - `lumina-video::VideoPlayer` (egui widget wrapper)
 //! - `lumina-video-ios` (C FFI for iOS/Swift)
 //!
-//! CorePlayer is MoQ-agnostic: callers choose the decoder (platform default
-//! or MoqDecoder) and pass it via [`CorePlayer::with_decoder`].
+//! CorePlayer selects the platform decoder, including the native MoQ decoder
+//! when the `moq` feature is enabled and the source uses a MoQ URL.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +24,8 @@ use crate::frame_queue::{DecodeThread, FrameQueue, FrameScheduler};
 use crate::linux_video::ZeroCopyGStreamerDecoder;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use crate::macos_video::MacOSVideoDecoder;
+#[cfg(feature = "moq")]
+use crate::moq_decoder::MoqDecoder;
 use crate::sync_metrics::{SyncMetrics, SyncMetricsSnapshot};
 use crate::video::{VideoDecoderBackend, VideoError, VideoFrame, VideoMetadata, VideoState};
 
@@ -87,6 +89,8 @@ pub struct CorePlayer {
     init_thread: Option<std::thread::JoinHandle<()>>,
     /// Promise for async initialization result
     init_promise: Option<Promise<Result<Box<dyn VideoDecoderBackend + Send>, VideoError>>>,
+    /// Whether the pending initialization uses the native MoQ decoder.
+    pending_moq_init: bool,
     /// Android player ID for multi-player frame isolation
     #[cfg(target_os = "android")]
     android_player_id: u64,
@@ -116,6 +120,7 @@ impl CorePlayer {
             url: url.into(),
             init_thread: None,
             init_promise: None,
+            pending_moq_init: false,
             #[cfg(target_os = "android")]
             android_player_id: 0,
             #[cfg(target_os = "linux")]
@@ -151,6 +156,7 @@ impl CorePlayer {
             url: url.into(),
             init_thread: None,
             init_promise: None,
+            pending_moq_init: false,
             #[cfg(target_os = "android")]
             android_player_id: 0,
             #[cfg(target_os = "linux")]
@@ -171,8 +177,21 @@ impl CorePlayer {
         }
 
         let url = self.url.clone();
+        let pending_moq_init = source_uses_moq(&url);
+        self.pending_moq_init = pending_moq_init;
         let (sender, promise) = Promise::new();
         self.init_promise = Some(promise);
+
+        #[cfg(feature = "moq")]
+        if pending_moq_init {
+            let handle = std::thread::spawn(move || {
+                let result = MoqDecoder::new(&url)
+                    .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoderBackend + Send>);
+                sender.send(result);
+            });
+            self.init_thread = Some(handle);
+            return;
+        }
 
         #[cfg(target_os = "macos")]
         let macos_decoder_result: Option<Result<MacOSVideoDecoder, VideoError>> = {
@@ -330,6 +349,7 @@ impl CorePlayer {
         };
 
         let Ok(result) = promise.try_take() else {
+            self.pending_moq_init = false;
             self.state = VideoState::Error(VideoError::Generic("Init thread crashed".into()));
             self.init_thread = None;
             return true;
@@ -337,6 +357,22 @@ impl CorePlayer {
 
         match result {
             Ok(decoder) => {
+                if self.pending_moq_init {
+                    let muted = self.audio_handle.is_muted();
+                    let volume = self.audio_handle.volume();
+                    let url = self.url.clone();
+
+                    // Promise readiness means the init thread sent its result;
+                    // detach its handle before replacing self so Drop cannot join
+                    // from the UI thread.
+                    self.init_thread.take();
+                    *self = Self::with_decoder(url, decoder);
+                    self.set_muted(muted);
+                    self.set_volume(volume);
+                    return true;
+                }
+
+                self.pending_moq_init = false;
                 let metadata = decoder.metadata().clone();
                 self.metadata = Some(metadata.clone());
 
@@ -400,6 +436,7 @@ impl CorePlayer {
                 true
             }
             Err(e) => {
+                self.pending_moq_init = false;
                 self.state = VideoState::Error(e);
                 self.init_thread = None;
                 self.initialized = true;
@@ -791,8 +828,38 @@ impl CorePlayer {
     }
 }
 
+fn source_uses_moq(url: &str) -> bool {
+    #[cfg(feature = "moq")]
+    {
+        MoqDecoder::is_moq_url(url)
+    }
+    #[cfg(not(feature = "moq"))]
+    {
+        let _ = url;
+        false
+    }
+}
+
 impl Drop for CorePlayer {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(all(test, feature = "moq"))]
+mod tests {
+    use super::source_uses_moq;
+
+    #[test]
+    fn moq_source_routing_only_matches_moq_schemes() {
+        assert!(source_uses_moq("moq://localhost/live/stream"));
+        assert!(source_uses_moq("moqs://relay.example/live/stream"));
+        for source in [
+            "file:///tmp/video.mp4",
+            "https://example.com/video.mp4",
+            "https://example.com/live/index.m3u8",
+        ] {
+            assert!(!source_uses_moq(source), "unexpected MoQ route: {source}");
+        }
     }
 }

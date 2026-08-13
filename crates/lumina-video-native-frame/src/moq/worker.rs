@@ -20,12 +20,12 @@ use bytes::{Buf, BytesMut};
 use moq_lite::{Origin, PathOwned};
 use moq_native::ClientConfig;
 
-use crate::media::moq::MoqUrl;
-use crate::media::moq_audio::{
+use crate::moq::MoqUrl;
+use crate::moq_audio::{
     audio_codec_from_config, select_preferred_audio_rendition, ChannelClosed, LiveEdgeSender,
     MoqAudioFrame, MoqAudioThread,
 };
-use crate::media::moq_decoder::{
+use crate::moq_decoder::{
     MoqAudioStatus, MoqDecoder, MoqDecoderConfig, MoqDecoderState, MoqSharedState, MoqVideoFrame,
     MOQ_STARTUP_HARD_FAILSAFE_SECS,
 };
@@ -1513,7 +1513,7 @@ fn setup_audio(
         if let Some(existing) = slot.clone() {
             existing
         } else {
-            let handle = crate::media::audio::AudioHandle::new();
+            let handle = crate::audio::AudioHandle::new();
             *slot = Some(handle.clone());
             handle
         }
@@ -1567,7 +1567,7 @@ fn setup_audio(
 fn spawn_audio_forward_task(
     consumer: Option<hang::container::OrderedConsumer>,
     sender: Option<LiveEdgeSender<MoqAudioFrame>>,
-    audio_shared: &Arc<crate::media::moq_decoder::MoqAudioShared>,
+    audio_shared: &Arc<crate::moq_decoder::MoqAudioShared>,
     label: &str,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (mut audio_consumer, audio_sender) = match (consumer, sender) {
@@ -1754,7 +1754,7 @@ async fn teardown_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::moq::MoqUrl;
+    use crate::moq::MoqUrl;
 
     #[test]
     fn test_sanitize_path_strips_trailing_slashes() {

@@ -73,6 +73,20 @@ pub mod frame_to_texture;
 #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
 pub mod vendored_runtime;
 
+// Native desktop MoQ transport, discovery, and decoder implementation.
+#[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
+pub mod moq;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "moq",
+    any(target_os = "macos", target_os = "linux", target_os = "android")
+))]
+pub(crate) mod moq_audio;
+#[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
+pub mod moq_decoder;
+#[cfg(all(not(target_arch = "wasm32"), feature = "moq"))]
+pub mod nostr_discovery;
+
 /// A media timestamp in the session master-clock time base.
 pub type MediaTime = Duration;
 

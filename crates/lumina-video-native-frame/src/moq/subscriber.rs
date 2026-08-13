@@ -334,7 +334,7 @@ impl Default for MoqSubscriptionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::moq::catalog::VideoCodec;
+    use crate::moq::catalog::VideoCodec;
 
     #[test]
     fn test_track_info() {
