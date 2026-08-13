@@ -288,7 +288,7 @@ impl GpuiVideoPlayer {
 
     /// Asynchronously replaces the current source while retaining the last
     /// uploaded GPU texture until the new session presents a frame.
-    pub fn open(&mut self, url: impl Into<String>) {
+    pub fn open(&mut self, url: impl Into<String>, cx: &App) {
         let url = url.into();
         #[cfg(target_os = "linux")]
         let next_generation = self
@@ -296,14 +296,17 @@ impl GpuiVideoPlayer {
             .as_ref()
             .map_or(1, |session| session.stream_generation().saturating_add(1));
 
-        // Signal old backends before constructing the replacement. CorePlayer
-        // and GstMediaSession drops detach their workers, so this never joins
-        // a decoder on the GPUI thread and gives GStreamer its full teardown
-        // budget from the open call.
+        // CorePlayer teardown retains its join semantics, so move the old
+        // backend to GPUI's background executor before replacing it. The
+        // GStreamer session drop is already fire-and-forget.
         #[cfg(any(not(target_os = "linux"), feature = "moq"))]
         let old_core = self.core.take();
         #[cfg(any(not(target_os = "linux"), feature = "moq"))]
-        drop(old_core);
+        if let Some(old_core) = old_core {
+            cx.background_spawn(async move { drop(old_core) }).detach();
+        }
+        #[cfg(all(target_os = "linux", not(feature = "moq")))]
+        let _ = cx;
         #[cfg(target_os = "linux")]
         let old_session = self.session.take();
         #[cfg(target_os = "linux")]
@@ -337,6 +340,11 @@ impl GpuiVideoPlayer {
                 #[cfg(feature = "moq")]
                 LinuxPlaybackRoute::Core => None,
             };
+            if let Some(session) = self.session.as_ref() {
+                let audio = session.audio_handle();
+                audio.set_muted(self.config.muted);
+                audio.set_volume((self.config.volume.clamp(0.0, 1.0) * 100.0) as u32);
+            }
         }
         #[cfg(any(not(target_os = "linux"), feature = "moq"))]
         if let Some(core) = self.core.as_mut() {
@@ -427,6 +435,11 @@ impl GpuiVideoPlayer {
                     generation,
                 ),
             );
+            if let Some(session) = self.session.as_ref() {
+                let audio = session.audio_handle();
+                audio.set_muted(self.config.muted);
+                audio.set_volume((self.config.volume.clamp(0.0, 1.0) * 100.0) as u32);
+            }
         }
         self
     }

@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -30,7 +31,7 @@ use lumina_video_native_frame::{
     into_cpu_planes, AcquireSync, CpuMemory, FrameExtent, NativeFrameDescriptor, NativeFrameLease,
     NativeMemory,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use url::Url;
 
 /// The session's decode-to-presentation mailbox holds only the newest frame.
@@ -46,6 +47,49 @@ pub type SessionEventFrame = SessionEvent<Frame>;
 struct SequencedEvent {
     sequence: u64,
     event: Event,
+}
+
+/// Bounded worker-to-session control events. State updates are replaceable;
+/// metadata, errors, and terminal events stay ahead of state pressure.
+#[derive(Clone)]
+struct ControlMailbox {
+    queue: Arc<Mutex<VecDeque<SequencedEvent>>>,
+}
+
+impl ControlMailbox {
+    fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(VecDeque::with_capacity(CONTROL_QUEUE_CAPACITY))),
+        }
+    }
+
+    fn push(&self, event: SequencedEvent) -> bool {
+        let mut queue = self.queue.lock();
+        if queue.len() >= CONTROL_QUEUE_CAPACITY {
+            if let Some(index) = queue
+                .iter()
+                .position(|queued| matches!(queued.event, SessionEvent::StateChanged { .. }))
+            {
+                let _ = queue.remove(index);
+            } else if matches!(event.event, SessionEvent::StateChanged { .. }) {
+                // All slots are terminal/diagnostic events. Keep those and
+                // rely on the snapshot for this redundant state update.
+                return true;
+            } else {
+                // A worker normally emits at most one metadata/error/ended
+                // event per terminal path. If a caller violates that
+                // assumption, keep the mailbox bounded and keep the worker
+                // alive rather than turning Full into a worker failure.
+                return true;
+            }
+        }
+        queue.push_back(event);
+        true
+    }
+
+    fn try_recv(&self) -> Option<SequencedEvent> {
+        self.queue.lock().pop_front()
+    }
 }
 
 /// The presentation result a GPUI tick can make from one session poll.
@@ -207,8 +251,8 @@ fn owned_cpu_lease(
     .map_err(|error| SessionError::Decode(error.to_string()))
 }
 
-fn send_control(sender: &Sender<SequencedEvent>, event: SequencedEvent) -> bool {
-    sender.try_send(event).is_ok()
+fn send_control(mailbox: &ControlMailbox, event: SequencedEvent) -> bool {
+    mailbox.push(event)
 }
 
 fn send_frame(
@@ -239,7 +283,7 @@ fn send_frame(
 
 fn publish_state(
     state: &Arc<SnapshotState>,
-    control_sender: &Sender<SequencedEvent>,
+    control_sender: &ControlMailbox,
     sequence: &mut u64,
     next_state: SessionState,
 ) -> bool {
@@ -259,7 +303,7 @@ fn publish_state(
 
 fn publish_error(
     state: &Arc<SnapshotState>,
-    control_sender: &Sender<SequencedEvent>,
+    control_sender: &ControlMailbox,
     sequence: &mut u64,
     error: SessionError,
 ) -> bool {
@@ -290,12 +334,16 @@ fn process_command(
     playback: &mut PlaybackState,
     audio_handle: &AudioHandle,
     state: &Arc<SnapshotState>,
-    control_sender: &Sender<SequencedEvent>,
+    control_sender: &ControlMailbox,
     sequence: &mut u64,
 ) -> bool {
     match command {
         SessionCommand::Play => {
             if decoder.is_eof() {
+                // Produce a paused preroll during replay, then explicitly
+                // resume below. This keeps one seek deadline and avoids
+                // duplicate replay intent advancing generations.
+                decoder.set_paused_intent(true);
                 if let Err(error) = decoder.seek(Duration::ZERO) {
                     let _ = publish_error(state, control_sender, sequence, session_error(error));
                     return false;
@@ -340,7 +388,7 @@ fn process_command(
             }
         },
         SessionCommand::Stop => {
-            let _ = decoder.pause();
+            let deadline = decoder.begin_operation_deadline();
             let published = publish_state(state, control_sender, sequence, SessionState::Ended);
             if published {
                 let _ = send_control(
@@ -351,30 +399,33 @@ fn process_command(
                     },
                 );
             }
-            decoder.shutdown();
+            decoder.shutdown_with_deadline(Some(deadline));
             false
         }
-        SessionCommand::Seek { position: target } => match decoder.seek(target) {
-            Ok(()) => {
-                playback.stream_generation = playback.stream_generation.saturating_add(1);
-                playback.position = target;
-                audio_handle.set_native_position(target);
-                let next_state = if playback.playing {
-                    SessionState::Playing {
-                        position: playback.position,
-                    }
-                } else {
-                    SessionState::Paused {
-                        position: playback.position,
-                    }
-                };
-                publish_state(state, control_sender, sequence, next_state)
+        SessionCommand::Seek { position: target } => {
+            decoder.set_paused_intent(!playback.playing);
+            match decoder.seek(target) {
+                Ok(()) => {
+                    playback.stream_generation = playback.stream_generation.saturating_add(1);
+                    playback.position = target;
+                    audio_handle.set_native_position(target);
+                    let next_state = if playback.playing {
+                        SessionState::Playing {
+                            position: playback.position,
+                        }
+                    } else {
+                        SessionState::Paused {
+                            position: playback.position,
+                        }
+                    };
+                    publish_state(state, control_sender, sequence, next_state)
+                }
+                Err(error) => {
+                    let _ = publish_error(state, control_sender, sequence, session_error(error));
+                    false
+                }
             }
-            Err(error) => {
-                let _ = publish_error(state, control_sender, sequence, session_error(error));
-                false
-            }
-        },
+        }
         SessionCommand::SetMuted { muted } => {
             audio_handle.set_muted(muted);
             true
@@ -400,7 +451,7 @@ fn process_command(
 
 struct WorkerIo {
     commands: Receiver<SessionCommand>,
-    control_sender: Sender<SequencedEvent>,
+    control_sender: ControlMailbox,
     frame_sender: Sender<SequencedEvent>,
     frame_drop_receiver: Receiver<SequencedEvent>,
     state: Arc<SnapshotState>,
@@ -411,8 +462,11 @@ struct WorkerIo {
 }
 
 fn shutdown_worker(decoder: &mut GStreamerDecoder, lifecycle: &GstLifecycleControl) {
-    if lifecycle.is_cancelled() {
-        decoder.shutdown_with_deadline(lifecycle.deadline());
+    let deadline = lifecycle
+        .deadline()
+        .or_else(|| decoder.active_operation_deadline());
+    if deadline.is_some() {
+        decoder.shutdown_with_deadline(deadline);
     } else {
         decoder.shutdown();
     }
@@ -422,7 +476,7 @@ fn lifecycle_cancelled(lifecycle: &GstLifecycleControl) -> bool {
     lifecycle.is_cancelled()
 }
 
-fn seed_worker_spawn_failure(state: &Arc<SnapshotState>, control_sender: &Sender<SequencedEvent>) {
+fn seed_worker_spawn_failure(state: &Arc<SnapshotState>, control_sender: &ControlMailbox) {
     let mut sequence = 0_u64;
     let _ = publish_error(
         state,
@@ -688,7 +742,7 @@ fn run_worker(
 /// A Linux GStreamer media session with bounded, nonblocking UI interaction.
 pub struct GstMediaSession {
     commands: Sender<SessionCommand>,
-    control_receiver: Receiver<SequencedEvent>,
+    control_receiver: ControlMailbox,
     frame_receiver: Receiver<SequencedEvent>,
     state: Arc<SnapshotState>,
     audio_handle: AudioHandle,
@@ -754,7 +808,7 @@ impl GstMediaSession {
     ) -> Self {
         let source = source.into();
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let (control_sender, control_receiver) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+        let control_mailbox = ControlMailbox::new();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let frame_drop_receiver = frame_receiver.clone();
         let state = Arc::new(SnapshotState::new());
@@ -765,7 +819,8 @@ impl GstMediaSession {
         let worker_dropped_frames = Arc::clone(&dropped_frames);
         let worker_audio_handle = audio_handle.clone();
         let worker_lifecycle_control = lifecycle_control.clone();
-        let spawn_failure_sender = control_sender.clone();
+        let spawn_failure_sender = control_mailbox.clone();
+        let worker_control_sender = control_mailbox.clone();
         let worker = thread::Builder::new()
             .name("lumina-gst-session".into())
             .spawn(move || {
@@ -776,7 +831,7 @@ impl GstMediaSession {
                     stream_generation,
                     WorkerIo {
                         commands: command_receiver,
-                        control_sender,
+                        control_sender: worker_control_sender,
                         frame_sender,
                         frame_drop_receiver,
                         state: worker_state,
@@ -795,7 +850,7 @@ impl GstMediaSession {
 
         Self {
             commands,
-            control_receiver,
+            control_receiver: control_mailbox,
             frame_receiver,
             state,
             audio_handle,
@@ -858,10 +913,8 @@ impl GstMediaSession {
 
     fn fill_pending(&mut self) {
         if self.pending_control.is_none() {
-            match self.control_receiver.try_recv() {
-                Ok(event) => self.pending_control = Some(event),
-                Err(TryRecvError::Disconnected) => self.worker_disconnected = true,
-                Err(TryRecvError::Empty) => {}
+            if let Some(event) = self.control_receiver.try_recv() {
+                self.pending_control = Some(event);
             }
         }
         loop {
@@ -1069,14 +1122,14 @@ mod tests {
     #[test]
     fn pending_frame_refresh_keeps_latest_after_control_event() {
         let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let (control_sender, control_receiver) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+        let control_mailbox = ControlMailbox::new();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let state = Arc::new(SnapshotState::new());
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
         let mut session = GstMediaSession {
             commands,
-            control_receiver,
+            control_receiver: control_mailbox.clone(),
             frame_receiver,
             state,
             audio_handle,
@@ -1103,14 +1156,12 @@ mod tests {
             .is_ok());
         session.fill_pending();
 
-        assert!(control_sender
-            .send(SequencedEvent {
-                sequence: 0,
-                event: SessionEvent::StateChanged {
-                    state: SessionState::Ready,
-                },
-            })
-            .is_ok());
+        assert!(control_mailbox.push(SequencedEvent {
+            sequence: 0,
+            event: SessionEvent::StateChanged {
+                state: SessionState::Ready,
+            },
+        }));
         assert!(frame_sender
             .send(SequencedEvent {
                 sequence: 2,
@@ -1150,12 +1201,11 @@ mod tests {
     #[test]
     fn stale_frames_are_dropped_after_generation_advance() {
         let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let (_control_sender, control_receiver) =
-            crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+        let control_mailbox = ControlMailbox::new();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
-            control_receiver,
+            control_receiver: control_mailbox,
             frame_receiver,
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
@@ -1202,12 +1252,11 @@ mod tests {
     #[test]
     fn queued_seek_advances_generation_without_waiting_for_worker() {
         let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let (_control_sender, control_receiver) =
-            crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+        let control_mailbox = ControlMailbox::new();
         let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
-            control_receiver,
+            control_receiver: control_mailbox,
             frame_receiver,
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
@@ -1234,14 +1283,13 @@ mod tests {
     #[test]
     fn duplicate_play_while_ended_keeps_one_replay_generation_pending() {
         let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let (_control_sender, control_receiver) =
-            crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+        let control_mailbox = ControlMailbox::new();
         let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let state = Arc::new(SnapshotState::new());
         state.snapshot.write().state = SessionState::Ended;
         let mut session = GstMediaSession {
             commands,
-            control_receiver,
+            control_receiver: control_mailbox,
             frame_receiver,
             state,
             audio_handle: AudioHandle::new(),
@@ -1267,19 +1315,82 @@ mod tests {
     }
 
     #[test]
+    fn control_mailbox_coalesces_state_pressure_and_keeps_terminal_events() {
+        let mailbox = ControlMailbox::new();
+        for sequence in 0..CONTROL_QUEUE_CAPACITY {
+            assert!(mailbox.push(SequencedEvent {
+                sequence: sequence as u64,
+                event: SessionEvent::StateChanged {
+                    state: SessionState::Ready,
+                },
+            }));
+        }
+        assert!(mailbox.push(SequencedEvent {
+            sequence: CONTROL_QUEUE_CAPACITY as u64,
+            event: SessionEvent::StateChanged {
+                state: SessionState::Playing {
+                    position: Duration::from_millis(750),
+                },
+            },
+        }));
+        assert!(mailbox.push(SequencedEvent {
+            sequence: 100,
+            event: SessionEvent::Metadata {
+                metadata: SessionMetadata {
+                    width: 1,
+                    height: 1,
+                    duration: Some(Duration::from_secs(2)),
+                    frame_rate: 30.0,
+                    codec: "test".into(),
+                    pixel_aspect_ratio: 1.0,
+                    start_time: None,
+                },
+            },
+        }));
+        assert!(mailbox.push(SequencedEvent {
+            sequence: 101,
+            event: SessionEvent::Error(SessionError::Open("pressure".into())),
+        }));
+        assert!(mailbox.push(SequencedEvent {
+            sequence: 102,
+            event: SessionEvent::Ended,
+        }));
+
+        let mut events = Vec::new();
+        while let Some(event) = mailbox.try_recv() {
+            events.push(event.event);
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::StateChanged {
+                state: SessionState::Playing { position }
+            } if *position == Duration::from_millis(750)
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Metadata { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Error(SessionError::Open(_)))));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Ended)));
+    }
+
+    #[test]
     fn worker_spawn_failure_is_observable_as_open_error() {
         let state = Arc::new(SnapshotState::new());
-        let (sender, receiver) = crossbeam_channel::bounded(CONTROL_QUEUE_CAPACITY);
+        let mailbox = ControlMailbox::new();
 
-        seed_worker_spawn_failure(&state, &sender);
+        seed_worker_spawn_failure(&state, &mailbox);
 
         assert!(matches!(
             &state.snapshot.read().state,
             SessionState::Error(SessionError::Open(_))
         ));
         assert!(matches!(
-            receiver.try_recv(),
-            Ok(SequencedEvent {
+            mailbox.try_recv(),
+            Some(SequencedEvent {
                 event: SessionEvent::Error(SessionError::Open(_)),
                 ..
             })

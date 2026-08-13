@@ -231,6 +231,9 @@ pub struct GStreamerDecoder {
     last_seek_backward: bool,
     /// Deadline shared by the seek and first-frame resync phase.
     seek_deadline: Option<Instant>,
+    /// Absolute deadline for the current worker operation, retained after a
+    /// failed seek so teardown cannot start a fresh timeout window.
+    active_operation_deadline: Option<Instant>,
     /// Cached preroll sample for first decode_next() call
     preroll_sample: Option<gst::Sample>,
     /// Buffering percentage (0-100), 100 means fully buffered
@@ -673,6 +676,7 @@ impl GStreamerDecoder {
             seek_target: None,
             last_seek_backward: false,
             seek_deadline: None,
+            active_operation_deadline: None,
             preroll_sample,
             buffering_percent: initial_buffering,
             was_fully_buffered: initial_buffering >= 100,
@@ -695,6 +699,7 @@ impl GStreamerDecoder {
         let deadline = self
             .lifecycle_control
             .deadline()
+            .or(self.active_operation_deadline)
             .unwrap_or_else(|| self.deadline_for());
         self.cleanup_with_deadline(deadline);
     }
@@ -704,6 +709,26 @@ impl GStreamerDecoder {
     pub fn shutdown_with_deadline(&mut self, deadline: Option<Instant>) {
         let deadline = deadline.unwrap_or_else(|| self.deadline_for());
         self.cleanup_with_deadline(deadline);
+    }
+
+    /// Returns the absolute deadline of the operation currently being
+    /// completed by the worker, if any.
+    pub fn active_operation_deadline(&self) -> Option<Instant> {
+        self.active_operation_deadline
+    }
+
+    /// Starts one bounded worker operation and returns its absolute deadline.
+    pub fn begin_operation_deadline(&mut self) -> Instant {
+        let deadline = self.deadline_for();
+        self.active_operation_deadline = Some(deadline);
+        deadline
+    }
+
+    /// Sets the playback intent used when a seek has to produce a preroll
+    /// frame. A paused session must remain paused after resync, including a
+    /// seek issued after natural EOS.
+    pub fn set_paused_intent(&mut self, paused: bool) {
+        self.user_paused = paused;
     }
 
     /// Converts a GStreamer sample to our VideoFrame format.
@@ -1557,6 +1582,7 @@ impl GStreamerDecoder {
             }
             self.preroll_sample = Some(sample);
             self.seek_deadline = None;
+            self.active_operation_deadline = None;
             self.restore_paused_after_seek(deadline);
             return Ok(());
         }
@@ -1746,6 +1772,7 @@ impl VideoDecoderBackend for GStreamerDecoder {
             self.seeking = false;
             self.seek_target = None;
             self.seek_deadline = None;
+            self.active_operation_deadline = None;
             return Ok(Some(frame));
         }
 
@@ -1825,6 +1852,7 @@ impl VideoDecoderBackend for GStreamerDecoder {
             self.seeking = false;
             self.seek_target = None;
             self.seek_deadline = None;
+            self.active_operation_deadline = None;
             return Ok(Some(frame));
         }
     }
@@ -1834,6 +1862,7 @@ impl VideoDecoderBackend for GStreamerDecoder {
         const MAX_RETRIES: u32 = 3;
         let deadline = self.deadline_for();
         self.seek_deadline = Some(deadline);
+        self.active_operation_deadline = Some(deadline);
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
@@ -1877,10 +1906,9 @@ impl VideoDecoderBackend for GStreamerDecoder {
                             }
                         }
                         // Longer delay for HTTP reconnection
-                        let mut delay = Self::remaining(deadline).min(LIFECYCLE_POLL);
-                        while !delay.is_zero() && !self.lifecycle_control.is_cancelled() {
+                        let delay = Self::remaining(deadline).min(LIFECYCLE_POLL);
+                        if !delay.is_zero() && !self.lifecycle_control.is_cancelled() {
                             std::thread::sleep(delay);
-                            delay = Self::remaining(deadline).min(LIFECYCLE_POLL);
                         }
                     }
                     last_error = Some(e);

@@ -370,7 +370,7 @@ impl DecodeThread {
         // Stop the frame queue first to wake any blocked producers
         self.frame_queue.stop();
         self.stop_flag.store(true, Ordering::Release);
-        let _ = self.command_tx.try_send(DecodeCommand::Stop);
+        let _ = self.command_tx.send(DecodeCommand::Stop);
     }
 
     /// Sets the muted state (sent to platform decoder: AVPlayer on iOS/macOS, ExoPlayer on Android).
@@ -412,10 +412,9 @@ impl DecodeThread {
 impl Drop for DecodeThread {
     fn drop(&mut self) {
         self.stop();
-        // The stop flag and queue wakeups are the synchronization contract;
-        // dropping the handle detaches the worker instead of joining from a
-        // UI/session destructor.
-        let _ = self.handle.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -790,7 +789,7 @@ impl AudioThread {
     /// Stops the audio thread.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Release);
-        let _ = self.command_tx.try_send(DecodeCommand::Stop);
+        let _ = self.command_tx.send(DecodeCommand::Stop);
     }
 }
 
@@ -798,7 +797,9 @@ impl AudioThread {
 impl Drop for AudioThread {
     fn drop(&mut self) {
         self.stop();
-        let _ = self.handle.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

@@ -812,21 +812,19 @@ impl CorePlayer {
         }
     }
 
-    /// Signals worker teardown without joining from the caller's thread.
+    /// Stops the decode thread and joins the init thread (called during cleanup).
     fn stop(&mut self) {
-        if let Some(thread) = self.decode_thread.take() {
+        if let Some(ref thread) = self.decode_thread {
             thread.stop();
-            drop(thread);
         }
         #[cfg(target_os = "macos")]
-        if let Some(audio_thread) = self.audio_thread.take() {
+        if let Some(ref audio_thread) = self.audio_thread {
             audio_thread.stop();
-            drop(audio_thread);
         }
-        // Dropping a JoinHandle detaches an initialization worker. Its
-        // promise sender is owned by that worker and the UI promise is already
-        // unreachable once this player is being torn down.
-        let _ = self.init_thread.take();
+        // Join init thread if still running to avoid leaking the handle
+        if let Some(handle) = self.init_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
