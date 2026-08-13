@@ -81,8 +81,7 @@ cargo run --package lumina-video-demo
 The iOS FFI and Swift package remain separate from the GPUI entry point. They use the native-frame player and IOSurface/Metal delivery:
 
 ```bash
-./ios/build-ios.sh sim
-./ios/build-ios.sh device
+./scripts/build-ios.sh
 ```
 
 See [docs/IOS.md](docs/IOS.md) and [docs/ios-ffi-contract.md](docs/ios-ffi-contract.md) for the Swift integration and test harness.

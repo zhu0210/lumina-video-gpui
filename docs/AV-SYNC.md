@@ -181,15 +181,8 @@ println!("Quality: {}", snapshot.quality_summary());
 
 ## Baseline Testing Tool
 
-Run the sync baseline tool to measure A/V sync on your system:
-
-```bash
-# Default: 30 seconds with remote test video
-cargo run -p lumina-video --example sync_baseline --features "ffmpeg,macos-native-video"
-
-# Local file with custom duration
-cargo run -p lumina-video --example sync_baseline --features "ffmpeg,macos-native-video" -- /path/to/video.mp4 60
-```
+The former facade's `sync_baseline` example was removed with that crate. Use the
+GPUI demo or the package-specific sync-metrics tests when validating playback.
 
 ## Further Reading
 

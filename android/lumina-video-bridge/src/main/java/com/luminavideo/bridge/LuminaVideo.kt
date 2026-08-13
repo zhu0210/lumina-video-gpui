@@ -2,7 +2,7 @@
  * Static initialization entry point for lumina-video on Android.
  *
  * Call [LuminaVideo.init] once in your Activity's `onCreate()` to enable
- * self-contained video playback from Rust via `VideoPlayer::with_wgpu(url)`.
+ * native-frame Android playback from Rust via `AndroidVideoDecoder::new()`.
  *
  * # Usage
  *
@@ -53,7 +53,7 @@ object LuminaVideo {
      * Initializes lumina-video for self-contained Android video playback.
      *
      * Must be called once from your Activity's `onCreate()` before any
-     * `VideoPlayer::with_wgpu()` calls from Rust.
+     * `AndroidVideoDecoder::new()` calls from Rust.
      *
      * @param activity The host Activity. Only `applicationContext` is retained (no leak).
      * @param builder Optional custom ExoPlayer.Builder for advanced configuration

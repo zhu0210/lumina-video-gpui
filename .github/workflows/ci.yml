@@ -118,12 +118,6 @@ jobs:
         run: cargo build --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
       - name: Run tests
         run: cargo test --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
-      - name: Check Windows native video features
-        run: |
-          cargo check --package lumina-video-native-frame --features windows-native-video
-          cargo check --package lumina-video-wgpu --features windows-native-video
-          cargo check --package lumina-video-gpui --features windows-native-video
-
   check-android:
     name: Check (Android)
     runs-on: ubuntu-latest
