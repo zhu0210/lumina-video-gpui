@@ -11,8 +11,8 @@
 //! avoiding the expensive CPU YUV→RGB conversion. Only NV12 and YUV420p use
 //! the NV12 path; RGB formats use RGBA passthrough.
 //!
-//! Platform GPU surfaces (IOSurface, DMABuf, etc.) are imported zero-copy
-//! when possible, falling back to the CPU path via `cpu_fallback`.
+//! Platform GPU surfaces remain outside the borrowed compatibility boundary;
+//! producers must hand an owned lease to [`native_frame_lease_to_textures`].
 
 #[cfg(test)]
 use lumina_video_native_frame::video::Plane;
@@ -160,14 +160,30 @@ impl<'a> CpuFrameRef<'a> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Convert any `DecodedFrame` to `GpuFrameTextures` for GPUI's `surface()`.
+/// A borrowed native GPU surface cannot cross the legacy rendering boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyFrameIngestionError {
+    /// Native GPU surfaces are reserved for the owned producer seam in #7.
+    UnsupportedNativeSurface,
+}
+
+impl std::fmt::Display for LegacyFrameIngestionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedNativeSurface => write!(
+                f,
+                "borrowed native GPU surfaces are unsupported; use the owned lease seam"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LegacyFrameIngestionError {}
+
+/// Converts legacy borrowed CPU frames for GPUI's `surface()`.
 ///
-/// - NV12/YUV420p CPU frames → NV12 dual-texture (GPU-side YUV→RGB conversion)
-/// - RGBA/BGRA/RGB24 CPU frames → single RGBA8Unorm texture
-/// - Platform GPU surfaces → CPU fallback path (zero-copy import is TODO)
-///
-/// If the decode pipeline produces a GPU surface without a CPU fallback and
-/// zero-copy import hasn't been implemented for this integration, returns `None`.
+/// Native GPU surfaces are rejected until #7 connects producers to the owned
+/// [`NativeFrameLease`](lumina_video_native_frame::NativeFrameLease) seam.
 pub fn decoded_frame_to_textures(
     frame: &DecodedFrame,
     device: &wgpu::Device,
@@ -175,92 +191,23 @@ pub fn decoded_frame_to_textures(
     y_cache: &mut Option<Arc<wgpu::Texture>>,
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
-) -> Option<GpuFrameTextures> {
+) -> Result<GpuFrameTextures, LegacyFrameIngestionError> {
     match frame {
-        DecodedFrame::Cpu(cpu) => Some(upload_cpu_frame_as_textures(
+        DecodedFrame::Cpu(cpu) => Ok(upload_cpu_frame_as_textures(
             cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
         )),
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        DecodedFrame::MacOS(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                Some(upload_cpu_frame_as_textures(
-                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
-                ))
-            } else {
-                // No CPU fallback — try zero-copy IOSurface → Metal → wgpu import.
-                // IOSurface-backed textures cannot be reliably CPU-mapped.
-                tracing::debug!(
-                    "macOS IOSurface frame: {}x{} fmt={:?}, attempting zero-copy import",
-                    surface.width,
-                    surface.height,
-                    surface.format
-                );
-                match import_macos_iosurface_frame(surface, device) {
-                    Ok(textures) => {
-                        tracing::info!("macOS IOSurface zero-copy import succeeded");
-                        Some(textures)
-                    }
-                    Err(e) => {
-                        tracing::warn!("macOS IOSurface zero-copy import failed: {e}");
-                        None
-                    }
-                }
-            }
-        }
+        DecodedFrame::MacOS(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
 
         #[cfg(target_os = "linux")]
-        DecodedFrame::Linux(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                Some(upload_cpu_frame_as_textures(
-                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
-                ))
-            } else {
-                // No CPU fallback — try zero-copy DMABuf → Vulkan → wgpu import.
-                // DMABuf memory is GPU-only and cannot be CPU-mapped.
-                tracing::debug!(
-                    "Linux DMABuf frame: {}x{} fmt={:?}, {} planes, attempting zero-copy import",
-                    surface.width,
-                    surface.height,
-                    surface.format,
-                    surface.planes.len()
-                );
-                match import_linux_dmabuf_frame(surface, device) {
-                    Ok(textures) => {
-                        tracing::info!("Linux DMABuf zero-copy import succeeded");
-                        Some(textures)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Linux DMABuf zero-copy import failed: {e}");
-                        None
-                    }
-                }
-            }
-        }
+        DecodedFrame::Linux(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
 
         #[cfg(target_os = "android")]
-        DecodedFrame::Android(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                Some(upload_cpu_frame_as_textures(
-                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
-                ))
-            } else {
-                tracing::warn!("Android GPU surface without CPU fallback — frame dropped");
-                None
-            }
-        }
+        DecodedFrame::Android(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
 
         #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-        DecodedFrame::Windows(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                Some(upload_cpu_frame_as_textures(
-                    cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
-                ))
-            } else {
-                tracing::warn!("Windows GPU surface without CPU fallback — frame dropped");
-                None
-            }
-        }
+        DecodedFrame::Windows(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
     }
 }
 
@@ -268,9 +215,11 @@ pub fn decoded_frame_to_textures(
 #[derive(Debug)]
 pub enum NativeFrameIngestionError {
     /// The renderer has no contract for consuming the producer's acquire fence.
-    UnsupportedAcquireSync(Box<NativeFrameLease>),
+    UnsupportedAcquireSync(NativeFrameLease),
     /// External-memory import is not safe until the renderer supplies layout and sync state.
-    UnsupportedDmaBuf(Box<NativeFrameLease>),
+    UnsupportedDmaBuf(NativeFrameLease),
+    /// The direct upload seam intentionally accepts only owned RGBA or NV12 bytes.
+    UnsupportedCpuFormat(NativeFrameLease),
 }
 
 impl std::fmt::Display for NativeFrameIngestionError {
@@ -284,6 +233,10 @@ impl std::fmt::Display for NativeFrameIngestionError {
                 f,
                 "Linux DMABuf import requires renderer-boundary layout and sync support"
             ),
+            Self::UnsupportedCpuFormat(_) => write!(
+                f,
+                "owned CPU ingestion supports only direct RGBA and NV12 uploads"
+            ),
         }
     }
 }
@@ -294,12 +247,18 @@ impl NativeFrameIngestionError {
     /// Returns the unchanged lease so the caller can retry at a boundary that owns synchronization.
     pub fn into_lease(self) -> NativeFrameLease {
         match self {
-            Self::UnsupportedAcquireSync(lease) | Self::UnsupportedDmaBuf(lease) => *lease,
+            Self::UnsupportedAcquireSync(lease)
+            | Self::UnsupportedDmaBuf(lease)
+            | Self::UnsupportedCpuFormat(lease) => lease,
         }
     }
 }
 
 /// Uploads an owned native frame without cloning its CPU planes.
+///
+/// This is the renderer seam for #7 producers. Only owned RGBA and NV12 CPU
+/// leases are accepted until explicit external-memory synchronization exists.
+#[allow(clippy::result_large_err)]
 pub fn native_frame_lease_to_textures(
     lease: NativeFrameLease,
     device: &wgpu::Device,
@@ -308,7 +267,7 @@ pub fn native_frame_lease_to_textures(
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<GpuFrameTextures, NativeFrameIngestionError> {
-    let lease = ensure_native_frame_lease_supported(lease)?;
+    let lease = validate_native_frame_lease(lease)?;
 
     let NativeFrameLease {
         descriptor,
@@ -331,136 +290,31 @@ pub fn native_frame_lease_to_textures(
         )),
         #[cfg(target_os = "linux")]
         NativeMemory::DmaBuf(memory) => Err(NativeFrameIngestionError::UnsupportedDmaBuf(
-            Box::new(NativeFrameLease {
+            NativeFrameLease {
                 descriptor,
                 memory: NativeMemory::DmaBuf(memory),
                 acquire,
-            }),
+            },
         )),
     }
 }
 
-fn ensure_native_frame_lease_supported(
+#[allow(clippy::result_large_err)]
+fn validate_native_frame_lease(
     lease: NativeFrameLease,
 ) -> Result<NativeFrameLease, NativeFrameIngestionError> {
     if !matches!(&lease.acquire, AcquireSync::None) {
-        return Err(NativeFrameIngestionError::UnsupportedAcquireSync(Box::new(
-            lease,
-        )));
+        return Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease));
     }
-    #[cfg(target_os = "linux")]
-    if matches!(&lease.memory, NativeMemory::DmaBuf(_)) {
-        return Err(NativeFrameIngestionError::UnsupportedDmaBuf(Box::new(
-            lease,
-        )));
+    if matches!(&lease.memory, NativeMemory::Cpu(_))
+        && !matches!(
+            lease.descriptor.format,
+            PixelFormat::Rgba | PixelFormat::Nv12
+        )
+    {
+        return Err(NativeFrameIngestionError::UnsupportedCpuFormat(lease));
     }
     Ok(lease)
-}
-
-// ---------------------------------------------------------------------------
-// macOS zero-copy IOSurface → wgpu texture import
-// ---------------------------------------------------------------------------
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn import_macos_iosurface_frame(
-    surface: &lumina_video_native_frame::video::MacOSGpuSurface,
-    device: &wgpu::Device,
-) -> Result<GpuFrameTextures, lumina_video_native_frame::video::VideoError> {
-    // SAFETY: The decoder owns the IOSurface and keeps its CVPixelBuffer owner
-    // alive through `surface`; the import is only attempted for that live frame.
-    let texture = unsafe {
-        crate::zero_copy::macos::import_iosurface(
-            device,
-            surface.io_surface,
-            surface.width,
-            surface.height,
-            wgpu::TextureFormat::Bgra8Unorm,
-        )
-    }
-    .map_err(|e| {
-        lumina_video_native_frame::video::VideoError::DecodeFailed(format!(
-            "IOSurface zero-copy import failed: {e}"
-        ))
-    })?;
-
-    // IOSurface textures are always BGRA8Unorm
-    Ok(GpuFrameTextures::Rgba {
-        texture: std::sync::Arc::new(texture),
-        width: surface.width,
-        height: surface.height,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Linux zero-copy DMABuf → wgpu texture import
-// ---------------------------------------------------------------------------
-
-#[cfg(target_os = "linux")]
-fn import_linux_dmabuf_frame(
-    surface: &lumina_video_native_frame::video::LinuxGpuSurface,
-    device: &wgpu::Device,
-) -> Result<GpuFrameTextures, lumina_video_native_frame::video::VideoError> {
-    use crate::zero_copy::linux::DmaBufHandle;
-    use crate::zero_copy::linux::DmaBufPlaneHandle;
-    use lumina_video_native_frame::video::PixelFormat;
-
-    let plane_handles: Vec<DmaBufPlaneHandle> = surface
-        .planes
-        .iter()
-        .map(|p| DmaBufPlaneHandle {
-            fd: p.fd,
-            offset: p.offset,
-            stride: p.stride,
-            size: p.size,
-        })
-        .collect();
-
-    let dmabuf_handle = DmaBufHandle::new(plane_handles, surface.modifier);
-
-    // SAFETY: The plane descriptors reference the live DMABuf owner retained by
-    // `surface`; the import consumes only the duplicated handles it receives.
-    let textures = unsafe {
-        crate::zero_copy::linux::import_dmabuf_multi_plane(
-            device,
-            dmabuf_handle,
-            surface.width,
-            surface.height,
-            surface.format,
-        )
-    }
-    .map_err(|e| {
-        lumina_video_native_frame::video::VideoError::DecodeFailed(format!(
-            "DMABuf zero-copy import failed: {e}"
-        ))
-    })?;
-
-    match surface.format {
-        PixelFormat::Nv12 => {
-            let mut textures = textures.into_iter();
-            let Some(y_texture) = textures.next() else {
-                return Err(lumina_video_native_frame::video::VideoError::DecodeFailed(
-                    "NV12 import returned insufficient textures".into(),
-                ));
-            };
-            let Some(cb_cr_texture) = textures.next() else {
-                return Err(lumina_video_native_frame::video::VideoError::DecodeFailed(
-                    "NV12 import returned insufficient textures".into(),
-                ));
-            };
-            Ok(GpuFrameTextures::Nv12 {
-                y_texture: std::sync::Arc::new(y_texture),
-                cb_cr_texture: std::sync::Arc::new(cb_cr_texture),
-                width: surface.width,
-                height: surface.height,
-            })
-        }
-        _ => Err(
-            lumina_video_native_frame::video::VideoError::UnsupportedFormat(format!(
-                "Zero-copy import not implemented for {:?} on Linux",
-                surface.format
-            )),
-        ),
-    }
 }
 
 /// Upload a CPU frame to GPU textures, choosing the best path:
@@ -555,49 +409,32 @@ pub fn upload_cpu_frame(
     texture
 }
 
-/// Convert any DecodedFrame to an Arc<wgpu::Texture> (CPU YUV→RGB conversion).
+/// Converts a borrowed CPU `DecodedFrame` to one RGBA texture.
 ///
-/// Prefer [`decoded_frame_to_textures`] for the NV12 native path.
+/// Native GPU surfaces are rejected; this compatibility helper never imports
+/// them or consumes their optional CPU fallback. Prefer
+/// [`decoded_frame_to_textures`] for the GPUI NV12 path.
+#[deprecated(note = "use decoded_frame_to_textures for the legacy CPU boundary")]
 pub fn decoded_frame_to_texture(
     frame: &DecodedFrame,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture_cache: &mut Option<Arc<wgpu::Texture>>,
-) -> Option<Arc<wgpu::Texture>> {
+) -> Result<Arc<wgpu::Texture>, LegacyFrameIngestionError> {
     match frame {
-        DecodedFrame::Cpu(cpu) => Some(upload_cpu_frame(cpu, device, queue, texture_cache)),
+        DecodedFrame::Cpu(cpu) => Ok(upload_cpu_frame(cpu, device, queue, texture_cache)),
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        DecodedFrame::MacOS(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
-            }
-            None
-        }
+        DecodedFrame::MacOS(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
 
         #[cfg(target_os = "linux")]
-        DecodedFrame::Linux(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
-            }
-            None
-        }
+        DecodedFrame::Linux(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
 
         #[cfg(target_os = "android")]
-        DecodedFrame::Android(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
-            }
-            None
-        }
+        DecodedFrame::Android(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
 
         #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-        DecodedFrame::Windows(surface) => {
-            if let Some(ref cpu) = surface.cpu_fallback {
-                return Some(upload_cpu_frame(cpu, device, queue, texture_cache));
-            }
-            None
-        }
+        DecodedFrame::Windows(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
     }
 }
 
@@ -1110,10 +947,12 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
 fn bgra_to_rgba(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for chunk in data.chunks_exact(4) {
-        out.push(chunk[2]);
-        out.push(chunk[1]);
-        out.push(chunk[0]);
-        out.push(chunk[3]);
+        let (Some(&b), Some(&g), Some(&r), Some(&a)) =
+            (chunk.first(), chunk.get(1), chunk.get(2), chunk.get(3))
+        else {
+            continue;
+        };
+        out.extend_from_slice(&[r, g, b, a]);
     }
     out
 }
@@ -1130,11 +969,13 @@ fn rgb24_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     for row in 0..height {
         for col in 0..width {
             let idx = row * stride + col * 3;
-            if idx + 2 < data.len() {
-                out.push(data[idx]); // R
-                out.push(data[idx + 1]); // G
-                out.push(data[idx + 2]); // B
-                out.push(255); // A
+            if let Some(pixel) = data.get(idx..idx.saturating_add(3)) {
+                let (Some(&r), Some(&g), Some(&b)) = (pixel.first(), pixel.get(1), pixel.get(2))
+                else {
+                    out.extend_from_slice(&[0, 0, 0, 255]);
+                    continue;
+                };
+                out.extend_from_slice(&[r, g, b, 255]);
             } else {
                 out.extend_from_slice(&[0, 0, 0, 255]);
             }
@@ -1166,10 +1007,9 @@ fn yuv420p_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
             let v_value = v_plane.get(uv_idx).copied().unwrap_or(128);
             let (r, g, b) = yuv_to_rgb(y_value, u_value, v_value);
             let out_idx = idx * 4;
-            rgba[out_idx] = r;
-            rgba[out_idx + 1] = g;
-            rgba[out_idx + 2] = b;
-            rgba[out_idx + 3] = 255;
+            if let Some(pixel) = rgba.get_mut(out_idx..out_idx.saturating_add(4)) {
+                pixel.copy_from_slice(&[r, g, b, 255]);
+            }
         }
     }
     rgba
@@ -1195,10 +1035,9 @@ fn nv12_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
             let v_value = uv_plane.get(uv_idx + 1).copied().unwrap_or(128);
             let (r, g, b) = yuv_to_rgb(y_value, u_value, v_value);
             let out_idx = idx * 4;
-            rgba[out_idx] = r;
-            rgba[out_idx + 1] = g;
-            rgba[out_idx + 2] = b;
-            rgba[out_idx + 3] = 255;
+            if let Some(pixel) = rgba.get_mut(out_idx..out_idx.saturating_add(4)) {
+                pixel.copy_from_slice(&[r, g, b, 255]);
+            }
         }
     }
     rgba
@@ -1265,7 +1104,7 @@ mod tests {
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(bytes, 4)])),
             AcquireSync::None,
         )?;
-        let lease = ensure_native_frame_lease_supported(lease)?;
+        let lease = validate_native_frame_lease(lease)?;
         let NativeMemory::Cpu(memory) = lease.memory else {
             return Err("expected CPU memory".into());
         };
@@ -1298,11 +1137,55 @@ mod tests {
                 OwnedFd::from_raw_fd(fd)
             }),
         )?;
-        let error = ensure_native_frame_lease_supported(lease)
+        let error = validate_native_frame_lease(lease)
             .err()
             .ok_or("accepted sync file")?;
+        assert!(matches!(
+            &error,
+            NativeFrameIngestionError::UnsupportedAcquireSync(_)
+        ));
         let returned = error.into_lease();
-        assert!(matches!(returned.acquire, AcquireSync::SyncFile(_)));
+        let AcquireSync::SyncFile(fd) = returned.acquire else {
+            return Err("sync file was not returned".into());
+        };
+        assert!(File::from(fd).metadata().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_owned_cpu_formats_return_the_lease() -> Result<(), Box<dyn std::error::Error>> {
+        for format in [PixelFormat::Yuv420p, PixelFormat::Bgra, PixelFormat::Rgb24] {
+            let first_bytes = vec![1, 2, 3, 4];
+            let first_bytes_ptr = first_bytes.as_ptr();
+            let mut planes = vec![CpuPlane::new(first_bytes, 4)];
+            planes.extend((1..format.num_planes()).map(|_| CpuPlane::new(vec![0; 4], 4)));
+            let lease = NativeFrameLease::new(
+                NativeFrameDescriptor {
+                    frame_id: 3,
+                    stream_generation: 1,
+                    pts: Duration::ZERO,
+                    duration: None,
+                    extent: FrameExtent::new(1, 1),
+                    format,
+                },
+                NativeMemory::Cpu(CpuMemory::new(planes)),
+                AcquireSync::None,
+            )?;
+            let error = validate_native_frame_lease(lease)
+                .err()
+                .ok_or("accepted unsupported CPU format")?;
+            assert!(matches!(
+                &error,
+                NativeFrameIngestionError::UnsupportedCpuFormat(_)
+            ));
+            let returned = error.into_lease();
+            assert_eq!(returned.descriptor.format, format);
+            let NativeMemory::Cpu(memory) = returned.memory else {
+                return Err("expected CPU memory".into());
+            };
+            let first_plane = memory.planes.first().ok_or("missing CPU plane")?;
+            assert_eq!(first_plane.bytes.as_ptr(), first_bytes_ptr);
+        }
         Ok(())
     }
 }
