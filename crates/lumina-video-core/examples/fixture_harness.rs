@@ -29,8 +29,7 @@ fn source_url(input: &str) -> Result<String, io::Error> {
 fn open_player(source: &str) -> Result<CorePlayer, VideoError> {
     let decoder = ZeroCopyGStreamerDecoder::open(source)?;
     println!(
-        "backend=ZeroCopyGStreamerDecoder hw_accel={:?} native_audio={} dimensions={:?}",
-        decoder.hw_accel_type(),
+        "backend=ZeroCopyGStreamerDecoder native_audio={} dimensions={:?}",
         decoder.handles_audio_internally(),
         decoder.dimensions()
     );
@@ -52,7 +51,7 @@ fn wait_for_initialization(player: &mut CorePlayer) -> Result<(), io::Error> {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "decoder initialization timed out",
+                "media session initialization timed out",
             ));
         }
         thread::sleep(Duration::from_millis(10));
@@ -60,9 +59,9 @@ fn wait_for_initialization(player: &mut CorePlayer) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn realization(frame: &DecodedFrame) -> &'static str {
+fn frame_storage(frame: &DecodedFrame) -> &'static str {
     if frame.as_cpu().is_some() {
-        "cpu"
+        "system-memory"
     } else if frame.is_gpu_surface() {
         "native-surface"
     } else {
@@ -88,6 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(error.into());
         }
     };
+    player.init_decoder();
     wait_for_initialization(&mut player)?;
 
     if let VideoState::Error(error) = player.state() {
@@ -122,13 +122,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(frame) = player.poll_frame() {
             let (width, height) = frame.dimensions();
             println!(
-                "frame={} pts={:?} dimensions={}x{} format={:?} realization={} full_frame_realization=unavailable",
+                "frame={} pts={:?} dimensions={}x{} format={:?} frame_storage={} frame_realization=unavailable",
                 frames_seen,
                 frame.pts,
                 width,
                 height,
                 frame.frame.format(),
-                realization(&frame.frame)
+                frame_storage(&frame.frame)
             );
             frames_seen += 1;
         } else if player.is_eos() {
