@@ -166,6 +166,8 @@ fn linux_playback_route(url: &str) -> LinuxPlaybackRoute {
 /// element.
 pub struct GpuiVideoPlayer {
     #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    background_executor: BackgroundExecutor,
+    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
     core: Option<CorePlayer>,
     #[cfg(target_os = "linux")]
     session: Option<GstMediaSession>,
@@ -211,12 +213,16 @@ impl GpuiVideoPlayer {
     // Constructors
     // -----------------------------------------------------------------------
 
-    pub fn new(url: impl Into<String>) -> Self {
-        Self::with_config(url, GpuiVideoPlayerConfig::default())
+    pub fn new(url: impl Into<String>, cx: &App) -> Self {
+        Self::with_config(url, GpuiVideoPlayerConfig::default(), cx)
     }
 
-    pub fn with_config(url: impl Into<String>, config: GpuiVideoPlayerConfig) -> Self {
+    pub fn with_config(url: impl Into<String>, config: GpuiVideoPlayerConfig, cx: &App) -> Self {
         let url = url.into();
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        let background_executor = cx.background_executor().clone();
+        #[cfg(all(target_os = "linux", not(feature = "moq")))]
+        let _ = cx;
         #[cfg(target_os = "linux")]
         let route = linux_playback_route(&url);
         #[cfg(not(target_os = "linux"))]
@@ -244,6 +250,8 @@ impl GpuiVideoPlayer {
         let volume = config.volume;
         #[allow(unused_mut)]
         let mut player = Self {
+            #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+            background_executor,
             #[cfg(any(not(target_os = "linux"), feature = "moq"))]
             core,
             #[cfg(target_os = "linux")]
@@ -288,7 +296,7 @@ impl GpuiVideoPlayer {
 
     /// Asynchronously replaces the current source while retaining the last
     /// uploaded GPU texture until the new session presents a frame.
-    pub fn open(&mut self, url: impl Into<String>, cx: &App) {
+    pub fn open(&mut self, url: impl Into<String>, _cx: &App) {
         let url = url.into();
         #[cfg(target_os = "linux")]
         let next_generation = self
@@ -303,10 +311,10 @@ impl GpuiVideoPlayer {
         let old_core = self.core.take();
         #[cfg(any(not(target_os = "linux"), feature = "moq"))]
         if let Some(old_core) = old_core {
-            cx.background_spawn(async move { drop(old_core) }).detach();
+            self.background_executor
+                .spawn(async move { drop(old_core) })
+                .detach();
         }
-        #[cfg(all(target_os = "linux", not(feature = "moq")))]
-        let _ = cx;
         #[cfg(target_os = "linux")]
         let old_session = self.session.take();
         #[cfg(target_os = "linux")]
@@ -1239,6 +1247,17 @@ impl GpuiVideoPlayer {
                     "Preview rejected borrowed native GPU surface; keeping previous texture"
                 );
             }
+        }
+    }
+}
+
+impl Drop for GpuiVideoPlayer {
+    fn drop(&mut self) {
+        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        if let Some(core) = self.core.take() {
+            self.background_executor
+                .spawn(async move { drop(core) })
+                .detach();
         }
     }
 }

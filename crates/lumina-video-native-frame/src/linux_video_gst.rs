@@ -164,6 +164,7 @@ pub const DEFAULT_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug)]
 pub struct GstLifecycleControl {
     cancelled: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
     deadline: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
@@ -172,6 +173,7 @@ impl GstLifecycleControl {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
             deadline: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -179,16 +181,30 @@ impl GstLifecycleControl {
     /// Requests cancellation and records the one absolute cleanup deadline.
     pub fn cancel(&self, timeout: Duration) {
         let now = Instant::now();
-        let deadline = now.checked_add(timeout).unwrap_or(now);
+        let requested_deadline = now.checked_add(timeout).unwrap_or(now);
         if let Ok(mut shared_deadline) = self.deadline.lock() {
-            *shared_deadline = Some(deadline);
+            *shared_deadline = Some(match *shared_deadline {
+                Some(existing) if existing <= requested_deadline => existing,
+                _ => requested_deadline,
+            });
         }
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Requests worker-side Stop while also bypassing the command FIFO.
+    pub fn request_stop(&self, timeout: Duration) {
+        self.stop_requested.store(true, Ordering::Release);
+        self.cancel(timeout);
     }
 
     /// Returns whether the owning session has been dropped or replaced.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Returns whether cancellation was requested by an explicit Stop command.
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
     }
 
     /// Returns the absolute deadline established by [`Self::cancel`].
@@ -252,6 +268,14 @@ pub struct GStreamerDecoder {
 }
 
 impl GStreamerDecoder {
+    fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+        match (first, second) {
+            (Some(first), Some(second)) => Some(if first <= second { first } else { second }),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+    }
+
     fn cleanup_pipeline(pipeline: &gst::Pipeline, deadline: Instant) {
         let _ = pipeline.set_state(gst::State::Null);
         let remaining = deadline
@@ -696,18 +720,22 @@ impl GStreamerDecoder {
 
     /// Stops the pipeline with the configured worker-side deadline.
     pub fn shutdown(&mut self) {
-        let deadline = self
-            .lifecycle_control
-            .deadline()
-            .or(self.active_operation_deadline)
-            .unwrap_or_else(|| self.deadline_for());
+        let deadline = Self::earliest_deadline(
+            self.lifecycle_control.deadline(),
+            self.active_operation_deadline,
+        )
+        .unwrap_or_else(|| self.deadline_for());
         self.cleanup_with_deadline(deadline);
     }
 
     /// Stops the pipeline without extending an already-started teardown
     /// deadline.
     pub fn shutdown_with_deadline(&mut self, deadline: Option<Instant>) {
-        let deadline = deadline.unwrap_or_else(|| self.deadline_for());
+        let deadline = Self::earliest_deadline(
+            self.lifecycle_control.deadline(),
+            Self::earliest_deadline(deadline, self.active_operation_deadline),
+        )
+        .unwrap_or_else(|| self.deadline_for());
         self.cleanup_with_deadline(deadline);
     }
 
@@ -1974,7 +2002,7 @@ impl VideoDecoderBackend for GStreamerDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::GstLifecycleControl;
+    use super::{GStreamerDecoder, GstLifecycleControl};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1991,5 +2019,20 @@ mod tests {
         };
         assert!(deadline >= before);
         assert!(deadline <= before + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cleanup_deadline_uses_the_earlier_lifecycle_or_operation_deadline() {
+        let now = Instant::now();
+        let lifecycle = now + Duration::from_millis(10);
+        let operation = now + Duration::from_millis(100);
+        assert_eq!(
+            GStreamerDecoder::earliest_deadline(Some(lifecycle), Some(operation)),
+            Some(lifecycle)
+        );
+        assert_eq!(
+            GStreamerDecoder::earliest_deadline(Some(operation), Some(lifecycle)),
+            Some(lifecycle)
+        );
     }
 }

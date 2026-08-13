@@ -18,7 +18,8 @@ lumina-video-gpui = { git = "https://github.com/lumina-video/lumina-video" }
 ```rust
 use lumina_video_gpui::GpuiVideoPlayer;
 
-let player = GpuiVideoPlayer::new("https://example.com/video.mp4")
+// `cx` is the current GPUI `&App` context.
+let player = GpuiVideoPlayer::new("https://example.com/video.mp4", cx)
     .with_autoplay(true);
 ```
 

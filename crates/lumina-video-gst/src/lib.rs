@@ -7,7 +7,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -31,12 +30,11 @@ use lumina_video_native_frame::{
     into_cpu_planes, AcquireSync, CpuMemory, FrameExtent, NativeFrameDescriptor, NativeFrameLease,
     NativeMemory,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use url::Url;
 
 /// The session's decode-to-presentation mailbox holds only the newest frame.
 pub const FRAME_QUEUE_CAPACITY: usize = 1;
-const CONTROL_QUEUE_CAPACITY: usize = 32;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 
 pub type Frame = NativeFrameLease;
@@ -49,46 +47,47 @@ struct SequencedEvent {
     event: Event,
 }
 
-/// Bounded worker-to-session control events. State updates are replaceable;
-/// metadata, errors, and terminal events stay ahead of state pressure.
+const CONTROL_ESSENTIAL_CAPACITY: usize = 8;
+
+/// The reliable worker-to-session lane. Its capacity covers one lifecycle
+/// path (metadata, ready, one diagnostic/terminal transition) without allowing
+/// transient playback states to evict terminal events.
 #[derive(Clone)]
-struct ControlMailbox {
-    queue: Arc<Mutex<VecDeque<SequencedEvent>>>,
+struct ControlSender {
+    essential: Sender<SequencedEvent>,
+    transient: Sender<SequencedEvent>,
+    transient_drop: Receiver<SequencedEvent>,
 }
 
-impl ControlMailbox {
-    fn new() -> Self {
-        Self {
-            queue: Arc::new(Mutex::new(VecDeque::with_capacity(CONTROL_QUEUE_CAPACITY))),
-        }
-    }
+struct ControlReceiver {
+    essential: Receiver<SequencedEvent>,
+    transient: Receiver<SequencedEvent>,
+}
 
-    fn push(&self, event: SequencedEvent) -> bool {
-        let mut queue = self.queue.lock();
-        if queue.len() >= CONTROL_QUEUE_CAPACITY {
-            if let Some(index) = queue
-                .iter()
-                .position(|queued| matches!(queued.event, SessionEvent::StateChanged { .. }))
-            {
-                let _ = queue.remove(index);
-            } else if matches!(event.event, SessionEvent::StateChanged { .. }) {
-                // All slots are terminal/diagnostic events. Keep those and
-                // rely on the snapshot for this redundant state update.
-                return true;
-            } else {
-                // A worker normally emits at most one metadata/error/ended
-                // event per terminal path. If a caller violates that
-                // assumption, keep the mailbox bounded and keep the worker
-                // alive rather than turning Full into a worker failure.
-                return true;
-            }
-        }
-        queue.push_back(event);
-        true
-    }
+fn control_channels() -> (ControlSender, ControlReceiver) {
+    let (essential, essential_receiver) = crossbeam_channel::bounded(CONTROL_ESSENTIAL_CAPACITY);
+    let (transient, transient_receiver) = crossbeam_channel::bounded(1);
+    (
+        ControlSender {
+            essential,
+            transient,
+            transient_drop: transient_receiver.clone(),
+        },
+        ControlReceiver {
+            essential: essential_receiver,
+            transient: transient_receiver,
+        },
+    )
+}
 
-    fn try_recv(&self) -> Option<SequencedEvent> {
-        self.queue.lock().pop_front()
+fn is_essential_control(event: &Event) -> bool {
+    match event {
+        SessionEvent::Metadata { .. } | SessionEvent::Error(_) | SessionEvent::Ended => true,
+        SessionEvent::StateChanged { state } => matches!(
+            state,
+            SessionState::Ready | SessionState::Ended | SessionState::Error(_)
+        ),
+        SessionEvent::Frame { .. } => false,
     }
 }
 
@@ -251,8 +250,33 @@ fn owned_cpu_lease(
     .map_err(|error| SessionError::Decode(error.to_string()))
 }
 
-fn send_control(mailbox: &ControlMailbox, event: SequencedEvent) -> bool {
-    mailbox.push(event)
+fn send_control(sender: &ControlSender, event: SequencedEvent) -> bool {
+    if is_essential_control(&event.event) {
+        return match sender.essential.try_send(event) {
+            Ok(()) => true,
+            // Keep the worker alive under pressure; the reliable lane still
+            // retains its queued metadata/terminal events and the snapshot
+            // was updated before this send.
+            Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        };
+    }
+
+    let mut event = event;
+    loop {
+        match sender.transient.try_send(event) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(next)) => {
+                event = next;
+                match sender.transient_drop.try_recv() {
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => thread::yield_now(),
+                    Err(TryRecvError::Disconnected) => return false,
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
 }
 
 fn send_frame(
@@ -283,7 +307,7 @@ fn send_frame(
 
 fn publish_state(
     state: &Arc<SnapshotState>,
-    control_sender: &ControlMailbox,
+    control_sender: &ControlSender,
     sequence: &mut u64,
     next_state: SessionState,
 ) -> bool {
@@ -303,7 +327,7 @@ fn publish_state(
 
 fn publish_error(
     state: &Arc<SnapshotState>,
-    control_sender: &ControlMailbox,
+    control_sender: &ControlSender,
     sequence: &mut u64,
     error: SessionError,
 ) -> bool {
@@ -334,7 +358,7 @@ fn process_command(
     playback: &mut PlaybackState,
     audio_handle: &AudioHandle,
     state: &Arc<SnapshotState>,
-    control_sender: &ControlMailbox,
+    control_sender: &ControlSender,
     sequence: &mut u64,
 ) -> bool {
     match command {
@@ -451,7 +475,7 @@ fn process_command(
 
 struct WorkerIo {
     commands: Receiver<SessionCommand>,
-    control_sender: ControlMailbox,
+    control_sender: ControlSender,
     frame_sender: Sender<SequencedEvent>,
     frame_drop_receiver: Receiver<SequencedEvent>,
     state: Arc<SnapshotState>,
@@ -472,11 +496,22 @@ fn shutdown_worker(decoder: &mut GStreamerDecoder, lifecycle: &GstLifecycleContr
     }
 }
 
+fn publish_ended(state: &Arc<SnapshotState>, control_sender: &ControlSender, sequence: &mut u64) {
+    let _ = publish_state(state, control_sender, sequence, SessionState::Ended);
+    let _ = send_control(
+        control_sender,
+        SequencedEvent {
+            sequence: *sequence,
+            event: SessionEvent::Ended,
+        },
+    );
+}
+
 fn lifecycle_cancelled(lifecycle: &GstLifecycleControl) -> bool {
     lifecycle.is_cancelled()
 }
 
-fn seed_worker_spawn_failure(state: &Arc<SnapshotState>, control_sender: &ControlMailbox) {
+fn seed_worker_spawn_failure(state: &Arc<SnapshotState>, control_sender: &ControlSender) {
     let mut sequence = 0_u64;
     let _ = publish_error(
         state,
@@ -506,12 +541,17 @@ fn run_worker(
     } = io;
     let mut sequence = 0_u64;
     if lifecycle_cancelled(&lifecycle_control) {
+        if lifecycle_control.is_stop_requested() {
+            publish_ended(&state, &control_sender, &mut sequence);
+        }
         return;
     }
     let source = match local_source_url(&source) {
         Ok(source) => source,
         Err(error) => {
-            if !lifecycle_cancelled(&lifecycle_control) {
+            if lifecycle_control.is_stop_requested() {
+                publish_ended(&state, &control_sender, &mut sequence);
+            } else if !lifecycle_cancelled(&lifecycle_control) {
                 let _ = publish_error(&state, &control_sender, &mut sequence, error);
             }
             return;
@@ -526,7 +566,9 @@ fn run_worker(
         ) {
             Ok(decoder) => decoder,
             Err(error) => {
-                if !lifecycle_cancelled(&lifecycle_control) {
+                if lifecycle_control.is_stop_requested() {
+                    publish_ended(&state, &control_sender, &mut sequence);
+                } else if !lifecycle_cancelled(&lifecycle_control) {
                     let _ =
                         publish_error(&state, &control_sender, &mut sequence, session_error(error));
                 }
@@ -534,13 +576,18 @@ fn run_worker(
             }
         };
     if lifecycle_cancelled(&lifecycle_control) {
+        if lifecycle_control.is_stop_requested() {
+            publish_ended(&state, &control_sender, &mut sequence);
+        }
         shutdown_worker(&mut decoder, &lifecycle_control);
         return;
     }
 
     let mut last_applied_audio = None;
     if let Err(error) = sync_audio_controls(&audio_handle, &mut decoder, &mut last_applied_audio) {
-        if !lifecycle_cancelled(&lifecycle_control) {
+        if lifecycle_control.is_stop_requested() {
+            publish_ended(&state, &control_sender, &mut sequence);
+        } else if !lifecycle_cancelled(&lifecycle_control) {
             let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
         }
         shutdown_worker(&mut decoder, &lifecycle_control);
@@ -591,7 +638,9 @@ fn run_worker(
                 }
             }
             Err(error) => {
-                if !lifecycle_cancelled(&lifecycle_control) {
+                if lifecycle_control.is_stop_requested() {
+                    publish_ended(&state, &control_sender, &mut sequence);
+                } else if !lifecycle_cancelled(&lifecycle_control) {
                     let _ =
                         publish_error(&state, &control_sender, &mut sequence, session_error(error));
                 }
@@ -603,6 +652,9 @@ fn run_worker(
 
     loop {
         if lifecycle_cancelled(&lifecycle_control) {
+            if lifecycle_control.is_stop_requested() {
+                publish_ended(&state, &control_sender, &mut sequence);
+            }
             shutdown_worker(&mut decoder, &lifecycle_control);
             return;
         }
@@ -624,6 +676,9 @@ fn run_worker(
             }
         }
         if lifecycle_cancelled(&lifecycle_control) {
+            if lifecycle_control.is_stop_requested() {
+                publish_ended(&state, &control_sender, &mut sequence);
+            }
             shutdown_worker(&mut decoder, &lifecycle_control);
             return;
         }
@@ -631,7 +686,9 @@ fn run_worker(
         if let Err(error) =
             sync_audio_controls(&audio_handle, &mut decoder, &mut last_applied_audio)
         {
-            if !lifecycle_cancelled(&lifecycle_control) {
+            if lifecycle_control.is_stop_requested() {
+                publish_ended(&state, &control_sender, &mut sequence);
+            } else if !lifecycle_cancelled(&lifecycle_control) {
                 let _ = publish_error(&state, &control_sender, &mut sequence, session_error(error));
             }
             shutdown_worker(&mut decoder, &lifecycle_control);
@@ -667,6 +724,9 @@ fn run_worker(
         match decoder.decode_next() {
             Ok(Some(frame)) => {
                 if lifecycle_cancelled(&lifecycle_control) {
+                    if lifecycle_control.is_stop_requested() {
+                        publish_ended(&state, &control_sender, &mut sequence);
+                    }
                     shutdown_worker(&mut decoder, &lifecycle_control);
                     return;
                 }
@@ -683,7 +743,9 @@ fn run_worker(
                 ) {
                     Ok(lease) => lease,
                     Err(error) => {
-                        if !lifecycle_cancelled(&lifecycle_control) {
+                        if lifecycle_control.is_stop_requested() {
+                            publish_ended(&state, &control_sender, &mut sequence);
+                        } else if !lifecycle_cancelled(&lifecycle_control) {
                             let _ = publish_error(&state, &control_sender, &mut sequence, error);
                         }
                         shutdown_worker(&mut decoder, &lifecycle_control);
@@ -728,7 +790,9 @@ fn run_worker(
             }
             Ok(None) => {}
             Err(error) => {
-                if !lifecycle_cancelled(&lifecycle_control) {
+                if lifecycle_control.is_stop_requested() {
+                    publish_ended(&state, &control_sender, &mut sequence);
+                } else if !lifecycle_cancelled(&lifecycle_control) {
                     let _ =
                         publish_error(&state, &control_sender, &mut sequence, session_error(error));
                 }
@@ -742,12 +806,14 @@ fn run_worker(
 /// A Linux GStreamer media session with bounded, nonblocking UI interaction.
 pub struct GstMediaSession {
     commands: Sender<SessionCommand>,
-    control_receiver: ControlMailbox,
+    command_drop_receiver: Receiver<SessionCommand>,
+    control_receiver: ControlReceiver,
+    pending_essential: Option<SequencedEvent>,
+    pending_transient: Option<SequencedEvent>,
     frame_receiver: Receiver<SequencedEvent>,
     state: Arc<SnapshotState>,
     audio_handle: AudioHandle,
     dropped_frames: Arc<AtomicU64>,
-    pending_control: Option<SequencedEvent>,
     pending_frame: Option<SequencedEvent>,
     has_presented_frame: bool,
     worker: Option<JoinHandle<()>>,
@@ -808,7 +874,8 @@ impl GstMediaSession {
     ) -> Self {
         let source = source.into();
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let control_mailbox = ControlMailbox::new();
+        let command_drop_receiver = command_receiver.clone();
+        let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let frame_drop_receiver = frame_receiver.clone();
         let state = Arc::new(SnapshotState::new());
@@ -819,8 +886,8 @@ impl GstMediaSession {
         let worker_dropped_frames = Arc::clone(&dropped_frames);
         let worker_audio_handle = audio_handle.clone();
         let worker_lifecycle_control = lifecycle_control.clone();
-        let spawn_failure_sender = control_mailbox.clone();
-        let worker_control_sender = control_mailbox.clone();
+        let spawn_failure_sender = control_sender.clone();
+        let worker_control_sender = control_sender;
         let worker = thread::Builder::new()
             .name("lumina-gst-session".into())
             .spawn(move || {
@@ -850,12 +917,14 @@ impl GstMediaSession {
 
         Self {
             commands,
-            control_receiver: control_mailbox,
+            command_drop_receiver,
+            control_receiver,
+            pending_essential: None,
+            pending_transient: None,
             frame_receiver,
             state,
             audio_handle,
             dropped_frames,
-            pending_control: None,
             pending_frame: None,
             has_presented_frame: false,
             worker,
@@ -912,9 +981,14 @@ impl GstMediaSession {
     }
 
     fn fill_pending(&mut self) {
-        if self.pending_control.is_none() {
-            if let Some(event) = self.control_receiver.try_recv() {
-                self.pending_control = Some(event);
+        if self.pending_essential.is_none() {
+            if let Ok(event) = self.control_receiver.essential.try_recv() {
+                self.pending_essential = Some(event);
+            }
+        }
+        if self.pending_transient.is_none() {
+            if let Ok(event) = self.control_receiver.transient.try_recv() {
+                self.pending_transient = Some(event);
             }
         }
         loop {
@@ -958,6 +1032,31 @@ impl GstMediaSession {
     }
 }
 
+fn enqueue_latest_command(
+    commands: &Sender<SessionCommand>,
+    command_drop_receiver: &Receiver<SessionCommand>,
+    mut command: SessionCommand,
+) -> Result<(), SessionError> {
+    loop {
+        match commands.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(next)) => {
+                command = next;
+                match command_drop_receiver.try_recv() {
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => thread::yield_now(),
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(SessionError::Fatal("session worker stopped".into()))
+                    }
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(SessionError::Fatal("session worker stopped".into()))
+            }
+        }
+    }
+}
+
 impl MediaSession for GstMediaSession {
     type Frame = Frame;
 
@@ -982,18 +1081,18 @@ impl MediaSession for GstMediaSession {
             }
             return Ok(());
         }
+        if matches!(&command, SessionCommand::Stop) {
+            // Stop must wake opening/decoding workers even when the command
+            // FIFO is full. The FIFO send below is only a best-effort wake.
+            self.lifecycle_control.request_stop(self.lifecycle_timeout);
+            let _ = self.commands.try_send(command);
+            return Ok(());
+        }
         let is_seek = matches!(&command, SessionCommand::Seek { .. });
         let is_play = matches!(&command, SessionCommand::Play);
         let was_ended = matches!(self.snapshot().state, SessionState::Ended);
         let is_replay = is_play && was_ended && !self.replay_pending;
-        self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => SessionError::InvalidCommand("command queue full".into()),
-                TrySendError::Disconnected(_) => {
-                    SessionError::Fatal("session worker stopped".into())
-                }
-            })?;
+        enqueue_latest_command(&self.commands, &self.command_drop_receiver, command)?;
         if is_seek {
             self.stream_generation = self.stream_generation.saturating_add(1);
             self.replay_pending = was_ended;
@@ -1008,14 +1107,25 @@ impl MediaSession for GstMediaSession {
 
     fn try_next_event(&mut self) -> Result<Option<Event>, SessionError> {
         self.fill_pending();
-        let next = match (&self.pending_control, &self.pending_frame) {
-            (None, None) => None,
-            (Some(_), None) => self.pending_control.take(),
-            (None, Some(_)) => self.pending_frame.take(),
-            (Some(control), Some(frame)) if control.sequence <= frame.sequence => {
-                self.pending_control.take()
+        let mut source: Option<(u64, u8)> = None;
+        if let Some(event) = self.pending_essential.as_ref() {
+            source = Some((event.sequence, 0));
+        }
+        if let Some(event) = self.pending_transient.as_ref() {
+            if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
+                source = Some((event.sequence, 1));
             }
-            (Some(_), Some(_)) => self.pending_frame.take(),
+        }
+        if let Some(event) = self.pending_frame.as_ref() {
+            if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
+                source = Some((event.sequence, 2));
+            }
+        }
+        let next = match source.map(|(_, kind)| kind) {
+            Some(0) => self.pending_essential.take(),
+            Some(1) => self.pending_transient.take(),
+            Some(2) => self.pending_frame.take(),
+            _ => None,
         };
         if let Some(event) = next {
             return Ok(Some(event.event));
@@ -1121,20 +1231,23 @@ mod tests {
 
     #[test]
     fn pending_frame_refresh_keeps_latest_after_control_event() {
-        let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let control_mailbox = ControlMailbox::new();
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let state = Arc::new(SnapshotState::new());
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
         let mut session = GstMediaSession {
             commands,
-            control_receiver: control_mailbox.clone(),
+            command_drop_receiver,
+            control_receiver,
             frame_receiver,
             state,
             audio_handle,
             dropped_frames: Arc::clone(&dropped_frames),
-            pending_control: None,
+            pending_essential: None,
+            pending_transient: None,
             pending_frame: None,
             has_presented_frame: false,
             worker: None,
@@ -1156,12 +1269,15 @@ mod tests {
             .is_ok());
         session.fill_pending();
 
-        assert!(control_mailbox.push(SequencedEvent {
-            sequence: 0,
-            event: SessionEvent::StateChanged {
-                state: SessionState::Ready,
-            },
-        }));
+        assert!(send_control(
+            &control_sender,
+            SequencedEvent {
+                sequence: 0,
+                event: SessionEvent::StateChanged {
+                    state: SessionState::Ready,
+                },
+            }
+        ));
         assert!(frame_sender
             .send(SequencedEvent {
                 sequence: 2,
@@ -1200,17 +1316,20 @@ mod tests {
 
     #[test]
     fn stale_frames_are_dropped_after_generation_advance() {
-        let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let control_mailbox = ControlMailbox::new();
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (_control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
-            control_receiver: control_mailbox,
+            command_drop_receiver,
+            control_receiver,
             frame_receiver,
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_control: None,
+            pending_essential: None,
+            pending_transient: None,
             pending_frame: None,
             has_presented_frame: false,
             worker: None,
@@ -1251,17 +1370,20 @@ mod tests {
 
     #[test]
     fn queued_seek_advances_generation_without_waiting_for_worker() {
-        let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let control_mailbox = ControlMailbox::new();
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (_control_sender, control_receiver) = control_channels();
         let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
-            control_receiver: control_mailbox,
+            command_drop_receiver,
+            control_receiver,
             frame_receiver,
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_control: None,
+            pending_essential: None,
+            pending_transient: None,
             pending_frame: None,
             has_presented_frame: false,
             worker: None,
@@ -1282,19 +1404,22 @@ mod tests {
 
     #[test]
     fn duplicate_play_while_ended_keeps_one_replay_generation_pending() {
-        let (commands, _command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
-        let control_mailbox = ControlMailbox::new();
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (_control_sender, control_receiver) = control_channels();
         let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let state = Arc::new(SnapshotState::new());
         state.snapshot.write().state = SessionState::Ended;
         let mut session = GstMediaSession {
             commands,
-            control_receiver: control_mailbox,
+            command_drop_receiver,
+            control_receiver,
             frame_receiver,
             state,
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_control: None,
+            pending_essential: None,
+            pending_transient: None,
             pending_frame: None,
             has_presented_frame: false,
             worker: None,
@@ -1315,55 +1440,153 @@ mod tests {
     }
 
     #[test]
-    fn control_mailbox_coalesces_state_pressure_and_keeps_terminal_events() {
-        let mailbox = ControlMailbox::new();
-        for sequence in 0..CONTROL_QUEUE_CAPACITY {
-            assert!(mailbox.push(SequencedEvent {
-                sequence: sequence as u64,
-                event: SessionEvent::StateChanged {
-                    state: SessionState::Ready,
-                },
-            }));
+    fn full_command_queue_drops_oldest_and_keeps_latest_command() {
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (_control_sender, control_receiver) = control_channels();
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            assert!(commands.send(SessionCommand::Pause).is_ok());
         }
-        assert!(mailbox.push(SequencedEvent {
-            sequence: CONTROL_QUEUE_CAPACITY as u64,
-            event: SessionEvent::StateChanged {
-                state: SessionState::Playing {
-                    position: Duration::from_millis(750),
+        let mut session = GstMediaSession {
+            commands,
+            command_drop_receiver,
+            control_receiver,
+            pending_essential: None,
+            pending_transient: None,
+            frame_receiver: crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY).1,
+            state: Arc::new(SnapshotState::new()),
+            audio_handle: AudioHandle::new(),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            pending_frame: None,
+            has_presented_frame: false,
+            worker: None,
+            worker_disconnected: false,
+            lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
+            lifecycle_control: GstLifecycleControl::new(),
+            stream_generation: 0,
+            replay_pending: false,
+        };
+
+        assert!(session
+            .command(SessionCommand::Seek {
+                position: Duration::from_millis(750),
+            })
+            .is_ok());
+        let mut queued = Vec::new();
+        while let Ok(command) = command_receiver.try_recv() {
+            queued.push(command);
+        }
+        assert_eq!(queued.len(), COMMAND_QUEUE_CAPACITY);
+        assert!(
+            matches!(queued.last(), Some(SessionCommand::Seek { position }) if *position == Duration::from_millis(750))
+        );
+    }
+
+    #[test]
+    fn stop_cancels_without_waiting_for_a_full_command_queue() {
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (_control_sender, control_receiver) = control_channels();
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            assert!(commands.send(SessionCommand::Pause).is_ok());
+        }
+        let lifecycle_control = GstLifecycleControl::new();
+        let mut session = GstMediaSession {
+            commands,
+            command_drop_receiver,
+            control_receiver,
+            pending_essential: None,
+            pending_transient: None,
+            frame_receiver: crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY).1,
+            state: Arc::new(SnapshotState::new()),
+            audio_handle: AudioHandle::new(),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            pending_frame: None,
+            has_presented_frame: false,
+            worker: None,
+            worker_disconnected: false,
+            lifecycle_timeout: Duration::from_secs(2),
+            lifecycle_control: lifecycle_control.clone(),
+            stream_generation: 0,
+            replay_pending: false,
+        };
+
+        assert!(session.command(SessionCommand::Stop).is_ok());
+        assert!(lifecycle_control.is_cancelled());
+        assert!(lifecycle_control.is_stop_requested());
+        assert!(lifecycle_control.deadline().is_some());
+    }
+
+    #[test]
+    fn control_lanes_coalesce_transient_states_and_keep_terminal_events() {
+        let (sender, receiver) = control_channels();
+        for sequence in 0..8_u64 {
+            assert!(send_control(
+                &sender,
+                SequencedEvent {
+                    sequence,
+                    event: SessionEvent::StateChanged {
+                        state: SessionState::Playing {
+                            position: Duration::from_millis(sequence),
+                        },
+                    },
+                }
+            ));
+        }
+        assert!(send_control(
+            &sender,
+            SequencedEvent {
+                sequence: 8,
+                event: SessionEvent::StateChanged {
+                    state: SessionState::Paused {
+                        position: Duration::from_millis(750),
+                    },
                 },
-            },
-        }));
-        assert!(mailbox.push(SequencedEvent {
-            sequence: 100,
-            event: SessionEvent::Metadata {
-                metadata: SessionMetadata {
-                    width: 1,
-                    height: 1,
-                    duration: Some(Duration::from_secs(2)),
-                    frame_rate: 30.0,
-                    codec: "test".into(),
-                    pixel_aspect_ratio: 1.0,
-                    start_time: None,
+            }
+        ));
+        assert!(send_control(
+            &sender,
+            SequencedEvent {
+                sequence: 100,
+                event: SessionEvent::Metadata {
+                    metadata: SessionMetadata {
+                        width: 1,
+                        height: 1,
+                        duration: Some(Duration::from_secs(2)),
+                        frame_rate: 30.0,
+                        codec: "test".into(),
+                        pixel_aspect_ratio: 1.0,
+                        start_time: None,
+                    },
                 },
-            },
-        }));
-        assert!(mailbox.push(SequencedEvent {
-            sequence: 101,
-            event: SessionEvent::Error(SessionError::Open("pressure".into())),
-        }));
-        assert!(mailbox.push(SequencedEvent {
-            sequence: 102,
-            event: SessionEvent::Ended,
-        }));
+            }
+        ));
+        assert!(send_control(
+            &sender,
+            SequencedEvent {
+                sequence: 101,
+                event: SessionEvent::Error(SessionError::Open("pressure".into())),
+            }
+        ));
+        assert!(send_control(
+            &sender,
+            SequencedEvent {
+                sequence: 102,
+                event: SessionEvent::Ended,
+            }
+        ));
 
         let mut events = Vec::new();
-        while let Some(event) = mailbox.try_recv() {
+        while let Ok(event) = receiver.essential.try_recv() {
+            events.push(event.event);
+        }
+        while let Ok(event) = receiver.transient.try_recv() {
             events.push(event.event);
         }
         assert!(events.iter().any(|event| matches!(
             event,
             SessionEvent::StateChanged {
-                state: SessionState::Playing { position }
+                state: SessionState::Paused { position }
             } if *position == Duration::from_millis(750)
         )));
         assert!(events
@@ -1380,17 +1603,17 @@ mod tests {
     #[test]
     fn worker_spawn_failure_is_observable_as_open_error() {
         let state = Arc::new(SnapshotState::new());
-        let mailbox = ControlMailbox::new();
+        let (sender, receiver) = control_channels();
 
-        seed_worker_spawn_failure(&state, &mailbox);
+        seed_worker_spawn_failure(&state, &sender);
 
         assert!(matches!(
             &state.snapshot.read().state,
             SessionState::Error(SessionError::Open(_))
         ));
         assert!(matches!(
-            mailbox.try_recv(),
-            Some(SequencedEvent {
+            receiver.essential.try_recv(),
+            Ok(SequencedEvent {
                 event: SessionEvent::Error(SessionError::Open(_)),
                 ..
             })

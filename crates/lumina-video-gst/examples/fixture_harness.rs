@@ -18,8 +18,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     };
 
-    let mut session =
-        GstMediaSession::new_with_autoplay_and_audio_sink(source, true, GstAudioSinkMode::Fake);
+    let mut session = GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+        source,
+        true,
+        GstAudioSinkMode::Fake,
+        Duration::from_secs(10),
+        0,
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut polls = 0_u32;
     let mut frames = 0_u32;
