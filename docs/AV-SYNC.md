@@ -181,8 +181,8 @@ println!("Quality: {}", snapshot.quality_summary());
 
 ## Baseline Testing Tool
 
-The former facade's `sync_baseline` example was removed with that crate. Use the
-GPUI demo or the package-specific sync-metrics tests when validating playback.
+The legacy `sync_baseline` example is no longer included. Use the GPUI demo or
+the package-specific sync-metrics tests when validating playback.
 
 ## Further Reading
 
