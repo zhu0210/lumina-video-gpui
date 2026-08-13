@@ -1542,10 +1542,18 @@ impl GStreamerDecoder {
                 return Err(VideoError::SeekFailed("Seek preroll timed out".into()));
             }
             let timeout = Self::clock_time(remaining.min(LIFECYCLE_POLL));
-            let sample = self
-                .appsink
-                .try_pull_sample(timeout)
-                .or_else(|| self.appsink.try_pull_preroll(timeout));
+            let sample = self.appsink.try_pull_sample(timeout);
+            let sample = if sample.is_some() {
+                sample
+            } else {
+                let remaining = Self::remaining(deadline);
+                if remaining.is_zero() {
+                    None
+                } else {
+                    self.appsink
+                        .try_pull_preroll(Self::clock_time(remaining.min(LIFECYCLE_POLL)))
+                }
+            };
             let Some(sample) = sample else {
                 continue;
             };
