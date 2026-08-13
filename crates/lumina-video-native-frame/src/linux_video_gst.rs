@@ -21,7 +21,7 @@
 //! `drm-format` field (e.g., `NV12:0x0100000000000002` for Intel X-tile).
 //! This module parses the modifier to ensure correct Vulkan import of tiled buffers.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +37,16 @@ use crate::video::{
 
 use crate::video::{DmaBufPlane, LinuxGpuSurface};
 
+/// Selects the sink used by a GStreamer audio branch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GstAudioSinkMode {
+    /// Use the platform's normal audio sink.
+    #[default]
+    Auto,
+    /// Use a synchronized headless sink for deterministic harnesses.
+    Fake,
+}
+
 /// Shared audio state for GStreamer audio control.
 /// This is used to control volume/mute from the UI thread.
 #[derive(Clone)]
@@ -49,6 +59,8 @@ struct GstAudioHandleInner {
     volume_element: Option<gst::Element>,
     /// Whether audio is available
     has_audio: AtomicBool,
+    /// Number of buffers observed on the connected audio branch.
+    audio_buffers_seen: AtomicU64,
     /// Whether audio is muted
     muted: AtomicBool,
     /// Volume level (0.0 - 1.0)
@@ -62,6 +74,7 @@ impl GstAudioHandle {
             inner: Arc::new(GstAudioHandleInner {
                 volume_element,
                 has_audio: AtomicBool::new(false),
+                audio_buffers_seen: AtomicU64::new(0),
                 muted: AtomicBool::new(false),
                 volume: std::sync::atomic::AtomicU32::new(100), // 100%
             }),
@@ -76,6 +89,17 @@ impl GstAudioHandle {
     /// Returns whether audio is available.
     pub fn has_audio(&self) -> bool {
         self.inner.has_audio.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of buffers observed on the audio branch.
+    pub fn audio_buffers_seen(&self) -> u64 {
+        self.inner.audio_buffers_seen.load(Ordering::Relaxed)
+    }
+
+    fn record_audio_buffer(&self) {
+        self.inner
+            .audio_buffers_seen
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns whether audio is muted.
@@ -171,7 +195,7 @@ pub struct GStreamerDecoder {
 impl GStreamerDecoder {
     /// Creates a new GStreamer decoder for the given URL.
     pub fn new(url: &str) -> Result<Self, VideoError> {
-        Self::new_with_memory_policy(url, false)
+        Self::new_with_memory_policy_and_audio_sink(url, false, GstAudioSinkMode::Auto)
     }
 
     /// Creates a decoder that rejects DMABuf output and returns owned CPU frames.
@@ -180,10 +204,22 @@ impl GStreamerDecoder {
     /// `SystemMemoryUpload`; the one GStreamer buffer-to-CPU extraction is the
     /// ownership hand-off and no second PTS wait or frame copy is introduced.
     pub fn new_system_memory(url: &str) -> Result<Self, VideoError> {
-        Self::new_with_memory_policy(url, true)
+        Self::new_with_memory_policy_and_audio_sink(url, true, GstAudioSinkMode::Auto)
     }
 
-    fn new_with_memory_policy(url: &str, system_memory_only: bool) -> Result<Self, VideoError> {
+    /// Creates a system-memory decoder with an explicit audio sink policy.
+    pub fn new_system_memory_with_audio_sink(
+        url: &str,
+        audio_sink: GstAudioSinkMode,
+    ) -> Result<Self, VideoError> {
+        Self::new_with_memory_policy_and_audio_sink(url, true, audio_sink)
+    }
+
+    fn new_with_memory_policy_and_audio_sink(
+        url: &str,
+        system_memory_only: bool,
+        audio_sink: GstAudioSinkMode,
+    ) -> Result<Self, VideoError> {
         // Initialize vendored runtime environment before GStreamer init
         #[cfg(feature = "vendored-runtime")]
         {
@@ -234,21 +270,23 @@ impl GStreamerDecoder {
             .property("volume", 1.0f64)
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create volume: {e}")))?;
+        let audio_probe_pad = volume.static_pad("sink");
 
-        // Production uses autoaudiosink. Headless fixture probes can opt into
-        // fakesink without changing the session's audio ownership or clock.
-        let audio_sink_factory = match std::env::var("LUMINA_GST_AUDIO_SINK") {
-            Ok(value) if value == "fakesink" => "fakesink",
-            _ if std::env::var_os("EGUI_VID_FAKE_AUDIO").is_some() => "fakesink",
-            _ => "autoaudiosink",
+        let audiosink = match audio_sink {
+            GstAudioSinkMode::Auto => {
+                gst::ElementFactory::make("autoaudiosink")
+                    .build()
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!("Failed to create autoaudiosink: {e}"))
+                    })?
+            }
+            GstAudioSinkMode::Fake => gst::ElementFactory::make("fakesink")
+                .property("sync", true)
+                .build()
+                .map_err(|e| {
+                    VideoError::DecoderInit(format!("Failed to create synchronized fakesink: {e}"))
+                })?,
         };
-        let audiosink = gst::ElementFactory::make(audio_sink_factory)
-            .build()
-            .map_err(|e| {
-                VideoError::DecoderInit(format!(
-                    "Failed to create audio sink {audio_sink_factory}: {e}"
-                ))
-            })?;
 
         // Add all elements to pipeline
         pipeline
@@ -274,6 +312,14 @@ impl GStreamerDecoder {
 
         // Create audio handle with volume element (has_audio starts false until pad connects)
         let audio_handle = GstAudioHandle::new(Some(volume));
+
+        if let Some(audio_pad) = audio_probe_pad {
+            let audio_handle = audio_handle.clone();
+            let _ = audio_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                audio_handle.record_audio_buffer();
+                gst::PadProbeReturn::Ok
+            });
+        }
 
         // Handle dynamic pad creation from uridecodebin
         let videoconvert_weak = videoconvert.downgrade();

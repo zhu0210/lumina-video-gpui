@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumina_video_core::session::{CapabilityTier, MediaSession, SessionState};
-use lumina_video_gst::{GstMediaSession, PresentationDecision};
+use lumina_video_gst::{GstAudioSinkMode, GstMediaSession, PresentationDecision};
 use lumina_video_native_frame::NativeMemory;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -18,7 +18,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     };
 
-    let mut session = GstMediaSession::new_with_autoplay(source, true);
+    let mut session =
+        GstMediaSession::new_with_autoplay_and_audio_sink(source, true, GstAudioSinkMode::Fake);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut polls = 0_u32;
     let mut frames = 0_u32;
@@ -26,6 +27,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut playing_seen = false;
     let mut ended_seen = false;
     let mut presented = false;
+    let mut empty_before_frame_seen = false;
+    let mut audio_connected_seen = false;
+    let mut audio_buffers_seen = 0_u64;
 
     while Instant::now() < deadline && !ended_seen {
         // One and only one public session poll per animation-like tick.
@@ -47,20 +51,35 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if presented {
                     return Err(io::Error::other("presentation became empty after a frame").into());
                 }
+                empty_before_frame_seen = true;
             }
         }
         let snapshot = session.snapshot();
+        if let SessionState::Error(error) = &snapshot.state {
+            return Err(io::Error::other(format!("fixture session error: {error}")).into());
+        }
         metadata_seen |= snapshot.metadata.is_some();
         playing_seen |= matches!(snapshot.state, SessionState::Playing { .. });
         ended_seen = matches!(snapshot.state, SessionState::Ended);
+        audio_connected_seen |= snapshot.audio.connected;
+        audio_buffers_seen = audio_buffers_seen.max(snapshot.audio.buffers_seen);
         if !metadata_seen || !playing_seen || !ended_seen {
             thread::sleep(Duration::from_millis(5));
         }
     }
 
-    if !metadata_seen || !playing_seen || frames == 0 {
+    if !metadata_seen || !playing_seen || frames == 0 || !ended_seen {
         return Err(io::Error::other(format!(
-            "fixture session incomplete: metadata={metadata_seen} playing={playing_seen} frames={frames}"
+            "fixture session incomplete: metadata={metadata_seen} playing={playing_seen} frames={frames} ended={ended_seen}"
+        ))
+        .into());
+    }
+    if !empty_before_frame_seen {
+        return Err(io::Error::other("presentation never reported initial Empty").into());
+    }
+    if !audio_connected_seen || audio_buffers_seen == 0 {
+        return Err(io::Error::other(format!(
+            "fixture audio branch incomplete: connected={audio_connected_seen} buffers_seen={audio_buffers_seen}"
         ))
         .into());
     }
@@ -72,12 +91,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "metadata={} playing={} frames={} polls={} dropped_frames={} audio=gstreamer capability=SystemMemoryUpload",
+        "metadata={} playing={} frames={} polls={} dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload",
         metadata_seen,
         playing_seen,
         frames,
         polls,
         session.dropped_frame_count(),
+        audio_connected_seen,
+        audio_buffers_seen,
     );
     Ok(())
 }

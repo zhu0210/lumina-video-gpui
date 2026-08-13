@@ -44,6 +44,7 @@ pub use media::{
 pub use lumina_video_core::audio::{
     AudioConfig, AudioHandle, AudioPlayer, AudioSamples, AudioState, AudioSync,
 };
+pub use lumina_video_core::session::AudioObservation;
 pub use lumina_video_native_frame::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata, VideoState,
@@ -61,7 +62,7 @@ pub use lumina_video_wgpu::{
 };
 
 #[cfg(target_os = "linux")]
-pub use lumina_video_gst::{GstMediaSession, PresentationDecision};
+pub use lumina_video_gst::{GstAudioSinkMode, GstMediaSession, PresentationDecision};
 
 // macOS/iOS FFmpeg decoder (when available)
 #[cfg(any(target_os = "macos", target_os = "ios"))]

@@ -139,8 +139,9 @@ fn video_state(state: &CoreSessionState) -> VideoState {
 
 /// A GPU-accelerated video player for GPUI.
 ///
-/// Wraps [`CorePlayer`] for decode/audio/sync and manages GPU texture
-/// upload for GPUI's `surface()` element.
+/// Wraps the Linux [`GstMediaSession`] or non-Linux [`CorePlayer`] for
+/// decode/audio/sync and manages GPU texture upload for GPUI's `surface()`
+/// element.
 pub struct GpuiVideoPlayer {
     #[cfg(not(target_os = "linux"))]
     core: CorePlayer,
@@ -163,7 +164,7 @@ pub struct GpuiVideoPlayer {
     cbcr_cache: Option<Arc<wgpu::Texture>>,
     rgba_cache: Option<Arc<wgpu::Texture>>,
 
-    // Playback state (synced from CorePlayer each update)
+    // Playback state (synced from the platform session each update)
     position: Duration,
     duration: Option<Duration>,
     metadata: Option<VideoMetadata>,
@@ -201,6 +202,7 @@ impl GpuiVideoPlayer {
         let session = GstMediaSession::new(url.clone());
         let muted = config.muted;
         let volume = config.volume;
+        #[allow(unused_mut)]
         let mut player = Self {
             #[cfg(not(target_os = "linux"))]
             core,
@@ -237,12 +239,9 @@ impl GpuiVideoPlayer {
         player.core.set_volume((volume * 100.0) as u32);
         #[cfg(target_os = "linux")]
         {
-            let _ = player
-                .session
-                .command(lumina_video_core::session::SessionCommand::SetMuted { muted });
-            let _ = player
-                .session
-                .command(lumina_video_core::session::SessionCommand::SetVolume { volume });
+            let audio = player.session.audio_handle();
+            audio.set_muted(muted);
+            audio.set_volume((volume.clamp(0.0, 1.0) * 100.0) as u32);
         }
         player
     }
@@ -271,11 +270,7 @@ impl GpuiVideoPlayer {
         #[cfg(not(target_os = "linux"))]
         self.core.set_muted(muted);
         #[cfg(target_os = "linux")]
-        {
-            let _ = self
-                .session
-                .command(lumina_video_core::session::SessionCommand::SetMuted { muted });
-        }
+        self.session.audio_handle().set_muted(muted);
         self
     }
 
@@ -284,13 +279,9 @@ impl GpuiVideoPlayer {
         #[cfg(not(target_os = "linux"))]
         self.core.set_volume((self.config.volume * 100.0) as u32);
         #[cfg(target_os = "linux")]
-        {
-            let _ = self
-                .session
-                .command(lumina_video_core::session::SessionCommand::SetVolume {
-                    volume: self.config.volume,
-                });
-        }
+        self.session
+            .audio_handle()
+            .set_volume((self.config.volume * 100.0) as u32);
         self
     }
 
@@ -344,13 +335,7 @@ impl GpuiVideoPlayer {
         #[cfg(not(target_os = "linux"))]
         self.core.set_muted(self.config.muted);
         #[cfg(target_os = "linux")]
-        {
-            let _ = self
-                .session
-                .command(lumina_video_core::session::SessionCommand::SetMuted {
-                    muted: self.config.muted,
-                });
-        }
+        self.session.audio_handle().set_muted(self.config.muted);
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -358,13 +343,9 @@ impl GpuiVideoPlayer {
         #[cfg(not(target_os = "linux"))]
         self.core.set_volume((self.config.volume * 100.0) as u32);
         #[cfg(target_os = "linux")]
-        {
-            let _ = self
-                .session
-                .command(lumina_video_core::session::SessionCommand::SetVolume {
-                    volume: self.config.volume,
-                });
-        }
+        self.session
+            .audio_handle()
+            .set_volume((self.config.volume * 100.0) as u32);
     }
 
     // -----------------------------------------------------------------------
@@ -490,9 +471,15 @@ impl GpuiVideoPlayer {
     }
 
     /// Returns the audio handle for external volume/mute control.
-    #[cfg(not(target_os = "linux"))]
     pub fn audio_handle(&self) -> &lumina_video_core::audio::AudioHandle {
-        self.core.audio_handle()
+        #[cfg(target_os = "linux")]
+        {
+            self.session.audio_handle()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.core.audio_handle()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -508,7 +495,8 @@ impl GpuiVideoPlayer {
     // -----------------------------------------------------------------------
 
     /// Must be called every frame. Polls the decode pipeline, uploads textures,
-    /// and syncs playback state from the Linux session or non-Linux CorePlayer.
+    /// and syncs playback state from the Linux GStreamer session or the
+    /// non-Linux CorePlayer.
     pub fn update(&mut self, window: &mut Window, _cx: &mut App) {
         // Lazy GPU context init — retry every frame until available.
         if self.gpu_context.is_none() {
@@ -620,6 +608,8 @@ impl GpuiVideoPlayer {
                     match event {
                         SessionEvent::Metadata { metadata } => {
                             self.metadata = Some(video_metadata(&metadata));
+                            self.duration = metadata.duration;
+                            self.buffering_percent = 100;
                             if self.has_presented_frame {
                                 PresentationDecision::Hold
                             } else {
@@ -628,6 +618,12 @@ impl GpuiVideoPlayer {
                         }
                         SessionEvent::StateChanged { state } => {
                             self.state = video_state(&state);
+                            if !self.initialized && matches!(state, CoreSessionState::Ready) {
+                                self.initialized = true;
+                                if self.config.autoplay {
+                                    self.play();
+                                }
+                            }
                             if self.has_presented_frame {
                                 PresentationDecision::Hold
                             } else {
@@ -676,26 +672,6 @@ impl GpuiVideoPlayer {
 
         if let PresentationDecision::Advanced(frame) = decision {
             self.pending_frame = Some(frame);
-        }
-
-        let snapshot = self.session.snapshot();
-        if let Some(metadata) = snapshot.metadata {
-            self.duration = metadata.duration;
-            self.metadata = Some(video_metadata(&metadata));
-            self.buffering_percent = 100;
-        }
-        self.state = video_state(&snapshot.state);
-        self.position = match snapshot.state {
-            CoreSessionState::Playing { position }
-            | CoreSessionState::Paused { position }
-            | CoreSessionState::Buffering { position } => position,
-            _ => self.position,
-        };
-        if !self.initialized && matches!(self.state, VideoState::Ready) {
-            self.initialized = true;
-            if self.config.autoplay {
-                self.play();
-            }
         }
 
         if let Some(gpu) = self.gpu_context.as_ref() {

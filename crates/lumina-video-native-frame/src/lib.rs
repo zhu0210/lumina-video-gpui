@@ -34,6 +34,9 @@ pub mod player;
 
 pub mod video;
 
+/// The owned lease uses the decoder's existing CPU plane type directly.
+pub use video::Plane as CpuPlane;
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod audio_decoder;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -88,26 +91,6 @@ pub struct FrameExtent {
 impl FrameExtent {
     pub const fn new(width: u32, height: u32) -> Self {
         Self { width, height }
-    }
-}
-
-/// One owned CPU format plane.
-///
-/// [`CpuPlane::new`] takes ownership of the supplied bytes without allocating
-/// or copying them.  The producer is responsible for allocation and pooling;
-/// this type only carries that ownership through the frame lease.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CpuPlane {
-    /// Bytes owned by this plane until the containing lease is dropped.
-    pub bytes: Vec<u8>,
-    /// Bytes between the starts of adjacent rows.
-    pub stride: usize,
-}
-
-impl CpuPlane {
-    /// Takes ownership of `bytes` without allocating or copying it.
-    pub fn new(bytes: Vec<u8>, stride: usize) -> Self {
-        Self { bytes, stride }
     }
 }
 

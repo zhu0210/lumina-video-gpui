@@ -739,12 +739,19 @@ unsafe impl Send for LinuxGpuSurface {}
 unsafe impl Sync for LinuxGpuSurface {}
 
 /// A single plane of pixel data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plane {
     /// Raw pixel data
     pub data: Vec<u8>,
     /// Stride (bytes per row, may include padding)
     pub stride: usize,
+}
+
+impl Plane {
+    /// Takes ownership of one plane's bytes without copying them.
+    pub fn new(data: Vec<u8>, stride: usize) -> Self {
+        Self { data, stride }
+    }
 }
 
 /// A decoded video frame with CPU-accessible pixel data.
