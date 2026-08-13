@@ -143,6 +143,8 @@ const BUFFER_HIGH_THRESHOLD: i32 = 100; // Resume when buffer reaches this %
 pub struct GStreamerDecoder {
     pipeline: gst::Pipeline,
     appsink: gst_app::AppSink,
+    /// Keep the #7 session on the owned system-memory path.
+    system_memory_only: bool,
     metadata: VideoMetadata,
     position: Duration,
     eof: bool,
@@ -169,6 +171,19 @@ pub struct GStreamerDecoder {
 impl GStreamerDecoder {
     /// Creates a new GStreamer decoder for the given URL.
     pub fn new(url: &str) -> Result<Self, VideoError> {
+        Self::new_with_memory_policy(url, false)
+    }
+
+    /// Creates a decoder that rejects DMABuf output and returns owned CPU frames.
+    ///
+    /// The session adapter uses this path because its renderer contract is
+    /// `SystemMemoryUpload`; the one GStreamer buffer-to-CPU extraction is the
+    /// ownership hand-off and no second PTS wait or frame copy is introduced.
+    pub fn new_system_memory(url: &str) -> Result<Self, VideoError> {
+        Self::new_with_memory_policy(url, true)
+    }
+
+    fn new_with_memory_policy(url: &str, system_memory_only: bool) -> Result<Self, VideoError> {
         // Initialize vendored runtime environment before GStreamer init
         #[cfg(feature = "vendored-runtime")]
         {
@@ -220,9 +235,20 @@ impl GStreamerDecoder {
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create volume: {e}")))?;
 
-        let audiosink = gst::ElementFactory::make("autoaudiosink")
+        // Production uses autoaudiosink. Headless fixture probes can opt into
+        // fakesink without changing the session's audio ownership or clock.
+        let audio_sink_factory = match std::env::var("LUMINA_GST_AUDIO_SINK") {
+            Ok(value) if value == "fakesink" => "fakesink",
+            _ if std::env::var_os("EGUI_VID_FAKE_AUDIO").is_some() => "fakesink",
+            _ => "autoaudiosink",
+        };
+        let audiosink = gst::ElementFactory::make(audio_sink_factory)
             .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create autoaudiosink: {e}")))?;
+            .map_err(|e| {
+                VideoError::DecoderInit(format!(
+                    "Failed to create audio sink {audio_sink_factory}: {e}"
+                ))
+            })?;
 
         // Add all elements to pipeline
         pipeline
@@ -444,6 +470,7 @@ impl GStreamerDecoder {
         Ok(Self {
             pipeline,
             appsink,
+            system_memory_only,
             metadata,
             position: Duration::ZERO,
             eof: false,
@@ -490,8 +517,10 @@ impl GStreamerDecoder {
         let width = video_info.width();
         let height = video_info.height();
 
-        // Try zero-copy DMABuf path first (always enabled on Linux)
-        {
+        // The #7 session explicitly negotiates system-memory upload. Do not
+        // let a hardware allocator cross that seam as an implicit DMABuf path.
+        if !self.system_memory_only {
+            // Try zero-copy DMABuf path first (always enabled on Linux)
             if let Some(frame) =
                 self.try_dmabuf_frame(buffer, &video_info, pts, width, height, sample.clone())?
             {

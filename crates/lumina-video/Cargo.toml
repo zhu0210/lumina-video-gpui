@@ -49,6 +49,9 @@ poll-promise = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+lumina-video-gst = { path = "../lumina-video-gst" }
+
 # Web/WASM video playback using browser APIs
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3" }
