@@ -15,15 +15,15 @@ members = [
 ]
 
 [workspace.dependencies]
-# wgpu — shared with GPUI (must match zed-industries fork to keep Arc<wgpu::Texture> compatible)
+# wgpu — shared with GPUI (must match the pinned Zed-compatible fork)
 wgpu = {
-  git = "https://github.com/zed-industries/wgpu.git",
-  rev = "357a0c56e0070480ad9daea5d2eaa83150b79e88"
+  git = "https://github.com/zhu0210/wgpu.git",
+  rev = "b544e9c585d91f5548f96577f3f547e920e38fd5"
 }
 # wgpu-hal for zero-copy platform import
 wgpu-hal = {
-  git = "https://github.com/zed-industries/wgpu.git",
-  rev = "357a0c56e0070480ad9daea5d2eaa83150b79e88"
+  git = "https://github.com/zhu0210/wgpu.git",
+  rev = "b544e9c585d91f5548f96577f3f547e920e38fd5"
 }
 
 # Video/audio dependencies

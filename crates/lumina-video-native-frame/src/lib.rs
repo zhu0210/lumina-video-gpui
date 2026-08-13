@@ -58,18 +58,6 @@ pub mod windows_audio;
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
 pub mod windows_video;
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "android",
-    all(target_os = "windows", feature = "windows-native-video")
-))]
-pub mod zero_copy;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub mod frame_to_texture;
-
 #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
 pub mod vendored_runtime;
 

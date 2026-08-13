@@ -7,3 +7,37 @@ repository = "https://github.com/lumina-video/lumina-video"
 license = "MIT OR Apache-2.0"
 keywords = ["multimedia", "video", "wgpu"]
 categories = ["multimedia", "rendering"]
+
+[dependencies]
+lumina-video-native-frame = { path = "../lumina-video-native-frame" }
+tracing = { workspace = true }
+wgpu = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+metal = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { version = "0.38" }
+libc = { version = "0.2" }
+wgpu = { workspace = true, features = ["vulkan-portability"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ash = { version = "0.38" }
+wgpu = { workspace = true, features = ["vulkan"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = {
+  version = "0.58",
+  features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+  ]
+}
+
+[features]
+default = []
+windows-native-video = []

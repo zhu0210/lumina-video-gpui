@@ -14,12 +14,11 @@
 //! Platform GPU surfaces (IOSurface, DMABuf, etc.) are imported zero-copy
 //! when possible, falling back to the CPU path via `cpu_fallback`.
 
-use std::sync::Arc;
-use wgpu;
-
 #[cfg(test)]
-use crate::video::Plane;
-use crate::video::{CpuFrame, DecodedFrame, PixelFormat};
+use lumina_video_native_frame::video::Plane;
+use lumina_video_native_frame::video::{CpuFrame, DecodedFrame, PixelFormat};
+use lumina_video_native_frame::{AcquireSync, CpuMemory, NativeFrameLease, NativeMemory};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Write-texture guard — prevents GPU validation crashes when frame
@@ -91,6 +90,70 @@ pub enum GpuFrameTextures {
         width: u32,
         height: u32,
     },
+}
+
+#[derive(Clone, Copy)]
+struct PlaneRef<'a> {
+    data: &'a [u8],
+    stride: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CpuFrameRef<'a> {
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    planes: [Option<PlaneRef<'a>>; 3],
+}
+
+impl<'a> CpuFrameRef<'a> {
+    fn plane(&self, index: usize) -> Option<PlaneRef<'a>> {
+        self.planes.get(index).copied().flatten()
+    }
+
+    fn from_cpu(frame: &'a CpuFrame) -> Self {
+        Self {
+            format: frame.format,
+            width: frame.width,
+            height: frame.height,
+            planes: [
+                frame.planes.first().map(|p| PlaneRef {
+                    data: &p.data,
+                    stride: p.stride,
+                }),
+                frame.planes.get(1).map(|p| PlaneRef {
+                    data: &p.data,
+                    stride: p.stride,
+                }),
+                frame.planes.get(2).map(|p| PlaneRef {
+                    data: &p.data,
+                    stride: p.stride,
+                }),
+            ],
+        }
+    }
+
+    fn from_memory(memory: &'a CpuMemory, width: u32, height: u32, format: PixelFormat) -> Self {
+        Self {
+            format,
+            width,
+            height,
+            planes: [
+                memory.planes.first().map(|p| PlaneRef {
+                    data: &p.bytes,
+                    stride: p.stride,
+                }),
+                memory.planes.get(1).map(|p| PlaneRef {
+                    data: &p.bytes,
+                    stride: p.stride,
+                }),
+                memory.planes.get(2).map(|p| PlaneRef {
+                    data: &p.bytes,
+                    stride: p.stride,
+                }),
+            ],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,15 +264,108 @@ pub fn decoded_frame_to_textures(
     }
 }
 
+/// Failure while handing an owned native frame to the renderer.
+#[derive(Debug)]
+pub enum NativeFrameIngestionError {
+    /// The renderer has no contract for consuming the producer's acquire fence.
+    UnsupportedAcquireSync(Box<NativeFrameLease>),
+    /// External-memory import is not safe until the renderer supplies layout and sync state.
+    UnsupportedDmaBuf(Box<NativeFrameLease>),
+}
+
+impl std::fmt::Display for NativeFrameIngestionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedAcquireSync(_) => write!(
+                f,
+                "native frame acquire synchronization is unsupported at the wgpu boundary"
+            ),
+            Self::UnsupportedDmaBuf(_) => write!(
+                f,
+                "Linux DMABuf import requires renderer-boundary layout and sync support"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NativeFrameIngestionError {}
+
+impl NativeFrameIngestionError {
+    /// Returns the unchanged lease so the caller can retry at a boundary that owns synchronization.
+    pub fn into_lease(self) -> NativeFrameLease {
+        match self {
+            Self::UnsupportedAcquireSync(lease) | Self::UnsupportedDmaBuf(lease) => *lease,
+        }
+    }
+}
+
+/// Uploads an owned native frame without cloning its CPU planes.
+pub fn native_frame_lease_to_textures(
+    lease: NativeFrameLease,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_cache: &mut Option<Arc<wgpu::Texture>>,
+    cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+    rgba_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> Result<GpuFrameTextures, NativeFrameIngestionError> {
+    let lease = ensure_native_frame_lease_supported(lease)?;
+
+    let NativeFrameLease {
+        descriptor,
+        memory,
+        acquire,
+    } = lease;
+    match memory {
+        NativeMemory::Cpu(memory) => Ok(upload_cpu_frame_ref_as_textures(
+            CpuFrameRef::from_memory(
+                &memory,
+                descriptor.extent.width,
+                descriptor.extent.height,
+                descriptor.format,
+            ),
+            device,
+            queue,
+            y_cache,
+            cbcr_cache,
+            rgba_cache,
+        )),
+        #[cfg(target_os = "linux")]
+        NativeMemory::DmaBuf(memory) => Err(NativeFrameIngestionError::UnsupportedDmaBuf(
+            Box::new(NativeFrameLease {
+                descriptor,
+                memory: NativeMemory::DmaBuf(memory),
+                acquire,
+            }),
+        )),
+    }
+}
+
+fn ensure_native_frame_lease_supported(
+    lease: NativeFrameLease,
+) -> Result<NativeFrameLease, NativeFrameIngestionError> {
+    if !matches!(&lease.acquire, AcquireSync::None) {
+        return Err(NativeFrameIngestionError::UnsupportedAcquireSync(Box::new(
+            lease,
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(&lease.memory, NativeMemory::DmaBuf(_)) {
+        return Err(NativeFrameIngestionError::UnsupportedDmaBuf(Box::new(
+            lease,
+        )));
+    }
+    Ok(lease)
+}
+
 // ---------------------------------------------------------------------------
 // macOS zero-copy IOSurface → wgpu texture import
 // ---------------------------------------------------------------------------
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn import_macos_iosurface_frame(
-    surface: &crate::video::MacOSGpuSurface,
+    surface: &lumina_video_native_frame::video::MacOSGpuSurface,
     device: &wgpu::Device,
-) -> Result<GpuFrameTextures, crate::video::VideoError> {
+) -> Result<GpuFrameTextures, lumina_video_native_frame::video::VideoError> {
     // SAFETY: The decoder owns the IOSurface and keeps its CVPixelBuffer owner
     // alive through `surface`; the import is only attempted for that live frame.
     let texture = unsafe {
@@ -222,7 +378,9 @@ fn import_macos_iosurface_frame(
         )
     }
     .map_err(|e| {
-        crate::video::VideoError::DecodeFailed(format!("IOSurface zero-copy import failed: {e}"))
+        lumina_video_native_frame::video::VideoError::DecodeFailed(format!(
+            "IOSurface zero-copy import failed: {e}"
+        ))
     })?;
 
     // IOSurface textures are always BGRA8Unorm
@@ -239,12 +397,12 @@ fn import_macos_iosurface_frame(
 
 #[cfg(target_os = "linux")]
 fn import_linux_dmabuf_frame(
-    surface: &crate::video::LinuxGpuSurface,
+    surface: &lumina_video_native_frame::video::LinuxGpuSurface,
     device: &wgpu::Device,
-) -> Result<GpuFrameTextures, crate::video::VideoError> {
-    use crate::video::PixelFormat;
+) -> Result<GpuFrameTextures, lumina_video_native_frame::video::VideoError> {
     use crate::zero_copy::linux::DmaBufHandle;
     use crate::zero_copy::linux::DmaBufPlaneHandle;
+    use lumina_video_native_frame::video::PixelFormat;
 
     let plane_handles: Vec<DmaBufPlaneHandle> = surface
         .planes
@@ -271,27 +429,37 @@ fn import_linux_dmabuf_frame(
         )
     }
     .map_err(|e| {
-        crate::video::VideoError::DecodeFailed(format!("DMABuf zero-copy import failed: {e}"))
+        lumina_video_native_frame::video::VideoError::DecodeFailed(format!(
+            "DMABuf zero-copy import failed: {e}"
+        ))
     })?;
 
     match surface.format {
         PixelFormat::Nv12 => {
-            if textures.len() < 2 {
-                return Err(crate::video::VideoError::DecodeFailed(
+            let mut textures = textures.into_iter();
+            let Some(y_texture) = textures.next() else {
+                return Err(lumina_video_native_frame::video::VideoError::DecodeFailed(
                     "NV12 import returned insufficient textures".into(),
                 ));
-            }
+            };
+            let Some(cb_cr_texture) = textures.next() else {
+                return Err(lumina_video_native_frame::video::VideoError::DecodeFailed(
+                    "NV12 import returned insufficient textures".into(),
+                ));
+            };
             Ok(GpuFrameTextures::Nv12 {
-                y_texture: std::sync::Arc::new(textures[0].clone()),
-                cb_cr_texture: std::sync::Arc::new(textures[1].clone()),
+                y_texture: std::sync::Arc::new(y_texture),
+                cb_cr_texture: std::sync::Arc::new(cb_cr_texture),
                 width: surface.width,
                 height: surface.height,
             })
         }
-        _ => Err(crate::video::VideoError::UnsupportedFormat(format!(
-            "Zero-copy import not implemented for {:?} on Linux",
-            surface.format
-        ))),
+        _ => Err(
+            lumina_video_native_frame::video::VideoError::UnsupportedFormat(format!(
+                "Zero-copy import not implemented for {:?} on Linux",
+                surface.format
+            )),
+        ),
     }
 }
 
@@ -303,6 +471,24 @@ fn import_linux_dmabuf_frame(
 /// - RGB24 → converted to RGBA8Unorm
 pub fn upload_cpu_frame_as_textures(
     frame: &CpuFrame,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    y_cache: &mut Option<Arc<wgpu::Texture>>,
+    cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+    rgba_cache: &mut Option<Arc<wgpu::Texture>>,
+) -> GpuFrameTextures {
+    upload_cpu_frame_ref_as_textures(
+        CpuFrameRef::from_cpu(frame),
+        device,
+        queue,
+        y_cache,
+        cbcr_cache,
+        rgba_cache,
+    )
+}
+
+fn upload_cpu_frame_ref_as_textures(
+    frame: CpuFrameRef<'_>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     y_cache: &mut Option<Arc<wgpu::Texture>>,
@@ -331,44 +517,29 @@ pub fn upload_cpu_frame(
     queue: &wgpu::Queue,
     texture_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Arc<wgpu::Texture> {
-    let rgba = cpu_frame_to_rgba(frame);
+    let frame_ref = CpuFrameRef::from_cpu(frame);
+    let rgba = cpu_frame_ref_to_rgba(frame_ref);
     let width = frame.width;
     let height = frame.height;
 
-    let needs_create = match texture_cache {
-        Some(ref tex) => tex.width() != width || tex.height() != height,
-        None => true,
-    };
-
-    if needs_create {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("lumina_video_frame"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        *texture_cache = Some(Arc::new(texture));
-    }
-
-    let texture = texture_cache.as_ref().unwrap();
+    let texture = get_or_create_texture(
+        device,
+        texture_cache,
+        width,
+        height,
+        wgpu::TextureFormat::Rgba8Unorm,
+        "lumina_video_frame",
+    );
     // Compute bytes_per_row from actual RGBA data to be robust against size mismatches
     let bytes_per_row = if height > 0 {
         (rgba.len() / height as usize) as u32
     } else {
-        return texture.clone();
+        return texture;
     };
     safe_write_texture(
         queue,
-        texture,
-        &rgba,
+        &texture,
+        rgba.as_slice(),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(bytes_per_row),
@@ -381,7 +552,7 @@ pub fn upload_cpu_frame(
         },
     );
 
-    texture.clone()
+    texture
 }
 
 /// Convert any DecodedFrame to an Arc<wgpu::Texture> (CPU YUV→RGB conversion).
@@ -435,7 +606,7 @@ pub fn decoded_frame_to_texture(
 // ---------------------------------------------------------------------------
 
 fn upload_nv12(
-    frame: &CpuFrame,
+    frame: CpuFrameRef<'_>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     y_cache: &mut Option<Arc<wgpu::Texture>>,
@@ -495,7 +666,7 @@ fn upload_nv12(
         safe_write_texture(
             queue,
             &y_texture,
-            &y_plane.data,
+            y_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(y_bytes_per_row),
@@ -535,7 +706,7 @@ fn upload_nv12(
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &uv_plane.data,
+            uv_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(uv_bytes_per_row),
@@ -562,7 +733,7 @@ fn upload_nv12(
 ///
 /// This avoids the expensive CPU YUV→RGB conversion — we just interleave bytes.
 fn upload_yuv420p_as_nv12(
-    frame: &CpuFrame,
+    frame: CpuFrameRef<'_>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     y_cache: &mut Option<Arc<wgpu::Texture>>,
@@ -615,7 +786,7 @@ fn upload_yuv420p_as_nv12(
         safe_write_texture(
             queue,
             &y_texture,
-            &y_plane.data,
+            y_plane.data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(y_bytes_per_row),
@@ -644,11 +815,15 @@ fn upload_yuv420p_as_nv12(
                     let u_idx = row * u.stride + col;
                     let v_idx = row * v.stride + col;
                     let out_idx = row * cbcr_stride + col * 2;
-                    if u_idx < u.data.len() {
-                        cbcr_data[out_idx] = u.data[u_idx]; // Cb (maps to R in RG8)
+                    if let (Some(output), Some(&value)) =
+                        (cbcr_data.get_mut(out_idx), u.data.get(u_idx))
+                    {
+                        *output = value; // Cb (maps to R in RG8)
                     }
-                    if v_idx < v.data.len() {
-                        cbcr_data[out_idx + 1] = v.data[v_idx]; // Cr (maps to G in RG8)
+                    if let (Some(output), Some(&value)) =
+                        (cbcr_data.get_mut(out_idx + 1), v.data.get(v_idx))
+                    {
+                        *output = value; // Cr (maps to G in RG8)
                     }
                 }
             }
@@ -692,7 +867,7 @@ fn upload_yuv420p_as_nv12(
 // ---------------------------------------------------------------------------
 
 fn upload_rgba(
-    frame: &CpuFrame,
+    frame: CpuFrameRef<'_>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     cache: &mut Option<Arc<wgpu::Texture>>,
@@ -712,7 +887,7 @@ fn upload_rgba(
     if let Some(plane) = frame.plane(0) {
         if frame.format == PixelFormat::Bgra {
             // BGRA → RGBA: swizzle in-place
-            let rgba = bgra_to_rgba(&plane.data);
+            let rgba = bgra_to_rgba(plane.data);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -720,7 +895,7 @@ fn upload_rgba(
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &rgba,
+                rgba.as_slice(),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(width * 4),
@@ -759,7 +934,7 @@ fn upload_rgba(
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &plane.data,
+                plane.data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(rgba_bytes_per_row),
@@ -782,7 +957,7 @@ fn upload_rgba(
 }
 
 fn upload_rgb24(
-    frame: &CpuFrame,
+    frame: CpuFrameRef<'_>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     cache: &mut Option<Arc<wgpu::Texture>>,
@@ -808,7 +983,7 @@ fn upload_rgb24(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &rgba,
+        rgba.as_slice(),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(width * 4),
@@ -864,7 +1039,23 @@ fn get_or_create_texture(
         *cache = Some(Arc::new(texture));
     }
 
-    cache.as_ref().unwrap().clone()
+    match cache.as_ref() {
+        Some(texture) => Arc::clone(texture),
+        None => Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,9 +1067,19 @@ fn get_or_create_texture(
 /// Handles YUV420p, NV12, RGB24, BGRA, and RGBA formats.
 /// YUV→RGB uses BT.601 limited-range conversion.
 pub fn cpu_frame_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+    cpu_frame_ref_to_rgba(CpuFrameRef::from_cpu(frame))
+}
+
+fn cpu_frame_ref_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     match frame.format {
-        PixelFormat::Rgba => frame.planes[0].data.clone(),
-        PixelFormat::Bgra => bgra_to_rgba(&frame.planes[0].data),
+        PixelFormat::Rgba => frame
+            .plane(0)
+            .map(|plane| plane.data.to_vec())
+            .unwrap_or_default(),
+        PixelFormat::Bgra => frame
+            .plane(0)
+            .map(|plane| bgra_to_rgba(plane.data))
+            .unwrap_or_default(),
         PixelFormat::Rgb24 => rgb24_to_rgba(frame),
         PixelFormat::Yuv420p => yuv420p_to_rgba(frame),
         PixelFormat::Nv12 => nv12_to_rgba(frame),
@@ -917,11 +1118,14 @@ fn bgra_to_rgba(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rgb24_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+fn rgb24_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let data = &frame.planes[0].data;
-    let stride = frame.planes[0].stride;
+    let Some(plane) = frame.plane(0) else {
+        return Vec::new();
+    };
+    let data = plane.data;
+    let stride = plane.stride;
     let mut out = Vec::with_capacity(width * height * 4);
     for row in 0..height {
         for col in 0..width {
@@ -939,19 +1143,28 @@ fn rgb24_to_rgba(frame: &CpuFrame) -> Vec<u8> {
     out
 }
 
-fn yuv420p_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+fn yuv420p_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let y_plane = &frame.planes[0].data;
-    let u_plane = &frame.planes[1].data;
-    let v_plane = &frame.planes[2].data;
+    let Some(y_plane) = frame.plane(0).map(|plane| plane.data) else {
+        return Vec::new();
+    };
+    let Some(u_plane) = frame.plane(1).map(|plane| plane.data) else {
+        return Vec::new();
+    };
+    let Some(v_plane) = frame.plane(2).map(|plane| plane.data) else {
+        return Vec::new();
+    };
 
     let mut rgba = vec![0u8; width * height * 4];
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
             let uv_idx = (y / 2) * (width / 2) + (x / 2);
-            let (r, g, b) = yuv_to_rgb(y_plane[idx], u_plane[uv_idx], v_plane[uv_idx]);
+            let y_value = y_plane.get(idx).copied().unwrap_or(0);
+            let u_value = u_plane.get(uv_idx).copied().unwrap_or(128);
+            let v_value = v_plane.get(uv_idx).copied().unwrap_or(128);
+            let (r, g, b) = yuv_to_rgb(y_value, u_value, v_value);
             let out_idx = idx * 4;
             rgba[out_idx] = r;
             rgba[out_idx + 1] = g;
@@ -962,18 +1175,25 @@ fn yuv420p_to_rgba(frame: &CpuFrame) -> Vec<u8> {
     rgba
 }
 
-fn nv12_to_rgba(frame: &CpuFrame) -> Vec<u8> {
+fn nv12_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let y_plane = &frame.planes[0].data;
-    let uv_plane = &frame.planes[1].data;
+    let Some(y_plane) = frame.plane(0).map(|plane| plane.data) else {
+        return Vec::new();
+    };
+    let Some(uv_plane) = frame.plane(1).map(|plane| plane.data) else {
+        return Vec::new();
+    };
 
     let mut rgba = vec![0u8; width * height * 4];
     for y in 0..height {
         for x in 0..width {
             let idx = y * width + x;
             let uv_idx = (y / 2) * (width / 2) * 2 + (x / 2) * 2;
-            let (r, g, b) = yuv_to_rgb(y_plane[idx], uv_plane[uv_idx], uv_plane[uv_idx + 1]);
+            let y_value = y_plane.get(idx).copied().unwrap_or(0);
+            let u_value = uv_plane.get(uv_idx).copied().unwrap_or(128);
+            let v_value = uv_plane.get(uv_idx + 1).copied().unwrap_or(128);
+            let (r, g, b) = yuv_to_rgb(y_value, u_value, v_value);
             let out_idx = idx * 4;
             rgba[out_idx] = r;
             rgba[out_idx + 1] = g;
@@ -991,6 +1211,9 @@ fn nv12_to_rgba(frame: &CpuFrame) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use lumina_video_native_frame::{CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor};
 
     #[test]
     fn test_bgra_to_rgba() {
@@ -1010,7 +1233,7 @@ mod tests {
                 stride: 6,
             }],
         };
-        let rgba = rgb24_to_rgba(&frame);
+        let rgba = rgb24_to_rgba(CpuFrameRef::from_cpu(&frame));
         assert_eq!(rgba, vec![255, 0, 0, 255, 0, 255, 0, 255]);
     }
 
@@ -1024,5 +1247,62 @@ mod tests {
     fn test_yuv_to_rgb_white() {
         let (r, g, b) = yuv_to_rgb(235, 128, 128);
         assert_eq!((r, g, b), (255, 255, 255));
+    }
+
+    #[test]
+    fn owned_cpu_lease_view_borrows_plane_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = vec![1, 2, 3, 4];
+        let bytes_ptr = bytes.as_ptr();
+        let lease = NativeFrameLease::new(
+            NativeFrameDescriptor {
+                frame_id: 1,
+                stream_generation: 1,
+                pts: Duration::ZERO,
+                duration: None,
+                extent: FrameExtent::new(1, 1),
+                format: PixelFormat::Rgba,
+            },
+            NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(bytes, 4)])),
+            AcquireSync::None,
+        )?;
+        let lease = ensure_native_frame_lease_supported(lease)?;
+        let NativeMemory::Cpu(memory) = lease.memory else {
+            return Err("expected CPU memory".into());
+        };
+        let view = CpuFrameRef::from_memory(&memory, 1, 1, PixelFormat::Rgba);
+        let plane = view.plane(0).ok_or("missing CPU plane")?;
+        assert_eq!(plane.data.as_ptr(), bytes_ptr);
+        assert_eq!(plane.stride, 4);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_file_lease_is_rejected_and_returned() -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::File;
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+        let fd = File::open("/dev/null")?.into_raw_fd();
+        let lease = NativeFrameLease::new(
+            NativeFrameDescriptor {
+                frame_id: 2,
+                stream_generation: 1,
+                pts: Duration::ZERO,
+                duration: None,
+                extent: FrameExtent::new(1, 1),
+                format: PixelFormat::Rgba,
+            },
+            NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(vec![0; 4], 4)])),
+            AcquireSync::SyncFile(unsafe {
+                // SAFETY: ownership of the descriptor is transferred exactly once.
+                OwnedFd::from_raw_fd(fd)
+            }),
+        )?;
+        let error = ensure_native_frame_lease_supported(lease)
+            .err()
+            .ok_or("accepted sync file")?;
+        let returned = error.into_lease();
+        assert!(matches!(returned.acquire, AcquireSync::SyncFile(_)));
+        Ok(())
     }
 }

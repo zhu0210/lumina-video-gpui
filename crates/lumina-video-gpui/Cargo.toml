@@ -13,18 +13,22 @@ lumina-video-core = { path = "../lumina-video-core" }
 lumina-video-native-frame = { path = "../lumina-video-native-frame" }
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend",
+  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2",
   features = ["wgpu"]
 }
 gpui_wgpu = {
   git = "https://github.com/zhu0210/zed.git",
-  branch = "gpui_wgpu_backend"
+  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2"
 }
+lumina-video-wgpu = { path = "../lumina-video-wgpu" }
 tracing = { workspace = true }
 
 [features]
 default = []
-windows-native-video = ["lumina-video-native-frame/windows-native-video"]
+windows-native-video = [
+  "lumina-video-native-frame/windows-native-video",
+  "lumina-video-wgpu/windows-native-video",
+]
 vendored-runtime = ["lumina-video-native-frame/vendored-runtime"]
 android-zero-copy = ["lumina-video-native-frame/android-zero-copy"]
 moq = ["lumina-video-native-frame/moq"]

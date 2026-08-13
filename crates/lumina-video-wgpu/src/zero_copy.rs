@@ -425,8 +425,11 @@ pub mod macos {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Metal>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Metal>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported IOSurface as wgpu texture (zero-copy)");
 
@@ -1190,8 +1193,11 @@ pub mod linux {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported DMABuf as wgpu texture (zero-copy)");
 
@@ -1254,9 +1260,9 @@ pub mod linux {
         dmabuf: DmaBufHandle,
         width: u32,
         height: u32,
-        format: super::super::video::PixelFormat,
+        format: lumina_video_native_frame::video::PixelFormat,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use super::super::video::PixelFormat;
+        use lumina_video_native_frame::video::PixelFormat;
 
         // Validate plane count matches format
         let expected_planes = match format {
@@ -1432,10 +1438,10 @@ pub mod linux {
         planes: &[DmaBufPlaneHandle],
         width: u32,
         height: u32,
-        format: super::super::video::PixelFormat,
+        format: lumina_video_native_frame::video::PixelFormat,
         modifier: u64,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use super::super::video::PixelFormat;
+        use lumina_video_native_frame::video::PixelFormat;
 
         // Validate FD
         if fd < 0 {
@@ -2163,8 +2169,11 @@ pub mod android {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported AHardwareBuffer as wgpu texture (zero-copy)");
 
@@ -2361,7 +2370,7 @@ pub mod android {
         height: u32,
         hw_buffer_format: u32,
     ) -> Result<Vec<wgpu::Texture>, ZeroCopyError> {
-        use crate::android_video::AHARDWAREBUFFER_FORMAT_YV12;
+        use lumina_video_native_frame::android_video::AHARDWAREBUFFER_FORMAT_YV12;
         let is_yv12 = hw_buffer_format == AHARDWAREBUFFER_FORMAT_YV12;
         if ahardware_buffer.is_null() {
             return Err(ZeroCopyError::InvalidResource(
@@ -4522,8 +4531,11 @@ pub mod android {
                 view_formats: &[],
             };
 
-            let wgpu_texture = wgpu_device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc);
+            let wgpu_texture = wgpu_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu_desc,
+                wgpu::TextureUses::RESOURCE,
+            );
 
             info!(
                 "Successfully converted YUV AHardwareBuffer to RGBA ({}x{})",
@@ -5024,8 +5036,11 @@ pub mod android {
                 view_formats: &[],
             };
 
-            let wgpu_texture = wgpu_device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc);
+            let wgpu_texture = wgpu_device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(
+                hal_texture,
+                &wgpu_desc,
+                wgpu::TextureUses::RESOURCE,
+            );
 
             info!(
                 "Successfully imported AHB via YCbCr conversion ({}x{})",
@@ -6438,8 +6453,11 @@ pub mod windows {
         };
 
         // Wrap the HAL texture as a wgpu::Texture
-        let wgpu_texture =
-            device.create_texture_from_hal::<wgpu::hal::api::Dx12>(hal_texture, &texture_desc);
+        let wgpu_texture = device.create_texture_from_hal::<wgpu::hal::api::Dx12>(
+            hal_texture,
+            &texture_desc,
+            wgpu::TextureUses::RESOURCE,
+        );
 
         info!("Successfully imported D3D11 shared handle as wgpu texture (zero-copy)");
 

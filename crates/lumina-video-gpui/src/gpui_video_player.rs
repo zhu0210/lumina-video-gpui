@@ -9,7 +9,7 @@
 //! CorePlayer (decode + A/V sync)
 //!   │ poll_frame()
 //!   ▼
-//! decoded_frame_to_textures()  ← frame_to_texture.rs
+//! decoded_frame_to_textures()  ← lumina-video-wgpu
 //!   │ NV12: Y(R8) + CbCr(RG8)  →  surface((y, cbcr, size))  [GPU YUV→RGB]
 //!   │ RGBA: single RGBA8        →  surface((tex, desc))      [passthrough]
 //!   ▼
@@ -26,9 +26,9 @@ use gpui::*;
 use gpui_wgpu::wgpu;
 
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
-use lumina_video_native_frame::frame_to_texture::{self, GpuFrameTextures};
 use lumina_video_native_frame::player::CorePlayer;
 use lumina_video_native_frame::video::{VideoMetadata, VideoState};
+use lumina_video_wgpu::{decoded_frame_to_textures, GpuFrameTextures};
 
 // ---------------------------------------------------------------------------
 // Configuration & response types
@@ -683,7 +683,7 @@ impl GpuiVideoPlayer {
         }
 
         if let Some(video_frame) = last_frame {
-            let textures = frame_to_texture::decoded_frame_to_textures(
+            let textures = decoded_frame_to_textures(
                 &video_frame.frame,
                 &gpu.device,
                 &gpu.queue,
@@ -721,7 +721,7 @@ impl GpuiVideoPlayer {
             return;
         };
 
-        let textures = frame_to_texture::decoded_frame_to_textures(
+        let textures = decoded_frame_to_textures(
             &frame.frame,
             &gpu.device,
             &gpu.queue,

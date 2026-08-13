@@ -26,6 +26,7 @@ lumina-video-core = { path = "../lumina-video-core" }
 
 # GPUI composition boundary.
 lumina-video-gpui = { path = "../lumina-video-gpui" }
+lumina-video-wgpu = { path = "../lumina-video-wgpu" }
 
 # Utilities
 bytemuck = { version = "1.14", features = ["derive"] }
@@ -87,7 +88,11 @@ wgpu = { workspace = true }
 default = []
 
 # Windows: Native Media Foundation + DXVA2/D3D11VA hardware acceleration
-windows-native-video = ["lumina-video-native-frame/windows-native-video"]
+windows-native-video = [
+  "lumina-video-native-frame/windows-native-video",
+  "lumina-video-gpui/windows-native-video",
+  "lumina-video-wgpu/windows-native-video",
+]
 
 # Vendored runtime: Bundle GStreamer libraries with the binary (Linux only)
 # This eliminates the need for users to install GStreamer system packages.
