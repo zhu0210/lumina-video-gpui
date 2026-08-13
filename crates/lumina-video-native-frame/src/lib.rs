@@ -49,7 +49,7 @@ pub mod linux_video_gst;
 pub mod android_video;
 #[cfg(target_os = "android")]
 pub mod android_vulkan;
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "android-zero-copy"))]
 pub mod ndk_image_reader;
 
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]

@@ -130,11 +130,12 @@ default = []
 vendored-runtime = []
 windows-native-video = ["profiling", "rodio", "windows"]
 zero-copy = []
+android-zero-copy = []
 
 [lints.rust]
 unexpected_cfgs = {
   level = "warn",
   check-cfg = [
-    "cfg(feature, values(\"cargo-clippy\", \"vendored-runtime\", \"zero-copy\", \"windows-native-video\"))"
+    "cfg(feature, values(\"android-zero-copy\", \"cargo-clippy\", \"vendored-runtime\", \"zero-copy\", \"windows-native-video\"))"
   ]
 }

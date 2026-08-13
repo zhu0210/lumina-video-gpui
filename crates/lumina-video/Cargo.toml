@@ -138,6 +138,9 @@ windows-native-video = ["lumina-video-native-frame/windows-native-video"]
 # LGPL compliance: See vendor/README.md for source availability and relinking instructions.
 vendored-runtime = ["lumina-video-native-frame/vendored-runtime"]
 
+# Android: opt-in NDK ImageReader zero-copy bridge.
+android-zero-copy = ["lumina-video-native-frame/android-zero-copy"]
+
 # MoQ: Media over QUIC live streaming transport
 moq = [
   "async-channel",
