@@ -633,6 +633,7 @@ impl GpuiVideoPlayer {
                         SessionEvent::Frame { pts, frame } => {
                             self.position = pts;
                             self.has_presented_frame = true;
+                            self.loop_seek_pending = false;
                             PresentationDecision::Advanced(frame)
                         }
                         SessionEvent::Ended => {
