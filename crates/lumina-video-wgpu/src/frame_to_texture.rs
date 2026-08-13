@@ -17,7 +17,9 @@
 #[cfg(test)]
 use lumina_video_native_frame::video::Plane;
 use lumina_video_native_frame::video::{CpuFrame, DecodedFrame, PixelFormat};
-use lumina_video_native_frame::{AcquireSync, CpuMemory, NativeFrameLease, NativeMemory};
+use lumina_video_native_frame::{
+    AcquireSync, CpuMemory, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
+};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -192,10 +194,15 @@ pub fn decoded_frame_to_textures(
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<GpuFrameTextures, LegacyFrameIngestionError> {
+    let cpu = classify_legacy_frame(frame)?;
+    Ok(upload_cpu_frame_as_textures(
+        cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
+    ))
+}
+
+fn classify_legacy_frame(frame: &DecodedFrame) -> Result<&CpuFrame, LegacyFrameIngestionError> {
     match frame {
-        DecodedFrame::Cpu(cpu) => Ok(upload_cpu_frame_as_textures(
-            cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
-        )),
+        DecodedFrame::Cpu(cpu) => Ok(cpu),
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         DecodedFrame::MacOS(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
@@ -267,27 +274,47 @@ pub fn native_frame_lease_to_textures(
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<GpuFrameTextures, NativeFrameIngestionError> {
-    let lease = validate_native_frame_lease(lease)?;
+    let (descriptor, memory) = classify_native_frame_lease(lease)?;
+    Ok(upload_cpu_frame_ref_as_textures(
+        CpuFrameRef::from_memory(
+            &memory,
+            descriptor.extent.width,
+            descriptor.extent.height,
+            descriptor.format,
+        ),
+        device,
+        queue,
+        y_cache,
+        cbcr_cache,
+        rgba_cache,
+    ))
+}
 
+#[allow(clippy::result_large_err)]
+fn classify_native_frame_lease(
+    lease: NativeFrameLease,
+) -> Result<(NativeFrameDescriptor, CpuMemory), NativeFrameIngestionError> {
+    if !matches!(&lease.acquire, AcquireSync::None) {
+        return Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease));
+    }
     let NativeFrameLease {
         descriptor,
         memory,
         acquire,
     } = lease;
     match memory {
-        NativeMemory::Cpu(memory) => Ok(upload_cpu_frame_ref_as_textures(
-            CpuFrameRef::from_memory(
-                &memory,
-                descriptor.extent.width,
-                descriptor.extent.height,
-                descriptor.format,
-            ),
-            device,
-            queue,
-            y_cache,
-            cbcr_cache,
-            rgba_cache,
-        )),
+        NativeMemory::Cpu(memory) => {
+            if !matches!(descriptor.format, PixelFormat::Rgba | PixelFormat::Nv12) {
+                return Err(NativeFrameIngestionError::UnsupportedCpuFormat(
+                    NativeFrameLease {
+                        descriptor,
+                        memory: NativeMemory::Cpu(memory),
+                        acquire,
+                    },
+                ));
+            }
+            Ok((descriptor, memory))
+        }
         #[cfg(target_os = "linux")]
         NativeMemory::DmaBuf(memory) => Err(NativeFrameIngestionError::UnsupportedDmaBuf(
             NativeFrameLease {
@@ -297,24 +324,6 @@ pub fn native_frame_lease_to_textures(
             },
         )),
     }
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_native_frame_lease(
-    lease: NativeFrameLease,
-) -> Result<NativeFrameLease, NativeFrameIngestionError> {
-    if !matches!(&lease.acquire, AcquireSync::None) {
-        return Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease));
-    }
-    if matches!(&lease.memory, NativeMemory::Cpu(_))
-        && !matches!(
-            lease.descriptor.format,
-            PixelFormat::Rgba | PixelFormat::Nv12
-        )
-    {
-        return Err(NativeFrameIngestionError::UnsupportedCpuFormat(lease));
-    }
-    Ok(lease)
 }
 
 /// Upload a CPU frame to GPU textures, choosing the best path:
@@ -421,21 +430,8 @@ pub fn decoded_frame_to_texture(
     queue: &wgpu::Queue,
     texture_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<Arc<wgpu::Texture>, LegacyFrameIngestionError> {
-    match frame {
-        DecodedFrame::Cpu(cpu) => Ok(upload_cpu_frame(cpu, device, queue, texture_cache)),
-
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        DecodedFrame::MacOS(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
-
-        #[cfg(target_os = "linux")]
-        DecodedFrame::Linux(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
-
-        #[cfg(target_os = "android")]
-        DecodedFrame::Android(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
-
-        #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
-        DecodedFrame::Windows(_) => Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
-    }
+    let cpu = classify_legacy_frame(frame)?;
+    Ok(upload_cpu_frame(cpu, device, queue, texture_cache))
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,7 +1048,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
+    use lumina_video_native_frame::video::LinuxGpuSurface;
     use lumina_video_native_frame::{CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor};
+    #[cfg(target_os = "linux")]
+    use lumina_video_native_frame::{DmaBufMemory, DmaBufObject, DmaBufPlane};
 
     #[test]
     fn test_bgra_to_rgba() {
@@ -1104,10 +1104,7 @@ mod tests {
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(bytes, 4)])),
             AcquireSync::None,
         )?;
-        let lease = validate_native_frame_lease(lease)?;
-        let NativeMemory::Cpu(memory) = lease.memory else {
-            return Err("expected CPU memory".into());
-        };
+        let (_, memory) = classify_native_frame_lease(lease)?;
         let view = CpuFrameRef::from_memory(&memory, 1, 1, PixelFormat::Rgba);
         let plane = view.plane(0).ok_or("missing CPU plane")?;
         assert_eq!(plane.data.as_ptr(), bytes_ptr);
@@ -1137,7 +1134,7 @@ mod tests {
                 OwnedFd::from_raw_fd(fd)
             }),
         )?;
-        let error = validate_native_frame_lease(lease)
+        let error = classify_native_frame_lease(lease)
             .err()
             .ok_or("accepted sync file")?;
         assert!(matches!(
@@ -1171,7 +1168,7 @@ mod tests {
                 NativeMemory::Cpu(CpuMemory::new(planes)),
                 AcquireSync::None,
             )?;
-            let error = validate_native_frame_lease(lease)
+            let error = classify_native_frame_lease(lease)
                 .err()
                 .ok_or("accepted unsupported CPU format")?;
             assert!(matches!(
@@ -1186,6 +1183,107 @@ mod tests {
             let first_plane = memory.planes.first().ok_or("missing CPU plane")?;
             assert_eq!(first_plane.bytes.as_ptr(), first_bytes_ptr);
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_dmabuf_lease_is_rejected_and_returned() -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::File;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let raw_fd = File::open("/dev/null")?.into_raw_fd();
+        let lease = NativeFrameLease::new(
+            NativeFrameDescriptor {
+                frame_id: 4,
+                stream_generation: 2,
+                pts: Duration::from_millis(7),
+                duration: Some(Duration::from_millis(33)),
+                extent: FrameExtent::new(1, 1),
+                format: PixelFormat::Rgba,
+            },
+            NativeMemory::DmaBuf(DmaBufMemory::new(
+                vec![DmaBufObject {
+                    fd: unsafe {
+                        // SAFETY: ownership of the valid descriptor is transferred exactly once.
+                        std::os::fd::OwnedFd::from_raw_fd(raw_fd)
+                    },
+                    size: 4,
+                }],
+                vec![DmaBufPlane {
+                    object: 0,
+                    offset: 16,
+                    stride: 4,
+                    size: 4,
+                }],
+                0x3432_5241,
+                0,
+            )?),
+            AcquireSync::None,
+        )?;
+
+        let error = classify_native_frame_lease(lease)
+            .err()
+            .ok_or("accepted DMABuf lease")?;
+        assert!(matches!(
+            &error,
+            NativeFrameIngestionError::UnsupportedDmaBuf(_)
+        ));
+        let returned = error.into_lease();
+        assert_eq!(returned.descriptor.frame_id, 4);
+        assert_eq!(returned.descriptor.stream_generation, 2);
+        assert_eq!(returned.descriptor.extent, FrameExtent::new(1, 1));
+
+        let NativeMemory::DmaBuf(memory) = returned.memory else {
+            return Err("expected DMABuf memory".into());
+        };
+        assert_eq!(memory.objects.len(), 1);
+        assert_eq!(memory.planes.len(), 1);
+        let object = memory.objects.first().ok_or("missing DMABuf object")?;
+        let plane = memory.planes.first().ok_or("missing DMABuf plane")?;
+        assert_eq!(plane.object, 0);
+        assert_eq!(plane.offset, 16);
+        assert_eq!(plane.stride, 4);
+        assert!(File::from(object.fd.try_clone()?).metadata().is_ok());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn borrowed_linux_surface_is_classified_as_unsupported(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::File;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::sync::Arc;
+
+        let raw_fd = File::open("/dev/null")?.into_raw_fd();
+        let surface = unsafe {
+            // SAFETY: raw_fd is a valid descriptor and the Arc owner outlives the surface.
+            LinuxGpuSurface::new_single_plane(
+                raw_fd,
+                1,
+                1,
+                PixelFormat::Rgba,
+                0,
+                4,
+                0,
+                4,
+                None,
+                Arc::new(()),
+            )
+        };
+        let frame = DecodedFrame::Linux(surface);
+        let error = classify_legacy_frame(&frame)
+            .err()
+            .ok_or("accepted borrowed Linux GPU surface")?;
+        assert_eq!(error, LegacyFrameIngestionError::UnsupportedNativeSurface);
+        let surface = frame.as_linux_surface().ok_or("missing Linux surface")?;
+        assert_eq!(surface.primary_fd(), raw_fd);
+        let file = unsafe {
+            // SAFETY: LinuxGpuSurface only borrows this raw descriptor; this closes the test fd.
+            File::from_raw_fd(surface.primary_fd())
+        };
+        assert!(file.metadata().is_ok());
         Ok(())
     }
 }

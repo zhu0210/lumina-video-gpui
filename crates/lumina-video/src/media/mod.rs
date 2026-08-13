@@ -29,14 +29,6 @@ pub use lumina_video_native_frame::frame_queue;
 pub use lumina_video_native_frame::player;
 #[cfg(not(target_arch = "wasm32"))]
 pub use lumina_video_wgpu as frame_to_texture;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "windows"
-))]
-pub use lumina_video_wgpu::zero_copy;
 
 // Platform-specific re-exports
 #[cfg(any(target_os = "macos", target_os = "ios"))]

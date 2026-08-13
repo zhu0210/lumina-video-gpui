@@ -1,10 +1,15 @@
 //! wgpu frame-import boundary.
 //!
-//! This crate will own native-memory import, GPU conversion, and completion
-//! lifetime.  wgpu types remain private to this crate's future implementation;
-//! the migration seam consumes core session descriptions and owned native
-//! frame leases.  This ticket intentionally adds no importer or player stub.
-//! wgpu rendering boundary for native video frames.
+//! The public external-memory seam accepts an owned
+//! [`lumina_video_native_frame::NativeFrameLease`]. Its CPU path uploads owned
+//! RGBA or NV12 bytes without cloning them; unsupported acquire fences, DMABuf
+//! memory, and other CPU formats return the lease unchanged.
+//!
+//! Borrowed [`lumina_video_native_frame::video::DecodedFrame`] values remain a
+//! compatibility path for CPU frames. Borrowed native GPU surfaces return a
+//! typed unsupported error until #7 connects producers to the owned seam.
+//! Platform-specific import backends stay in the private `zero_copy` module;
+//! they are maintained internally and are not part of this crate's public API.
 
 mod frame_to_texture;
 #[cfg(any(
@@ -14,7 +19,8 @@ mod frame_to_texture;
     target_os = "android",
     target_os = "windows"
 ))]
-pub mod zero_copy;
+#[allow(dead_code)]
+mod zero_copy;
 
 #[allow(deprecated)]
 pub use frame_to_texture::{
