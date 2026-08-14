@@ -29,6 +29,14 @@ locked sources and Cerbero archive, then packages offline:
   --output dist/gstreamer-runtime
 ```
 
+Cerbero 1.28.6 routes one required dependency, zlib 1.3.1, through its
+recipe URL rather than the GStreamer mirror. Discovery reads that exact pinned
+recipe and records its checksum while constructing only the official GStreamer
+mirror URL; the formal build verifies the recipe again and pre-seeds
+`$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz` before the
+dependency-aware Cerbero fetch. This is one locked acquisition exception, not
+the recursive closure/license/source inventory deferred to issue #19.
+
 The generated standalone artifact has this runtime layout:
 
 ```text

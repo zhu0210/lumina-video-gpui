@@ -24,7 +24,7 @@ while (($#)); do
     esac
 done
 
-for command_name in curl git jq sha256sum sort mktemp mv grep awk; do
+for command_name in curl git jq sha256sum sort mktemp mv grep awk sed tar; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -88,6 +88,19 @@ cleanup() {
 trap cleanup EXIT
 curl -fL --retry 3 --max-filesize 50000000 "$cerbero_archive_url" -o "$archive_tmp"
 cerbero_archive_sha=$(sha256sum "$archive_tmp" | awk '{ print $1 }')
+zlib_recipe=$(tar -xOf "$archive_tmp" --wildcards '*/recipes/zlib.recipe')
+zlib_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" <<<"$zlib_recipe")
+zlib_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" <<<"$zlib_recipe")
+[[ "$zlib_version" == 1.3.1 ]] || {
+    echo "Cerbero zlib recipe is not the approved 1.3.1 route" >&2
+    exit 1
+}
+[[ "$zlib_sha" == 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23 ]] || {
+    echo "Cerbero zlib recipe checksum changed" >&2
+    exit 1
+}
+zlib_filename="zlib-${zlib_version}.tar.gz"
+zlib_url="https://gstreamer.freedesktop.org/src/mirror/zlib/${zlib_filename}"
 
 registry=https://registry-1.docker.io
 token=$(curl -fsSL --retry 3 \
@@ -121,6 +134,10 @@ jq -n \
     --arg gstreamer_sha "$gstreamer_sha" \
     --arg libav_url "$libav_url" \
     --arg libav_sha "$libav_sha" \
+    --arg zlib_version "$zlib_version" \
+    --arg zlib_filename "$zlib_filename" \
+    --arg zlib_url "$zlib_url" \
+    --arg zlib_sha "$zlib_sha" \
     --arg cerbero_repo "$cerbero_repo" \
     --arg cerbero_tag "$gstreamer_version" \
     --arg cerbero_tag_object "$cerbero_tag_object" \
@@ -132,7 +149,10 @@ jq -n \
     '{
       schema_version: 1,
       gstreamer: {version: $version, source: {url: $gstreamer_url, sha256: $gstreamer_sha}},
-      sources: {gst_libav: {package: "gst-libav-1.0", filename: ("gst-libav-" + $version + ".tar.xz"), url: $libav_url, sha256: $libav_sha}},
+      sources: {
+        gst_libav: {package: "gst-libav-1.0", filename: ("gst-libav-" + $version + ".tar.xz"), url: $libav_url, sha256: $libav_sha},
+        zlib: {version: $zlib_version, filename: $zlib_filename, url: $zlib_url, sha256: $zlib_sha}
+      },
       cerbero: {repository: $cerbero_repo, tag: $cerbero_tag, tag_object: $cerbero_tag_object, commit: $cerbero_commit, archive: {url: $cerbero_archive_url, sha256: $cerbero_archive_sha}},
       target: {os: "linux", architecture: "x86_64", distribution: "ubuntu", distribution_version: "24.04", glibc: "2.39"},
       builder: {image: ("ubuntu@" + $ubuntu_digest), platform: "linux/amd64"},

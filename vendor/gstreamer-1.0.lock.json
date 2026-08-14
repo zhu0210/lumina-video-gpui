@@ -13,6 +13,12 @@
       "filename": "gst-libav-1.28.6.tar.xz",
       "url": "https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.28.6.tar.xz",
       "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51"
+    },
+    "zlib": {
+      "version": "1.3.1",
+      "filename": "zlib-1.3.1.tar.gz",
+      "url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz",
+      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
     }
   },
   "cerbero": {
