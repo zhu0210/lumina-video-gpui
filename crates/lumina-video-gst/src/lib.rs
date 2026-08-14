@@ -24,9 +24,10 @@ use lumina_video_native_frame::linux_video_gst::{
     DEFAULT_LIFECYCLE_TIMEOUT,
 };
 pub use lumina_video_native_frame::linux_video_gst::{GstAudioSinkMode, DEFAULT_OPEN_TIMEOUT};
-use lumina_video_native_frame::video::{VideoDecoderBackend, VideoError};
+use lumina_video_native_frame::video::{PixelFormat, VideoDecoderBackend, VideoError};
 use lumina_video_native_frame::{
-    AcquireSync, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
+    nv12_to_rgba_into, AcquireSync, ColorMetadata, ColorRenderDecision, CpuMemoryPool, FrameExtent,
+    NativeFrameDescriptor, NativeFrameLease, NativeMemory,
 };
 use parking_lot::RwLock;
 use url::Url;
@@ -810,6 +811,131 @@ struct WorkerIo {
     lifecycle_control: GstLifecycleControl,
 }
 
+#[derive(Debug)]
+struct ColorGeneration {
+    extent: FrameExtent,
+    color: ColorMetadata,
+    decision: ColorRenderDecision,
+    rgba_pool: Option<CpuMemoryPool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ColorGenerationError {
+    Unsupported,
+    UnsupportedSdrColor,
+}
+
+fn ensure_color_generation(
+    generation: &mut Option<ColorGeneration>,
+    extent: FrameExtent,
+    color: ColorMetadata,
+) -> Result<&mut ColorGeneration, ColorGenerationError> {
+    if let Some(current) = generation.as_mut() {
+        if current.extent == extent && current.color == color {
+            return Ok(current);
+        }
+    }
+    let decision = lumina_video_native_frame::render_decision(color);
+    let rgba_pool = match decision {
+        ColorRenderDecision::CpuRgba(_) => CpuMemoryPool::new(extent),
+        ColorRenderDecision::Gpu(_)
+        | ColorRenderDecision::Unsupported
+        | ColorRenderDecision::UnsupportedSdrColor => None,
+    };
+    match decision {
+        ColorRenderDecision::Unsupported => return Err(ColorGenerationError::Unsupported),
+        ColorRenderDecision::UnsupportedSdrColor => {
+            return Err(ColorGenerationError::UnsupportedSdrColor)
+        }
+        ColorRenderDecision::Gpu(_) => {}
+        ColorRenderDecision::CpuRgba(_) if rgba_pool.is_none() => {
+            return Err(ColorGenerationError::UnsupportedSdrColor)
+        }
+        ColorRenderDecision::CpuRgba(_) => {}
+    }
+    *generation = Some(ColorGeneration {
+        extent,
+        color,
+        decision,
+        rgba_pool,
+    });
+    match generation.as_mut() {
+        Some(current) => Ok(current),
+        None => Err(ColorGenerationError::UnsupportedSdrColor),
+    }
+}
+
+#[derive(Debug)]
+enum FramePreparationError {
+    Unsupported(ColorGenerationError),
+    Decode(String),
+}
+
+fn prepare_frame_memory(
+    format: PixelFormat,
+    extent: FrameExtent,
+    color: ColorMetadata,
+    memory: NativeMemory,
+    generation: &mut Option<ColorGeneration>,
+) -> Result<Option<(PixelFormat, NativeMemory)>, FramePreparationError> {
+    if format != PixelFormat::Nv12 {
+        return Ok(Some((format, memory)));
+    }
+    let decision = ensure_color_generation(generation, extent, color)
+        .map_err(FramePreparationError::Unsupported)?
+        .decision;
+    match decision {
+        ColorRenderDecision::Gpu(_) => Ok(Some((PixelFormat::Nv12, memory))),
+        ColorRenderDecision::Unsupported => Err(FramePreparationError::Unsupported(
+            ColorGenerationError::Unsupported,
+        )),
+        ColorRenderDecision::UnsupportedSdrColor => Err(FramePreparationError::Unsupported(
+            ColorGenerationError::UnsupportedSdrColor,
+        )),
+        ColorRenderDecision::CpuRgba(matrix) => {
+            let Some(mut output) = generation
+                .as_ref()
+                .and_then(|current| current.rgba_pool.as_ref())
+                .and_then(CpuMemoryPool::try_acquire)
+            else {
+                return Ok(None);
+            };
+            let NativeMemory::Cpu(input) = memory else {
+                return Err(FramePreparationError::Unsupported(
+                    ColorGenerationError::UnsupportedSdrColor,
+                ));
+            };
+            let Some(output_plane) = output.planes.first_mut() else {
+                return Err(FramePreparationError::Decode(
+                    "RGBA pool returned no plane".into(),
+                ));
+            };
+            nv12_to_rgba_into(
+                &input.planes,
+                extent,
+                color,
+                &matrix,
+                &mut output_plane.bytes,
+            )
+            .map_err(|error| {
+                FramePreparationError::Decode(format!("NV12 conversion: {error:?}"))
+            })?;
+            Ok(Some((PixelFormat::Rgba, NativeMemory::Cpu(output))))
+        }
+    }
+}
+
+fn color_generation_error(error: ColorGenerationError) -> SessionError {
+    match error {
+        ColorGenerationError::Unsupported => SessionError::Unsupported(
+            "native video color metadata is unsupported (unknown matrix/range or HDR)".into(),
+        ),
+        ColorGenerationError::UnsupportedSdrColor => SessionError::Unsupported(
+            "native video uses SDR color metadata outside the implemented renderer contract".into(),
+        ),
+    }
+}
+
 fn shutdown_worker(decoder: &mut GStreamerDecoder, lifecycle: &GstLifecycleControl) {
     let deadline = lifecycle
         .deadline()
@@ -976,6 +1102,11 @@ fn run_worker(
         stream_generation: initial_stream_generation,
     };
     let mut frame_id = 0_u64;
+    // One decision and (for CPU fallback) one exactly-two-payload pool per
+    // negotiated extent/color generation. A caps or color change replaces
+    // this value; old payload senders then disconnect when outstanding leases
+    // return, so no generation can recycle into a newer pool.
+    let mut color_generation = None;
     let mut live_gap = LiveGapDeadline::default();
     let mut last_audio_buffers_seen = decoder.audio_handle().audio_buffers_seen();
 
@@ -1136,23 +1267,70 @@ fn run_worker(
                     .position_us
                     .store(playback.position.as_micros() as u64, Ordering::Relaxed);
                 update_audio_observation(&state, &audio_handle, &decoder, playback.position);
+                let frame_color = frame.color;
+                let frame_extent = frame.extent;
+                let frame_pts = frame.pts;
+                let frame_format = frame.format;
+                let (format, memory) = match prepare_frame_memory(
+                    frame_format,
+                    frame_extent,
+                    frame_color,
+                    frame.memory,
+                    &mut color_generation,
+                ) {
+                    Ok(Some(prepared)) => prepared,
+                    Ok(None) => {
+                        dropped_frames.fetch_add(1, Ordering::Relaxed);
+                        update_gst_observation(&state, &decoder, frame_sender.len());
+                        continue;
+                    }
+                    Err(FramePreparationError::Unsupported(error)) => {
+                        let _ = publish_error(
+                            &state,
+                            &control_sender,
+                            &mut sequence,
+                            color_generation_error(error),
+                        );
+                        shutdown_worker(&mut decoder, &lifecycle_control);
+                        return;
+                    }
+                    Err(FramePreparationError::Decode(message)) => {
+                        let _ = publish_error(
+                            &state,
+                            &control_sender,
+                            &mut sequence,
+                            SessionError::Decode(message),
+                        );
+                        shutdown_worker(&mut decoder, &lifecycle_control);
+                        return;
+                    }
+                };
+                let color_transform = if format == PixelFormat::Nv12 {
+                    match color_generation.as_ref().map(|current| current.decision) {
+                        Some(ColorRenderDecision::Gpu(transform)) => Some(transform),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let descriptor = NativeFrameDescriptor {
                     frame_id,
                     stream_generation: playback.stream_generation,
-                    pts: frame.pts,
+                    pts: frame_pts,
                     duration: Some(decoder.metadata().frame_duration()),
-                    extent: frame.extent,
-                    format: frame.format,
+                    extent: frame_extent,
+                    format,
+                    color: frame_color,
+                    color_transform,
                 };
                 let settled_tier = if requested_tier != CapabilityTier::SystemMemoryUpload
-                    && matches!(&frame.memory, NativeMemory::DmaBuf(_))
+                    && matches!(&memory, NativeMemory::DmaBuf(_))
                 {
                     requested_tier
                 } else {
                     CapabilityTier::SystemMemoryUpload
                 };
-                let lease = match NativeFrameLease::new(descriptor, frame.memory, AcquireSync::None)
-                {
+                let lease = match NativeFrameLease::new(descriptor, memory, AcquireSync::None) {
                     Ok(lease) => lease,
                     Err(error) => {
                         if lifecycle_control.is_stop_requested() {
@@ -1826,7 +2004,10 @@ impl Drop for GstMediaSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumina_video_native_frame::{CpuMemory, CpuPlane, FrameExtent, NativeMemory};
+    use lumina_video_native_frame::{
+        ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorPrimaries, ColorRange,
+        ColorTransfer, CpuMemory, CpuPlane, FrameExtent, NativeMemory,
+    };
     use std::fs;
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener};
@@ -2779,6 +2960,8 @@ mod tests {
                 duration: None,
                 extent: FrameExtent::new(1, 1),
                 format: lumina_video_native_frame::video::PixelFormat::Rgba,
+                color: lumina_video_native_frame::ColorMetadata::default(),
+                color_transform: None,
             },
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(vec![0, 0, 0, 255], 4)])),
             AcquireSync::None,
@@ -2790,6 +2973,63 @@ mod tests {
 
     fn test_frame(frame_id: u64) -> Frame {
         test_frame_with_generation(frame_id, 0)
+    }
+
+    fn cpu_color() -> ColorMetadata {
+        ColorMetadata {
+            matrix: ColorMatrix::Bt709,
+            primaries: ColorPrimaries::Bt709,
+            transfer: ColorTransfer::Srgb,
+            range: ColorRange::Limited,
+            chroma_horizontal: ChromaHorizontal::Cosited,
+            chroma_vertical: ChromaVertical::Centered,
+        }
+    }
+
+    #[test]
+    fn color_decision_is_once_per_generation_and_caps_change_rebuilds_pool() {
+        let mut generation = None;
+        let extent = FrameExtent::new(2, 2);
+        let first = ensure_color_generation(&mut generation, extent, cpu_color())
+            .map(|value| value as *const _);
+        let second = ensure_color_generation(&mut generation, extent, cpu_color())
+            .map(|value| value as *const _);
+        assert!(first.is_ok());
+        assert_eq!(first.ok(), second.ok());
+        let changed = ensure_color_generation(&mut generation, FrameExtent::new(4, 2), cpu_color());
+        assert!(changed.is_ok());
+        assert_ne!(first.ok(), changed.ok().map(|value| value as *const _));
+        let unsupported = ColorMetadata {
+            matrix: ColorMatrix::Unknown,
+            ..cpu_color()
+        };
+        assert!(matches!(
+            ensure_color_generation(&mut generation, extent, unsupported),
+            Err(ColorGenerationError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn cpu_pool_exhaustion_drops_without_allocating_a_third_payload() {
+        let mut generation = None;
+        let color = cpu_color();
+        let extent = FrameExtent::new(2, 2);
+        assert!(ensure_color_generation(&mut generation, extent, color).is_ok());
+        let source = || {
+            NativeMemory::Cpu(CpuMemory::new(vec![
+                CpuPlane::new(vec![16, 235, 16, 235], 2),
+                CpuPlane::new(vec![128, 128], 2),
+            ]))
+        };
+        let first =
+            prepare_frame_memory(PixelFormat::Nv12, extent, color, source(), &mut generation);
+        let second =
+            prepare_frame_memory(PixelFormat::Nv12, extent, color, source(), &mut generation);
+        let third =
+            prepare_frame_memory(PixelFormat::Nv12, extent, color, source(), &mut generation);
+        assert!(matches!(first, Ok(Some((PixelFormat::Rgba, _)))));
+        assert!(matches!(second, Ok(Some((PixelFormat::Rgba, _)))));
+        assert_eq!(third.ok(), Some(None));
     }
 
     #[test]

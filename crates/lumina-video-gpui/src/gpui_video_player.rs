@@ -942,11 +942,9 @@ impl GpuiVideoPlayer {
                     Ok(textures) => self.frame_textures = Some(textures),
                     Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease))
                     | Err(NativeFrameIngestionError::UnsupportedDmaBuf(lease))
-                    | Err(NativeFrameIngestionError::UnsupportedCpuFormat(lease)) => {
-                        let _ = lease;
-                        tracing::warn!(
-                            "GStreamer session frame was unsupported by the GPU upload seam; keeping previous texture"
-                        );
+                    | Err(NativeFrameIngestionError::UnsupportedCpuFormat(lease))
+                    | Err(NativeFrameIngestionError::UnsupportedColorMetadata(lease)) => {
+                        drop(lease);
                     }
                 }
             }
@@ -967,7 +965,8 @@ impl GpuiVideoPlayer {
     /// Returns the GPUI element for the video frame.
     ///
     /// Uses `surface()` for GPU compositing:
-    /// - NV12 frames: `surface((y_tex, cbcr_tex, size))` — GPU-side YUV→RGB
+    /// - GPU NV12 frames: `surface((y_tex, cbcr_tex, size, transform))`
+    /// - CPU-fallback NV12 frames: RGBA passthrough
     /// - RGBA frames: `surface((tex, desc))` — passthrough
     /// - No frame: black placeholder
     pub fn surface_element(&self) -> impl IntoElement {
@@ -978,9 +977,13 @@ impl GpuiVideoPlayer {
                     cb_cr_texture,
                     width,
                     height,
+                    color_transform,
                 } => {
                     let native_size =
                         size(DevicePixels(*width as i32), DevicePixels(*height as i32));
+                    let color_transform = gpui::Nv12ColorTransform {
+                        yuv_to_rgb: *color_transform,
+                    };
                     // Surface must request explicit size; otherwise flex containers
                     // allocate zero bounds to auto-sized children with only aspect_ratio,
                     // and the resulting paint_bounds cause the scissor rect to clip
@@ -988,9 +991,14 @@ impl GpuiVideoPlayer {
                     div()
                         .size_full()
                         .child(
-                            surface((y_texture.clone(), cb_cr_texture.clone(), native_size))
-                                .size_full()
-                                .object_fit(ObjectFit::Contain),
+                            surface((
+                                y_texture.clone(),
+                                cb_cr_texture.clone(),
+                                native_size,
+                                color_transform,
+                            ))
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
                         )
                         .into_element()
                 }
@@ -1329,5 +1337,20 @@ mod tests {
         ] {
             assert_eq!(linux_playback_route(source), LinuxPlaybackRoute::Gst);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod color_boundary_tests {
+    #[test]
+    fn gpui_boundary_copies_all_asymmetric_matrix_columns() {
+        let source = [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+            [13.0, 14.0, 15.0, 16.0],
+        ];
+        let copied = gpui::Nv12ColorTransform { yuv_to_rgb: source };
+        assert_eq!(copied.yuv_to_rgb, source);
     }
 }

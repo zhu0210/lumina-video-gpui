@@ -38,8 +38,9 @@ use crate::video::{
 };
 
 use crate::{
-    into_cpu_planes, DmaBufFormatPlane, DmaBufMemory, DmaBufMemoryPlane, DmaBufObject, FrameExtent,
-    NativeMemory,
+    into_cpu_planes, render_decision, ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata,
+    ColorPrimaries, ColorRange, ColorRenderDecision, ColorTransfer, DmaBufFormatPlane,
+    DmaBufMemory, DmaBufMemoryPlane, DmaBufObject, FrameExtent, NativeMemory,
 };
 
 /// A decoder result containing only owned native-frame data. No GStreamer
@@ -49,7 +50,85 @@ pub struct NativeDecodedFrame {
     pub pts: Duration,
     pub extent: FrameExtent,
     pub format: PixelFormat,
+    pub color: ColorMetadata,
     pub memory: NativeMemory,
+}
+
+fn color_metadata_from_video_info(video_info: &gst_video::VideoInfo) -> ColorMetadata {
+    let colorimetry = video_info.colorimetry();
+    let matrix = match colorimetry.matrix() {
+        gst_video::VideoColorMatrix::Bt601 => ColorMatrix::Bt601,
+        gst_video::VideoColorMatrix::Bt709 => ColorMatrix::Bt709,
+        gst_video::VideoColorMatrix::Fcc => ColorMatrix::Fcc,
+        gst_video::VideoColorMatrix::Smpte240m => ColorMatrix::Smpte240m,
+        gst_video::VideoColorMatrix::Bt2020 => ColorMatrix::Bt2020,
+        gst_video::VideoColorMatrix::Rgb => ColorMatrix::Unsupported,
+        _ => ColorMatrix::Unknown,
+    };
+    let primaries = match colorimetry.primaries() {
+        gst_video::VideoColorPrimaries::Bt709 => ColorPrimaries::Bt709,
+        gst_video::VideoColorPrimaries::Bt470m => ColorPrimaries::Bt470m,
+        gst_video::VideoColorPrimaries::Bt470bg => ColorPrimaries::Bt470Bg,
+        gst_video::VideoColorPrimaries::Smpte170m => ColorPrimaries::Smpte170m,
+        gst_video::VideoColorPrimaries::Smpte240m => ColorPrimaries::Smpte240m,
+        gst_video::VideoColorPrimaries::Film => ColorPrimaries::Film,
+        gst_video::VideoColorPrimaries::Bt2020 => ColorPrimaries::Bt2020,
+        gst_video::VideoColorPrimaries::Adobergb => ColorPrimaries::Adobergb,
+        _ => ColorPrimaries::Unknown,
+    };
+    let transfer = match colorimetry.transfer() {
+        gst_video::VideoTransferFunction::Bt601 => ColorTransfer::Bt601,
+        gst_video::VideoTransferFunction::Bt709 => ColorTransfer::Bt709,
+        gst_video::VideoTransferFunction::Smpte240m => ColorTransfer::Smpte240m,
+        gst_video::VideoTransferFunction::Srgb => ColorTransfer::Srgb,
+        gst_video::VideoTransferFunction::Gamma10 => ColorTransfer::Gamma10,
+        gst_video::VideoTransferFunction::Gamma18 => ColorTransfer::Gamma18,
+        gst_video::VideoTransferFunction::Gamma20 => ColorTransfer::Gamma20,
+        gst_video::VideoTransferFunction::Gamma22 => ColorTransfer::Gamma22,
+        gst_video::VideoTransferFunction::Gamma28 => ColorTransfer::Gamma28,
+        gst_video::VideoTransferFunction::Log100 => ColorTransfer::Log100,
+        gst_video::VideoTransferFunction::Log316 => ColorTransfer::Log316,
+        gst_video::VideoTransferFunction::Adobergb => ColorTransfer::Adobergb,
+        gst_video::VideoTransferFunction::Bt202012 => ColorTransfer::Bt202012,
+        gst_video::VideoTransferFunction::Bt202010 => ColorTransfer::Bt202010,
+        gst_video::VideoTransferFunction::Smpte2084 => ColorTransfer::Smpte2084,
+        gst_video::VideoTransferFunction::AribStdB67 => ColorTransfer::AribStdB67,
+        _ => ColorTransfer::Unknown,
+    };
+    let range = match colorimetry.range() {
+        gst_video::VideoColorRange::Range0_255 => ColorRange::Full,
+        gst_video::VideoColorRange::Range16_235 => ColorRange::Limited,
+        gst_video::VideoColorRange::Unknown => ColorRange::Unknown,
+        _ => ColorRange::Unsupported,
+    };
+    let site = video_info.chroma_site();
+    let (chroma_horizontal, chroma_vertical) = if site.is_empty() {
+        (ChromaHorizontal::Unknown, ChromaVertical::Unknown)
+    } else if site == gst_video::VideoChromaSite::JPEG {
+        (ChromaHorizontal::Centered, ChromaVertical::Centered)
+    } else if site == gst_video::VideoChromaSite::MPEG2 {
+        (ChromaHorizontal::Cosited, ChromaVertical::Centered)
+    } else if site == gst_video::VideoChromaSite::H_COSITED {
+        (ChromaHorizontal::Cosited, ChromaVertical::Centered)
+    } else if site == gst_video::VideoChromaSite::V_COSITED {
+        (ChromaHorizontal::Centered, ChromaVertical::Cosited)
+    } else if site == gst_video::VideoChromaSite::COSITED {
+        (ChromaHorizontal::Cosited, ChromaVertical::Cosited)
+    } else if site.contains(gst_video::VideoChromaSite::ALT_LINE) {
+        (ChromaHorizontal::Unsupported, ChromaVertical::AlternateLine)
+    } else if site.contains(gst_video::VideoChromaSite::DV) {
+        (ChromaHorizontal::Unsupported, ChromaVertical::Dv)
+    } else {
+        (ChromaHorizontal::Unsupported, ChromaVertical::Unsupported)
+    };
+    ColorMetadata {
+        matrix,
+        primaries,
+        transfer,
+        range,
+        chroma_horizontal,
+        chroma_vertical,
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +559,8 @@ pub struct GStreamerDecoder {
     /// Once native layout negotiation fails, use CPU extraction for the rest
     /// of this decoder instead of retrying DMABuf on every frame.
     native_layout_failed: bool,
+    /// Cached native/GPU color eligibility for the current caps tuple.
+    native_color_generation: Option<(FrameExtent, ColorMetadata, bool)>,
     metadata: VideoMetadata,
     position: Duration,
     eof: bool,
@@ -1363,6 +1444,7 @@ impl GStreamerDecoder {
             first_byte_seen,
             requested_tier,
             native_layout_failed: false,
+            native_color_generation: None,
             metadata,
             position: Duration::ZERO,
             eof: false,
@@ -1507,8 +1589,24 @@ impl GStreamerDecoder {
             .unwrap_or(self.position);
         let width = video_info.width();
         let height = video_info.height();
+        let color = color_metadata_from_video_info(&video_info);
 
-        if should_attempt_native(self.requested_tier, self.native_layout_failed) {
+        let extent = FrameExtent::new(width, height);
+        let native_color_supported = match self.native_color_generation {
+            Some((cached_extent, cached_color, supported))
+                if cached_extent == extent && cached_color == color =>
+            {
+                supported
+            }
+            _ => {
+                let supported = matches!(render_decision(color), ColorRenderDecision::Gpu(_));
+                self.native_color_generation = Some((extent, color, supported));
+                supported
+            }
+        };
+        if native_color_supported
+            && should_attempt_native(self.requested_tier, self.native_layout_failed)
+        {
             match self.try_dmabuf_memory(buffer, &video_info, &sample) {
                 Ok(Some(memory)) => {
                     let format = pixel_format_from_memory(&memory).ok_or_else(|| {
@@ -1520,6 +1618,7 @@ impl GStreamerDecoder {
                         pts,
                         extent: FrameExtent::new(width, height),
                         format,
+                        color,
                         memory: NativeMemory::DmaBuf(memory),
                     });
                 }
@@ -1555,6 +1654,7 @@ impl GStreamerDecoder {
             pts,
             extent: FrameExtent::new(width, height),
             format,
+            color,
             memory: NativeMemory::Cpu(crate::CpuMemory::new(into_cpu_planes(planes))),
         })
     }
@@ -2740,11 +2840,102 @@ mod tests {
         AudioSelectionAttemptError, AudioTrackSelectionResult, GStreamerDecoder,
         GstLifecycleControl,
     };
+    use super::{
+        ChromaHorizontal, ChromaVertical, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer,
+    };
     use crate::video::VideoError;
     use gstreamer as gst;
+    use gstreamer_video as gst_video;
     use lumina_video_core::session::{AudioTrack, CapabilityTier};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn maps_sdr_colorimetry_and_chroma_without_crossing_gstreamer_types(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        let colorimetry = gst_video::VideoColorimetry::new(
+            gst_video::VideoColorRange::Range16_235,
+            gst_video::VideoColorMatrix::Bt709,
+            gst_video::VideoTransferFunction::Bt709,
+            gst_video::VideoColorPrimaries::Bt709,
+        );
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 2, 2)
+            .colorimetry(&colorimetry)
+            .chroma_site(gst_video::VideoChromaSite::MPEG2)
+            .build()?;
+        assert_eq!(
+            super::color_metadata_from_video_info(&info),
+            crate::ColorMetadata {
+                matrix: ColorMatrix::Bt709,
+                primaries: ColorPrimaries::Bt709,
+                transfer: ColorTransfer::Bt709,
+                range: ColorRange::Limited,
+                chroma_horizontal: ChromaHorizontal::Cosited,
+                chroma_vertical: ChromaVertical::Centered,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_asymmetric_and_interlaced_chroma_siting() -> Result<(), Box<dyn std::error::Error>>
+    {
+        gst::init()?;
+        for (site, horizontal, vertical) in [
+            (
+                gst_video::VideoChromaSite::H_COSITED,
+                ChromaHorizontal::Cosited,
+                ChromaVertical::Centered,
+            ),
+            (
+                gst_video::VideoChromaSite::V_COSITED,
+                ChromaHorizontal::Centered,
+                ChromaVertical::Cosited,
+            ),
+            (
+                gst_video::VideoChromaSite::ALT_LINE,
+                ChromaHorizontal::Unsupported,
+                ChromaVertical::AlternateLine,
+            ),
+            (
+                gst_video::VideoChromaSite::DV,
+                ChromaHorizontal::Unsupported,
+                ChromaVertical::Dv,
+            ),
+        ] {
+            let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 2, 2)
+                .chroma_site(site)
+                .build()?;
+            let color = super::color_metadata_from_video_info(&info);
+            assert_eq!(color.chroma_horizontal, horizontal);
+            assert_eq!(color.chroma_vertical, vertical);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maps_unknown_and_hdr_like_values_to_explicit_safe_states(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        let colorimetry = gst_video::VideoColorimetry::new(
+            gst_video::VideoColorRange::Unknown,
+            gst_video::VideoColorMatrix::Bt2020,
+            gst_video::VideoTransferFunction::Bt202012,
+            gst_video::VideoColorPrimaries::Bt2020,
+        );
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 2, 2)
+            .colorimetry(&colorimetry)
+            .build()?;
+        let color = super::color_metadata_from_video_info(&info);
+        assert_eq!(color.matrix, ColorMatrix::Bt2020);
+        assert_eq!(color.primaries, ColorPrimaries::Bt2020);
+        assert_eq!(color.transfer, ColorTransfer::Bt202012);
+        assert_eq!(color.range, ColorRange::Unknown);
+        assert_eq!(color.chroma_horizontal, ChromaHorizontal::Unknown);
+        assert_eq!(color.chroma_vertical, ChromaVertical::Unknown);
+        Ok(())
+    }
 
     #[test]
     fn unknown_modifier_downgrades_once_without_retry() -> Result<(), Box<dyn std::error::Error>> {
