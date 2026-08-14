@@ -3013,12 +3013,27 @@ mod tests {
         let mut generation = None;
         let extent = FrameExtent::new(2, 2);
         let decision = lumina_video_native_frame::render_decision(cpu_color());
-        let first = ensure_color_generation(&mut generation, extent, cpu_color(), decision)
-            .map(|value| value as *const _);
-        let second = ensure_color_generation(&mut generation, extent, cpu_color(), decision)
-            .map(|value| value as *const _);
-        assert!(first.is_ok());
-        assert_eq!(first.ok(), second.ok());
+        assert!(ensure_color_generation(&mut generation, extent, cpu_color(), decision).is_ok());
+        let Some(old_first) = generation
+            .as_ref()
+            .and_then(|current| current.rgba_pool.as_ref())
+            .and_then(RgbaPool::try_acquire)
+        else {
+            panic!("first generation payload must be available");
+        };
+        assert!(ensure_color_generation(&mut generation, extent, cpu_color(), decision).is_ok());
+        let Some(old_second) = generation
+            .as_ref()
+            .and_then(|current| current.rgba_pool.as_ref())
+            .and_then(RgbaPool::try_acquire)
+        else {
+            panic!("same generation must retain its second payload");
+        };
+        assert!(generation
+            .as_ref()
+            .and_then(|current| current.rgba_pool.as_ref())
+            .and_then(RgbaPool::try_acquire)
+            .is_none());
         let changed = ensure_color_generation(
             &mut generation,
             FrameExtent::new(4, 2),
@@ -3026,7 +3041,33 @@ mod tests {
             decision,
         );
         assert!(changed.is_ok());
-        assert_ne!(first.ok(), changed.ok().map(|value| value as *const _));
+        let Some(new_first) = generation
+            .as_ref()
+            .and_then(|current| current.rgba_pool.as_ref())
+            .and_then(RgbaPool::try_acquire)
+        else {
+            panic!("new generation first payload must be available");
+        };
+        let Some(new_second) = generation
+            .as_ref()
+            .and_then(|current| current.rgba_pool.as_ref())
+            .and_then(RgbaPool::try_acquire)
+        else {
+            panic!("new generation second payload must be available");
+        };
+        assert_eq!(
+            new_first.planes.first().map(|plane| plane.bytes.len()),
+            Some(4 * 4 * 2)
+        );
+        assert!(generation
+            .as_ref()
+            .and_then(|current| current.rgba_pool.as_ref())
+            .and_then(RgbaPool::try_acquire)
+            .is_none());
+        drop(new_first);
+        drop(new_second);
+        drop(old_first);
+        drop(old_second);
         let unsupported = ColorMetadata {
             matrix: ColorMatrix::Unknown,
             ..cpu_color()
@@ -3114,9 +3155,15 @@ mod tests {
         );
         drop(recycled_first);
         drop(second);
-        assert!(pool.try_acquire().is_some());
-        assert!(pool.try_acquire().is_some());
+        let Some(final_first) = pool.try_acquire() else {
+            panic!("first final payload must be available");
+        };
+        let Some(final_second) = pool.try_acquire() else {
+            panic!("second final payload must be available");
+        };
         assert!(pool.try_acquire().is_none());
+        drop(final_first);
+        drop(final_second);
     }
 
     #[test]
