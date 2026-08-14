@@ -15,12 +15,14 @@
 //! producers must hand an owned lease to [`native_frame_lease_to_textures`].
 
 #[cfg(test)]
+use lumina_video_native_frame::apply_yuv_matrix;
+#[cfg(test)]
 use lumina_video_native_frame::video::Plane;
 use lumina_video_native_frame::video::{CpuFrame, DecodedFrame, PixelFormat};
 use lumina_video_native_frame::{
-    apply_yuv_matrix, nv12_bytes_to_rgba_into, yuv420p_bytes_to_rgba_into, yuv_to_rgb_matrix,
-    AcquireSync, ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorRange,
-    ColorTransfer, CpuMemory, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
+    nv12_bytes_to_rgba_into, yuv420p_bytes_to_rgba_into, yuv_to_rgb_matrix, AcquireSync,
+    ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorRange, ColorTransfer,
+    CpuMemory, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
 };
 use std::sync::Arc;
 
@@ -98,17 +100,11 @@ pub enum GpuFrameTextures {
 }
 
 fn default_nv12_color_transform() -> [[f32; 4]; 4] {
-    match yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Full) {
-        Some(transform) => transform,
-        None => [[0.0; 4]; 4],
-    }
+    yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Full).unwrap_or([[0.0; 4]; 4])
 }
 
 fn legacy_cpu_nv12_color_transform() -> [[f32; 4]; 4] {
-    match yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Limited) {
-        Some(transform) => transform,
-        None => [[0.0; 4]; 4],
-    }
+    yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Limited).unwrap_or([[0.0; 4]; 4])
 }
 
 #[derive(Clone, Copy)]

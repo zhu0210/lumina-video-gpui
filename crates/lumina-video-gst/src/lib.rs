@@ -3077,7 +3077,7 @@ mod tests {
         );
         assert!(matches!(first, Ok(Some((PixelFormat::Rgba, _)))));
         assert!(matches!(second, Ok(Some((PixelFormat::Rgba, _)))));
-        assert_eq!(third.ok(), Some(None));
+        assert!(matches!(third, Ok(None)));
     }
 
     #[test]
