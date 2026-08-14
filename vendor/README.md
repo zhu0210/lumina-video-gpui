@@ -54,8 +54,10 @@ vendor/linux-x86_64/
 ├── bin/
 │   └── lumina-gstreamer-runtime
 ├── lib/
-│   └── x86_64-linux-gnu/
-│       └── gstreamer-1.0/
+│   ├── x86_64-linux-gnu/
+│   │   └── gstreamer-1.0/
+│   └── python3.12/
+│       └── site-packages/
 └── libexec/gstreamer-1.0/gst-plugin-scanner
 ```
 
