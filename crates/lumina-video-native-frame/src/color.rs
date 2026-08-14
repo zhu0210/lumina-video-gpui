@@ -557,6 +557,7 @@ fn decode_transfer(value: f32, transfer: ColorTransfer) -> f32 {
         ColorTransfer::Gamma22 => value.powf(2.2),
         ColorTransfer::Gamma28 => value.powf(2.8),
         ColorTransfer::Srgb | ColorTransfer::Unknown | ColorTransfer::Unsupported => value,
+        ColorTransfer::Smpte240m => value,
         ColorTransfer::Bt202010
         | ColorTransfer::Bt202012
         | ColorTransfer::Smpte2084
