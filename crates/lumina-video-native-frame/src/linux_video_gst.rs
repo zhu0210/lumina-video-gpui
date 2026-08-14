@@ -347,9 +347,8 @@ fn native_layout(
             .and_then(|value| {
                 value
                     .split_once(':')
-                    .map(|(_, modifier)| modifier.to_owned())
+                    .and_then(|(_, modifier)| parse_modifier(modifier))
             })
-            .and_then(|modifier| parse_modifier(&modifier))
             .or_else(|| (info.modifier() != 0x00ff_ffff_ffff_ffff).then_some(info.modifier()))
             .or_else(|| {
                 structure
@@ -2147,6 +2146,8 @@ impl GStreamerDecoder {
             });
         }
 
+        // The type-erased GstBuffer owner is the bounded producer lease required by
+        // the DMABuf callback; the capacity-one mailbox prevents this from becoming a cache.
         let owner = ProducerOwner::new(buffer.to_owned());
         DmaBufMemory::new(
             objects,

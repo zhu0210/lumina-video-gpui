@@ -59,6 +59,8 @@ use lumina_video_wgpu::{native_frame_lease_to_textures, NativeFrameIngestionErro
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct ExternalPresentation {
+    // The local pending/display slot and GPUI's exact texture Arc are both
+    // required owners; the bounded mailbox/renderer slots prevent growth.
     texture: Arc<wgpu::Texture>,
     width: u32,
     height: u32,
@@ -97,6 +99,11 @@ impl DirectImportWorker {
             .name("lumina-dmabuf-import".into())
             .spawn(move || {
                 while let Ok(lease) = input_receiver.recv() {
+                    // SAFETY: this route enqueues only GStreamer-owned DMABuf leases whose
+                    // export supplied a producer-ready SyncFile and truthful NV12 layout;
+                    // the producer has handed the image to GENERAL/FOREIGN ownership and
+                    // `device` is the matching Vulkan device. The importer only validates
+                    // and wraps the image/fence; it never waits or submits GPU work.
                     let imported = unsafe { import_external_dmabuf_nv12(lease, &device) };
                     let _ = try_send_drop_oldest(&output, &worker_output_drop, imported);
                 }
@@ -838,34 +845,24 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
-    fn mark_external_retirement<T, U>(
-        pending_retirement: &mut bool,
-        pending_external: &mut Option<T>,
-        direct_display: &mut Option<T>,
-        frame_realization: &mut Option<U>,
-    ) {
-        *pending_retirement = true;
-        *pending_external = None;
-        *direct_display = None;
-        *frame_realization = None;
-    }
-
-    #[cfg(target_os = "linux")]
     fn request_external_retirement(&mut self) {
-        Self::mark_external_retirement(
-            &mut self.pending_external_retirement,
-            &mut self.pending_external,
-            &mut self.direct_display,
-            &mut self.frame_realization,
-        );
+        self.pending_external_retirement = true;
+        self.pending_external = None;
+        self.direct_display = None;
+        self.frame_realization = None;
     }
 
     #[cfg(target_os = "linux")]
     fn retire_external_frame_now(&mut self, window: &mut Window) {
-        let _ = window.clear_external_frame();
-        // clear_external_frame() reports Accepted through the same one-shot
-        // outcome channel; it must not certify a still-pending submission.
-        let _ = window.take_external_frame_outcome();
+        let owns_external_frame = self.pending_external_retirement
+            || self.pending_external.is_some()
+            || self.direct_display.is_some();
+        if owns_external_frame {
+            let _ = window.clear_external_frame();
+            // clear_external_frame() reports Accepted through the same one-shot
+            // outcome channel; it must not certify a still-pending submission.
+            let _ = window.take_external_frame_outcome();
+        }
         self.pending_external_retirement = false;
         self.pending_external = None;
         self.direct_display = None;
@@ -953,29 +950,36 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
+    fn external_frame_outcome_certifies(
+        pending_external: bool,
+        outcome: gpui_wgpu::ExternalFrameOutcome,
+    ) -> bool {
+        pending_external && matches!(outcome, gpui_wgpu::ExternalFrameOutcome::Accepted)
+    }
+
+    #[cfg(target_os = "linux")]
     fn poll_external_outcome(&mut self, window: &mut Window) {
+        if self.pending_external.is_none() {
+            return;
+        }
         let Some(outcome) = window.take_external_frame_outcome() else {
             return;
         };
-        let Some(pending) = self.pending_external.take() else {
-            return;
-        };
-        match outcome {
-            gpui_wgpu::ExternalFrameOutcome::Accepted => {
-                self.direct_display = Some(pending);
-                self.frame_realization = Some(FrameRealization {
-                    decode: DecodeMode::Hardware,
-                    residency: DecodeResidency::NativeGpu,
-                    import: ImportMode::DirectAlias,
-                    conversion: ConversionMode::YuvShader,
-                    synchronization: SynchronizationMode::Explicit,
-                });
-            }
-            gpui_wgpu::ExternalFrameOutcome::Unsupported
-            | gpui_wgpu::ExternalFrameOutcome::TransientFailure
-            | gpui_wgpu::ExternalFrameOutcome::FatalFailure => {
-                self.disable_direct_import(window);
-            }
+        if Self::external_frame_outcome_certifies(self.pending_external.is_some(), outcome) {
+            let Some(pending) = self.pending_external.take() else {
+                return;
+            };
+            self.direct_display = Some(pending);
+            self.frame_realization = Some(FrameRealization {
+                decode: DecodeMode::Hardware,
+                residency: DecodeResidency::NativeGpu,
+                import: ImportMode::DirectAlias,
+                conversion: ConversionMode::YuvShader,
+                synchronization: SynchronizationMode::Explicit,
+            });
+        } else {
+            self.pending_external = None;
+            self.disable_direct_import(window);
         }
     }
 
@@ -987,6 +991,10 @@ impl GpuiVideoPlayer {
             height: imported.height,
             color_transform: imported.color_transform,
         };
+        // SAFETY: `imported.texture` is the exact NV12 Arc created on this window's
+        // matching Vulkan device, with wgpu RESOURCE tracking. Its imported image is
+        // GENERAL/FOREIGN, and `imported.sync_file` is the single producer fence moved
+        // into GPUI; this call only wraps those owned values for renderer submission.
         let frame = match unsafe {
             ExternalNv12Frame::new(
                 Arc::clone(&imported.texture),
@@ -1071,6 +1079,10 @@ impl GpuiVideoPlayer {
     /// Must be called every frame. Polls the decode pipeline, uploads textures,
     /// and syncs playback state from the Linux GStreamer session or the
     /// non-Linux CorePlayer.
+    ///
+    /// Linux DirectAlias currently requires this player to be the sole active
+    /// presenter for `window`; GPUI exposes a Window-global one-shot outcome.
+    /// Multi-presenter correlation is deferred outside issue #16.
     pub fn update(&mut self, window: &mut Window, _cx: &mut App) {
         // Lazy GPU context init — retry every frame until available.
         if self.gpu_context.is_none() {
@@ -1696,6 +1708,9 @@ impl Drop for GpuiVideoPlayer {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
         {
+            // Drop has no Window: it releases local/session resources here, while Zed may
+            // retain at most its bounded latest + displayed external slots (<=2 leases)
+            // until an explicit window-aware retire, replacement, or window teardown.
             self.pending_frame = None;
             self.pending_external = None;
             self.direct_import.take();
@@ -1757,113 +1772,20 @@ mod direct_route_state_tests {
     use crossbeam_channel::bounded;
     use gpui_wgpu::ExternalFrameOutcome;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum ExternalStage {
-        Empty,
-        Pending,
-        Displayed,
-    }
-
-    fn stage_after_submit(outcome: ExternalFrameOutcome, had_displayed: bool) -> ExternalStage {
-        if matches!(outcome, ExternalFrameOutcome::Accepted) {
-            ExternalStage::Pending
-        } else if had_displayed {
-            ExternalStage::Displayed
-        } else {
-            ExternalStage::Empty
-        }
-    }
-
-    fn stage_after_renderer(
-        stage: ExternalStage,
-        outcome: ExternalFrameOutcome,
-        had_displayed: bool,
-    ) -> ExternalStage {
-        if stage != ExternalStage::Pending {
-            return stage;
-        }
-        if matches!(outcome, ExternalFrameOutcome::Accepted) || had_displayed {
-            ExternalStage::Displayed
-        } else {
-            ExternalStage::Empty
-        }
-    }
-
-    fn surface_stage(pending: bool, displayed: bool) -> ExternalStage {
-        if pending {
-            ExternalStage::Pending
-        } else if displayed {
-            ExternalStage::Displayed
-        } else {
-            ExternalStage::Empty
-        }
-    }
-
     #[test]
-    fn pending_external_is_painted_before_acceptance_and_promoted_afterward() {
-        assert_eq!(
-            stage_after_submit(ExternalFrameOutcome::Accepted, false),
-            ExternalStage::Pending
-        );
-        assert_eq!(surface_stage(true, false), ExternalStage::Pending);
-        let mut realization: Option<()> = None;
-        assert!(realization.is_none());
-        let promoted = stage_after_renderer(
-            ExternalStage::Pending,
-            ExternalFrameOutcome::Accepted,
+    fn delayed_acceptance_is_the_only_direct_alias_certification() {
+        assert!(GpuiVideoPlayer::external_frame_outcome_certifies(
+            true,
+            ExternalFrameOutcome::Accepted
+        ));
+        assert!(!GpuiVideoPlayer::external_frame_outcome_certifies(
             false,
-        );
-        if promoted == ExternalStage::Displayed {
-            realization = Some(());
-        }
-        assert!(realization.is_some());
-        assert_eq!(promoted, ExternalStage::Displayed);
-        let failed_realization: Option<()> = None;
-        assert_eq!(
-            stage_after_renderer(
-                ExternalStage::Pending,
-                ExternalFrameOutcome::TransientFailure,
-                false
-            ),
-            ExternalStage::Empty
-        );
-        assert!(failed_realization.is_none());
-        assert_eq!(
-            stage_after_renderer(
-                ExternalStage::Pending,
-                ExternalFrameOutcome::FatalFailure,
-                true
-            ),
-            ExternalStage::Displayed
-        );
-    }
-
-    #[test]
-    fn retirement_drops_local_external_state_and_leaves_a_pending_clear() {
-        let mut pending_retirement = false;
-        let mut pending_external = Some(1);
-        let mut direct_display = Some(2);
-        let mut frame_realization = Some(3);
-
-        GpuiVideoPlayer::mark_external_retirement(
-            &mut pending_retirement,
-            &mut pending_external,
-            &mut direct_display,
-            &mut frame_realization,
-        );
-
-        assert!(pending_retirement);
-        assert!(pending_external.is_none());
-        assert!(direct_display.is_none());
-        assert!(frame_realization.is_none());
-    }
-
-    #[test]
-    fn clear_echo_without_pending_frame_cannot_certify_direct_alias() {
-        assert_eq!(
-            stage_after_renderer(ExternalStage::Empty, ExternalFrameOutcome::Accepted, false),
-            ExternalStage::Empty
-        );
+            ExternalFrameOutcome::Accepted
+        ));
+        assert!(!GpuiVideoPlayer::external_frame_outcome_certifies(
+            true,
+            ExternalFrameOutcome::TransientFailure
+        ));
     }
 
     #[test]
