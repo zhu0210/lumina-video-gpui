@@ -21,6 +21,7 @@
 //! `drm-format` field (e.g., `NV12:0x0100000000000002` for Intel X-tile).
 //! This module parses the modifier to ensure correct Vulkan import of tiled buffers.
 
+use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,14 +30,145 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use lumina_video_core::session::AudioTrack;
+use lumina_video_core::session::{AudioTrack, CapabilityTier};
 
 use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
 
-use crate::video::{DmaBufPlane, LinuxGpuSurface};
+use crate::{
+    into_cpu_planes, DmaBufFormatPlane, DmaBufMemory, DmaBufMemoryPlane, DmaBufObject, FrameExtent,
+    NativeMemory,
+};
+
+/// A decoder result containing only owned native-frame data. No GStreamer
+/// sample, buffer, memory, or allocator type crosses this seam.
+#[derive(Debug)]
+pub struct NativeDecodedFrame {
+    pub pts: Duration,
+    pub extent: FrameExtent,
+    pub format: PixelFormat,
+    pub memory: NativeMemory,
+}
+
+#[cfg(test)]
+fn native_tier(requested: CapabilityTier, native_layout_valid: bool) -> CapabilityTier {
+    if requested != CapabilityTier::SystemMemoryUpload && native_layout_valid {
+        requested
+    } else {
+        CapabilityTier::SystemMemoryUpload
+    }
+}
+
+fn should_attempt_native(requested: CapabilityTier, layout_failed: bool) -> bool {
+    requested != CapabilityTier::SystemMemoryUpload && !layout_failed
+}
+
+fn normalize_requested_tier(requested: CapabilityTier) -> CapabilityTier {
+    if requested == CapabilityTier::DirectAlias {
+        CapabilityTier::SystemMemoryUpload
+    } else {
+        requested
+    }
+}
+
+fn pixel_format_from_drm_fourcc(fourcc: u32) -> Option<PixelFormat> {
+    match fourcc {
+        x if x == drm_fourcc::DrmFourcc::Nv12 as u32 => Some(PixelFormat::Nv12),
+        x if x == drm_fourcc::DrmFourcc::Yuv420 as u32
+            || x == drm_fourcc::DrmFourcc::Yvu420 as u32 =>
+        {
+            Some(PixelFormat::Yuv420p)
+        }
+        x if x == drm_fourcc::DrmFourcc::Bgra8888 as u32
+            || x == drm_fourcc::DrmFourcc::Xrgb8888 as u32
+            || x == drm_fourcc::DrmFourcc::Argb8888 as u32 =>
+        {
+            Some(PixelFormat::Bgra)
+        }
+        x if x == drm_fourcc::DrmFourcc::Rgba8888 as u32
+            || x == drm_fourcc::DrmFourcc::Xbgr8888 as u32
+            || x == drm_fourcc::DrmFourcc::Abgr8888 as u32 =>
+        {
+            Some(PixelFormat::Rgba)
+        }
+        _ => None,
+    }
+}
+
+fn drm_fourcc_name(name: &str) -> Option<u32> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "NV12" => Some(drm_fourcc::DrmFourcc::Nv12 as u32),
+        "YU12" | "I420" => Some(drm_fourcc::DrmFourcc::Yuv420 as u32),
+        "YV12" => Some(drm_fourcc::DrmFourcc::Yvu420 as u32),
+        "ARGB" | "AR24" => Some(drm_fourcc::DrmFourcc::Argb8888 as u32),
+        "ABGR" | "AB24" => Some(drm_fourcc::DrmFourcc::Abgr8888 as u32),
+        "XRGB" | "XR24" => Some(drm_fourcc::DrmFourcc::Xrgb8888 as u32),
+        "XBGR" | "XB24" => Some(drm_fourcc::DrmFourcc::Xbgr8888 as u32),
+        "RGBA" => Some(drm_fourcc::DrmFourcc::Rgba8888 as u32),
+        "BGRA" => Some(drm_fourcc::DrmFourcc::Bgra8888 as u32),
+        _ => None,
+    }
+}
+
+fn drm_fourcc_for_video_format(format: gst_video::VideoFormat) -> Option<u32> {
+    match format {
+        gst_video::VideoFormat::Bgra | gst_video::VideoFormat::Bgrx => {
+            Some(drm_fourcc::DrmFourcc::Bgra8888 as u32)
+        }
+        gst_video::VideoFormat::Rgba | gst_video::VideoFormat::Rgbx => {
+            Some(drm_fourcc::DrmFourcc::Rgba8888 as u32)
+        }
+        gst_video::VideoFormat::Nv12 => Some(drm_fourcc::DrmFourcc::Nv12 as u32),
+        gst_video::VideoFormat::I420 => Some(drm_fourcc::DrmFourcc::Yuv420 as u32),
+        _ => None,
+    }
+}
+
+fn parse_modifier(value: &str) -> Option<u64> {
+    if value.eq_ignore_ascii_case("linear") || value.eq_ignore_ascii_case("drm_format_mod_linear") {
+        return Some(0);
+    }
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hex| u64::from_str_radix(hex, 16).ok(),
+        )
+}
+
+fn native_layout(
+    sample: &gst::Sample,
+    video_info: &gst_video::VideoInfo,
+) -> Option<(PixelFormat, u32, Option<u64>)> {
+    let caps = sample.caps()?;
+    let structure = caps.structure(0)?;
+    if let Ok(drm_format) = structure.get::<String>("drm-format") {
+        let (name, modifier) = match drm_format.split_once(':') {
+            Some((name, modifier)) => (name, parse_modifier(modifier)),
+            None => (drm_format.as_str(), None),
+        };
+        let fourcc = drm_fourcc_name(name)?;
+        let format = pixel_format_from_drm_fourcc(fourcc)?;
+        return Some((format, fourcc, modifier));
+    }
+    let fourcc = drm_fourcc_for_video_format(video_info.format())?;
+    let format = pixel_format_from_drm_fourcc(fourcc)?;
+    Some((format, fourcc, None))
+}
+
+fn pixel_format_from_memory(memory: &DmaBufMemory) -> Option<PixelFormat> {
+    memory.drm_fourcc.and_then(pixel_format_from_drm_fourcc)
+}
+
+fn plane_height(format: PixelFormat, plane: usize, height: u32) -> u32 {
+    match format {
+        PixelFormat::Nv12 | PixelFormat::Yuv420p if plane > 0 => height.div_ceil(2),
+        _ => height,
+    }
+}
 
 /// Selects the sink used by a GStreamer audio branch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -343,8 +475,11 @@ pub struct GStreamerDecoder {
     /// Records whether the network source delivered any data; only pre-first-byte
     /// failures use this as a transport classification fallback.
     first_byte_seen: Arc<AtomicBool>,
-    /// Keep the #7 session on the owned system-memory path.
-    system_memory_only: bool,
+    /// Capability requested by the explicit native-frame entry point.
+    requested_tier: CapabilityTier,
+    /// Once native layout negotiation fails, use CPU extraction for the rest
+    /// of this decoder instead of retrying DMABuf on every frame.
+    native_layout_failed: bool,
     metadata: VideoMetadata,
     position: Duration,
     eof: bool,
@@ -600,12 +735,54 @@ impl GStreamerDecoder {
     pub fn new(url: &str) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
-            false,
+            CapabilityTier::SystemMemoryUpload,
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
             DEFAULT_OPEN_TIMEOUT,
             GstLifecycleControl::new(),
             None,
+        )
+    }
+
+    /// Creates a decoder for an explicitly requested frame capability.
+    /// Unsupported or ambiguous native layouts downgrade to system memory
+    /// before the first decoded frame is returned.
+    #[doc(hidden)]
+    pub fn new_with_requested_tier(
+        url: &str,
+        requested_tier: CapabilityTier,
+    ) -> Result<Self, VideoError> {
+        Self::new_with_memory_policy_and_audio_sink_and_timeout(
+            url,
+            requested_tier,
+            GstAudioSinkMode::Auto,
+            DEFAULT_LIFECYCLE_TIMEOUT,
+            DEFAULT_OPEN_TIMEOUT,
+            GstLifecycleControl::new(),
+            None,
+        )
+    }
+
+    /// Worker/test constructor with an explicit requested capability and
+    /// instance-scoped lifecycle/TLS settings.
+    #[doc(hidden)]
+    pub fn new_with_requested_tier_and_audio_sink_and_timeouts_and_control_and_tls_ca_file(
+        url: &str,
+        requested_tier: CapabilityTier,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        open_timeout: Duration,
+        lifecycle_control: GstLifecycleControl,
+        tls_ca_file: Option<String>,
+    ) -> Result<Self, VideoError> {
+        Self::new_with_memory_policy_and_audio_sink_and_timeout(
+            url,
+            requested_tier,
+            audio_sink,
+            lifecycle_timeout,
+            open_timeout,
+            lifecycle_control,
+            tls_ca_file,
         )
     }
 
@@ -617,7 +794,7 @@ impl GStreamerDecoder {
     pub fn new_system_memory(url: &str) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
-            true,
+            CapabilityTier::SystemMemoryUpload,
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
             DEFAULT_OPEN_TIMEOUT,
@@ -633,7 +810,7 @@ impl GStreamerDecoder {
     ) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
-            true,
+            CapabilityTier::SystemMemoryUpload,
             audio_sink,
             DEFAULT_LIFECYCLE_TIMEOUT,
             DEFAULT_OPEN_TIMEOUT,
@@ -653,7 +830,7 @@ impl GStreamerDecoder {
     ) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
-            true,
+            CapabilityTier::SystemMemoryUpload,
             audio_sink,
             lifecycle_timeout,
             DEFAULT_OPEN_TIMEOUT,
@@ -674,7 +851,7 @@ impl GStreamerDecoder {
     ) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
-            true,
+            CapabilityTier::SystemMemoryUpload,
             audio_sink,
             lifecycle_timeout,
             DEFAULT_OPEN_TIMEOUT,
@@ -697,7 +874,7 @@ impl GStreamerDecoder {
     ) -> Result<Self, VideoError> {
         Self::new_with_memory_policy_and_audio_sink_and_timeout(
             url,
-            true,
+            CapabilityTier::SystemMemoryUpload,
             audio_sink,
             lifecycle_timeout,
             open_timeout,
@@ -727,13 +904,14 @@ impl GStreamerDecoder {
 
     fn new_with_memory_policy_and_audio_sink_and_timeout(
         url: &str,
-        system_memory_only: bool,
+        requested_tier: CapabilityTier,
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
         open_timeout: Duration,
         lifecycle_control: GstLifecycleControl,
         tls_ca_file: Option<String>,
     ) -> Result<Self, VideoError> {
+        let requested_tier = normalize_requested_tier(requested_tier);
         let init_now = Instant::now();
         let init_deadline = init_now.checked_add(open_timeout).unwrap_or(init_now);
         if lifecycle_control.is_cancelled() {
@@ -1183,7 +1361,8 @@ impl GStreamerDecoder {
             network_source,
             certificate_rejected,
             first_byte_seen,
-            system_memory_only,
+            requested_tier,
+            native_layout_failed: false,
             metadata,
             position: Duration::ZERO,
             eof: false,
@@ -1280,12 +1459,7 @@ impl GStreamerDecoder {
         self.user_paused = paused;
     }
 
-    /// Converts a GStreamer sample to our VideoFrame format.
-    ///
-    /// When the `zero-copy` feature is enabled, this will attempt to extract
-    /// a DMABuf file descriptor from the sample first. If DMABuf is not available
-    /// (e.g., software decoder, or unsupported allocator), it falls back to
-    /// CPU memory copy.
+    /// Converts a GStreamer sample to an owned CPU VideoFrame.
     fn sample_to_frame(&self, sample: gst::Sample) -> Result<VideoFrame, VideoError> {
         let buffer = sample
             .buffer()
@@ -1303,354 +1477,245 @@ impl GStreamerDecoder {
             .map(|t| Duration::from_nanos(t.nseconds()))
             .unwrap_or(self.position);
 
+        self.sample_to_cpu_frame(
+            buffer,
+            &video_info,
+            pts,
+            video_info.width(),
+            video_info.height(),
+        )
+    }
+
+    /// Converts one sample to the owned native-frame boundary. A missing or
+    /// ambiguous DMABuf layout permanently selects CPU extraction for this
+    /// decoder, so native negotiation is never retried per frame.
+    fn sample_to_native_frame(
+        &mut self,
+        sample: gst::Sample,
+    ) -> Result<NativeDecodedFrame, VideoError> {
+        let buffer = sample
+            .buffer()
+            .ok_or_else(|| VideoError::DecodeFailed("Sample has no buffer".to_string()))?;
+        let caps = sample
+            .caps()
+            .ok_or_else(|| VideoError::DecodeFailed("Sample has no caps".to_string()))?;
+        let video_info = gst_video::VideoInfo::from_caps(caps)
+            .map_err(|e| VideoError::DecodeFailed(format!("Invalid video caps: {e}")))?;
+        let pts = buffer
+            .pts()
+            .map(|time| Duration::from_nanos(time.nseconds()))
+            .unwrap_or(self.position);
         let width = video_info.width();
         let height = video_info.height();
 
-        // The #7 session explicitly negotiates system-memory upload. Do not
-        // let a hardware allocator cross that seam as an implicit DMABuf path.
-        if !self.system_memory_only {
-            // Try zero-copy DMABuf path first (always enabled on Linux)
-            if let Some(frame) =
-                self.try_dmabuf_frame(buffer, &video_info, pts, width, height, sample.clone())?
-            {
-                return Ok(frame);
+        if should_attempt_native(self.requested_tier, self.native_layout_failed) {
+            match self.try_dmabuf_memory(buffer, &video_info, &sample) {
+                Ok(Some(memory)) => {
+                    let format = pixel_format_from_memory(&memory).ok_or_else(|| {
+                        VideoError::DecodeFailed(
+                            "DMABuf layout did not identify a supported pixel format".into(),
+                        )
+                    })?;
+                    return Ok(NativeDecodedFrame {
+                        pts,
+                        extent: FrameExtent::new(width, height),
+                        format,
+                        memory: NativeMemory::DmaBuf(memory),
+                    });
+                }
+                Ok(None) => {
+                    self.native_layout_failed = true;
+                    tracing::debug!(
+                        "GStreamer native layout unavailable; downgrading this decoder to system memory"
+                    );
+                }
+                Err(error) => {
+                    self.native_layout_failed = true;
+                    tracing::debug!(
+                        "GStreamer native layout rejected ({error}); downgrading this decoder to system memory"
+                    );
+                }
             }
-            // Fall through to CPU path if DMABuf not available
         }
 
-        // CPU copy path (fallback)
-        self.sample_to_cpu_frame(buffer, &video_info, pts, width, height)
-    }
-
-    /// Parses the DRM modifier from GStreamer 1.24+ `drm-format` caps field.
-    ///
-    /// The `drm-format` field contains a string like `NV12:0x0100000000000002` where:
-    /// - `NV12` is the DRM fourcc format
-    /// - `0x0100000000000002` is the DRM modifier (e.g., Intel X-tile)
-    ///
-    /// Returns the modifier if found and parseable, or `None` if:
-    /// - Caps don't have `drm-format` field (GStreamer < 1.24)
-    /// - The format is LINEAR (no modifier suffix)
-    /// - Parsing fails
-    fn parse_drm_modifier_from_caps(sample: &gst::Sample) -> Option<u64> {
-        let caps = sample.caps()?;
-        let structure = caps.structure(0)?;
-
-        // Try to get the drm-format field (GStreamer 1.24+ with va plugin)
-        let drm_format: String = structure.get("drm-format").ok()?;
-
-        // Parse format like "NV12:0x0100000000000002"
-        // If no colon, it's just the format without modifier (assume LINEAR)
-        let modifier_str = drm_format.split(':').nth(1)?;
-
-        // Parse the hex modifier value
-        let modifier = if modifier_str.starts_with("0x") || modifier_str.starts_with("0X") {
-            u64::from_str_radix(&modifier_str[2..], 16).ok()?
-        } else {
-            modifier_str.parse::<u64>().ok()?
+        let VideoFrame { frame, .. } =
+            self.sample_to_cpu_frame(buffer, &video_info, pts, width, height)?;
+        let DecodedFrame::Cpu(CpuFrame {
+            format,
+            width,
+            height,
+            planes,
+        }) = frame
+        else {
+            return Err(VideoError::DecodeFailed(
+                "GStreamer CPU extraction returned a non-CPU frame".into(),
+            ));
         };
-
-        tracing::debug!(
-            "Parsed DRM modifier from caps: drm-format='{}' -> modifier=0x{:016x}",
-            drm_format,
-            modifier
-        );
-
-        Some(modifier)
+        Ok(NativeDecodedFrame {
+            pts,
+            extent: FrameExtent::new(width, height),
+            format,
+            memory: NativeMemory::Cpu(crate::CpuMemory::new(into_cpu_planes(planes))),
+        })
     }
 
-    /// Extracts DMABuf file descriptors and per-plane metadata from a GStreamer buffer.
-    ///
-    /// Returns `Ok(Some(frame))` if DMABuf extraction succeeded,
-    /// `Ok(None)` if the memory is not a DMABuf (fall back to CPU),
-    /// `Err` if there was an error during extraction.
-    ///
-    /// # Multi-Plane Support (lumina-video-s0e)
-    ///
-    /// This function extracts per-plane metadata for multi-plane formats (NV12, YUV420p).
-    /// GStreamer can provide planes in two configurations:
-    /// 1. **Single FD with offsets**: All planes share one fd, distinguished by offset
-    /// 2. **Multiple FDs**: Each plane has its own fd (offset is typically 0)
-    ///
-    /// Both cases are handled by checking `buffer.n_memory()` and extracting the
-    /// appropriate fd/offset/stride for each plane from `video_info`.
-    ///
-    /// Multi-plane YUV formats are parsed and returned as [`DmaBufFrame`] with
-    /// [`PixelFormat::Nv12`] or [`PixelFormat::Yuv420p`]. The zero-copy import path
-    /// in [`zero_copy::linux`] handles these via `VkImageDrmFormatModifierExplicitCreateInfoEXT`.
-    /// If zero-copy import fails (e.g., driver doesn't support the modifier), the
-    /// CPU fallback path in [`DmaBufFrame`] is used automatically.
-    fn try_dmabuf_frame(
+    /// Converts each GStreamer memory view into one owned descriptor, deduping
+    /// by the underlying FD while retaining every view as a memory plane.
+    fn try_dmabuf_memory(
         &self,
         buffer: &gst::BufferRef,
         video_info: &gst_video::VideoInfo,
-        pts: Duration,
-        width: u32,
-        height: u32,
-        sample: gst::Sample,
-    ) -> Result<Option<VideoFrame>, VideoError> {
-        use std::os::fd::RawFd;
-
-        let format = video_info.format();
-        let num_planes = video_info.n_planes() as usize;
-
-        // Map GStreamer format to our PixelFormat
-        let pixel_format = match format {
-            gst_video::VideoFormat::Bgra | gst_video::VideoFormat::Bgrx => PixelFormat::Bgra,
-            gst_video::VideoFormat::Rgba | gst_video::VideoFormat::Rgbx => PixelFormat::Rgba,
-            gst_video::VideoFormat::Nv12 => PixelFormat::Nv12,
-            gst_video::VideoFormat::I420 => PixelFormat::Yuv420p,
-            _ => {
-                tracing::debug!(
-                    "Linux zero-copy: unsupported format {:?}, using CPU path",
-                    format
-                );
-                return Ok(None);
-            }
-        };
-
-        // Check if the first memory block is a DMABuf
-        let Some(memory) = buffer.memory(0) else {
+        sample: &gst::Sample,
+    ) -> Result<Option<DmaBufMemory>, VideoError> {
+        let Some((format, drm_fourcc, modifier)) = native_layout(sample, video_info) else {
             return Ok(None);
         };
-
-        // Check if this is DMABuf memory
-        if !memory.is_memory_type::<gstreamer_allocators::DmaBufMemory>() {
-            tracing::trace!("Buffer memory is not DMABuf, using CPU copy path");
+        let Some(modifier) = modifier else {
+            return Ok(None);
+        };
+        let plane_count = format.num_planes();
+        let memory_count = buffer.n_memory();
+        if memory_count == 0 {
             return Ok(None);
         }
 
-        // Determine if we have multiple FDs (one per plane) or single FD with offsets
-        let n_memory = buffer.n_memory();
-        let multi_fd = n_memory >= num_planes && num_planes > 1;
-
-        // Detect single-FD multi-plane layouts (common with VA-API).
-        // These require special Vulkan import using VkImageDrmFormatModifierExplicitCreateInfoEXT
-        // with a pPlaneLayouts array specifying each plane's offset and stride.
-        let is_single_fd = num_planes > 1 && !multi_fd;
-
-        // Extract per-plane metadata
-        let mut planes: Vec<DmaBufPlane> = Vec::with_capacity(num_planes);
-
-        // For single-FD layouts, dup the primary FD once and share it across all planes.
-        // This avoids leaking N-1 FDs per frame (lumina-video-dvh).
-        // The import code only uses primary_fd() for single-FD layouts.
-        let mut primary_dup_fd: RawFd = -1;
-
-        for plane_idx in 0..num_planes {
-            // Get the memory block for this plane
-            // If multi_fd: each plane has its own GstMemory
-            // If single_fd: all planes share the first GstMemory, differentiated by offset
-            let mem_idx = if multi_fd { plane_idx as u32 } else { 0 };
-            let Some(plane_memory) = buffer.memory(mem_idx as usize) else {
-                tracing::warn!(
-                    "DMABuf plane {} has no memory block (expected at index {})",
-                    plane_idx,
-                    mem_idx
-                );
+        let mut objects: Vec<DmaBufObject> = Vec::with_capacity(memory_count);
+        let mut memory_planes: Vec<DmaBufMemoryPlane> = Vec::with_capacity(memory_count);
+        for memory_index in 0..memory_count {
+            let Some(memory) = buffer.memory(memory_index) else {
                 return Ok(None);
             };
-
-            // Verify it's DMABuf memory
-            if !plane_memory.is_memory_type::<gstreamer_allocators::DmaBufMemory>() {
-                tracing::warn!("DMABuf plane {} memory is not DMABuf type", plane_idx);
+            if !memory.is_memory_type::<gstreamer_allocators::DmaBufMemory>() {
                 return Ok(None);
             }
-
-            // Downcast to DmaBufMemory to access fd() method
-            let dmabuf_memory = plane_memory
-                .downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()
-                .ok_or_else(|| {
-                    VideoError::DecodeFailed("Failed to downcast to DmaBufMemory".to_string())
-                })?;
-
-            // Extract the file descriptor
-            let gst_fd: RawFd = dmabuf_memory.fd();
-            if gst_fd < 0 {
-                tracing::warn!("DMABuf plane {} has invalid fd: {}", plane_idx, gst_fd);
+            let Some(dmabuf_memory) =
+                memory.downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()
+            else {
+                return Ok(None);
+            };
+            let fd = dmabuf_memory.fd();
+            if fd < 0 || memory.size() == 0 {
                 return Ok(None);
             }
-
-            // SAFETY: dup() the FD so Vulkan gets its own copy to take ownership of.
-            // This avoids double-close: GStreamer closes its FD when GstMemory drops,
-            // Vulkan closes the dup'd FD when vkFreeMemory is called.
-            //
-            // For single-FD layouts: only dup once (first plane), reuse for others.
-            // The import code only uses primary_fd(), so other planes just need
-            // offset/stride metadata - their fd field is set to the shared dup'd fd
-            // but won't be used directly.
-            let fd: RawFd = if is_single_fd {
-                if plane_idx == 0 {
-                    // First plane: dup and save for reuse
-                    // SAFETY: `gst_fd` is a live GStreamer DMABuf descriptor;
-                    // `dup` creates the owned descriptor passed to Vulkan.
-                    let dup_fd = unsafe { libc::dup(gst_fd) };
-                    if dup_fd < 0 {
-                        tracing::warn!(
-                            "Failed to dup DMABuf fd {} for plane {}: {}",
-                            gst_fd,
-                            plane_idx,
-                            std::io::Error::last_os_error()
-                        );
-                        return Ok(None);
-                    }
-                    primary_dup_fd = dup_fd;
-                    dup_fd
+            let offset = u64::try_from(memory.offset()).map_err(|_| {
+                VideoError::DecodeFailed("DMABuf memory view offset is too large".into())
+            })?;
+            let size = u64::try_from(memory.size()).map_err(|_| {
+                VideoError::DecodeFailed("DMABuf memory view size is too large".into())
+            })?;
+            let observed_end = offset.checked_add(size).ok_or_else(|| {
+                VideoError::DecodeFailed("DMABuf memory view extent overflowed".into())
+            })?;
+            let maxsize = u64::try_from(memory.maxsize()).map_err(|_| {
+                VideoError::DecodeFailed("DMABuf memory maxsize is too large".into())
+            })?;
+            let object_extent = maxsize.max(observed_end);
+            if object_extent == 0 {
+                return Ok(None);
+            }
+            let existing_object = (0..memory_index).find_map(|prior_index| {
+                let prior_memory = buffer.memory(prior_index)?;
+                let prior_dmabuf =
+                    prior_memory.downcast_memory_ref::<gstreamer_allocators::DmaBufMemory>()?;
+                if prior_dmabuf.fd() == fd {
+                    memory_planes.get(prior_index).map(|plane| plane.object)
                 } else {
-                    // Subsequent planes in single-FD: reuse the already dup'd fd
-                    // This fd value is stored but not used directly - only offset/stride matter
-                    primary_dup_fd
+                    None
                 }
-            } else {
-                // Multi-FD: each plane gets its own dup'd fd
-                // SAFETY: `gst_fd` is a live GStreamer DMABuf descriptor;
-                // `dup` creates the owned descriptor passed to Vulkan.
-                let dup_fd = unsafe { libc::dup(gst_fd) };
-                if dup_fd < 0 {
-                    tracing::warn!(
-                        "Failed to dup DMABuf fd {} for plane {}: {}",
-                        gst_fd,
-                        plane_idx,
-                        std::io::Error::last_os_error()
-                    );
-                    // Close any already-dup'd fds before returning
-                    for plane in &planes {
-                        // SAFETY: Each plane fd was duplicated and remains
-                        // owned by this error path.
-                        unsafe { libc::close(plane.fd) };
-                    }
-                    return Ok(None);
-                }
-                dup_fd
-            };
-
-            // Get stride and offset from VideoInfo (use .get() to avoid panic on malformed caps)
-            // Helper to close FDs on error - for single-FD we only have one unique FD to close
-            let close_fds_on_error =
-                |planes: &[DmaBufPlane], current_fd: RawFd, is_single: bool| {
-                    if is_single {
-                        // Single-FD: all planes share the same fd, close once
-                        if current_fd >= 0 {
-                            // SAFETY: `current_fd` is the duplicated descriptor
-                            // owned by this cleanup path.
-                            unsafe { libc::close(current_fd) };
-                        }
-                    } else {
-                        // Multi-FD: close all unique plane fds plus current
-                        for plane in planes {
-                            // SAFETY: Each plane fd is a duplicated descriptor
-                            // still owned by this cleanup path.
-                            unsafe { libc::close(plane.fd) };
-                        }
-                        if current_fd >= 0 {
-                            // SAFETY: `current_fd` is the duplicated descriptor
-                            // owned by this cleanup path.
-                            unsafe { libc::close(current_fd) };
-                        }
-                    }
+            });
+            let object = if let Some(object) = existing_object {
+                let Some(object_value) = objects.get_mut(object) else {
+                    return Err(VideoError::DecodeFailed(
+                        "DMABuf FD table referenced a missing object".into(),
+                    ));
                 };
+                object_value.size = Some(object_value.size.unwrap_or(0).max(object_extent));
+                object
+            } else {
+                let borrowed = {
+                    // SAFETY: GStreamer reports this descriptor from a live
+                    // DmaBufMemory, and it remains valid through this call.
+                    unsafe { BorrowedFd::borrow_raw(fd) }
+                };
+                let owned_fd = borrowed.try_clone_to_owned().map_err(|error| {
+                    VideoError::DecodeFailed(format!("Failed to own DMABuf fd {fd}: {error}"))
+                })?;
+                let object = objects.len();
+                objects.push(DmaBufObject {
+                    fd: owned_fd,
+                    size: Some(object_extent),
+                });
+                object
+            };
+            memory_planes.push(DmaBufMemoryPlane {
+                object,
+                offset,
+                size: Some(size),
+            });
+        }
 
-            let Some(&stride_i32) = video_info.stride().get(plane_idx) else {
-                tracing::warn!(
-                    "DMABuf plane {} missing stride entry in VideoInfo",
-                    plane_idx
-                );
-                close_fds_on_error(&planes, fd, is_single_fd);
+        let mut format_planes = Vec::with_capacity(plane_count);
+        for plane_index in 0..plane_count {
+            let (Some(offset), Some(stride)) = (
+                buffer
+                    .meta::<gst_video::VideoMeta>()
+                    .and_then(|meta| meta.offset().get(plane_index).copied())
+                    .or_else(|| video_info.offset().get(plane_index).copied()),
+                buffer
+                    .meta::<gst_video::VideoMeta>()
+                    .and_then(|meta| meta.stride().get(plane_index).copied())
+                    .or_else(|| video_info.stride().get(plane_index).copied()),
+            ) else {
                 return Ok(None);
             };
-            let Some(&offset_usize) = video_info.offset().get(plane_idx) else {
-                tracing::warn!(
-                    "DMABuf plane {} missing offset entry in VideoInfo",
-                    plane_idx
-                );
-                close_fds_on_error(&planes, fd, is_single_fd);
-                return Ok(None);
-            };
-            if stride_i32 < 0 {
-                tracing::warn!(
-                    "DMABuf plane {} has negative stride {}",
-                    plane_idx,
-                    stride_i32
-                );
-                close_fds_on_error(&planes, fd, is_single_fd);
+            if stride <= 0 {
                 return Ok(None);
             }
-            let stride = stride_i32 as u32;
-            let offset = offset_usize as u64;
-
-            // Calculate plane size (approximate - may not account for padding)
-            let plane_size = plane_memory.size() as u64;
-
-            planes.push(DmaBufPlane {
-                fd,
-                offset,
-                stride,
-                size: plane_size,
+            let plane_height = plane_height(format, plane_index, video_info.height());
+            let size = u64::try_from(stride)
+                .ok()
+                .and_then(|stride| u64::from(plane_height).checked_mul(stride));
+            let Some(size) = size else {
+                return Ok(None);
+            };
+            let Ok(size_usize) = usize::try_from(size) else {
+                return Ok(None);
+            };
+            let Some(global_end) = offset.checked_add(size_usize) else {
+                return Ok(None);
+            };
+            let Some((memory_range, skip)) = buffer.find_memory(offset..global_end) else {
+                return Ok(None);
+            };
+            if memory_range.len() != 1 {
+                return Ok(None);
+            }
+            let memory_plane = memory_range.start;
+            if memory_plane >= memory_planes.len() {
+                return Ok(None);
+            }
+            let local_offset = u64::try_from(skip).map_err(|_| {
+                VideoError::DecodeFailed("DMABuf format-plane offset is too large".into())
+            })?;
+            format_planes.push(DmaBufFormatPlane {
+                memory_plane,
+                offset: local_offset,
+                stride: u32::try_from(stride).map_err(|_| {
+                    VideoError::DecodeFailed("DMABuf plane stride is too large".into())
+                })?,
+                size: Some(size),
             });
-
-            tracing::debug!(
-                "Extracted DMABuf plane {}: fd={}, offset={}, stride={}, size={}",
-                plane_idx,
-                fd,
-                offset,
-                stride,
-                plane_size
-            );
         }
 
-        // Get DRM format modifier from caps (GStreamer 1.24+ with va plugin)
-        // The va plugin exposes the actual modifier in drm-format caps field.
-        // Example: "NV12:0x0100000000000002" = Intel X-tile
-        // Fall back to LINEAR (0) if not available (older GStreamer or vaapi plugin)
-        let modifier: u64 = Self::parse_drm_modifier_from_caps(&sample).unwrap_or_else(|| {
-            tracing::debug!(
-                "No DRM modifier in caps (GStreamer < 1.24 or legacy vaapi plugin), assuming LINEAR"
-            );
-            0 // DRM_FORMAT_MOD_LINEAR
-        });
-
-        tracing::debug!(
-            "Extracted DMABuf with {} planes: {}x{} {:?}, modifier=0x{:x}, multi_fd={}",
-            planes.len(),
-            width,
-            height,
-            pixel_format,
-            modifier,
-            multi_fd
-        );
-
-        // Extract CPU fallback data in case zero-copy import fails at render time.
-        // This ensures graceful degradation rather than dropping frames.
-        let cpu_fallback = self.extract_cpu_fallback(buffer, video_info, width, height);
-
-        // Create the LinuxGpuSurface
-        // The sample is kept alive by wrapping it in an Arc.
-        // The FDs passed here are dup'd copies - Vulkan takes ownership and will close them.
-        let sample_owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample);
-
-        if is_single_fd {
-            tracing::debug!(
-                "Single-FD multi-plane DMABuf detected: {} planes share fd={}",
-                planes.len(),
-                planes.first().map(|p| p.fd).unwrap_or(-1)
-            );
-        }
-
-        // SAFETY: We've verified all fds are valid (they're dup'd copies we own)
-        let surface = unsafe {
-            LinuxGpuSurface::new(
-                planes,
-                width,
-                height,
-                pixel_format,
-                modifier,
-                is_single_fd,
-                cpu_fallback,
-                sample_owner,
-            )
-        };
-
-        Ok(Some(VideoFrame::new(pts, DecodedFrame::Linux(surface))))
+        DmaBufMemory::new(
+            objects,
+            memory_planes,
+            format_planes,
+            Some(drm_fourcc),
+            Some(modifier),
+        )
+        .map(Some)
+        .map_err(|error| VideoError::DecodeFailed(error.to_string()))
     }
 
     /// Converts a GStreamer buffer to a CPU frame (fallback path).
@@ -1806,149 +1871,6 @@ impl GStreamerDecoder {
         let cpu_frame = CpuFrame::new(pixel_format, width, height, planes);
 
         Ok(VideoFrame::new(pts, DecodedFrame::Cpu(cpu_frame)))
-    }
-
-    /// Extracts CPU frame data from a GStreamer buffer for zero-copy fallback.
-    ///
-    /// This is called during DMABuf frame extraction to provide fallback data
-    /// in case zero-copy import fails at render time. Returns `None` if extraction
-    /// fails (e.g., buffer mapping error), in which case the frame may be dropped.
-    ///
-    /// Supports both NV12 (2 planes: Y, UV interleaved) and I420/YUV420p (3 planes: Y, U, V).
-    fn extract_cpu_fallback(
-        &self,
-        buffer: &gst::BufferRef,
-        video_info: &gst_video::VideoInfo,
-        width: u32,
-        height: u32,
-    ) -> Option<CpuFrame> {
-        // Map the buffer for reading
-        let map = match buffer.map_readable() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!("Failed to map buffer for CPU fallback: {e}");
-                return None;
-            }
-        };
-
-        let data = map.as_slice();
-        let format = video_info.format();
-
-        // Determine pixel format and extract planes accordingly
-        match format {
-            gst_video::VideoFormat::Nv12 => {
-                // NV12: Y plane followed by interleaved UV plane (2 planes)
-                let strides = video_info.stride();
-                let offsets = video_info.offset();
-                let y_stride = (*strides.first()?) as usize;
-                let uv_stride = (*strides.get(1)?) as usize;
-                let y_offset = *offsets.first()?;
-                let uv_offset = *offsets.get(1)?;
-
-                let y_size = y_stride * height as usize;
-                let uv_size = uv_stride * (height as usize).div_ceil(2);
-
-                // Extract Y plane
-                let y_data = if y_offset + y_size <= data.len() {
-                    data[y_offset..y_offset + y_size].to_vec()
-                } else {
-                    tracing::debug!("Y plane out of bounds for CPU fallback");
-                    return None;
-                };
-
-                // Extract UV plane
-                let uv_data = if uv_offset + uv_size <= data.len() {
-                    data[uv_offset..uv_offset + uv_size].to_vec()
-                } else {
-                    tracing::debug!("UV plane out of bounds for CPU fallback");
-                    return None;
-                };
-
-                let y_plane = Plane {
-                    data: y_data,
-                    stride: y_stride,
-                };
-
-                let uv_plane = Plane {
-                    data: uv_data,
-                    stride: uv_stride,
-                };
-
-                Some(CpuFrame::new(
-                    PixelFormat::Nv12,
-                    width,
-                    height,
-                    vec![y_plane, uv_plane],
-                ))
-            }
-            gst_video::VideoFormat::I420 => {
-                // I420/YUV420p: Y, U, V as separate planes (3 planes)
-                let strides = video_info.stride();
-                let offsets = video_info.offset();
-                let y_stride = (*strides.first()?) as usize;
-                let u_stride = (*strides.get(1)?) as usize;
-                let v_stride = (*strides.get(2)?) as usize;
-                let y_offset = *offsets.first()?;
-                let u_offset = *offsets.get(1)?;
-                let v_offset = *offsets.get(2)?;
-
-                let y_size = y_stride * height as usize;
-                // U and V planes are quarter size (half width, half height)
-                let uv_height = (height as usize).div_ceil(2);
-                let u_size = u_stride * uv_height;
-                let v_size = v_stride * uv_height;
-
-                // Extract Y plane
-                let y_data = if y_offset + y_size <= data.len() {
-                    data[y_offset..y_offset + y_size].to_vec()
-                } else {
-                    tracing::debug!("Y plane out of bounds for CPU fallback");
-                    return None;
-                };
-
-                // Extract U plane
-                let u_data = if u_offset + u_size <= data.len() {
-                    data[u_offset..u_offset + u_size].to_vec()
-                } else {
-                    tracing::debug!("U plane out of bounds for CPU fallback");
-                    return None;
-                };
-
-                // Extract V plane
-                let v_data = if v_offset + v_size <= data.len() {
-                    data[v_offset..v_offset + v_size].to_vec()
-                } else {
-                    tracing::debug!("V plane out of bounds for CPU fallback");
-                    return None;
-                };
-
-                let y_plane = Plane {
-                    data: y_data,
-                    stride: y_stride,
-                };
-
-                let u_plane = Plane {
-                    data: u_data,
-                    stride: u_stride,
-                };
-
-                let v_plane = Plane {
-                    data: v_data,
-                    stride: v_stride,
-                };
-
-                Some(CpuFrame::new(
-                    PixelFormat::Yuv420p,
-                    width,
-                    height,
-                    vec![y_plane, u_plane, v_plane],
-                ))
-            }
-            _ => {
-                tracing::debug!("Unsupported pixel format for CPU fallback: {:?}", format);
-                None
-            }
-        }
     }
 
     fn deadline_for(&self) -> Instant {
@@ -2551,66 +2473,64 @@ const _: () = {
     assert_send::<GstAudioHandle>();
 };
 
-impl VideoDecoderBackend for GStreamerDecoder {
-    fn open(url: &str) -> Result<Self, VideoError>
-    where
-        Self: Sized,
-    {
-        Self::new(url)
+impl GStreamerDecoder {
+    fn finish_decoded_frame(&mut self, pts: Duration) {
+        self.position = pts;
+        self.seeking = false;
+        self.seek_target = None;
+        self.seek_deadline = None;
+        self.active_operation_deadline = None;
     }
 
-    fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError> {
+    fn decode_next_with<T, F>(&mut self, mut convert: F) -> Result<Option<T>, VideoError>
+    where
+        F: FnMut(&mut Self, gst::Sample) -> Result<(Duration, T), VideoError>,
+    {
         if self.lifecycle_control.is_cancelled() {
             return Err(VideoError::Generic("lifecycle cancelled".into()));
         }
-
-        // Return any queued error from seek (errors during seek are queued, not dropped)
         if let Some(error) = self.pending_error.take() {
-            // Clear seek state so the decoder doesn't use stale flags on next call
             self.seeking = false;
             self.seek_target = None;
             self.seek_deadline = None;
             return Err(error);
         }
-
         if self.eof {
             return Ok(None);
         }
 
-        // Return cached preroll sample on first call (consumed during init for dimensions)
         if let Some(sample) = self.preroll_sample.take() {
-            let frame = self.sample_to_frame(sample)?;
+            let (pts, frame) = convert(self, sample)?;
             if !self.pipeline_observation_refreshed_after_media {
                 self.refresh_pipeline_observation();
                 self.pipeline_observation_refreshed_after_media = true;
             }
-            tracing::debug!("Returning cached preroll frame at {:?}", frame.pts);
-            self.position = frame.pts;
-            self.seeking = false;
-            self.seek_target = None;
-            self.seek_deadline = None;
-            self.active_operation_deadline = None;
+            tracing::debug!("Returning cached frame at {:?}", pts);
+            self.finish_decoded_frame(pts);
             return Ok(Some(frame));
         }
 
-        // Poll bus for messages - errors during seek are queued (not dropped) and returned above
-        // EOS during seek is skipped; seek() handles AsyncDone
         if let Some(bus) = self.pipeline.bus() {
             while let Some(msg) = bus.pop() {
                 if let Some(result) = self.process_bus_message(&msg) {
-                    return result;
+                    match result {
+                        Ok(None) => return Ok(None),
+                        Ok(Some(_)) => {
+                            return Err(VideoError::DecodeFailed(
+                                "GStreamer bus produced an unexpected frame".into(),
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
         }
 
-        // Use longer timeout when buffering or after seek
         let timeout_ms = if self.seeking || self.buffering_percent < 100 {
             1000
         } else {
             100
         };
-
-        // When seeking, we may need to discard stale frames
         let max_stale_frames: u32 = if self.seeking { 5 } else { 0 };
         let mut discarded: u32 = 0;
 
@@ -2649,33 +2569,53 @@ impl VideoDecoderBackend for GStreamerDecoder {
                 return Ok(None);
             };
 
-            let frame = self.sample_to_frame(sample)?;
+            let (pts, frame) = convert(self, sample)?;
             if !self.pipeline_observation_refreshed_after_media {
                 self.refresh_pipeline_observation();
                 self.pipeline_observation_refreshed_after_media = true;
             }
-
-            // Check for stale frames after seek
-            if self.is_stale_frame(frame.pts, discarded, max_stale_frames) {
-                discarded += 1;
+            if self.is_stale_frame(pts, discarded, max_stale_frames) {
+                discarded = discarded.saturating_add(1);
                 continue;
             }
-
             if self.seeking {
                 tracing::debug!(
                     "First frame after seek at {:?} (expected ~{:?})",
-                    frame.pts,
+                    pts,
                     self.position
                 );
             }
-
-            self.position = frame.pts;
-            self.seeking = false;
-            self.seek_target = None;
-            self.seek_deadline = None;
-            self.active_operation_deadline = None;
+            self.finish_decoded_frame(pts);
             return Ok(Some(frame));
         }
+    }
+
+    /// Decodes one sample into the owned native-frame contract. This keeps the
+    /// transitional legacy `VideoDecoderBackend` return available without
+    /// exposing GStreamer objects through the new adapter seam.
+    pub fn decode_next_native(&mut self) -> Result<Option<NativeDecodedFrame>, VideoError> {
+        self.decode_next_with(|decoder, sample| {
+            decoder
+                .sample_to_native_frame(sample)
+                .map(|frame| (frame.pts, frame))
+        })
+    }
+}
+
+impl VideoDecoderBackend for GStreamerDecoder {
+    fn open(url: &str) -> Result<Self, VideoError>
+    where
+        Self: Sized,
+    {
+        Self::new(url)
+    }
+
+    fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError> {
+        self.decode_next_with(|decoder, sample| {
+            decoder
+                .sample_to_frame(sample)
+                .map(|frame| (frame.pts, frame))
+        })
     }
 
     fn seek(&mut self, position: Duration) -> Result<(), VideoError> {
@@ -2796,14 +2736,69 @@ impl VideoDecoderBackend for GStreamerDecoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_gst_error, AudioSelectionAttemptError, AudioTrackSelectionResult,
-        GStreamerDecoder, GstLifecycleControl,
+        classify_gst_error, native_tier, normalize_requested_tier, should_attempt_native,
+        AudioSelectionAttemptError, AudioTrackSelectionResult, GStreamerDecoder,
+        GstLifecycleControl,
     };
     use crate::video::VideoError;
     use gstreamer as gst;
-    use lumina_video_core::session::AudioTrack;
+    use lumina_video_core::session::{AudioTrack, CapabilityTier};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn unknown_modifier_downgrades_once_without_retry() -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::File;
+        use std::os::fd::OwnedFd;
+
+        assert_eq!(super::parse_modifier("not-a-modifier"), None);
+        let mut layout_failed = false;
+        assert!(should_attempt_native(
+            CapabilityTier::GpuConversion,
+            layout_failed
+        ));
+        layout_failed = true;
+        assert_eq!(
+            native_tier(CapabilityTier::GpuConversion, !layout_failed),
+            CapabilityTier::SystemMemoryUpload
+        );
+        assert!(!should_attempt_native(
+            CapabilityTier::GpuConversion,
+            layout_failed
+        ));
+        assert_eq!(
+            native_tier(CapabilityTier::GpuConversion, !layout_failed),
+            CapabilityTier::SystemMemoryUpload
+        );
+        let memory = crate::DmaBufMemory::new(
+            vec![crate::DmaBufObject {
+                fd: OwnedFd::from(File::open("/dev/null")?),
+                size: Some(4),
+            }],
+            Vec::new(),
+            Vec::new(),
+            Some(drm_fourcc::DrmFourcc::Nv12 as u32),
+            None,
+        )?;
+        assert_eq!(memory.modifier, None);
+        assert_eq!(
+            native_tier(CapabilityTier::GpuConversion, false),
+            CapabilityTier::SystemMemoryUpload
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_alias_request_is_clamped_before_native_selection() {
+        assert_eq!(
+            normalize_requested_tier(CapabilityTier::DirectAlias),
+            CapabilityTier::SystemMemoryUpload
+        );
+        assert_eq!(
+            normalize_requested_tier(CapabilityTier::GpuConversion),
+            CapabilityTier::GpuConversion
+        );
+    }
 
     #[test]
     fn stable_gstreamer_and_gio_transport_errors_preserve_tls_network_and_parse_errors() {

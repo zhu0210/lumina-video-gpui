@@ -183,8 +183,30 @@ mod plane_layout_tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeFrameError {
     InvalidExtent,
-    PlaneCount { expected: usize, actual: usize },
-    PlaneObject { plane: usize, object: usize },
+    PlaneCount {
+        expected: usize,
+        actual: usize,
+    },
+    MemoryPlaneObject {
+        memory_plane: usize,
+        object: usize,
+    },
+    FormatPlaneMemory {
+        format_plane: usize,
+        memory_plane: usize,
+    },
+    MemoryPlaneOutOfBounds {
+        memory_plane: usize,
+        offset: u64,
+        size: u64,
+        object_size: u64,
+    },
+    FormatPlaneOutOfBounds {
+        format_plane: usize,
+        offset: u64,
+        size: u64,
+        memory_plane_size: u64,
+    },
 }
 
 impl fmt::Display for NativeFrameError {
@@ -194,8 +216,47 @@ impl fmt::Display for NativeFrameError {
             Self::PlaneCount { expected, actual } => {
                 write!(f, "frame format requires {expected} planes, got {actual}")
             }
-            Self::PlaneObject { plane, object } => {
-                write!(f, "plane {plane} references missing memory object {object}")
+            Self::MemoryPlaneObject {
+                memory_plane,
+                object,
+            } => {
+                write!(
+                    f,
+                    "memory plane {memory_plane} references missing object {object}"
+                )
+            }
+            Self::FormatPlaneMemory {
+                format_plane,
+                memory_plane,
+            } => {
+                write!(
+                    f,
+                    "format plane {format_plane} references missing memory plane {memory_plane}"
+                )
+            }
+            Self::MemoryPlaneOutOfBounds {
+                memory_plane,
+                offset,
+                size,
+                object_size,
+            } => {
+                write!(
+                    f,
+                    "memory plane {memory_plane} view [{offset}, {}) exceeds object size {object_size}",
+                    offset.saturating_add(*size)
+                )
+            }
+            Self::FormatPlaneOutOfBounds {
+                format_plane,
+                offset,
+                size,
+                memory_plane_size,
+            } => {
+                write!(
+                    f,
+                    "format plane {format_plane} view [{offset}, {}) exceeds memory plane size {memory_plane_size}",
+                    offset.saturating_add(*size)
+                )
             }
         }
     }
@@ -208,35 +269,53 @@ impl std::error::Error for NativeFrameError {}
 #[derive(Debug)]
 pub struct DmaBufObject {
     pub fd: std::os::fd::OwnedFd,
-    pub size: u64,
+    /// Maximum known extent of the underlying DMABuf object. `None` means
+    /// that the producer could not prove a bound from allocator metadata.
+    pub size: Option<u64>,
 }
 
-/// A format-plane view into one of a DMABuf frame's memory objects.
+/// One GstMemory-like view into a DMABuf memory object.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DmaBufPlane {
-    /// Index into [`DmaBufMemory::objects`], not a file descriptor count.
+pub struct DmaBufMemoryPlane {
+    /// Index into [`DmaBufMemory::objects`].
     pub object: usize,
+    /// Offset of this memory view within the object.
     pub offset: u64,
-    pub stride: u32,
-    pub size: u64,
+    /// Size of this memory view, when the producer knows it.
+    pub size: Option<u64>,
 }
 
-/// Linux DMABuf memory with memory objects kept separate from format planes.
+/// A format-plane view into one of a DMABuf frame's memory views.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaBufFormatPlane {
+    /// Index into [`DmaBufMemory::memory_planes`].
+    pub memory_plane: usize,
+    /// Offset local to the referenced memory view.
+    pub offset: u64,
+    /// Bytes between the starts of adjacent rows.
+    pub stride: u32,
+    /// Size of this format-plane view, when derivable from negotiated layout.
+    pub size: Option<u64>,
+}
+
+/// Linux DMABuf memory with object, memory-view, and format-plane layers kept
+/// separate.
 ///
 /// [`DmaBufMemory::new`] takes ownership of the supplied memory objects and
-/// plane descriptors without allocating or copying them.  It only validates
-/// plane-to-object references; allocation and pooling are producer
-/// responsibilities.
+/// plane descriptors without allocating or copying them. It validates both
+/// reference layers; allocation and pooling remain producer responsibilities.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DmaBufMemory {
     pub objects: Vec<DmaBufObject>,
-    pub planes: Vec<DmaBufPlane>,
+    pub memory_planes: Vec<DmaBufMemoryPlane>,
+    pub format_planes: Vec<DmaBufFormatPlane>,
     /// DRM fourcc describing the image format at the import seam.
-    pub drm_fourcc: u32,
+    pub drm_fourcc: Option<u32>,
     /// DRM modifier shared by the image's memory layout.
-    pub modifier: u64,
+    pub modifier: Option<u64>,
 }
 
 #[cfg(target_os = "linux")]
@@ -245,24 +324,84 @@ impl DmaBufMemory {
     /// their references without allocating or copying either vector.
     pub fn new(
         objects: Vec<DmaBufObject>,
-        planes: Vec<DmaBufPlane>,
-        drm_fourcc: u32,
-        modifier: u64,
+        memory_planes: Vec<DmaBufMemoryPlane>,
+        format_planes: Vec<DmaBufFormatPlane>,
+        drm_fourcc: Option<u32>,
+        modifier: Option<u64>,
     ) -> Result<Self, NativeFrameError> {
-        for (plane_index, plane) in planes.iter().enumerate() {
-            if plane.object >= objects.len() {
-                return Err(NativeFrameError::PlaneObject {
-                    plane: plane_index,
-                    object: plane.object,
-                });
-            }
-        }
+        Self::validate_references(&objects, &memory_planes, &format_planes)?;
         Ok(Self {
             objects,
-            planes,
+            memory_planes,
+            format_planes,
             drm_fourcc,
             modifier,
         })
+    }
+
+    /// Validates both reference layers after construction.
+    pub fn validate(&self) -> Result<(), NativeFrameError> {
+        Self::validate_references(&self.objects, &self.memory_planes, &self.format_planes)
+    }
+
+    fn validate_references(
+        objects: &[DmaBufObject],
+        memory_planes: &[DmaBufMemoryPlane],
+        format_planes: &[DmaBufFormatPlane],
+    ) -> Result<(), NativeFrameError> {
+        for (memory_plane, plane) in memory_planes.iter().enumerate() {
+            let Some(object) = objects.get(plane.object) else {
+                return Err(NativeFrameError::MemoryPlaneObject {
+                    memory_plane,
+                    object: plane.object,
+                });
+            };
+            if let (Some(object_size), Some(view_size)) = (object.size, plane.size) {
+                let Some(view_end) = plane.offset.checked_add(view_size) else {
+                    return Err(NativeFrameError::MemoryPlaneOutOfBounds {
+                        memory_plane,
+                        offset: plane.offset,
+                        size: view_size,
+                        object_size,
+                    });
+                };
+                if view_end > object_size {
+                    return Err(NativeFrameError::MemoryPlaneOutOfBounds {
+                        memory_plane,
+                        offset: plane.offset,
+                        size: view_size,
+                        object_size,
+                    });
+                }
+            }
+        }
+        for (format_plane, plane) in format_planes.iter().enumerate() {
+            let Some(memory) = memory_planes.get(plane.memory_plane) else {
+                return Err(NativeFrameError::FormatPlaneMemory {
+                    format_plane,
+                    memory_plane: plane.memory_plane,
+                });
+            };
+            if let (Some(memory_size), Some(plane_size)) = (memory.size, plane.size) {
+                let Some(plane_end) = plane.offset.checked_add(plane_size) else {
+                    return Err(NativeFrameError::FormatPlaneOutOfBounds {
+                        format_plane,
+                        offset: plane.offset,
+                        size: plane_size,
+                        memory_plane_size: memory_size,
+                    });
+                };
+                if plane_end > memory_size {
+                    return Err(NativeFrameError::FormatPlaneOutOfBounds {
+                        format_plane,
+                        offset: plane.offset,
+                        size: plane_size,
+                        memory_plane_size: memory_size,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -317,7 +456,10 @@ impl NativeFrameLease {
         let plane_count = match &memory {
             NativeMemory::Cpu(cpu) => cpu.planes.len(),
             #[cfg(target_os = "linux")]
-            NativeMemory::DmaBuf(dmabuf) => dmabuf.planes.len(),
+            NativeMemory::DmaBuf(dmabuf) => {
+                dmabuf.validate()?;
+                dmabuf.format_planes.len()
+            }
         };
         let expected = descriptor.format.num_planes();
         if plane_count != expected {

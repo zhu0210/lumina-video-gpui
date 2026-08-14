@@ -1052,7 +1052,9 @@ mod tests {
     use lumina_video_native_frame::video::LinuxGpuSurface;
     use lumina_video_native_frame::{CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor};
     #[cfg(target_os = "linux")]
-    use lumina_video_native_frame::{DmaBufMemory, DmaBufObject, DmaBufPlane};
+    use lumina_video_native_frame::{
+        DmaBufFormatPlane, DmaBufMemory, DmaBufMemoryPlane, DmaBufObject,
+    };
 
     #[test]
     fn test_bgra_to_rgba() {
@@ -1116,9 +1118,9 @@ mod tests {
     #[test]
     fn sync_file_lease_is_rejected_and_returned() -> Result<(), Box<dyn std::error::Error>> {
         use std::fs::File;
-        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        use std::os::fd::OwnedFd;
 
-        let fd = File::open("/dev/null")?.into_raw_fd();
+        let file = File::open("/dev/null")?;
         let lease = NativeFrameLease::new(
             NativeFrameDescriptor {
                 frame_id: 2,
@@ -1129,10 +1131,7 @@ mod tests {
                 format: PixelFormat::Rgba,
             },
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(vec![0; 4], 4)])),
-            AcquireSync::SyncFile(unsafe {
-                // SAFETY: ownership of the descriptor is transferred exactly once.
-                OwnedFd::from_raw_fd(fd)
-            }),
+            AcquireSync::SyncFile(OwnedFd::from(file)),
         )?;
         let error = classify_native_frame_lease(lease)
             .err()
@@ -1190,9 +1189,9 @@ mod tests {
     #[test]
     fn owned_dmabuf_lease_is_rejected_and_returned() -> Result<(), Box<dyn std::error::Error>> {
         use std::fs::File;
-        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::fd::OwnedFd;
 
-        let raw_fd = File::open("/dev/null")?.into_raw_fd();
+        let file = File::open("/dev/null")?;
         let lease = NativeFrameLease::new(
             NativeFrameDescriptor {
                 frame_id: 4,
@@ -1204,20 +1203,22 @@ mod tests {
             },
             NativeMemory::DmaBuf(DmaBufMemory::new(
                 vec![DmaBufObject {
-                    fd: unsafe {
-                        // SAFETY: ownership of the valid descriptor is transferred exactly once.
-                        std::os::fd::OwnedFd::from_raw_fd(raw_fd)
-                    },
-                    size: 4,
+                    fd: OwnedFd::from(file),
+                    size: Some(32),
                 }],
-                vec![DmaBufPlane {
+                vec![DmaBufMemoryPlane {
                     object: 0,
                     offset: 16,
-                    stride: 4,
-                    size: 4,
+                    size: Some(8),
                 }],
-                0x3432_5241,
-                0,
+                vec![DmaBufFormatPlane {
+                    memory_plane: 0,
+                    offset: 4,
+                    stride: 4,
+                    size: Some(4),
+                }],
+                Some(0x3432_5241),
+                Some(0),
             )?),
             AcquireSync::None,
         )?;
@@ -1238,11 +1239,20 @@ mod tests {
             return Err("expected DMABuf memory".into());
         };
         assert_eq!(memory.objects.len(), 1);
-        assert_eq!(memory.planes.len(), 1);
+        assert_eq!(memory.memory_planes.len(), 1);
+        assert_eq!(memory.format_planes.len(), 1);
         let object = memory.objects.first().ok_or("missing DMABuf object")?;
-        let plane = memory.planes.first().ok_or("missing DMABuf plane")?;
-        assert_eq!(plane.object, 0);
-        assert_eq!(plane.offset, 16);
+        assert_eq!(object.size, Some(32));
+        let memory_plane = memory
+            .memory_planes
+            .first()
+            .ok_or("missing DMABuf memory plane")?;
+        assert_eq!(memory_plane.object, 0);
+        assert_eq!(memory_plane.offset, 16);
+        assert_eq!(memory_plane.size, Some(8));
+        let plane = memory.format_planes.first().ok_or("missing DMABuf plane")?;
+        assert_eq!(plane.memory_plane, 0);
+        assert_eq!(plane.offset, 4);
         assert_eq!(plane.stride, 4);
         assert!(File::from(object.fd.try_clone()?).metadata().is_ok());
         Ok(())
