@@ -230,6 +230,19 @@ impl SnapshotState {
     }
 }
 
+fn publish_capability_if_changed(
+    state: &SnapshotState,
+    published: &mut CapabilityTier,
+    next: CapabilityTier,
+) -> bool {
+    if *published == next {
+        return false;
+    }
+    state.snapshot.write().capability = next;
+    *published = next;
+    true
+}
+
 fn state_position(state: &SessionState) -> Option<Duration> {
     match state {
         SessionState::Playing { position }
@@ -621,12 +634,14 @@ fn sync_buffering_state(
     publish_state(state, control_sender, sequence, next_state)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_command(
     worker_command: WorkerCommand,
     decoder: &mut GStreamerDecoder,
     playback: &mut PlaybackState,
     audio_handle: &AudioHandle,
     state: &Arc<SnapshotState>,
+    published_capability: &mut CapabilityTier,
     control_sender: &ControlSender,
     sequence: &mut u64,
 ) -> bool {
@@ -789,7 +804,7 @@ fn process_command(
         }
         SessionCommand::Renegotiate { tier } => match decoder.renegotiate(tier) {
             Ok(()) => {
-                state.snapshot.write().capability = CapabilityTier::SystemMemoryUpload;
+                publish_capability_if_changed(state, published_capability, decoder.active_tier());
                 true
             }
             Err(error) => publish_nonterminal_error(control_sender, sequence, session_error(error)),
@@ -1094,7 +1109,8 @@ fn run_worker(
                 return;
             }
         };
-    state.snapshot.write().capability = decoder.active_tier();
+    let mut published_capability = requested_tier;
+    publish_capability_if_changed(&state, &mut published_capability, decoder.active_tier());
     if lifecycle_cancelled(&lifecycle_control) {
         if lifecycle_control.is_stop_requested() {
             publish_ended(&state, &control_sender, &mut sequence);
@@ -1222,6 +1238,7 @@ fn run_worker(
                 &mut playback,
                 &audio_handle,
                 &state,
+                &mut published_capability,
                 &control_sender,
                 &mut sequence,
             ) {
@@ -1292,6 +1309,7 @@ fn run_worker(
                         &mut playback,
                         &audio_handle,
                         &state,
+                        &mut published_capability,
                         &control_sender,
                         &mut sequence,
                     ) {
@@ -1409,7 +1427,7 @@ fn run_worker(
                         return;
                     }
                 };
-                state.snapshot.write().capability = settled_tier;
+                publish_capability_if_changed(&state, &mut published_capability, settled_tier);
                 frame_id = frame_id.saturating_add(1);
                 if !send_frame(
                     &frame_sender,
@@ -1477,7 +1495,11 @@ fn run_worker(
                 update_gst_observation(&state, &decoder, frame_sender.len());
             }
             Err(VideoError::UnsupportedFormat(_)) => {
-                state.snapshot.write().capability = CapabilityTier::SystemMemoryUpload;
+                publish_capability_if_changed(
+                    &state,
+                    &mut published_capability,
+                    CapabilityTier::SystemMemoryUpload,
+                );
                 dropped_frames.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -3361,6 +3383,38 @@ mod tests {
             }
             Err(error) => panic!("nonterminal error event missing: {error}"),
         }
+    }
+
+    #[test]
+    fn capability_snapshot_publishes_only_transitions() {
+        let state = SnapshotState::with_capability(CapabilityTier::DirectAlias);
+        let mut published = CapabilityTier::DirectAlias;
+
+        assert!(!publish_capability_if_changed(
+            &state,
+            &mut published,
+            CapabilityTier::DirectAlias
+        ));
+        assert_eq!(
+            state.snapshot.read().capability,
+            CapabilityTier::DirectAlias
+        );
+
+        assert!(publish_capability_if_changed(
+            &state,
+            &mut published,
+            CapabilityTier::SystemMemoryUpload
+        ));
+        assert_eq!(published, CapabilityTier::SystemMemoryUpload);
+        assert_eq!(
+            state.snapshot.read().capability,
+            CapabilityTier::SystemMemoryUpload
+        );
+        assert!(!publish_capability_if_changed(
+            &state,
+            &mut published,
+            CapabilityTier::SystemMemoryUpload
+        ));
     }
 
     #[test]
