@@ -30,12 +30,17 @@ while (($#)); do
     esac
 done
 
-for command_name in curl jq sha256sum tar xz gzip find sort awk grep sed mktemp realpath chmod; do
+for command_name in curl jq sha256sum tar xz gzip find sort awk grep sed mktemp realpath chmod cmp cp readlink stat; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
     }
 done
+
+fail() {
+    echo "build-gstreamer-runtime: $*" >&2
+    exit 1
+}
 
 lock_file=$(realpath "$lock_file")
 output_dir=$(realpath -m "$output_dir")
@@ -190,10 +195,120 @@ done
 bundle="$work_dir/bundle"
 runtime_root="$bundle/vendor/linux-x86_64"
 mkdir -p "$runtime_root"
+
+validate_package_archive() {
+    local archive=$1
+    local member_list=$2
+    local member
+
+    if ! tar -tJf "$archive" --quoting-style=escape >"$member_list"; then
+        fail "cannot list package archive: $archive"
+    fi
+    [[ -s "$member_list" ]] || fail "package archive is empty: $archive"
+    while IFS= read -r member; do
+        case "$member" in
+            /*|./*|*/./*|*/.|..|../*|*/../*|*/..|*//* )
+                fail "unsafe package member in $archive: $member"
+                ;;
+        esac
+        case "$member" in
+            opt|opt/|opt/gstreamer-1.0|opt/gstreamer-1.0/|opt/gstreamer-1.0/*)
+                ;;
+            *)
+                fail "package member outside opt/gstreamer-1.0 in $archive: $member"
+                ;;
+        esac
+    done <"$member_list"
+}
+
+assert_staging_prefix() {
+    local staging=$1
+    local prefix="$staging/opt/gstreamer-1.0"
+    local -a roots=()
+    local -a opt_children=()
+
+    mapfile -d '' -t roots < <(find -P "$staging" -mindepth 1 -maxdepth 1 -printf '%f\0')
+    [[ ${#roots[@]} -eq 1 && "${roots[0]}" == opt ]] || {
+        fail "package staging has roots outside opt: $staging"
+    }
+    [[ -d "$staging/opt" && ! -L "$staging/opt" ]] || {
+        fail "package staging opt prefix is not a directory: $staging/opt"
+    }
+
+    mapfile -d '' -t opt_children < <(find -P "$staging/opt" -mindepth 1 -maxdepth 1 -printf '%f\0')
+    [[ ${#opt_children[@]} -eq 1 && "${opt_children[0]}" == gstreamer-1.0 ]] || {
+        fail "package staging has roots outside opt/gstreamer-1.0: $staging"
+    }
+    [[ -d "$prefix" && ! -L "$prefix" ]] || {
+        fail "package staging prefix is not a directory: $prefix"
+    }
+}
+
+merge_package_prefix() {
+    local prefix=$1
+    local source rel destination source_kind source_target destination_target
+
+    while IFS= read -r -d '' source; do
+        rel=${source#"$prefix"/}
+        destination="$runtime_root/$rel"
+
+        if [[ -L "$source" ]]; then
+            source_kind=symlink
+        elif [[ -d "$source" ]]; then
+            source_kind=directory
+        elif [[ -f "$source" ]]; then
+            source_kind=file
+        else
+            fail "special file in package prefix: $source"
+        fi
+
+        if [[ ! -L "$destination" && ! -e "$destination" ]]; then
+            continue
+        fi
+
+        case "$source_kind" in
+            symlink)
+                [[ -L "$destination" ]] || {
+                    fail "package collision changes type at $destination"
+                }
+                source_target=$(readlink -- "$source")
+                destination_target=$(readlink -- "$destination")
+                [[ "$source_target" == "$destination_target" ]] || {
+                    fail "package collision changes symlink target at $destination"
+                }
+                ;;
+            directory)
+                [[ ! -L "$destination" && -d "$destination" ]] || {
+                    fail "package collision changes type at $destination"
+                }
+                ;;
+            file)
+                [[ ! -L "$destination" && -f "$destination" ]] || {
+                    fail "package collision changes type at $destination"
+                }
+                cmp -s -- "$source" "$destination" || {
+                    fail "package collision changes file contents at $destination"
+                }
+                [[ "$(stat -c '%a' -- "$source")" == "$(stat -c '%a' -- "$destination")" ]] || {
+                    fail "package collision changes file mode at $destination"
+                }
+                ;;
+        esac
+    done < <(find -P "$prefix" -mindepth 1 -print0)
+
+    cp -a -- "$prefix"/. "$runtime_root"/
+}
+
 package_count=0
 while IFS= read -r -d '' package_tarball; do
-    tar -xJf "$package_tarball" -C "$runtime_root"
     package_count=$((package_count + 1))
+    staging="$work_dir/package-staging-$package_count"
+    member_list="$work_dir/package-$package_count.members"
+    mkdir -p "$staging"
+    validate_package_archive "$package_tarball" "$member_list"
+    tar -xJf "$package_tarball" -C "$staging" --no-same-owner
+    assert_staging_prefix "$staging"
+    merge_package_prefix "$staging/opt/gstreamer-1.0"
 done < <(find "$package_dir" -type f -name '*.tar.xz' -print0 | sort -z)
 [[ "$package_count" == 2 ]] || { echo "expected two Cerbero package tarballs, got $package_count" >&2; exit 1; }
 
