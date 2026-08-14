@@ -3,6 +3,8 @@ name: Package audited GStreamer runtime
 on:
   workflow_dispatch:
   workflow_call:
+  push:
+    branches: [validation/lumina-19-runtime]
   pull_request:
     paths:
       - .github/workflows/package-gstreamer.yml
