@@ -1199,7 +1199,7 @@ impl GStreamerDecoder {
                 gio::TlsFileDatabase::new(&path).map_err(|error| {
                     VideoError::DecoderInit(format!("Failed to load TLS CA database: {error}"))
                 })?;
-                Ok(path)
+                Ok::<_, VideoError>(path)
             })
             .transpose()?;
         if network_source {
@@ -1620,18 +1620,21 @@ impl GStreamerDecoder {
             100 // Local files are immediately available
         };
 
+        let active_requested_tier = if !hardware_decoder_selected {
+            CapabilityTier::SystemMemoryUpload
+        } else {
+            requested_tier
+        };
         Ok(Self {
             pipeline,
             appsink,
             network_source,
             certificate_rejected,
             first_byte_seen,
-            requested_tier,
+            requested_tier: active_requested_tier,
             hardware_decoder_selected,
-            system_memory_negotiated: requested_tier == CapabilityTier::SystemMemoryUpload
-                || !hardware_decoder_selected,
-            native_layout_failed: requested_tier != CapabilityTier::SystemMemoryUpload
-                && !hardware_decoder_selected,
+            system_memory_negotiated: active_requested_tier == CapabilityTier::SystemMemoryUpload,
+            native_layout_failed: active_requested_tier == CapabilityTier::SystemMemoryUpload,
             native_color_generation: None,
             nv12_input_generation: None,
             metadata,

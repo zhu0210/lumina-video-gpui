@@ -100,9 +100,12 @@ impl DemoApp {
         }
     }
 
-    fn load_video(&mut self, url: &str, cx: &App) {
+    fn load_video(&mut self, url: &str, window: &mut Window, cx: &App) {
         tracing::info!("Loading: {url}");
         self.status = format!("Loading: {url}...");
+        if let Some(player) = self.player.as_mut() {
+            player.retire_external_frame(window);
+        }
         let player = GpuiVideoPlayer::new(url.to_string(), cx)
             .with_autoplay(true)
             .with_controls(true)
@@ -185,7 +188,7 @@ impl Render for DemoApp {
             .bg(rgb(0x0d1117))
             .text_color(rgb(0xe6edf3))
             .on_key_down(
-                cx.listener(|this: &mut DemoApp, event: &KeyDownEvent, _w, cx| {
+                cx.listener(|this: &mut DemoApp, event: &KeyDownEvent, window, cx| {
                     let key = event.keystroke.key.as_str();
                     match key {
                         "left" => {
@@ -219,7 +222,7 @@ impl Render for DemoApp {
                         }
                         "enter" | "return" => {
                             let url = SAMPLE_VIDEOS[this.selected_sample].1.to_string();
-                            this.load_video(&url, cx);
+                            this.load_video(&url, window, cx);
                             cx.notify();
                         }
                         "space" => {
@@ -326,9 +329,9 @@ impl Render for DemoApp {
                             .hover(|d| d.bg(rgb(0x2ea043)))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _e, _w, cx| {
+                                cx.listener(move |this, _e, window, cx| {
                                     let url = SAMPLE_VIDEOS[this.selected_sample].1.to_string();
-                                    this.load_video(&url, cx);
+                                    this.load_video(&url, window, cx);
                                     cx.notify();
                                 }),
                             )

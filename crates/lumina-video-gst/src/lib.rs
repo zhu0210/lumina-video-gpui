@@ -1094,6 +1094,7 @@ fn run_worker(
                 return;
             }
         };
+    state.snapshot.write().capability = decoder.active_tier();
     if lifecycle_cancelled(&lifecycle_control) {
         if lifecycle_control.is_stop_requested() {
             publish_ended(&state, &control_sender, &mut sequence);

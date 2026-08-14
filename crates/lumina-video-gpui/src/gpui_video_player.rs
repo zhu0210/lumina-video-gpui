@@ -9,13 +9,12 @@
 //! Linux: GstMediaSession (GStreamer decode + A/V timing), except MoQ URLs
 //! which use CorePlayer's native MoQ decoder.
 //!   │ one try_next_event() per animation tick
-//!   ▼
-//! native_frame_lease_to_textures()  ← lumina-video-wgpu
-//!   │
-//!   ├─ CorePlayer: decoded_frame_to_textures()
-//!   ▼
-//!   │ NV12: Y(R8) + CbCr(RG8)  →  surface((y, cbcr, size))  [GPU YUV→RGB]
-//!   │ RGBA: single RGBA8        →  surface((tex, desc))      [passthrough]
+//!   ├─ Intel Vulkan + NV12: Gst DMABuf + SyncFile
+//!   │    → bounded import worker → one multiplanar external texture
+//!   │    → same-frame pending surface → normal renderer acquire/render/release
+//!   └─ system fallback: native_frame_lease_to_textures()  ← lumina-video-wgpu
+//!        NV12: Y(R8) + CbCr(RG8) → surface((y, cbcr, size)) [GPU YUV→RGB]
+//!        RGBA: single RGBA8       → surface((tex, desc))     [passthrough]
 //!   ▼
 //! GPUI surface() element  ←  gpui renderer
 //! ```
@@ -79,11 +78,8 @@ fn try_send_drop_oldest<T>(sender: &Sender<T>, drop_receiver: &Receiver<T>, item
     match sender.try_send(item) {
         Ok(()) => true,
         Err(TrySendError::Full(item)) => {
-            if drop_receiver.try_recv().is_ok() {
-                sender.try_send(item).is_ok()
-            } else {
-                false
-            }
+            let _ = drop_receiver.try_recv();
+            sender.try_send(item).is_ok()
         }
         Err(TrySendError::Disconnected(_)) => false,
     }
@@ -274,6 +270,8 @@ pub struct GpuiVideoPlayer {
     direct_display: Option<ExternalPresentation>,
     #[cfg(target_os = "linux")]
     frame_realization: Option<FrameRealization>,
+    #[cfg(target_os = "linux")]
+    pending_external_retirement: bool,
     config: GpuiVideoPlayerConfig,
 
     // GPU state
@@ -373,6 +371,8 @@ impl GpuiVideoPlayer {
             direct_display: None,
             #[cfg(target_os = "linux")]
             frame_realization: None,
+            #[cfg(target_os = "linux")]
+            pending_external_retirement: false,
             config,
             gpu_context: None,
             frame_textures: None,
@@ -490,9 +490,7 @@ impl GpuiVideoPlayer {
             self.direct_import = None;
             self.direct_alias_supported = None;
             self.direct_downgrade_requested = false;
-            self.pending_external = None;
-            self.direct_display = None;
-            self.frame_realization = None;
+            self.request_external_retirement();
         }
     }
 
@@ -557,9 +555,7 @@ impl GpuiVideoPlayer {
             self.direct_import = None;
             self.direct_alias_supported = None;
             self.direct_downgrade_requested = false;
-            self.pending_external = None;
-            self.direct_display = None;
-            self.frame_realization = None;
+            self.request_external_retirement();
             self.session = Some(
                 GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
                     self.url.clone(),
@@ -594,9 +590,7 @@ impl GpuiVideoPlayer {
             self.direct_import = None;
             self.direct_alias_supported = None;
             self.direct_downgrade_requested = false;
-            self.pending_external = None;
-            self.direct_display = None;
-            self.frame_realization = None;
+            self.request_external_retirement();
             self.session = Some(
                 GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
                     self.url.clone(),
@@ -844,6 +838,60 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
+    fn mark_external_retirement<T, U>(
+        pending_retirement: &mut bool,
+        pending_external: &mut Option<T>,
+        direct_display: &mut Option<T>,
+        frame_realization: &mut Option<U>,
+    ) {
+        *pending_retirement = true;
+        *pending_external = None;
+        *direct_display = None;
+        *frame_realization = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_external_retirement(&mut self) {
+        Self::mark_external_retirement(
+            &mut self.pending_external_retirement,
+            &mut self.pending_external,
+            &mut self.direct_display,
+            &mut self.frame_realization,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retire_external_frame_now(&mut self, window: &mut Window) {
+        let _ = window.clear_external_frame();
+        // clear_external_frame() reports Accepted through the same one-shot
+        // outcome channel; it must not certify a still-pending submission.
+        let _ = window.take_external_frame_outcome();
+        self.pending_external_retirement = false;
+        self.pending_external = None;
+        self.direct_display = None;
+        self.frame_realization = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drain_pending_external_retirement(&mut self, window: &mut Window) {
+        if self.pending_external_retirement {
+            self.retire_external_frame_now(window);
+        }
+    }
+
+    /// Retire renderer-owned external frames before replacing or dropping this player.
+    ///
+    /// `Drop` cannot access a [`Window`], so callers that still have one must use this
+    /// method before removing the player. The normal `Drop` implementation still releases
+    /// all local resources.
+    pub fn retire_external_frame(&mut self, window: &mut Window) {
+        #[cfg(target_os = "linux")]
+        self.retire_external_frame_now(window);
+        #[cfg(not(target_os = "linux"))]
+        let _ = window;
+    }
+
+    #[cfg(target_os = "linux")]
     fn request_system_memory_downgrade(&mut self) {
         if self.direct_downgrade_requested {
             return;
@@ -859,14 +907,15 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
-    fn disable_direct_import(&mut self) {
+    fn disable_direct_import(&mut self, window: &mut Window) {
         self.direct_alias_supported = Some(false);
         self.direct_import = None;
+        self.retire_external_frame_now(window);
         self.request_system_memory_downgrade();
     }
 
     #[cfg(target_os = "linux")]
-    fn ensure_direct_import_route(&mut self) {
+    fn ensure_direct_import_route(&mut self, window: &mut Window) {
         if self.session.is_none() {
             return;
         }
@@ -893,10 +942,12 @@ impl GpuiVideoPlayer {
                 self.direct_import = Some(worker);
             } else {
                 self.direct_alias_supported = Some(false);
+                self.retire_external_frame_now(window);
                 self.request_system_memory_downgrade();
             }
         } else {
             self.direct_alias_supported = Some(false);
+            self.retire_external_frame_now(window);
             self.request_system_memory_downgrade();
         }
     }
@@ -923,7 +974,7 @@ impl GpuiVideoPlayer {
             gpui_wgpu::ExternalFrameOutcome::Unsupported
             | gpui_wgpu::ExternalFrameOutcome::TransientFailure
             | gpui_wgpu::ExternalFrameOutcome::FatalFailure => {
-                self.disable_direct_import();
+                self.disable_direct_import(window);
             }
         }
     }
@@ -946,7 +997,7 @@ impl GpuiVideoPlayer {
             Ok(frame) => frame,
             Err(error) => {
                 tracing::warn!("external NV12 frame rejected before staging: {error}");
-                self.disable_direct_import();
+                self.disable_direct_import(window);
                 return;
             }
         };
@@ -961,7 +1012,7 @@ impl GpuiVideoPlayer {
             gpui_wgpu::ExternalFrameOutcome::Unsupported
             | gpui_wgpu::ExternalFrameOutcome::TransientFailure
             | gpui_wgpu::ExternalFrameOutcome::FatalFailure => {
-                self.disable_direct_import();
+                self.disable_direct_import(window);
             }
         }
     }
@@ -978,14 +1029,18 @@ impl GpuiVideoPlayer {
             }
             Some(Ok(_)) => {}
             Some(Err(_error)) => {
-                self.disable_direct_import();
+                self.disable_direct_import(window);
             }
             None => {}
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn submit_linux_frame(&mut self, frame: lumina_video_native_frame::NativeFrameLease) {
+    fn submit_linux_frame(
+        &mut self,
+        window: &mut Window,
+        frame: lumina_video_native_frame::NativeFrameLease,
+    ) {
         if matches!(
             &frame.memory,
             lumina_video_native_frame::NativeMemory::DmaBuf(_)
@@ -996,7 +1051,7 @@ impl GpuiVideoPlayer {
                     .as_ref()
                     .is_some_and(|worker| worker.enqueue(frame));
                 if !enqueued {
-                    self.disable_direct_import();
+                    self.disable_direct_import(window);
                 }
             } else if self.direct_alias_supported == Some(false) {
                 drop(frame);
@@ -1037,7 +1092,8 @@ impl GpuiVideoPlayer {
 
         #[cfg(target_os = "linux")]
         {
-            self.ensure_direct_import_route();
+            self.drain_pending_external_retirement(window);
+            self.ensure_direct_import_route(window);
             self.poll_external_outcome(window);
             #[cfg(feature = "moq")]
             if self.core.is_some() {
@@ -1231,7 +1287,7 @@ impl GpuiVideoPlayer {
         };
 
         if let PresentationDecision::Advanced(frame) = decision {
-            self.submit_linux_frame(frame);
+            self.submit_linux_frame(window, frame);
         }
 
         self.poll_direct_import(window);
@@ -1247,9 +1303,8 @@ impl GpuiVideoPlayer {
                     &mut self.rgba_cache,
                 ) {
                     Ok(textures) => {
+                        self.retire_external_frame_now(window);
                         self.frame_textures = Some(textures);
-                        self.direct_display = None;
-                        self.frame_realization = None;
                     }
                     Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease))
                     | Err(NativeFrameIngestionError::UnsupportedDmaBuf(lease))
@@ -1698,7 +1753,7 @@ mod color_boundary_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod direct_route_state_tests {
-    use super::try_send_drop_oldest;
+    use super::{try_send_drop_oldest, GpuiVideoPlayer};
     use crossbeam_channel::bounded;
     use gpui_wgpu::ExternalFrameOutcome;
 
@@ -1751,14 +1806,19 @@ mod direct_route_state_tests {
             ExternalStage::Pending
         );
         assert_eq!(surface_stage(true, false), ExternalStage::Pending);
-        assert_eq!(
-            stage_after_renderer(
-                ExternalStage::Pending,
-                ExternalFrameOutcome::Accepted,
-                false
-            ),
-            ExternalStage::Displayed
+        let mut realization: Option<()> = None;
+        assert!(realization.is_none());
+        let promoted = stage_after_renderer(
+            ExternalStage::Pending,
+            ExternalFrameOutcome::Accepted,
+            false,
         );
+        if promoted == ExternalStage::Displayed {
+            realization = Some(());
+        }
+        assert!(realization.is_some());
+        assert_eq!(promoted, ExternalStage::Displayed);
+        let failed_realization: Option<()> = None;
         assert_eq!(
             stage_after_renderer(
                 ExternalStage::Pending,
@@ -1767,6 +1827,7 @@ mod direct_route_state_tests {
             ),
             ExternalStage::Empty
         );
+        assert!(failed_realization.is_none());
         assert_eq!(
             stage_after_renderer(
                 ExternalStage::Pending,
@@ -1774,6 +1835,34 @@ mod direct_route_state_tests {
                 true
             ),
             ExternalStage::Displayed
+        );
+    }
+
+    #[test]
+    fn retirement_drops_local_external_state_and_leaves_a_pending_clear() {
+        let mut pending_retirement = false;
+        let mut pending_external = Some(1);
+        let mut direct_display = Some(2);
+        let mut frame_realization = Some(3);
+
+        GpuiVideoPlayer::mark_external_retirement(
+            &mut pending_retirement,
+            &mut pending_external,
+            &mut direct_display,
+            &mut frame_realization,
+        );
+
+        assert!(pending_retirement);
+        assert!(pending_external.is_none());
+        assert!(direct_display.is_none());
+        assert!(frame_realization.is_none());
+    }
+
+    #[test]
+    fn clear_echo_without_pending_frame_cannot_certify_direct_alias() {
+        assert_eq!(
+            stage_after_renderer(ExternalStage::Empty, ExternalFrameOutcome::Accepted, false),
+            ExternalStage::Empty
         );
     }
 

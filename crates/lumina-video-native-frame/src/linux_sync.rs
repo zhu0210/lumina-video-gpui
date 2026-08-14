@@ -295,7 +295,9 @@ mod tests {
         assert_eq!(ops.exports, 2);
         assert_eq!(ops.merges, 1);
         assert_eq!(ops.merged_inputs.len(), 1);
-        let (left, right) = ops.merged_inputs[0];
+        let Some(&(left, right)) = ops.merged_inputs.first() else {
+            return Err("merge inputs were not recorded".into());
+        };
         assert!(fd_is_closed(left));
         assert!(fd_is_closed(right));
         Ok(())
