@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
 
+const RUNTIME_LIBDIR: &str = "lib/x86_64-linux-gnu";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimePaths {
     vendor_dir: PathBuf,
@@ -23,7 +25,7 @@ struct RuntimePaths {
 
 impl RuntimePaths {
     fn new(vendor_dir: PathBuf) -> Self {
-        let lib_dir = vendor_dir.join("lib");
+        let lib_dir = vendor_dir.join(RUNTIME_LIBDIR);
         Self {
             plugin_dir: lib_dir.join("gstreamer-1.0"),
             scanner_path: vendor_dir.join("libexec/gstreamer-1.0/gst-plugin-scanner"),
@@ -321,7 +323,7 @@ mod tests {
         let _cleanup = TestDir(root.clone());
 
         let vendor_dir = root.join("vendor/linux-x86_64");
-        let lib_dir = vendor_dir.join("lib");
+        let lib_dir = vendor_dir.join(RUNTIME_LIBDIR);
         let plugin_dir = lib_dir.join("gstreamer-1.0");
         let scanner_path = vendor_dir.join("libexec/gstreamer-1.0/gst-plugin-scanner");
         let launcher_path = vendor_dir.join("bin/lumina-gstreamer-runtime");

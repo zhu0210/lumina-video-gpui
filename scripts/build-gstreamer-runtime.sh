@@ -148,8 +148,12 @@ mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
     echo "unsupported Cerbero source library directory" >&2
     exit 1
 }
-[[ "$archive_runtime_libdir" == lib ]] || {
-    echo "unsupported runtime library directory" >&2
+[[ "$archive_runtime_libdir" == lib/x86_64-linux-gnu ]] || {
+    echo "unsupported Cerbero runtime library directory" >&2
+    exit 1
+}
+[[ "$archive_source_libdir" == "$archive_runtime_libdir" ]] || {
+    echo "source and runtime library directories differ" >&2
     exit 1
 }
 [[ "${packages[*]}" == "gstreamer-1.0 gstreamer-1.0-libav" ]] || {
@@ -330,35 +334,6 @@ assert_staging_roots() {
     done
 }
 
-assert_source_lib_layout() {
-    local staging=$1
-    local children_list=$2
-    local source_lib_name=${archive_source_libdir##*/}
-    local source_lib_parent=${archive_source_libdir%/*}
-    local source_lib="$staging/$archive_source_libdir"
-    local runtime_lib="$staging/$archive_runtime_libdir"
-    local -a children=()
-
-    [[ "$source_lib_parent" == "$archive_runtime_libdir" ]] || {
-        fail "source library directory is not under runtime library directory"
-    }
-    [[ -d "$runtime_lib" && ! -L "$runtime_lib" ]] || {
-        fail "package staging runtime library directory is not a real directory: $runtime_lib"
-    }
-    [[ -d "$source_lib" && ! -L "$source_lib" ]] || {
-        fail "package staging source library directory is not a real directory: $source_lib"
-    }
-    if ! find -P "$runtime_lib" -mindepth 1 -maxdepth 1 -printf '%f\0' >"$children_list"; then
-        fail "cannot enumerate package staging library directory: $runtime_lib"
-    fi
-    if ! mapfile -d '' -t children <"$children_list"; then
-        fail "cannot read package staging library directory: $children_list"
-    fi
-    [[ ${#children[@]} -eq 1 && "${children[0]}" == "$source_lib_name" ]] || {
-        fail "package staging library layout is not exactly $archive_source_libdir: $runtime_lib"
-    }
-}
-
 merge_tree() {
     local source_root=$1
     local destination_root=$2
@@ -507,34 +482,27 @@ for package in "${packages[@]}"; do
         '.artifact.archive_layout.package_roots[$package][]' "$lock_file")
     mapfile -t package_roots <<<"$package_roots_text"
     staging="$work_dir/package-staging-$package_count"
-    normalized="$work_dir/package-normalized-$package_count"
     member_list="$work_dir/package-$package_count.members"
     roots_list="$work_dir/package-$package_count.roots"
-    children_list="$work_dir/package-$package_count.lib-children"
-    if [[ -L "$staging" || -e "$staging" || -L "$normalized" || -e "$normalized" ]]; then
+    if [[ -L "$staging" || -e "$staging" ]]; then
         fail "package staging paths are not fresh: $package"
     fi
     validate_package_archive "$package_tarball" "$member_list" "$package" "${package_roots[@]}"
     mkdir "$staging"
     tar -xJf "$package_tarball" -C "$staging" --no-same-owner
     assert_staging_roots "$staging" "$roots_list" "${package_roots[@]}"
-    assert_source_lib_layout "$staging" "$children_list"
-    mkdir "$normalized"
+    [[ -d "$staging/$archive_source_libdir" && ! -L "$staging/$archive_source_libdir" ]] || {
+        fail "package staging source library directory is not a real directory: $staging/$archive_source_libdir"
+    }
+    [[ -d "$staging/$archive_runtime_libdir" && ! -L "$staging/$archive_runtime_libdir" ]] || {
+        fail "package staging runtime library directory is not a real directory: $staging/$archive_runtime_libdir"
+    }
     actual_roots=()
     if ! mapfile -d '' -t actual_roots <"$roots_list"; then
         fail "cannot read package staging roots: $roots_list"
     fi
     for root in "${actual_roots[@]}"; do
-        if [[ "$root" == "$archive_runtime_libdir" ]]; then
-            source_root="$staging/$archive_source_libdir"
-        else
-            source_root="$staging/$root"
-        fi
-        normalized_root="$normalized/$root"
-        merge_tree "$source_root" "$normalized_root" "$work_dir/package-$package_count-normalize-$root.sources"
-    done
-    for root in "${actual_roots[@]}"; do
-        merge_tree "$normalized/$root" "$runtime_root/$root" "$work_dir/package-$package_count-union-$root.sources"
+        merge_tree "$staging/$root" "$runtime_root/$root" "$work_dir/package-$package_count-$root.sources"
     done
 done
 [[ "$package_count" == 2 ]] || fail "expected exactly two lock packages, got $package_count"
@@ -544,9 +512,10 @@ fi
 
 launcher="$runtime_root/bin/lumina-gstreamer-runtime"
 mkdir -p "$(dirname -- "$launcher")"
-cat >"$launcher" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+{
+    printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+    printf 'runtime_libdir=%q\n' "$archive_runtime_libdir"
+    cat <<'EOF'
 
 fail() {
     echo "lumina-gstreamer-runtime: $*" >&2
@@ -555,7 +524,7 @@ fail() {
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 runtime_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
-lib_dir="$runtime_root/lib"
+lib_dir="$runtime_root/$runtime_libdir"
 plugin_dir="$lib_dir/gstreamer-1.0"
 scanner="$runtime_root/libexec/gstreamer-1.0/gst-plugin-scanner"
 
@@ -609,9 +578,10 @@ export GST_REGISTRY_REUSE_PLUGIN_SCANNER=no
 (($#)) || fail 'usage: lumina-gstreamer-runtime COMMAND [ARGUMENT ...]'
 exec "$@"
 EOF
+} >"$launcher"
 chmod 0755 "$launcher"
 
-plugin_dir="$runtime_root/lib/gstreamer-1.0"
+plugin_dir="$runtime_root/$archive_runtime_libdir/gstreamer-1.0"
 scanner="$runtime_root/libexec/gstreamer-1.0/gst-plugin-scanner"
 [[ -d "$plugin_dir" ]] || { echo "plugin directory missing from package union" >&2; exit 1; }
 [[ -x "$scanner" ]] || { echo "plugin scanner missing from package union" >&2; exit 1; }

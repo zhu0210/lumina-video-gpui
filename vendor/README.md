@@ -29,14 +29,15 @@ locked sources and Cerbero archive, then packages offline:
   --output dist/gstreamer-runtime
 ```
 
-The lock also pins the forced Cerbero `DistTarball` flat archive layout. The
+The lock also pins the Cerbero `DistTarball` flat archive layout. The
 meta package may contain only the top-level roots `bin`, `etc`, `lib`,
 `libexec`, and `share`; the libav package may contain only `lib`. The package
-archives use Debian's `lib/x86_64-linux-gnu` source directory. The build
-normalizes that multiarch directory explicitly to the stable runtime `lib`
-directory before merging the package union; it does not strip arbitrary path
-components or accept `/opt` roots. These package-specific allowlists are the
-#18 bootstrap boundary, not the recursive closure audit planned for #19.
+archives use Debian's native `lib/x86_64-linux-gnu` directory, and the
+standalone runtime preserves that identity directly. Siblings such as
+`lib/x86_64-linux-gnu/python3.12/site-packages` remain in the same tree; no
+path components are stripped, and `/opt` roots are rejected. These
+package-specific allowlists are the #18 bootstrap boundary, not the recursive
+closure audit planned for #19.
 
 Cerbero 1.28.6 routes one required dependency, zlib 1.3.1, through its
 recipe URL rather than the GStreamer mirror. Discovery reads that exact pinned
@@ -53,7 +54,8 @@ vendor/linux-x86_64/
 ├── bin/
 │   └── lumina-gstreamer-runtime
 ├── lib/
-│   └── gstreamer-1.0/
+│   └── x86_64-linux-gnu/
+│       └── gstreamer-1.0/
 └── libexec/gstreamer-1.0/gst-plugin-scanner
 ```
 

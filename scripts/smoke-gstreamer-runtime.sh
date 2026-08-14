@@ -33,6 +33,11 @@ builder_image=$(jq -er '.builder.image' "$lock_file")
     exit 1
 }
 expected_version=$(jq -er '.gstreamer.version' "$lock_file")
+runtime_libdir=$(jq -er '.artifact.archive_layout.runtime_libdir' "$lock_file")
+[[ "$runtime_libdir" == lib/x86_64-linux-gnu ]] || {
+    echo "smoke requires the locked native multiarch library directory" >&2
+    exit 1
+}
 required_elements=$(jq -r '.required_elements[] | [.name, .filename] | @tsv' "$lock_file")
 [[ -n "$required_elements" ]] || { echo "lock has no required smoke elements" >&2; exit 1; }
 
@@ -41,6 +46,7 @@ required_elements=$(jq -r '.required_elements[] | [.name, .filename] | @tsv' "$l
 # environment variable; this shell only supplies a clean HOME.
 docker run --rm --pull=always --network none \
     --env "EXPECTED_GSTREAMER_VERSION=$expected_version" \
+    --env "RUNTIME_LIBDIR=$runtime_libdir" \
     --env "REQUIRED_ELEMENTS=$required_elements" \
     -v "$artifact:/input/runtime.tar.gz:ro" \
     -v "$fixture:/input/h264-aac.mp4:ro" \
@@ -58,7 +64,9 @@ unset LD_LIBRARY_PATH GST_PLUGIN_PATH_1_0 GST_PLUGIN_SYSTEM_PATH_1_0 \
 
 runtime=/runtime/vendor/linux-x86_64
 launcher="$runtime/bin/lumina-gstreamer-runtime"
-plugin_dir="$runtime/lib/gstreamer-1.0"
+[[ "$RUNTIME_LIBDIR" == lib/x86_64-linux-gnu ]] || exit 1
+lib_dir="$runtime/$RUNTIME_LIBDIR"
+plugin_dir="$lib_dir/gstreamer-1.0"
 scanner="$runtime/libexec/gstreamer-1.0/gst-plugin-scanner"
 
 rm -rf /runtime
@@ -82,7 +90,7 @@ grep -Fx "GST_PLUGIN_SCANNER_1_0=$scanner" <<<"$contract" >/dev/null
 grep -Fx 'GST_PLUGIN_SCANNER=' <<<"$contract" >/dev/null
 grep -Fx 'GST_REGISTRY=' <<<"$contract" >/dev/null
 grep -Fx 'GST_REGISTRY_REUSE_PLUGIN_SCANNER=no' <<<"$contract" >/dev/null
-grep -Fx "LD_LIBRARY_PATH=$runtime/lib" <<<"$contract" >/dev/null
+grep -Fx "LD_LIBRARY_PATH=$lib_dir" <<<"$contract" >/dev/null
 registry_path=$("$launcher" bash -c 'printf "%s" "$GST_REGISTRY_1_0"')
 [[ -n "$registry_path" ]] || exit 1
 [[ "$(basename -- "$registry_path")" == gstreamer-1.0.registry ]] || exit 1

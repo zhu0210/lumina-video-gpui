@@ -104,7 +104,7 @@ zlib_url="https://gstreamer.freedesktop.org/src/mirror/zlib/${zlib_filename}"
 
 archive_layout='{
   "source_libdir": "lib/x86_64-linux-gnu",
-  "runtime_libdir": "lib",
+  "runtime_libdir": "lib/x86_64-linux-gnu",
   "package_roots": {
     "gstreamer-1.0": ["bin", "etc", "lib", "libexec", "share"],
     "gstreamer-1.0-libav": ["lib"]
