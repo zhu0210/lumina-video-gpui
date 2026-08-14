@@ -1,0 +1,75 @@
+class Recipe(recipe.Recipe):
+    # PipeWire owns libgstpipewire.so under src/gst; gst-plugins-good does not.
+    name = 'pipewire'
+    version = '1.6.8'
+    stype = SourceType.TARBALL
+    btype = BuildType.MESON
+    url = 'https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz'
+    tarball_checksum = 'a28f12524d69a8b47feffe31309a6702e45ca4ee54494ff1343d766abf2ec58b'
+    licenses = [{License.MIT: ['LICENSE']}]
+    deps = [
+        'glib', 'libffi', 'openssl', 'gstreamer-1.0', 'gst-plugins-base-1.0',
+    ]
+
+    # These are the real options declared by PipeWire 1.6.8's meson_options.txt.
+    # Only the client API, SPA support and GStreamer plugin are selected.
+    meson_options = {
+        'docs': 'disabled',
+        'man': 'disabled',
+        'examples': 'disabled',
+        'tests': 'disabled',
+        'installed_tests': 'disabled',
+        'gstreamer': 'enabled',
+        'gstreamer-device-provider': 'disabled',
+        'libsystemd': 'disabled',
+        'logind': 'disabled',
+        'selinux': 'disabled',
+        'systemd-system-service': 'disabled',
+        'systemd-user-service': 'disabled',
+        'flatpak': 'disabled',
+        'legacy-rtkit': False,
+        'pipewire-alsa': 'disabled',
+        'pipewire-jack': 'disabled',
+        'pipewire-v4l2': 'disabled',
+        'jack-devel': False,
+        'spa-plugins': 'enabled',
+        'alsa': 'disabled',
+        'bluez5': 'disabled',
+        'jack': 'disabled',
+        'v4l2': 'disabled',
+        'dbus': 'disabled',
+        'libcamera': 'disabled',
+        'udev': 'disabled',
+        'libpulse': 'disabled',
+        'sdl2': 'disabled',
+        'sndfile': 'disabled',
+        'libmysofa': 'disabled',
+        'roc': 'disabled',
+        'avahi': 'disabled',
+        'echo-cancel-webrtc': 'disabled',
+        'libusb': 'disabled',
+        'raop': 'disabled',
+        'lv2': 'disabled',
+        'x11': 'disabled',
+        'x11-xfixes': 'disabled',
+        'libcanberra': 'disabled',
+        'readline': 'disabled',
+        'gsettings': 'disabled',
+        'compress-offload': 'disabled',
+        'pw-cat': 'disabled',
+        'pw-cat-ffmpeg': 'disabled',
+        'ffmpeg': 'disabled',
+        'libffado': 'disabled',
+        'opus': 'disabled',
+        'gsettings-pulse-schema': 'disabled',
+        'ebur128': 'disabled',
+        'fftw': 'disabled',
+        'onnxruntime': 'disabled',
+        'session-managers': [],
+    }
+
+    files_libs = ['libpipewire-0.3', 'libspa-0.2']
+    files_plugins_gstreamer = [
+        '%(libdir)s/gstreamer-1.0/libgstpipewire%(mext)s',
+    ]
+    files_spa = ['%(libdir)s/spa-0.2']

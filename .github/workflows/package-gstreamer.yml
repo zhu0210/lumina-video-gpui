@@ -2,6 +2,7 @@ name: Package audited GStreamer runtime
 
 on:
   workflow_dispatch:
+  workflow_call:
   pull_request:
     paths:
       - .github/workflows/package-gstreamer.yml
@@ -11,6 +12,7 @@ on:
       - scripts/build-gstreamer-runtime.sh
       - scripts/audit-gstreamer-runtime.sh
       - scripts/smoke-gstreamer-runtime.sh
+      - scripts/run-gstreamer-smoke-case.sh
       - flatpak/io.github.lumina_video.Demo.yml
       - fixtures/generate.sh
 
@@ -127,23 +129,11 @@ jobs:
           name: gstreamer-runtime-linux-x86_64
           path: artifacts
 
-      - name: Install demo build prerequisites
+      - name: Install Flatpak 25.08 builder and fixture prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libspeechd-dev libxkbcommon-dev libssl-dev libunwind-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
-            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
-            libclang-dev
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build demo binary for the Flatpak manifest
-        run: |
-          cargo build --release --locked --package lumina-video-demo
-          cp target/release/lumina-video-demo flatpak/lumina-video-demo
+            flatpak flatpak-builder ffmpeg jq openssl python3
 
       - name: Install Flatpak 25.08 toolchain
         run: |
@@ -170,19 +160,17 @@ jobs:
           flatpak-builder --force-clean --repo=repo flatpak-build flatpak/io.github.lumina_video.Demo.yml
           flatpak build-bundle repo lumina-video-demo.flatpak io.github.lumina_video.Demo
 
-      - name: Smoke Flatpak registry isolation
+      - name: Generate the same deterministic fixture matrix
+        run: |
+          ./fixtures/generate.sh
+
+      - name: Run the same matrix inside the Flatpak launcher
         run: |
           flatpak install --user -y --bundle lumina-video-demo.flatpak
-          launcher=/app/vendor/linux-x86_64/bin/lumina-gstreamer-runtime
-          inspect=/app/vendor/linux-x86_64/bin/gst-inspect-1.0
-          flatpak run --user --command="$launcher" io.github.lumina_video.Demo \
-            "$inspect" fakesink >/dev/null
-          registry=$(flatpak run --user --command="$launcher" \
-            io.github.lumina_video.Demo bash -c 'printf "%s" "$GST_REGISTRY_1_0"')
-          case "$registry" in
-            /app/vendor/*|/app/*) exit 1 ;;
-          esac
-          test -f "$registry"
+          ./scripts/smoke-gstreamer-runtime.sh \
+            --flatpak-app io.github.lumina_video.Demo \
+            "$LOCK_FILE" \
+            fixtures/generated
 
       - name: Upload Flatpak and provenance
         uses: actions/upload-artifact@v4

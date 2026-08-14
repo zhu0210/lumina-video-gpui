@@ -29,12 +29,27 @@ modules:
       - type: file
         path: gstreamer-runtime-linux-x86_64.tar.xz
 
-  # Demo binary packaging remains deliberately small; the runtime above owns
-  # all GStreamer libraries and the launcher contract.
+  # Build the demo inside the declared 25.08 SDK/rust-stable extension. The
+  # source tree and Cargo.lock are the only Cargo inputs; no host binary is
+  # copied into the sandbox. Network is granted only to this SDK build so the
+  # SDK can materialize a lock-pinned Cargo vendor directory before switching
+  # Cargo itself to offline mode.
   - name: lumina-video-demo
     buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
+      env:
+        CARGO_BUILD_JOBS: '2'
+        CARGO_INCREMENTAL: '0'
+        CARGO_NET_OFFLINE: 'false'
+        CARGO_TARGET_DIR: /run/build/lumina-video-demo/target
     build-commands:
-      - install -Dm755 lumina-video-demo /app/bin/lumina-video-demo.bin
+      - |
+        mkdir -p .cargo
+        cargo vendor --locked /run/build/lumina-video-demo/cargo-vendor > .cargo/config.toml
+        CARGO_NET_OFFLINE=true cargo build --release --locked --package lumina-video-demo
+      - install -Dm755 /run/build/lumina-video-demo/target/release/lumina-video-demo /app/bin/lumina-video-demo.bin
       - |
         cat > /app/bin/lumina-video-demo <<'EOF'
         #!/bin/sh
@@ -42,5 +57,17 @@ modules:
         EOF
         chmod 0755 /app/bin/lumina-video-demo
     sources:
-      - type: file
-        path: lumina-video-demo
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - .git/**
+          - target
+          - target/**
+          - dist
+          - dist/**
+          - artifacts
+          - artifacts/**
+          - .flatpak-builder
+          - .flatpak-builder/**
+          - flatpak/*.tar.xz

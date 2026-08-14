@@ -30,7 +30,7 @@ while (($#)); do
     esac
 done
 
-for command_name in curl jq sha256sum tar xz find sort awk grep sed mktemp realpath chmod cmp cp readlink stat readelf; do
+for command_name in curl jq sha256sum tar xz find sort awk grep sed tr mktemp realpath chmod cmp cp readlink stat readelf patch; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -141,6 +141,7 @@ archive_runtime_libdir=$(jq -er '.artifact.archive_layout.runtime_libdir' "$lock
 mapfile -t packages < <(jq -er '.packages[]' "$lock_file")
 mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
 mapfile -t recipe_allowlist < <(jq -er '.audit.recipe_allowlist[]' "$lock_file")
+mapfile -t package_file_specs < <(jq -er '.audit.package_files[]' "$lock_file")
 mapfile -t system_elf_allowlist < <(jq -er '.audit.system_elf_allowlist[]' "$lock_file")
 mapfile -t forbidden_components < <(jq -er '.audit.policy.forbidden_components[]' "$lock_file")
 mapfile -t license_texts < <(jq -er '.license_texts[]' "$lock_file")
@@ -183,7 +184,15 @@ ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock
     exit 1
 }
 [[ "$pipewire_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid PipeWire checksum" >&2; exit 1; }
-[[ "$pipewire_license" == MIT/LGPL-2.1-or-later ]] || { echo "unsupported PipeWire license metadata" >&2; exit 1; }
+[[ "$pipewire_license" == MIT ]] || { echo "unsupported PipeWire license metadata" >&2; exit 1; }
+jq -e '
+    .sources.pipewire.plugin_license == "MIT/X11" and
+    .sources.pipewire.plugin_license_source == "src/gst" and
+    any(.audit.plugin_allowlist[]; .element == "pipewiresink" and .filename == "libgstpipewire.so" and .owner_component == "PipeWire" and .source == "pipewire/src/gst" and .license == "MIT/X11")
+' "$lock_file" >/dev/null || {
+    echo "PipeWire GStreamer plugin source/license metadata is incomplete" >&2
+    exit 1
+}
 [[ "$ffmpeg_version" == 7.1 ]] || { echo "unsupported FFmpeg version" >&2; exit 1; }
 [[ "$ffmpeg_url" == https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz ]] || { echo "unsupported FFmpeg source URL" >&2; exit 1; }
 [[ "$ffmpeg_sha" == 40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6 ]] || {
@@ -225,13 +234,13 @@ ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock
     echo "source and runtime library directories differ" >&2
     exit 1
 }
-[[ "${packages[*]}" == "gstreamer-1.0 gstreamer-1.0-libav" ]] || {
-    echo "package set is not the approved #18 pair" >&2
+[[ "${packages[*]}" == "lumina-audited" ]] || {
+    echo "package set must contain only lumina-audited" >&2
     exit 1
 }
 [[ "${variants[*]}" == "norust alsa pulse va" ]] || { echo "variants are not the audited set" >&2; exit 1; }
-[[ "${recipe_allowlist[*]}" == "gstreamer-1.0 gstreamer-1.0-libav" ]] || {
-    echo "recipe allowlist does not match the package set" >&2
+[[ "${recipe_allowlist[0]}" == "gstreamer-1.0" ]] || {
+    echo "recipe allowlist must start with gstreamer-1.0" >&2
     exit 1
 }
 [[ "${flatpak_runtime}:${flatpak_runtime_version}:${flatpak_sdk}:${flatpak_sdk_version}" == \
@@ -256,7 +265,7 @@ jq -e '
     exit 1
 }
 for policy_key in gst_bad_gpl gst_bad_ugly gst_libav_ffmpeg_gpl \
-    gst_libav_ffmpeg_nonfree gst_libav_ffmpeg_version3; do
+    gst_libav_ffmpeg_nonfree gst_libav_ffmpeg_version3 gst_libav_ffmpeg_external_x264; do
     [[ "$(jq -er --arg key "$policy_key" '.audit.policy[$key]' "$lock_file")" == false ]] || {
         echo "audited policy must disable $policy_key" >&2
         exit 1
@@ -274,12 +283,20 @@ jq -e 'all(.components[]; (.name and .version and .source_url and (.sha256 | tes
     echo "component inventory is incomplete" >&2
     exit 1
 }
-jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT"))))' "$lock_file" >/dev/null || {
-    echo "component license policy rejects a non-LGPL/Zlib/MIT component" >&2
+jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT")) or (.license | startswith("BSD")) or (.license == "BZIP2-1.0.6") or (.license == "Apache-2.0")))' "$lock_file" >/dev/null || {
+    echo "component license policy rejects an unapproved component" >&2
     exit 1
 }
-jq -e 'all(.audit.plugin_allowlist[]; (.filename and .element and .source and (.license | test("^LGPL"))))' "$lock_file" >/dev/null || {
+jq -e 'all(.audit.plugin_allowlist[]; (.filename and .element and .source and .owner_component and .license_source_url and (.license | test("^(LGPL|MIT)"))))' "$lock_file" >/dev/null || {
     echo "plugin effective-license inventory is incomplete" >&2
+    exit 1
+}
+jq -e '(.packages == ["lumina-audited"]) and ([.audit.recipe_allowlist[] | select(. == "gstreamer-1.0" or . == "gst-plugins-base-1.0" or . == "gst-plugins-good-1.0" or . == "gst-plugins-bad-1.0" or . == "gst-libav-1.0" or . == "pipewire" or . == "ffmpeg")] | length == 7)' "$lock_file" >/dev/null || {
+    echo "direct audited recipe closure is incomplete" >&2
+    exit 1
+}
+jq -e '(.audit.recipe_allowlist | length == 23) and (all(.audit.recipe_allowlist[]; . != "lumina-audited"))' "$lock_file" >/dev/null || {
+    echo "recipe allowlist must contain only fetched lock recipes" >&2
     exit 1
 }
 
@@ -294,20 +311,10 @@ for package in "${packages[@]}"; do
     package_roots_text=$(jq -er --arg package "$package" \
         '.artifact.archive_layout.package_roots[$package][]' "$lock_file")
     mapfile -t package_roots <<<"$package_roots_text"
-    case "$package" in
-        gstreamer-1.0)
-            [[ "${package_roots[*]}" == "bin etc lib libexec share" ]] || {
-                echo "unexpected archive layout roots for $package" >&2
-                exit 1
-            }
-            ;;
-        gstreamer-1.0-libav)
-            [[ "${package_roots[*]}" == lib ]] || {
-                echo "unexpected archive layout roots for $package" >&2
-                exit 1
-            }
-            ;;
-    esac
+    [[ "$package" == lumina-audited && "${package_roots[*]}" == "bin etc lib libexec share" ]] || {
+        echo "unexpected archive layout roots for $package" >&2
+        exit 1
+    }
 done
 
 if [[ -e "$output_dir" ]] && [[ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
@@ -348,24 +355,136 @@ cerbero_dir="$work_dir/$cerbero_root"
 overlay_dir="$repo_root/vendor/cerbero-overlay"
 overlay_config="$overlay_dir/config/lumina-audited.cbc"
 [[ -d "$overlay_dir" && -f "$overlay_config" ]] || fail "audited Cerbero overlay is missing"
-[[ -f "$overlay_dir/patches/ffmpeg-lgpl-only.conf" ]] || fail "FFmpeg license policy patch is missing"
+bad_gpl_patch="$overlay_dir/patches/gst-plugins-bad-1.0-disable-gpl.patch"
+[[ -f "$bad_gpl_patch" ]] || fail "gst-plugins-bad GPL patch is missing"
+base_minimal_patch="$overlay_dir/patches/gst-plugins-base-1.0-minimal.patch"
+good_minimal_patch="$overlay_dir/patches/gst-plugins-good-1.0-minimal.patch"
+bad_no_gpl_deps_patch="$overlay_dir/patches/gst-plugins-bad-1.0-no-gpl-deps.patch"
+bad_minimal_patch="$overlay_dir/patches/gst-plugins-bad-1.0-minimal.patch"
+[[ -f "$base_minimal_patch" && -f "$good_minimal_patch" &&
+   -f "$bad_no_gpl_deps_patch" && -f "$bad_minimal_patch" ]] || {
+    fail "minimal recipe patches are missing"
+}
 overlay_package="$overlay_dir/packages/lumina-audited.package"
 [[ -f "$overlay_package" ]] || fail "audited Cerbero package is missing"
-overlay_recipe="$overlay_dir/recipes/lumina-audited.recipe"
-[[ -f "$overlay_recipe" ]] || fail "audited Cerbero recipe is missing"
-for ffmpeg_option in --disable-gpl --disable-nonfree --disable-version3 --disable-libx264; do
-    grep -Fx -- "$ffmpeg_option" "$overlay_dir/patches/ffmpeg-lgpl-only.conf" >/dev/null || {
-        fail "FFmpeg LGPL policy is missing $ffmpeg_option"
+cp -a -- "$overlay_package" "$cerbero_dir/packages/lumina-audited.package"
+cp -a -- "$overlay_dir/recipes/pipewire.recipe" "$cerbero_dir/recipes/pipewire.recipe"
+grep -Eq '^[[:space:]]*files[[:space:]]*=' "$overlay_package" || fail "audited package has no direct files list"
+if grep -Eq '^[[:space:]]*deps[[:space:]]*=' "$overlay_package"; then
+    fail "audited private package must not depend on an upstream package"
+fi
+for package_file_spec in "${package_file_specs[@]}"; do
+    grep -F "'$package_file_spec'" "$overlay_package" >/dev/null || {
+        fail "audited package is missing lock file category: $package_file_spec"
     }
 done
-cp -a -- "$overlay_package" "$cerbero_dir/packages/lumina-audited.package"
-cp -a -- "$overlay_recipe" "$cerbero_dir/recipes/lumina-audited.recipe"
 
 grep -F "tarball_checksum = '$gstreamer_sha'" "$cerbero_dir/recipes/gstreamer-1.0.recipe" >/dev/null
 grep -F "tarball_checksum = '$libav_sha'" "$cerbero_dir/recipes/gst-libav-1.0.recipe" >/dev/null
+grep -F "tarball_checksum = '6636f2c2289ceda52c4aba971338c81e2b5780d3381bd3673c1c116ec87587c3'" \
+    "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null || {
+    fail "pinned gst-plugins-bad recipe checksum is not 1.28.6"
+}
+grep -F "tarball_checksum = '0ba699c7c6c66f4ba640be78cb38a24715add9683f3e3a199f5369dc5a4f04ac'" \
+    "$cerbero_dir/recipes/gst-plugins-base-1.0.recipe" >/dev/null || {
+    fail "pinned gst-plugins-base recipe checksum is not 1.28.6"
+}
+grep -F "tarball_checksum = 'b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df'" \
+    "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/dev/null || {
+    fail "pinned gst-plugins-good recipe checksum is not 1.28.6"
+}
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$base_minimal_patch" >/dev/null || {
+    fail "could not apply the pinned gst-plugins-base minimal patch"
+}
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$good_minimal_patch" >/dev/null || {
+    fail "could not apply the pinned gst-plugins-good minimal patch"
+}
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$bad_gpl_patch" >/dev/null || {
+    fail "could not apply the pinned gst-plugins-bad GPL patch"
+}
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$bad_no_gpl_deps_patch" >/dev/null || {
+    fail "could not apply the pinned gst-plugins-bad dependency patch"
+}
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$bad_minimal_patch" >/dev/null || {
+    fail "could not apply the pinned gst-plugins-bad minimal plugin patch"
+}
+grep -F "'adaptivedemux2': 'enabled'" "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/dev/null || {
+    fail "minimal gst-plugins-good recipe lost adaptivedemux2"
+}
+grep -F "'soup': 'enabled'" "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/dev/null || {
+    fail "minimal gst-plugins-good recipe lost HTTPS support"
+}
+grep -F "'vpx': 'enabled'" "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/dev/null || {
+    fail "minimal gst-plugins-good recipe lost VP9 support"
+}
+grep -F "'opus': 'enabled'" "$cerbero_dir/recipes/gst-plugins-base-1.0.recipe" >/dev/null || {
+    fail "minimal gst-plugins-base recipe lost Opus support"
+}
+grep -F "'gpl': 'disabled'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null || {
+    fail "patched gst-plugins-bad recipe does not disable its actual GPL option"
+}
+grep -F "'hls': 'enabled'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null || {
+    fail "minimal gst-plugins-bad recipe lost HLS"
+}
+grep -F "'hls-crypto': 'openssl'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null || {
+    fail "minimal gst-plugins-bad recipe lost OpenSSL HLS crypto"
+}
+if grep -F "'bz2': 'enabled'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null; then
+    fail "minimal gst-plugins-bad recipe still enables the bzip2 plugin"
+fi
+for forbidden_bad_hook in \
+    "enable_plugin('nvcodec'" "enable_plugin('curl'" \
+    "enable_plugin('svtjpegxs'" "enable_plugin('unixfd'" \
+    "enable_plugin('msdk'" "enable_plugin('rsvg'"; do
+    if grep -F "$forbidden_bad_hook" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null; then
+        fail "minimal gst-plugins-bad recipe still enables $forbidden_bad_hook"
+    fi
+done
+if grep -F "'gpl': 'enabled'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null; then
+    fail "patched gst-plugins-bad recipe still enables GPL"
+fi
+if grep -F "'codecs_gpl_restricted'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null; then
+    fail "patched gst-plugins-bad recipe still requests GPL-restricted codecs"
+fi
+grep -F "tarball_checksum = '$pipewire_sha'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe checksum disagrees with lock"
+}
+grep -F "'gstreamer': 'enabled'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe does not enable its actual GStreamer option"
+}
+grep -F "'spa-plugins': 'enabled'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe does not enable its actual SPA option"
+}
+for pipewire_option in \
+    docs man examples tests installed_tests gstreamer-device-provider \
+    libsystemd logind selinux systemd-system-service systemd-user-service \
+    bluez5 jack v4l2 pipewire-alsa pipewire-jack pipewire-v4l2 dbus libcamera \
+    udev libpulse sdl2 sndfile libmysofa roc avahi echo-cancel-webrtc libusb \
+    raop lv2 x11 x11-xfixes libcanberra readline gsettings compress-offload \
+    pw-cat pw-cat-ffmpeg ffmpeg libffado opus gsettings-pulse-schema ebur128 \
+    fftw onnxruntime flatpak; do
+    grep -F "'$pipewire_option': 'disabled'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+        fail "PipeWire recipe does not disable its audited $pipewire_option option"
+    }
+done
+grep -F "'session-managers': []" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe does not disable session managers"
+}
+grep -F "'jack-devel': False" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe has an invalid jack-devel option value"
+}
+grep -F "'legacy-rtkit': False" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe leaves legacy rtkit enabled"
+}
+grep -F "'gstreamer-1.0', 'gst-plugins-base-1.0'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe is missing its GStreamer plugin build dependencies"
+}
 ffmpeg_recipe="$cerbero_dir/recipes/ffmpeg.recipe"
 ffmpeg_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$ffmpeg_recipe")
 ffmpeg_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$ffmpeg_recipe")
+# Cerbero's pinned 7.1 Meson recipe has no separate gpl key; upstream's
+# default is disabled. If a future pinned recipe adds the key, it must state
+# disabled explicitly below.
 [[ "$ffmpeg_recipe_version" == "$ffmpeg_version" ]] || fail "Cerbero FFmpeg recipe version disagrees with lock"
 [[ "$ffmpeg_recipe_sha" == "$ffmpeg_sha" ]] || fail "Cerbero FFmpeg recipe checksum disagrees with lock"
 grep -F "url = 'https://ffmpeg.org/releases/%(name)s-%(version)s.tar.xz'" "$ffmpeg_recipe" >/dev/null || {
@@ -383,6 +502,13 @@ grep -F "'version3': 'disabled'" "$ffmpeg_recipe" >/dev/null || {
 if grep -Eq "['\"]gpl['\"][[:space:]]*:[[:space:]]*['\"]enabled['\"]" "$ffmpeg_recipe"; then
     fail "Cerbero FFmpeg recipe enables GPL code"
 fi
+if grep -Eq "['\"]gpl['\"][[:space:]]*:" "$ffmpeg_recipe" &&
+   ! grep -Eq "['\"]gpl['\"][[:space:]]*:[[:space:]]*['\"]disabled['\"]" "$ffmpeg_recipe"; then
+    fail "Cerbero FFmpeg recipe has an unreviewed GPL setting"
+fi
+if grep -Eiq 'x264|libx264' "$ffmpeg_recipe"; then
+    fail "Cerbero FFmpeg recipe names an external x264 input"
+fi
 zlib_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 [[ "$zlib_recipe_version" == "$zlib_version" ]] || {
@@ -394,16 +520,14 @@ zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "
     exit 1
 }
 
-# Seed Cerbero's source cache with the lock-owned release tarballs. The
-# remaining closure is fetched by Cerbero's pinned recipes in the fetch phase.
-download_and_verify "$gstreamer_url" "$gstreamer_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/gstreamer-1.0/gstreamer-${gstreamer_version}.tar.xz"
-download_and_verify "$libav_url" "$libav_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/$libav_package/$libav_filename"
-download_and_verify "$zlib_url" "$zlib_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz"
-download_and_verify "$pipewire_url" "$pipewire_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/pipewire-$pipewire_version/pipewire-$pipewire_version.tar.gz"
+# Seed every source archive named by the lock. Cerbero's dependency-resolution
+# fetch is checked against this exact cache, then bootstrap/package are offline;
+# the source bundle below is copied from the same cache.
+while IFS=$'\t' read -r component_name component_url component_sha component_cache_path; do
+    [[ -n "$component_name" && -n "$component_cache_path" ]] || fail "component source row is incomplete"
+    download_and_verify "$component_url" "$component_sha" \
+        "$XDG_CACHE_HOME/cerbero-sources/$component_cache_path"
+done < <(jq -er '.components[] | [.name, .source_url, .sha256, .cache_path] | @tsv' "$lock_file")
 
 variant_csv=$(IFS=,; printf '%s' "${variants[*]}")
 cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive \
@@ -412,10 +536,17 @@ cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive \
 for package in "${packages[@]}"; do
     "${cerbero[@]}" fetch-package "$package" --deps --jobs=2
 done
-# Parse the repository-owned package as part of the locked fetch closure. The
-# two upstream packages remain the only artifact inputs below, preserving the
-# #18 layout while making the local package policy executable by Cerbero.
-"${cerbero[@]}" fetch-package lumina-audited --deps --jobs=2
+[[ "${packages[*]}" == lumina-audited ]] || fail "only lumina-audited may be fetched"
+# A Cerbero fetch may resolve recipe dependencies, but it must not silently
+# add a source archive outside the reviewed component inventory. Compare the
+# cache as paths rather than storing an archive member list in one variable.
+expected_source_cache="$work_dir/expected-source-cache"
+actual_source_cache="$work_dir/actual-source-cache"
+jq -er '.components[].cache_path' "$lock_file" | sort >"$expected_source_cache"
+find -P "$XDG_CACHE_HOME/cerbero-sources" -type f -printf '%P\n' | sort >"$actual_source_cache"
+cmp -s "$expected_source_cache" "$actual_source_cache" || {
+    fail "Cerbero fetched a source archive outside the lock component inventory"
+}
 "${cerbero[@]}" bootstrap --system=no --toolchains=no --build-tools=yes --offline --assume-yes --jobs=2
 
 package_dir="$work_dir/packages"
@@ -426,6 +557,10 @@ for package in "${packages[@]}"; do
         --artifact=tarball --compress-method=xz --no-split --no-devel --offline --jobs=2 \
         --output-dir "$package_dir/$package"
 done
+all_package_tarballs_list="$work_dir/all-package-tarballs"
+find -P "$package_dir" -type f -name '*.tar.xz' -print0 >"$all_package_tarballs_list"
+mapfile -d '' -t all_package_tarballs <"$all_package_tarballs_list"
+[[ ${#all_package_tarballs[@]} -eq 1 ]] || fail "Cerbero emitted more than the lumina-audited package"
 
 bundle="$work_dir/bundle"
 runtime_root="$bundle/vendor/linux-x86_64"
@@ -689,7 +824,7 @@ for package in "${packages[@]}"; do
             "$work_dir/package-$package_count-$root.sources" "$staging"
     done
 done
-[[ "$package_count" == 2 ]] || fail "expected exactly two lock packages, got $package_count"
+[[ "$package_count" == 1 ]] || fail "expected exactly one lock package, got $package_count"
 if ! chmod 0755 "$runtime_root"; then
     fail "cannot finalize runtime root mode: $runtime_root"
 fi
@@ -779,15 +914,61 @@ jq -r '.required_elements[] | .filename' "$lock_file" | while IFS= read -r filen
     }
 done
 
-# The allowlist is the set of elements exercised and license-mapped by the
-# matrix. Cerbero's selected LGPL package groups may include helper plugins
-# (for example core tracers); they remain subject to the recipe/license and
-# forbidden-component checks below rather than being treated as host plugins.
+# Inspect the built plugin metadata in an isolated process. Declared lock
+# licenses are provenance, not evidence: an actual GPL or unknown plugin is a
+# hard failure even if its filename is absent from the matrix.
+plugin_license_tsv="$work_dir/plugin-effective-license.tsv"
+: >"$plugin_license_tsv"
+inspect_plugin_license() {
+    local plugin_file=$1
+    local plugin_name=$2
+    local report license normalized owner source_url
+    owner=$(jq -r --arg path "vendor/linux-x86_64/$archive_runtime_libdir/gstreamer-1.0/$plugin_file" '
+        first(.file_ownership[] | select(any(.prefixes[]; . as $prefix | ($path | startswith($prefix)))) | .component) // empty
+    ' "$lock_file")
+    [[ -n "$owner" ]] || fail "bundled plugin has no package/component owner: $plugin_file"
+    source_url=$(jq -r --arg owner "$owner" 'first(.components[] | select(.name == $owner) | .source_url) // empty' "$lock_file")
+    [[ -n "$source_url" ]] || fail "bundled plugin owner has no source URL: $plugin_file"
+    report=$("$launcher" "$runtime_root/bin/gst-inspect-1.0" "$plugin_name" 2>/dev/null) || {
+        fail "gst-inspect could not load bundled plugin $plugin_file"
+    }
+    license=$(sed -n 's/^[[:space:]]*License:[[:space:]]*//p' <<<"$report" | sed -n '1p')
+    normalized=$(tr '[:upper:]' '[:lower:]' <<<"$license")
+    [[ -n "$license" && "$normalized" != unknown* ]] || {
+        fail "bundled plugin has unknown effective license: $plugin_file"
+    }
+    if [[ "${normalized//lgpl/}" == *gpl* ]]; then
+        fail "bundled plugin has GPL effective license: $plugin_file ($license)"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$plugin_file" "$license" "$owner" "$source_url" >>"$plugin_license_tsv"
+}
+while IFS= read -r -d '' plugin_path; do
+    plugin_file=${plugin_path#"$plugin_dir"/}
+    plugin_name=${plugin_file#libgst}
+    plugin_name=${plugin_name%%.so*}
+    inspect_plugin_license "$plugin_file" "$plugin_name"
+done < <(find -P "$plugin_dir" -type f -name 'libgst*.so*' -print0 | sort -z)
+jq -r '.audit.plugin_allowlist[] | [.element, .filename, .owner_component, .license] | @tsv' "$lock_file" |
+    while IFS=$'\t' read -r element filename owner declared_license; do
+        actual_license=$(awk -F '\t' -v file="$filename" '$1 == file {print $2; exit}' "$plugin_license_tsv")
+        [[ -n "$actual_license" ]] || fail "allowlisted plugin was not inspected: $filename"
+        normalized_actual=$(tr '[:upper:]' '[:lower:]' <<<"$actual_license")
+        [[ "${normalized_actual//lgpl/}" != *gpl* ]] || {
+            fail "allowlisted plugin is GPL despite lock metadata: $element"
+        }
+        [[ "$owner" != "PipeWire" || "$actual_license" == *MIT* || "$actual_license" == *X11* ]] || {
+            fail "PipeWire GStreamer plugin is not MIT/X11: $actual_license"
+        }
+    done
 for forbidden in "${forbidden_components[@]}"; do
     if find -P "$runtime_root" -iname "*$forbidden*" -print -quit | grep -q .; then
         fail "forbidden component is present in the runtime: $forbidden"
     fi
 done
+
+# A package category is intentionally direct, but Cerbero may still install
+# helper plugins from the selected LGPL recipe categories. Every such plugin
+# was inspected above and remains subject to the same forbidden-component check.
 
 is_allowed_system_elf() {
     local candidate=$1 allowed_name
@@ -798,7 +979,9 @@ is_allowed_system_elf() {
 }
 
 # Walk DT_NEEDED recursively. Internal dependencies must resolve inside the
-# bundle; only the explicit glibc/loader/GPU/audio ABI contract may be external.
+# bundle; only the explicit glibc/loader/GPU/display ABI contract may be
+# external. Audio, PipeWire, VA-API, and other user-space libraries are
+# required to resolve from the bundle.
 closure_tsv="$work_dir/elf-closure.tsv"
 : >"$closure_tsv"
 elf_queue="$work_dir/elf-queue"
@@ -862,18 +1045,14 @@ extract_license() {
     rm -f -- "$temporary"
 }
 
-gstreamer_source_archive="$XDG_CACHE_HOME/cerbero-sources/gstreamer-1.0/gstreamer-${gstreamer_version}.tar.xz"
-libav_source_archive="$XDG_CACHE_HOME/cerbero-sources/$libav_package/$libav_filename"
-zlib_source_archive="$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz"
-pipewire_source_archive="$XDG_CACHE_HOME/cerbero-sources/pipewire-$pipewire_version/pipewire-$pipewire_version.tar.gz"
-ffmpeg_source_archive=$(find -P "$XDG_CACHE_HOME/cerbero-sources" -type f \
-    -name "ffmpeg-${ffmpeg_version}.tar.xz" -print -quit)
-[[ -f "$ffmpeg_source_archive" ]] || fail "FFmpeg source archive is missing from the fetched cache"
-extract_license "$gstreamer_source_archive" '*/COPYING' "$license_dir/gstreamer-COPYING"
-extract_license "$libav_source_archive" '*/COPYING.LGPL' "$license_dir/gst-libav-COPYING.LGPL"
-extract_license "$ffmpeg_source_archive" '*/COPYING.LGPLv2.1' "$license_dir/FFmpeg-COPYING.LGPLv2.1"
-extract_license "$zlib_source_archive" '*/README' "$license_dir/zlib-README"
-extract_license "$pipewire_source_archive" '*/LICENSE' "$license_dir/PipeWire-LICENSE"
+while IFS=$'\t' read -r component_name component_cache_path license_member license_output; do
+    [[ -n "$component_name" && -n "$component_cache_path" && -n "$license_member" && -n "$license_output" ]] || {
+        fail "component license metadata is incomplete"
+    }
+    component_archive="$XDG_CACHE_HOME/cerbero-sources/$component_cache_path"
+    [[ -f "$component_archive" ]] || fail "component archive is missing from source cache: $component_name"
+    extract_license "$component_archive" "$license_member" "$license_dir/$license_output"
+done < <(jq -er '.components[] | [.name, .cache_path, .license_member, .license_output] | @tsv' "$lock_file")
 mkdir -p "$license_dir/overlay"
 cp -a -- "$overlay_dir/LICENSE.md" "$license_dir/overlay/LICENSE.md"
 jq -n --argjson components "$(jq -c '.components' "$lock_file")" \
@@ -907,11 +1086,19 @@ tree_sha=$(sha256sum "$bundle/tree.sha256" | awk '{ print $1 }')
 file_inventory=$(cd "$bundle" &&
     find . -type f ! -name inventory.json -print0 | sort -z |
     while IFS= read -r -d '' file; do
-        printf '%s\t%s\n' "$file" "$(sha256sum "$file" | awk '{ print $1 }')"
-    done | jq -Rn '[inputs | split("\t") | {path: .[0], sha256: .[1]}]')
+        path=${file#./}
+        owner=$(jq -r --arg path "$path" '
+            first(.file_ownership[] | select(any(.prefixes[]; . as $prefix | ($path | startswith($prefix)))) | .component) // empty
+        ' "$lock_file")
+        if [[ "$path" == *.so || "$path" == *.so.* ]]; then
+            [[ -n "$owner" ]] || fail "bundled shared library has no component owner: $path"
+        fi
+        printf '%s\t%s\t%s\n' "$path" "$(sha256sum "$file" | awk '{ print $1 }')" "${owner:-metadata}"
+    done | jq -Rn '[inputs | split("\t") | {path: .[0], sha256: .[1], component: .[2]}]')
 plugin_inventory=$(jq -c '.audit.plugin_allowlist' "$lock_file")
 component_inventory=$(jq -c '.components' "$lock_file")
 closure_json=$(jq -Rn '[inputs | split("\t") | {object: .[0], needed: .[1], scope: .[2]}]' <"$closure_tsv")
+actual_plugin_inventory=$(jq -Rn '[inputs | select(length > 0) | split("\t") | {filename: .[0], license: .[1], component: .[2], source_url: .[3]}]' <"$plugin_license_tsv")
 jq -n \
     --arg version "$gstreamer_version" \
     --arg commit "$cerbero_commit" \
@@ -919,11 +1106,13 @@ jq -n \
     --arg tree_sha "$tree_sha" \
     --argjson variants "$(printf '%s\n' "${variants[@]}" | jq -R . | jq -s .)" \
     --argjson components "$component_inventory" \
+    --argjson package_files "$(jq -c '.audit.package_files' "$lock_file")" \
     --argjson plugins "$plugin_inventory" \
     --argjson files "$file_inventory" \
     --argjson closure "$closure_json" \
+    --argjson actual_plugins "$actual_plugin_inventory" \
     --argjson system_abi "$(printf '%s\n' "${system_elf_allowlist[@]}" | jq -R . | jq -s .)" \
-    '{schema_version: 2, gstreamer_version: $version, pipewire_version: $pipewire, cerbero_commit: $commit, tree_sha256: $tree_sha, packages: ["gstreamer-1.0", "gstreamer-1.0-libav"], variants: $variants, components: $components, plugin_effective_license: $plugins, bundled_files: $files, recursive_dt_needed: $closure, system_abi_allowlist: $system_abi, policy: {gpl: false, nonfree: false, unknown: false, ugly: false, h264_aac: "avdec_h264/avdec_aac"}}' \
+    '{schema_version: 2, gstreamer_version: $version, pipewire_version: $pipewire, cerbero_commit: $commit, tree_sha256: $tree_sha, packages: ["lumina-audited"], package_files: $package_files, variants: $variants, components: $components, plugin_effective_license: $plugins, actual_plugin_license: $actual_plugins, bundled_files: $files, recursive_dt_needed: $closure, system_abi_allowlist: $system_abi, policy: {gpl: false, nonfree: false, unknown: false, ugly: false, h264_aac: "avdec_h264/avdec_aac"}}' \
     >"$bundle/runtime-manifest.json"
 
 source_bundle_root="$work_dir/source-bundle"
@@ -933,8 +1122,11 @@ cp -a -- "$overlay_dir/." "$source_bundle_root/overlay/"
 cp -a -- "$cerbero_archive" "$source_bundle_root/cerbero/"
 jq -n --arg runtime_tree_sha "$tree_sha" \
     --arg pipewire "$pipewire_version" \
+    --arg cerbero_url "$cerbero_archive_url" \
+    --arg cerbero_sha "$cerbero_archive_sha" \
     --argjson components "$component_inventory" \
-    '{schema_version: 2, runtime_tree_sha256: $runtime_tree_sha, pipewire_version: $pipewire, components: $components, source_kind: "complete fetched Cerbero cache plus repository overlay"}' \
+    --argjson archives "$(jq -c '[.components[] | {name, version, source_url, sha256, cache_path}]' "$lock_file")" \
+    '{schema_version: 2, runtime_tree_sha256: $runtime_tree_sha, pipewire_version: $pipewire, components: $components, archives: $archives, cerbero_archive: {source_url: $cerbero_url, sha256: $cerbero_sha, path: "cerbero/cerbero.tar.gz"}, source_kind: "exact lock archives plus pinned Cerbero archive and repository overlay/patches"}' \
     >"$source_bundle_root/source-manifest.json"
 find "$source_bundle_root" -exec touch -h -d '@0' {} +
 source_artifact_name=gstreamer-runtime-linux-x86_64.sources.tar.xz

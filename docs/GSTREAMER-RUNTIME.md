@@ -1,17 +1,24 @@
 # Audited Linux GStreamer runtime
 
 `vendor/gstreamer-1.0.lock.json` (schema 2) is the only build authority. The
-formal workflow fetches the lock-owned sources, builds with the pinned
+formal workflow seeds the lock-owned source cache, fetches only the selected
+Cerbero closure, and builds with the pinned
 [Cerbero release](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html),
 then switches to offline mode for bootstrap, packaging, audit, and artifact
-assembly. All Cerbero jobs use two workers.
+assembly. `lumina-audited` is the only Cerbero package output; its direct file
+categories select the core/base/good/bad/libav plugins, the PipeWire-owned
+GStreamer plugin, and the explicitly bundled codec/audio/VA libraries. All
+Cerbero jobs use two workers.
 
-The lock fixes GStreamer 1.28.6, gst-libav, FFmpeg 7.1, zlib, PipeWire 1.6.8,
+The lock fixes GStreamer 1.28.6, the base/good/bad/libav plugin archives,
+FFmpeg 7.1, the direct codec/audio/VA libraries, zlib, and PipeWire 1.6.8,
 the Ubuntu builder image, the exact variant set `norust,alsa,pulse,va`,
 recipe/plugin audit allowlists, and the system ELF ABI allowlist.
-`vendor/cerbero-overlay` is a small repo-owned `localconf.cbc` plus
-policy/package closure; it is included in the corresponding-source archive
-rather than being an unreviewed local patch.
+`vendor/cerbero-overlay` is a small repo-owned `localconf.cbc`, direct package,
+PipeWire recipe, and applied base/good/bad recipe patches; all are included in
+the corresponding-source archive. The build verifies every patch against the
+pinned recipe, checks the actual FFmpeg options, and verifies actual plugin
+licenses with isolated `gst-inspect-1.0`.
 
 ## License and codec policy
 
@@ -48,9 +55,12 @@ vendor/linux-x86_64/bin/lumina-gstreamer-runtime /path/to/lumina-video
 
 It establishes private library/plugin/scanner paths and a writable registry
 under external `XDG_CACHE_HOME` (or `$HOME/.cache`). No host plugin path or
-bundle-local registry is accepted. Flatpak uses Freedesktop Platform/Sdk and
-`rust-stable` 25.08, exposes only the PulseAudio socket, and does not pass a
-broad `XDG_RUNTIME_DIR`; PipeWire is checked as native closure/presence only.
+bundle-local registry is accepted. Flatpak builds the demo inside the declared
+Freedesktop 25.08 SDK with the rust-stable extension, vendors the lock-pinned
+Cargo sources during that SDK build with network granted only to that module;
+the subsequent Cargo compile is offline. It exposes only the PulseAudio socket
+and does not pass a broad `XDG_RUNTIME_DIR`; PipeWire is checked as native
+closure/presence only.
 The workflow records the actual OSTree commits used by the build as
 provenance, without claiming a permanent user-runtime pin.
 
@@ -62,7 +72,13 @@ and HTTPS, and ALSA/Pulse/PipeWire/VA element presence. It does not cover
 session semantics or hardware certification; those remain separate scopes.
 
 Primary references: [GStreamer source index](https://gstreamer.freedesktop.org/src/gstreamer/),
+[Cerbero deployment guide](https://gstreamer.freedesktop.org/documentation/deploying/multiplatform-using-cerbero.html),
+[pinned gst-plugins-base recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/gst-plugins-base-1.0.recipe),
+[pinned gst-plugins-good recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/gst-plugins-good-1.0.recipe),
+[pinned gst-plugins-bad recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/gst-plugins-bad-1.0.recipe),
 [FFmpeg configure options](https://ffmpeg.org/ffmpeg-all.html#toc-Advanced-options),
+[GStreamer HLS demuxer](https://gstreamer.freedesktop.org/documentation/adaptivedemux2/hlsdemux2.html),
+[PipeWire 1.6.8 Meson options](https://raw.githubusercontent.com/PipeWire/pipewire/1.6.8/meson_options.txt),
 [PipeWire 1.6.8 tag](https://gitlab.freedesktop.org/pipewire/pipewire/-/tags/1.6.8),
 [PipeWire 1.6.8 archive](https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz),
 [PipeWire 1.6.8 documentation](https://docs.pipewire.org/),

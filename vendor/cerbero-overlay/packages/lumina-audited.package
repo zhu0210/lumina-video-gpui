@@ -4,14 +4,42 @@ from cerbero.packages import package
 
 class Package(package.Package):
     name = 'lumina-audited'
-    shortdesc = 'Lumina audited GStreamer closure'
-    longdesc = 'The lock-approved LGPL GStreamer runtime closure.'
-    version = '1'
+    shortdesc = 'Lumina audited GStreamer runtime closure'
+    longdesc = 'A direct, LGPL-only recipe closure with no upstream meta package.'
+    version = '1.28.6.1'
     license = License.LGPL
     uuid = '2f855e2d-68c2-46f0-ae2b-96c5f4ed4b9b'
-    deps = ['gstreamer-1.0', 'gstreamer-1.0-libav']
+
+    # Keep this package self-contained. Cerbero's package API resolves these
+    # recipe categories and their recipe deps; it never emits an upstream
+    # GStreamer meta package.
     files = [
-        'gstreamer-1.0:libs',
-        'gstreamer-1.0:bins',
+        'gstreamer-1.0:bins:libs:misc:plugins_core',
+        'gst-plugins-base-1.0:libs:plugins_core:plugins_playback:plugins_codecs',
+        # In Cerbero 1.28.6, isomp4/matroska/adaptivedemux2/vpx/audio
+        # parsers are in good's plugins_codecs; soup is plugins_net and
+        # ALSA/Pulse are added to plugins_sys by the selected variants.
+        'gst-plugins-good-1.0:libs:plugins_codecs:plugins_net:plugins_sys',
+        # bad's plugins_codecs carries HLS/H.264 parsing; VA is selected in
+        # its plugins_sys category by the pinned recipe patch.
+        'gst-plugins-bad-1.0:libs:plugins_codecs:plugins_sys',
         'gst-libav-1.0:plugins_codecs_restricted',
+        'pipewire:libs:plugins_gstreamer:spa',
+        'ffmpeg:libs',
+        'glib:libs',
+        'libffi:libs',
+        'pcre2:libs',
+        'zlib:libs',
+        'orc:libs',
+        'libogg:libs',
+        'opus:libs',
+        'libvpx:libs',
+        'alsa:libs',
+        'libpulse:libs',
+        'libva:libs',
+        'libdrm:libs',
+        'libsoup:libs',
+        'bzip2:libs',
+        'libxml2:libs',
+        'openssl:libs',
     ]

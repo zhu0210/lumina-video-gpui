@@ -16,21 +16,24 @@
       "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51",
       "license": "LGPL-2.1-or-later"
     },
-    "zlib": {
-      "version": "1.3.1",
-      "filename": "zlib-1.3.1.tar.gz",
-      "url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz",
-      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
-      "license": "Zlib"
-    },
     "pipewire": {
       "version": "1.6.8",
       "tag": "1.6.8",
       "tag_commit": "b741e0c74f5436f0c925f7741140db0efd32cf4e",
       "url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz",
       "sha256": "a28f12524d69a8b47feffe31309a6702e45ca4ee54494ff1343d766abf2ec58b",
-      "license": "MIT/LGPL-2.1-or-later",
-      "license_url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/1.6.8/LICENSE"
+      "license": "MIT",
+      "license_url": "https://github.com/PipeWire/pipewire/blob/1.6.8/LICENSE",
+      "plugin_license": "MIT/X11",
+      "plugin_license_url": "https://github.com/PipeWire/pipewire/tree/1.6.8/src/gst",
+      "plugin_license_source": "src/gst"
+    },
+    "zlib": {
+      "version": "1.3.1",
+      "filename": "zlib-1.3.1.tar.gz",
+      "url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz",
+      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+      "license": "Zlib"
     }
   },
   "cerbero": {
@@ -54,38 +57,76 @@
     "image": "ubuntu@sha256:019e8eb29a85e74d64925745884f2ec79aa27e3feab36353d24656f4d6b89467",
     "platform": "linux/amd64"
   },
-  "packages": [
-    "gstreamer-1.0",
-    "gstreamer-1.0-libav"
-  ],
-  "variants": [
-    "norust",
-    "alsa",
-    "pulse",
-    "va"
-  ],
+  "packages": ["lumina-audited"],
+  "variants": ["norust", "alsa", "pulse", "va"],
   "audit": {
     "recipe_allowlist": [
       "gstreamer-1.0",
-      "gstreamer-1.0-libav"
+      "gst-plugins-base-1.0",
+      "gst-plugins-good-1.0",
+      "gst-plugins-bad-1.0",
+      "gst-libav-1.0",
+      "pipewire",
+      "ffmpeg",
+      "glib",
+      "libffi",
+      "pcre2",
+      "zlib",
+      "orc",
+      "libogg",
+      "opus",
+      "libvpx",
+      "alsa",
+      "libpulse",
+      "libva",
+      "libdrm",
+      "libsoup",
+      "bzip2",
+      "libxml2",
+      "openssl"
+    ],
+    "package_files": [
+      "gstreamer-1.0:bins:libs:misc:plugins_core",
+      "gst-plugins-base-1.0:libs:plugins_core:plugins_playback:plugins_codecs",
+      "gst-plugins-good-1.0:libs:plugins_codecs:plugins_net:plugins_sys",
+      "gst-plugins-bad-1.0:libs:plugins_codecs:plugins_sys",
+      "gst-libav-1.0:plugins_codecs_restricted",
+      "pipewire:libs:plugins_gstreamer:spa",
+      "ffmpeg:libs",
+      "glib:libs",
+      "libffi:libs",
+      "pcre2:libs",
+      "zlib:libs",
+      "orc:libs",
+      "libogg:libs",
+      "opus:libs",
+      "libvpx:libs",
+      "alsa:libs",
+      "libpulse:libs",
+      "libva:libs",
+      "libdrm:libs",
+      "libsoup:libs",
+      "bzip2:libs",
+      "libxml2:libs",
+      "openssl:libs"
     ],
     "plugin_allowlist": [
-      {"element": "playbin3", "filename": "libgstplayback.so", "source": "gstreamer", "license": "LGPL-2.1-or-later"},
-      {"element": "qtdemux", "filename": "libgstisomp4.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
-      {"element": "h264parse", "filename": "libgstvideoparsersbad.so", "source": "gst-plugins-bad", "license": "LGPL-2.1-or-later"},
-      {"element": "avdec_h264", "filename": "libgstlibav.so", "source": "gst-libav/FFmpeg", "license": "LGPL-2.1-or-later"},
-      {"element": "aacparse", "filename": "libgstaudioparsers.so", "source": "gst-plugins-base", "license": "LGPL-2.1-or-later"},
-      {"element": "avdec_aac", "filename": "libgstlibav.so", "source": "gst-libav/FFmpeg", "license": "LGPL-2.1-or-later"},
-      {"element": "fakesink", "filename": "libgstcoreelements.so", "source": "gstreamer", "license": "LGPL-2.1-or-later"},
-      {"element": "matroskademux", "filename": "libgstmatroska.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
-      {"element": "vp9dec", "filename": "libgstvpx.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
-      {"element": "opusdec", "filename": "libgstopus.so", "source": "gst-plugins-base", "license": "LGPL-2.1-or-later"},
-      {"element": "hlsdemux", "filename": "libgsthls.so", "source": "gst-plugins-bad", "license": "LGPL-2.1-or-later"},
-      {"element": "souphttpsrc", "filename": "libgstsoup.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
-      {"element": "alsasink", "filename": "libgstalsa.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
-      {"element": "pulsesink", "filename": "libgstpulse.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
-      {"element": "pipewiresink", "filename": "libgstpipewire.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
-      {"element": "va", "filename": "libgstva.so", "source": "gst-plugins-bad", "license": "LGPL-2.1-or-later"}
+      {"element": "playbin3", "filename": "libgstplayback.so", "source": "gst-plugins-base-1.0", "owner_component": "gst-plugins-base", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-base/tree/1.28.6/gst/playback"},
+      {"element": "qtdemux", "filename": "libgstisomp4.so", "source": "gst-plugins-good-1.0", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-good/tree/1.28.6/gst/isomp4"},
+      {"element": "h264parse", "filename": "libgstvideoparsersbad.so", "source": "gst-plugins-bad-1.0", "owner_component": "gst-plugins-bad", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-bad/tree/1.28.6/gst/videoparsers"},
+      {"element": "avdec_h264", "filename": "libgstlibav.so", "source": "gst-libav-1.0/FFmpeg", "owner_component": "gst-libav", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-libav/tree/1.28.6/ext/libav"},
+      {"element": "aacparse", "filename": "libgstaudioparsers.so", "source": "gst-plugins-good-1.0", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-good/tree/1.28.6/gst/audioparsers"},
+      {"element": "avdec_aac", "filename": "libgstlibav.so", "source": "gst-libav-1.0/FFmpeg", "owner_component": "gst-libav", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-libav/tree/1.28.6/ext/libav"},
+      {"element": "fakesink", "filename": "libgstcoreelements.so", "source": "gstreamer-1.0", "owner_component": "gstreamer", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gstreamer/tree/1.28.6/subprojects/gstreamer/gst"},
+      {"element": "matroskademux", "filename": "libgstmatroska.so", "source": "gst-plugins-good-1.0", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-good/tree/1.28.6/gst/matroska"},
+      {"element": "vp9dec", "filename": "libgstvpx.so", "source": "gst-plugins-good-1.0/libvpx", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-good/tree/1.28.6/ext/vpx"},
+      {"element": "opusdec", "filename": "libgstopus.so", "source": "gst-plugins-base-1.0/opus", "owner_component": "gst-plugins-base", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-base/tree/1.28.6/ext/opus"},
+      {"element": "hlsdemux2", "filename": "libgstadaptivedemux2.so", "source": "gst-plugins-good-1.0", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://gstreamer.freedesktop.org/documentation/adaptivedemux2/hlsdemux2.html"},
+      {"element": "souphttpsrc", "filename": "libgstsoup.so", "source": "gst-plugins-good-1.0", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-good/tree/1.28.6/ext/soup"},
+      {"element": "alsasink", "filename": "libgstalsa.so", "source": "gst-plugins-good-1.0/alsa", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-good/tree/1.28.6/ext/alsa"},
+      {"element": "pulsesink", "filename": "libgstpulse.so", "source": "gst-plugins-good-1.0/pulse", "owner_component": "gst-plugins-good", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-good/tree/1.28.6/ext/pulse"},
+      {"element": "pipewiresink", "filename": "libgstpipewire.so", "source": "pipewire/src/gst", "owner_component": "PipeWire", "license": "MIT/X11", "license_source_url": "https://github.com/PipeWire/pipewire/tree/1.6.8/src/gst"},
+      {"element": "va", "filename": "libgstva.so", "source": "gst-plugins-bad-1.0", "owner_component": "gst-plugins-bad", "license": "LGPL-2.1-or-later", "license_source_url": "https://github.com/GStreamer/gst-plugins-bad/tree/1.28.6/sys/va"}
     ],
     "policy": {
       "gst_bad_gpl": false,
@@ -93,35 +134,45 @@
       "gst_libav_ffmpeg_gpl": false,
       "gst_libav_ffmpeg_nonfree": false,
       "gst_libav_ffmpeg_version3": false,
+      "gst_libav_ffmpeg_external_x264": false,
       "software_fallback": {"video": "avdec_h264", "audio": "avdec_aac"},
       "forbidden_components": ["gst-plugins-ugly", "x264"],
       "forbidden_licenses": ["GPL", "GPL-2.0", "GPL-3.0", "nonfree", "unknown"]
     },
     "system_elf_allowlist": [
-      "ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
-      "libgcc_s.so.1", "libstdc++.so.6", "libasound.so.2", "libpulse.so.0", "libpipewire-0.3.so.0", "libva.so.2",
-      "libva-drm.so.2", "libdrm.so.2", "libEGL.so.1", "libGL.so.1", "libGLX.so.0", "libX11.so.6", "libXext.so.6",
-      "libXfixes.so.3", "libXdamage.so.1", "libXrender.so.1", "libXi.so.6", "libXrandr.so.2", "libXcomposite.so.1",
-      "libxcb.so.1", "libxcb-shm.so.0", "libxcb-render.so.0", "libxcb-randr.so.0", "libxcb-xfixes.so.0", "libwayland-client.so.0",
-      "libwayland-egl.so.1", "libwayland-cursor.so.0", "libz.so.1", "libbz2.so.1.0", "libffi.so.8", "libpcre2-8.so.0",
-      "libfontconfig.so.1", "libfreetype.so.6", "libexpat.so.1", "libpng16.so.16", "libjpeg.so.8", "libcap.so.2",
-      "libmount.so.1", "libselinux.so.1", "libsystemd.so.0", "libdbus-1.so.3", "libudev.so.1", "libcrypt.so.1", "libresolv.so.2"
+      "ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "libgcc_s.so.1",
+      "libEGL.so.1", "libGL.so.1", "libGLX.so.0", "libGLdispatch.so.0",
+      "libX11.so.6", "libX11-xcb.so.1", "libXext.so.6", "libXfixes.so.3", "libXdamage.so.1", "libXrender.so.1", "libXi.so.6", "libXrandr.so.2", "libXcomposite.so.1",
+      "libxcb.so.1", "libxcb-shm.so.0", "libxcb-render.so.0", "libxcb-randr.so.0", "libxcb-xfixes.so.0", "libwayland-client.so.0", "libwayland-egl.so.1", "libwayland-cursor.so.0"
     ]
   },
   "components": [
-    {"name": "gstreamer", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz", "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca", "license": "LGPL-2.1-or-later"},
-    {"name": "gst-libav", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.28.6.tar.xz", "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51", "license": "LGPL-2.1-or-later"},
-    {"name": "FFmpeg", "version": "7.1", "source_url": "https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz", "sha256": "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6", "license": "LGPL-2.1-or-later (gpl/nonfree/version3 disabled)"},
-    {"name": "zlib", "version": "1.3.1", "source_url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz", "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23", "license": "Zlib"},
-    {"name": "PipeWire", "version": "1.6.8", "tag": "1.6.8", "tag_commit": "b741e0c74f5436f0c925f7741140db0efd32cf4e", "source_url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz", "sha256": "a28f12524d69a8b47feffe31309a6702e45ca4ee54494ff1343d766abf2ec58b", "license": "MIT/LGPL-2.1-or-later"}
+    {"name": "gstreamer", "recipe": "gstreamer-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz", "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca", "cache_path": "gstreamer-1.0/gstreamer-1.28.6.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING", "license_output": "gstreamer-COPYING"},
+    {"name": "gst-plugins-base", "recipe": "gst-plugins-base-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-1.28.6.tar.xz", "sha256": "0ba699c7c6c66f4ba640be78cb38a24715add9683f3e3a199f5369dc5a4f04ac", "cache_path": "gst-plugins-base-1.0/gst-plugins-base-1.28.6.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING", "license_output": "gst-plugins-base-COPYING"},
+    {"name": "gst-plugins-good", "recipe": "gst-plugins-good-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-1.28.6.tar.xz", "sha256": "b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df", "cache_path": "gst-plugins-good-1.0/gst-plugins-good-1.28.6.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING", "license_output": "gst-plugins-good-COPYING"},
+    {"name": "gst-plugins-bad", "recipe": "gst-plugins-bad-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.28.6.tar.xz", "sha256": "6636f2c2289ceda52c4aba971338c81e2b5780d3381bd3673c1c116ec87587c3", "cache_path": "gst-plugins-bad-1.0/gst-plugins-bad-1.28.6.tar.xz", "license": "LGPL-2.1-or-later/BSD-3-Clause", "license_member": "*/COPYING.LGPL", "license_output": "gst-plugins-bad-COPYING.LGPL"},
+    {"name": "gst-libav", "recipe": "gst-libav-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.28.6.tar.xz", "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51", "cache_path": "gst-libav-1.0/gst-libav-1.28.6.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING.LGPL", "license_output": "gst-libav-COPYING.LGPL"},
+    {"name": "FFmpeg", "recipe": "ffmpeg", "version": "7.1", "source_url": "https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz", "sha256": "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6", "cache_path": "ffmpeg/ffmpeg-7.1.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING.LGPLv2.1", "license_output": "FFmpeg-COPYING.LGPLv2.1", "configure": {"gpl": "disabled", "nonfree": "disabled", "version3": "disabled", "external_x264": "disabled"}},
+    {"name": "PipeWire", "recipe": "pipewire", "version": "1.6.8", "tag": "1.6.8", "tag_commit": "b741e0c74f5436f0c925f7741140db0efd32cf4e", "source_url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz", "sha256": "a28f12524d69a8b47feffe31309a6702e45ca4ee54494ff1343d766abf2ec58b", "cache_path": "pipewire/pipewire-1.6.8.tar.gz", "license": "MIT", "license_member": "*/LICENSE", "license_output": "PipeWire-LICENSE", "plugin_license": "MIT/X11", "plugin_license_source": "src/gst"},
+    {"name": "glib", "recipe": "glib", "version": "2.82.4", "source_url": "https://download.gnome.org/sources/glib/2.82/glib-2.82.4.tar.xz", "sha256": "37dd0877fe964cd15e9a2710b044a1830fb1bd93652a6d0cb6b8b2dff187c709", "cache_path": "glib/glib-2.82.4.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING", "license_output": "glib-COPYING"},
+    {"name": "libffi", "recipe": "libffi", "version": "3.2.9999.5", "source_url": "https://gitlab.freedesktop.org/gstreamer/meson-ports/libffi/-/archive/meson-3.2.9999.5/libffi-meson-3.2.9999.5.tar.bz2", "sha256": "b4d403932a8860589e571300e807e40bb4f7d9d2630c8ec19c29fb9e7b0fd227", "cache_path": "libffi/libffi-meson-3.2.9999.5.tar.bz2", "license": "MIT", "license_member": "*/LICENSE", "license_output": "libffi-LICENSE"},
+    {"name": "pcre2", "recipe": "pcre2", "version": "10.42", "source_url": "https://github.com/PhilipHazel/pcre2/releases/download/pcre2-10.42/pcre2-10.42.tar.bz2", "sha256": "8d36cd8cb6ea2a4c2bb358ff6411b0c788633a2a45dabbf1aeb4b701d1b5e840", "cache_path": "pcre2/pcre2-10.42.tar.bz2", "license": "BSD-3-Clause", "license_member": "*/LICENCE", "license_output": "pcre2-LICENCE"},
+    {"name": "zlib", "recipe": "zlib", "version": "1.3.1", "source_url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz", "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23", "cache_path": "zlib/zlib-1.3.1.tar.gz", "license": "Zlib", "license_member": "*/README", "license_output": "zlib-README"},
+    {"name": "orc", "recipe": "orc", "version": "0.4.42", "source_url": "https://gstreamer.freedesktop.org/src/orc/orc-0.4.42.tar.xz", "sha256": "7ec912ab59af3cc97874c456a56a8ae1eec520c385ec447e8a102b2bd122c90c", "cache_path": "orc/orc-0.4.42.tar.xz", "license": "BSD-3-Clause", "license_member": "*/COPYING", "license_output": "orc-COPYING"},
+    {"name": "libogg", "recipe": "libogg", "version": "1.3.5", "source_url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.xz", "sha256": "c4d91be36fc8e54deae7575241e03f4211eb102afb3fc0775fbbc1b740016705", "cache_path": "libogg/libogg-1.3.5.tar.xz", "license": "BSD-3-Clause", "license_member": "*/COPYING", "license_output": "libogg-COPYING"},
+    {"name": "opus", "recipe": "opus", "version": "1.5.2", "source_url": "https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz", "sha256": "65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1", "cache_path": "opus/opus-1.5.2.tar.gz", "license": "BSD-3-Clause", "license_member": "*/COPYING", "license_output": "opus-COPYING"},
+    {"name": "libvpx", "recipe": "libvpx", "version": "1.14.1", "source_url": "https://github.com/webmproject/libvpx/archive/v1.14.1/libvpx-1.14.1.tar.gz", "sha256": "901747254d80a7937c933d03bd7c5d41e8e6c883e0665fadcb172542167c7977", "cache_path": "libvpx/libvpx-1.14.1.tar.gz", "license": "BSD-3-Clause", "license_member": "*/LICENSE", "license_output": "libvpx-LICENSE"},
+    {"name": "ALSA", "recipe": "alsa", "version": "1.2.12", "source_url": "https://alsa-project.org/files/pub/lib/alsa-lib-1.2.12.tar.bz2", "sha256": "4868cd908627279da5a634f468701625be8cc251d84262c7e5b6a218391ad0d2", "cache_path": "alsa/alsa-lib-1.2.12.tar.bz2", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING", "license_output": "ALSA-COPYING"},
+    {"name": "PulseAudio", "recipe": "libpulse", "version": "17.0", "source_url": "https://freedesktop.org/software/pulseaudio/releases/pulseaudio-17.0.tar.xz", "sha256": "053794d6671a3e397d849e478a80b82a63cb9d8ca296bd35b73317bb5ceb87b5", "cache_path": "libpulse/pulseaudio-17.0.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/LGPL", "license_output": "PulseAudio-LGPL"},
+    {"name": "libva", "recipe": "libva", "version": "2.22.0", "source_url": "https://github.com/intel/libva/archive/2.22.0/libva-2.22.0.tar.gz", "sha256": "467c418c2640a178c6baad5be2e00d569842123763b80507721ab87eb7af8735", "cache_path": "libva/libva-2.22.0.tar.gz", "license": "MIT", "license_member": "*/COPYING", "license_output": "libva-COPYING"},
+    {"name": "libdrm", "recipe": "libdrm", "version": "2.4.124", "source_url": "https://dri.freedesktop.org/libdrm/libdrm-2.4.124.tar.xz", "sha256": "ac36293f61ca4aafaf4b16a2a7afff312aa4f5c37c9fbd797de9e3c0863ca379", "cache_path": "libdrm/libdrm-2.4.124.tar.xz", "license": "MIT", "license_member": "*/COPYING", "license_output": "libdrm-COPYING"},
+    {"name": "libsoup", "recipe": "libsoup", "version": "3.6.5", "source_url": "https://download.gnome.org/sources/libsoup/3.6/libsoup-3.6.5.tar.xz", "sha256": "6891765aac3e949017945c3eaebd8cc8216df772456dc9f460976fbdb7ada234", "cache_path": "libsoup/libsoup-3.6.5.tar.xz", "license": "LGPL-2.1-or-later", "license_member": "*/COPYING", "license_output": "libsoup-COPYING"},
+    {"name": "bzip2", "recipe": "bzip2", "version": "1.0.8", "source_url": "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz", "sha256": "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269", "cache_path": "bzip2/bzip2-1.0.8.tar.gz", "license": "BZIP2-1.0.6", "license_member": "*/LICENSE", "license_output": "bzip2-LICENSE"},
+    {"name": "libxml2", "recipe": "libxml2", "version": "2.13.5", "source_url": "https://download.gnome.org/sources/libxml2/2.13/libxml2-2.13.5.tar.xz", "sha256": "74fc163217a3964257d3be39af943e08861263c4231f9ef5b496b6f6d4c7b2b6", "cache_path": "libxml2/libxml2-2.13.5.tar.xz", "license": "MIT", "license_member": "*/Copyright", "license_output": "libxml2-Copyright"},
+    {"name": "OpenSSL", "recipe": "openssl", "version": "3.4.1", "source_url": "https://github.com/openssl/openssl/releases/download/openssl-3.4.1/openssl-3.4.1.tar.gz", "sha256": "002a2d6b30b58bf4bea46c43bdd96365aaf8daa6c428782aa4feee06da197df3", "cache_path": "openssl/openssl-3.4.1.tar.gz", "license": "Apache-2.0", "license_member": "*/LICENSE.txt", "license_output": "OpenSSL-LICENSE.txt"}
   ],
   "license_texts": [
-    "gstreamer/COPYING",
-    "gst-libav/COPYING.LGPL",
-    "FFmpeg/COPYING.LGPLv2.1",
-    "zlib/README",
-    "PipeWire/LICENSE",
-    "overlay/LICENSE.md"
+    "licenses/gstreamer-COPYING", "licenses/gst-plugins-base-COPYING", "licenses/gst-plugins-good-COPYING", "licenses/gst-plugins-bad-COPYING.LGPL", "licenses/gst-libav-COPYING.LGPL", "licenses/FFmpeg-COPYING.LGPLv2.1", "licenses/PipeWire-LICENSE", "licenses/glib-COPYING", "licenses/libffi-LICENSE", "licenses/pcre2-LICENCE", "licenses/zlib-README", "licenses/orc-COPYING", "licenses/libogg-COPYING", "licenses/opus-COPYING", "licenses/libvpx-LICENSE", "licenses/ALSA-COPYING", "licenses/PulseAudio-LGPL", "licenses/libva-COPYING", "licenses/libdrm-COPYING", "licenses/libsoup-COPYING", "licenses/bzip2-LICENSE", "licenses/libxml2-Copyright", "licenses/OpenSSL-LICENSE.txt", "licenses/overlay/LICENSE.md"
   ],
   "artifact": {
     "type": "tarball",
@@ -130,12 +181,34 @@
     "archive_layout": {
       "source_libdir": "lib/x86_64-linux-gnu",
       "runtime_libdir": "lib/x86_64-linux-gnu",
-      "package_roots": {
-        "gstreamer-1.0": ["bin", "etc", "lib", "libexec", "share"],
-        "gstreamer-1.0-libav": ["lib"]
-      }
+      "package_roots": {"lumina-audited": ["bin", "etc", "lib", "libexec", "share"]}
     }
   },
+  "file_ownership": [
+    {"component": "PipeWire", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libpipewire-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libspa-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/spa-0.2/", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstpipewire.so"]},
+    {"component": "FFmpeg", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libav", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libsw"]},
+    {"component": "gst-libav", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstlibav"]},
+    {"component": "ALSA", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libasound"]},
+    {"component": "PulseAudio", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libpulse"]},
+    {"component": "libva", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libva"]},
+    {"component": "glib", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libglib-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgobject-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgio-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgmodule-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgthread-"]},
+    {"component": "libffi", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libffi"]},
+    {"component": "pcre2", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libpcre2-"]},
+    {"component": "zlib", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libz"]},
+    {"component": "orc", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/liborc-"]},
+    {"component": "libogg", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libogg"]},
+    {"component": "opus", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libopus"]},
+    {"component": "libvpx", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libvpx"]},
+    {"component": "libdrm", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libdrm"]},
+    {"component": "libsoup", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libsoup-"]},
+    {"component": "bzip2", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libbz2"]},
+    {"component": "libxml2", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libxml2"]},
+    {"component": "OpenSSL", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libssl", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libcrypto"]},
+    {"component": "gstreamer", "prefixes": ["vendor/linux-x86_64/bin/gst-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstreamer-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstbase-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstcheck-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstnet-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstcore"]},
+    {"component": "gst-plugins-base", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstallocators-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstapp-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstaudio-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstfft-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstpbutils-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstriff-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstrtp-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstrtsp-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstsdp-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgsttag-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstvideo-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstgl-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstplayback", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstadder", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstapp", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstaudioconvert", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstaudiomixer", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstaudiorate", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstaudioresample", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstaudiotestsrc", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstcompositor", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstgio", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstoverlaycomposition", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstpbtypes", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrawparse", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgsttypefindfunctions", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvideoconvertscale", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvideorate", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvideotestsrc", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvolume", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstsubparse", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstogg", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstopus"]},
+    {"component": "gst-plugins-good", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstadaptivedemux2", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstaudioparsers", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstisomp4", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstmatroska", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvpx", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstsoup", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstalsa", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstpulse", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstalaw", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstavi", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstflac", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstflv", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstmulaw", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstmultipart", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstwavparse", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstwavenc", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstudp", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrtp", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrtpmanager", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstrtsp"]},
+    {"component": "gst-plugins-bad", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstadaptivedemux-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstcodecparsers-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstcodecs-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstmpegts-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstisoff-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstinsertbin-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstplay-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgstplayer-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgsturidownloader-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstadpcmdec", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstadpcmenc", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstdvbsubenc", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstdvbsuboverlay", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstdvdspu", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgsthls", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstid3tag", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstmidi", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstmxf", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstpnm", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgsttranscode", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstvideoparsersbad", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstipcpipeline", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstshm", "vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstva"]}
+  ],
   "flatpak": {
     "runtime": "org.freedesktop.Platform",
     "runtime_version": "25.08",

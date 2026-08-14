@@ -182,72 +182,12 @@ jobs:
           name: rpm-package
           path: "*.rpm"
 
-  package-flatpak:
-    name: Build Flatpak Bundle
-    needs: build-binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Flatpak and flatpak-builder
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y flatpak flatpak-builder
-          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          sudo flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
-
-      - name: Download binary
-        uses: actions/download-artifact@v4
-        with:
-          name: lumina-video-demo-linux-x86_64
-          path: ./binary
-
-      - name: Create simplified Flatpak manifest
-        run: |
-          VERSION="${{ needs.build-binary.outputs.version }}"
-
-          # Create manifest using printf to avoid YAML parsing issues
-          printf '%s\n' \
-            "app-id: io.github.lumina_video.Demo" \
-            "runtime: org.freedesktop.Platform" \
-            "runtime-version: '24.08'" \
-            "sdk: org.freedesktop.Sdk" \
-            "command: lumina-video-demo" \
-            "" \
-            "finish-args:" \
-            "  - --share=ipc" \
-            "  - --socket=x11" \
-            "  - --socket=wayland" \
-            "  - --device=dri" \
-            "  - --share=network" \
-            "  - --socket=pulseaudio" \
-            "  - --filesystem=home:ro" \
-            "  - --filesystem=xdg-videos" \
-            "  - --filesystem=xdg-download:ro" \
-            "  - --talk-name=org.freedesktop.portal.FileChooser" \
-            "" \
-            "modules:" \
-            "  - name: lumina-video-demo" \
-            "    buildsystem: simple" \
-            "    build-commands:" \
-            "      - install -Dm755 lumina-video-demo /app/bin/lumina-video-demo" \
-            "    sources:" \
-            "      - type: file" \
-            "        path: binary/lumina-video-demo" \
-            > flatpak-binary.yml
-
-      - name: Build Flatpak
-        run: |
-          VERSION="${{ needs.build-binary.outputs.version }}"
-          chmod +x binary/lumina-video-demo
-          flatpak-builder --force-clean --repo=repo build-dir flatpak-binary.yml
-          flatpak build-bundle repo "lumina-video-demo-${VERSION}.flatpak" io.github.lumina_video.Demo
-
-      - name: Upload Flatpak artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flatpak-package
-          path: "*.flatpak"
+  audited-runtime:
+    name: Build canonical audited runtime and Flatpak
+    uses: ./.github/workflows/package-gstreamer.yml
+    secrets: inherit
+    permissions:
+      contents: read
 
   package-aur:
     name: Prepare AUR PKGBUILD
@@ -274,7 +214,7 @@ jobs:
 
   upload-release:
     name: Upload to Release
-    needs: [build-binary, package-deb, package-rpm, package-flatpak, package-aur]
+    needs: [build-binary, package-deb, package-rpm, audited-runtime, package-aur]
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
     permissions:
@@ -292,5 +232,6 @@ jobs:
             artifacts/lumina-video-demo-linux-x86_64/lumina-video-demo
             artifacts/deb-package/*.deb
             artifacts/rpm-package/*.rpm
-            artifacts/flatpak-package/*.flatpak
+            artifacts/gstreamer-runtime-linux-x86_64/*
+            artifacts/lumina-video-demo-flatpak/*
             artifacts/aur-pkgbuild/PKGBUILD

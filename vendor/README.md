@@ -5,14 +5,14 @@ runtime build: GStreamer 1.28.6, gst-libav/FFmpeg 7.1, zlib, PipeWire 1.6.8,
 Cerbero, Ubuntu 24.04/glibc 2.39, the exact `norust,alsa,pulse,va` variants,
 and Freedesktop 25.08 Flatpak refs.
 
-The audited closure is intentionally narrow: only the lock's recipes are
-built, and the lock's matrix plugin allowlist records the effective
-license/source for every exercised element. Helper plugins that Cerbero's
-selected LGPL groups bring along remain inside that recipe closure and are
-checked for forbidden components/licenses. GPL/nonfree/version-3 FFmpeg
-options, gst-plugins-ugly, x264, and unknown licenses are rejected. H.264/AAC
-software fallback is `avdec_h264`/`avdec_aac`. The system ELF allowlist is
-limited to the explicit glibc/loader/GPU/audio runtime ABI contract.
+The audited closure is intentionally narrow: only the lock's direct recipe
+categories are built into the single `lumina-audited` package. The matrix
+plugin allowlist records effective license/source, while the build and audit
+run isolated `gst-inspect-1.0` over every bundled plugin. GPL/nonfree/version-3
+FFmpeg options, gst-plugins-ugly, x264, and unknown licenses are rejected.
+H.264/AAC software fallback is `avdec_h264`/`avdec_aac`. ALSA, PulseAudio,
+PipeWire, and libva user-space libraries are bundled; only glibc/loader and
+explicit GPU/display driver ABI names remain external.
 
 Discovery is the only moving-metadata path:
 
@@ -20,8 +20,8 @@ Discovery is the only moving-metadata path:
 ./scripts/discover-gstreamer-lock.sh
 ```
 
-The formal build reads only the lock, fetches sources, then runs Cerbero
-fetch/bootstrap/package offline with two workers:
+The formal build reads only the lock, seeds the Cerbero source cache from the
+locked URLs/checksums, then runs bootstrap/package offline with two workers:
 
 ```bash
 ./scripts/build-gstreamer-runtime.sh \
@@ -37,8 +37,10 @@ and recursive `DT_NEEDED` closure. Use `scripts/audit-gstreamer-runtime.sh`
 before publishing.
 
 `vendor/cerbero-overlay` is deliberately small and reviewable. It contains the
-Cerbero `localconf.cbc`, policy fragment, custom closure marker, and its own
-license text; the entire overlay is copied into corresponding-source.tar.xz.
+Cerbero `localconf.cbc`, the direct `lumina-audited` package, the real PipeWire
+recipe, and the applied base/good/bad recipe patches; the entire overlay is
+copied into corresponding-source.tar.xz. The custom package has no same-name
+recipe: its direct `files` categories drive the reviewed closure.
 
 The launcher establishes private `LD_LIBRARY_PATH`, GStreamer plugin/scanner
 paths, and an external registry/cache. It never falls back to host plugins.

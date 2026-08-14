@@ -1,0 +1,78 @@
+--- a/recipes/gst-plugins-good-1.0.recipe
++++ b/recipes/gst-plugins-good-1.0.recipe
+@@ -3,40 +3,23 @@
+     name = 'gst-plugins-good-1.0'
+     btype = BuildType.MESON
+     tarball_checksum = 'b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df'
+-    meson_options = {# enabled plugins
+-                     'amrnb': 'enabled',
+-                     'amrwbdec': 'enabled',
+-                     'adaptivedemux2': 'enabled',
+-                     'cairo': 'enabled',
+-                     'dv': 'enabled',
+-                     'flac': 'enabled',
+-                     'gdk-pixbuf': 'enabled',
+-                     'jpeg': 'enabled',
+-                     'lame': 'enabled',
+-                     'mpg123': 'enabled',
+-                     'png': 'enabled',
+-                     'soup': 'enabled',
+-                     'speex': 'enabled',
+-                     'taglib': 'enabled',
+-                     'vpx': 'enabled',
+-                     'wavpack': 'enabled',
+-                     # disabled plugins
+-                     'aalib': 'disabled',
+-                     'dv1394': 'disabled',
+-                     'gtk3': 'disabled',
+-                     'jack': 'disabled', # Enabled in prepare()
+-                     'libcaca': 'disabled',
+-                     'oss': 'disabled',
+-                     'oss4': 'disabled',
+-                     'qt5': 'disabled', # Enabled in prepare()
+-                     'qt6': 'disabled', # Enabled in prepare()
+-                     'shout2': 'disabled',
+-                     'twolame': 'disabled',
+-                     'waveform': 'disabled',}
+-    deps = ['gstreamer-1.0', 'gst-plugins-base-1.0', 'libjpeg-turbo', 'libpng',
+-            'speex', 'gdk-pixbuf', 'libsoup', 'mpg123', 'lame',
+-            'orc', 'wavpack', 'flac', 'taglib', 'bzip2', 'zlib',
+-            'libvpx', 'libdv', 'cairo', 'opencore-amr', 'libxml2']
++    meson_options = {# only HLS, HTTP(S), and VP9 support are selected
++                     'amrnb': 'disabled', 'amrwbdec': 'disabled',
++                     'adaptivedemux2': 'enabled', 'cairo': 'disabled',
++                     'dv': 'disabled', 'flac': 'disabled',
++                     'gdk-pixbuf': 'disabled', 'jpeg': 'disabled',
++                     'lame': 'disabled', 'mpg123': 'disabled',
++                     'png': 'disabled', 'soup': 'enabled',
++                     'speex': 'disabled', 'taglib': 'disabled',
++                     'vpx': 'enabled', 'wavpack': 'disabled',
++                     'aalib': 'disabled', 'dv1394': 'disabled',
++                     'gtk3': 'disabled', 'jack': 'disabled',
++                     'libcaca': 'disabled', 'oss': 'disabled',
++                     'oss4': 'disabled', 'qt5': 'disabled',
++                     'qt6': 'disabled', 'shout2': 'disabled',
++                     'twolame': 'disabled', 'waveform': 'disabled',}
++    deps = ['gstreamer-1.0', 'gst-plugins-base-1.0', 'libsoup',
++            'orc', 'zlib', 'libvpx']
+     platform_deps = {
+-        Platform.LINUX: ['alsa', 'x11', 'libpulse'],
++        Platform.LINUX: ['alsa', 'libpulse'],
+     }
+@@ -224,16 +224,3 @@
+     def prepare(self):
+         self.append_env('CFLAGS', '-DLIBSOUP_DOES_NOT_STEAL_OUR_CONTEXT=1')
+-        if self.config.target_platform == Platform.WINDOWS:
+-            self.meson_options['directsound'] = 'enabled'
+-            self.enable_plugin('jack', 'sys')
+-        elif self.config.target_platform == Platform.DARWIN:
+-            self.meson_options['osxaudio'] = 'enabled'
+-            self.meson_options['osxvideo'] = 'enabled'
+-            self.enable_plugin('jack', 'sys')
+-        elif Platform.is_apple_app_platform(self.config.target_platform):
+-            self.meson_options['osxaudio'] = 'enabled'
+-        elif self.config.target_platform == Platform.LINUX:
+-            self.enable_plugin('jack', 'sys')
+-        self.enable_plugin('video4linux2', 'capture', variant='v4l2', option='v4l2')
+-        self.enable_plugin('ximagesrc', 'capture', variant='x11')
+         self.enable_plugin('pulseaudio', 'sys', variant='pulse', option='pulse')
