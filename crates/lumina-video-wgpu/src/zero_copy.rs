@@ -601,9 +601,9 @@ pub mod linux {
     }
 
     /// Extension names required for DMABuf import
-    const EXT_EXTERNAL_MEMORY_DMA_BUF: &CStr = c"VK_EXT_external_memory_dma_buf";
-    const KHR_EXTERNAL_MEMORY_FD: &CStr = c"VK_KHR_external_memory_fd";
-    const EXT_IMAGE_DRM_FORMAT_MODIFIER: &CStr = c"VK_EXT_image_drm_format_modifier";
+    pub(crate) const EXT_EXTERNAL_MEMORY_DMA_BUF: &CStr = c"VK_EXT_external_memory_dma_buf";
+    pub(crate) const KHR_EXTERNAL_MEMORY_FD: &CStr = c"VK_KHR_external_memory_fd";
+    pub(crate) const EXT_IMAGE_DRM_FORMAT_MODIFIER: &CStr = c"VK_EXT_image_drm_format_modifier";
 
     /// Checks if the wgpu device is using the Vulkan backend.
     ///
@@ -674,7 +674,7 @@ pub mod linux {
     }
 
     /// Finds a suitable memory type index for the given requirements.
-    fn find_memory_type_index(
+    pub(crate) fn find_memory_type_index(
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         type_bits_req: u32,

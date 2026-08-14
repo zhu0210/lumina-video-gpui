@@ -11,6 +11,8 @@
 //! Platform-specific import backends stay in the private `zero_copy` module;
 //! they are maintained internally and are not part of this crate's public API.
 
+#[cfg(target_os = "linux")]
+mod dmabuf_import;
 mod frame_to_texture;
 #[cfg(any(
     target_os = "macos",
@@ -31,3 +33,6 @@ pub use frame_to_texture::{
     native_frame_lease_to_textures, upload_cpu_frame, upload_cpu_frame_as_textures,
     GpuFrameTextures, LegacyFrameIngestionError, NativeFrameIngestionError,
 };
+
+#[cfg(target_os = "linux")]
+pub use dmabuf_import::{import_ready_dmabuf_nv12, ImportedNv12Texture, Nv12ImportError};
