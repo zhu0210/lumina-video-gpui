@@ -5,45 +5,45 @@ sha256sum: sha256sum (GNU coreutils) 9.11
 
 ## Media stream probes
 h264-aac.mp4:
-  0|h264|video|320|180
+  0|h264|video|320|180|yuv420p|tv|bt709|bt709|bt709|center
   1|aac|audio|2
 vp9-opus.mkv:
-  0|vp9|video|320|180
+  0|vp9|video|320|180|yuv420p|tv|bt709|bt709|bt709|center
   1|opus|audio|2
 dual-aac.mkv:
-  0|h264|video|320|180
+  0|h264|video|320|180|yuv420p|tv|bt709|bt709|bt709|center
   1|aac|audio|2
   2|aac|audio|2
 hls-vod/index.m3u8:
-  0|h264|video|320|180
+  0|h264|video|320|180|yuv420p|tv|bt709|bt709|bt709|center
   1|aac|audio|2
   
-  0|h264|video|320|180
+  0|h264|video|320|180|yuv420p|tv|bt709|bt709|bt709|center
   1|aac|audio|2
 hls-live/index.m3u8:
-  0|h264|video|320|180
+  0|h264|video|320|180|yuv420p|tv|bt709|bt709|bt709|center
   1|aac|audio|2
   
-  0|h264|video|320|180
+  0|h264|video|320|180|yuv420p|tv|bt709|bt709|bt709|center
   1|aac|audio|2
 
 ## SHA256 (all generated files)
-4670d6c9229fd733999399db0c8dd989eb72d46573fe4bf763e24508a20d2474  generated/dual-aac.mkv
-6fcec92cb97ff05019adbd6f58714917901c5ea39778a2dd0cc6d51318b1124b  generated/h264-aac.mp4
+27e0dc5a3f4c14d9846fe1cc36bd9602628dd8dc1d52e4c5908d8e6f02e63e56  generated/dual-aac.mkv
+6302b217c35adce38dac8306aa52a87d2211ed913f64eb179dfc5a8b7667e68a  generated/h264-aac.mp4
 e5b15ef2b7d043dfc7528ab39b039f3e31c16478cd21765c5ea85403b25518d2  generated/hls-live/index.m3u8
-c86f7a6574d540d4fb43017d3dcaf63f2ce6f2772bbbb1d99136d77f9fe4dc02  generated/hls-live/segment-000.ts
-4c046e4cfb9e57583aa92881dadc38a2ddffebc6f4d5f1da6d37380c5540c969  generated/hls-live/segment-001.ts
-a63507369e593f5ff99483c6b8b35aadb6935e4999a29d04edf9366053cb7d2e  generated/hls-live/segment-002.ts
-eb64c425c44f37faba3cef5c5a84d340bfa13f97e0dbef14ca0f620b6ddd111d  generated/hls-live/segment-003.ts
-8804b56c06bb2791052808ff212d668f00f064a09b8228d19439f0d575f4fb09  generated/hls-live/segment-004.ts
-2288fe5639a13aec627c70380b3004b87d1944a3cd3c60463240aaee4607b943  generated/hls-live/segment-005.ts
-96a77678beb32207093d5598baa68173638e9956b031ed1b775bdfc1f400e066  generated/hls-live/segment-006.ts
-f5781188d4dabee4a671975a2f83deeac8f8cad23017e34e23981bd8bebd2d76  generated/hls-live/segment-007.ts
-efcaccd35744d9c3a5e22cba487718d7dae346c09588b150aa5196bc3ce3a3f5  generated/hls-live/segment-008.ts
-fa858879f6a75e4fbc8d923e064d1c035df4218c3a77fdd39bba9cc714fa7f18  generated/hls-live/segment-009.ts
-cd66b0d13208bcd7c3b1235a1288b5e3552d28200a811391ba3d173566860df1  generated/hls-live/segment-010.ts
-8d04508d08fdb7718f046b1a737c470db0d9989495b3d1e397bcd7fed4d14511  generated/hls-live/segment-011.ts
+8201907aff38564e064444f8f1153176bb0f0b57855dff029e2e55d02ec98cd2  generated/hls-live/segment-000.ts
+e3117059d6df54cab6a459c9e6831038fd1383138f4be52c52c633ae1773152b  generated/hls-live/segment-001.ts
+227b249f6e6974d56ee38b41a8578cd15bbe0b9b0d1a2b136e56ce15c929786a  generated/hls-live/segment-002.ts
+2dc7b7aa994847e9ae042dbaf42d03b95bd970bf95fcca1a80b93a41babe70d3  generated/hls-live/segment-003.ts
+7623445c137798eda7a9de2cd7cba4ed4f1214f8521ada3c872ca37d7eb21bd5  generated/hls-live/segment-004.ts
+47f147ccac2da4637c73ee39946826680767f91a9d1725c615240d1e4e6aef87  generated/hls-live/segment-005.ts
+387fa8b56dbbc99b0ca2ff9a0a4bf3b84dda41ebc19240a57cb3bc5918cfcaed  generated/hls-live/segment-006.ts
+2c2a618e21a4a20ab29d5f6906ff5d1055dd3b2ecd082885124ede9b86a1339e  generated/hls-live/segment-007.ts
+bd89ca81def01a8c031aa1470d9489d21466183a7ebe63dedfab833be2c9f200  generated/hls-live/segment-008.ts
+ef8e3674290524e436a3f4e475ffc9365c5205048bd748a1affa35f05fb80b4a  generated/hls-live/segment-009.ts
+a1da1d445fada13ed31519ae7013873e48fbc93e6d22aa50553fb0ef7f6230a6  generated/hls-live/segment-010.ts
+429980f6c5afb27e237fc7e01c2b822be44b88e2f6c0832a6597633e6a9fe8ad  generated/hls-live/segment-011.ts
 4e70d8ebaaefa40aa76c8d54399f1c28d0cb5330afa4f2f15a388d93ca44605b  generated/hls-vod/index.m3u8
-c86f7a6574d540d4fb43017d3dcaf63f2ce6f2772bbbb1d99136d77f9fe4dc02  generated/hls-vod/segment-000.ts
-e36320c3f27dc7eca403eaeb9db6b7084d82eb4c1cc04aaaf2983609cfa4f6dc  generated/hls-vod/segment-001.ts
-723a36150e8e1b8819f52c062f412a7b91c1be7703409b1921610c340b959c0b  generated/vp9-opus.mkv
+8201907aff38564e064444f8f1153176bb0f0b57855dff029e2e55d02ec98cd2  generated/hls-vod/segment-000.ts
+4962d3f4bc1e02cd8ad2b9cfe9c26c4b77faa3625be8583b442f072d947cf3b5  generated/hls-vod/segment-001.ts
+453e548f2fd280e8ad99757549cebb4d765a80589e50f765f0a2695f97d2aec6  generated/vp9-opus.mkv

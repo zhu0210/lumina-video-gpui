@@ -24,8 +24,21 @@ common_video=(
     -preset medium
     -crf 23
     -threads 1
-    -x264-params keyint=30:min-keyint=30:scenecut=0:threads=1
+    -x264-params keyint=30:min-keyint=30:scenecut=0:threads=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited
     -pix_fmt yuv420p
+    -color_range tv
+    -colorspace bt709
+    -color_primaries bt709
+    -color_trc bt709
+    -chroma_sample_location center
+)
+common_sdr_color=(
+    -pix_fmt yuv420p
+    -color_range tv
+    -colorspace bt709
+    -color_primaries bt709
+    -color_trc bt709
+    -chroma_sample_location center
 )
 common_audio=(
     -c:a aac
@@ -41,6 +54,21 @@ common_output=(
     -flags:a +bitexact
 )
 
+remux_sdr_metadata() {
+    local media=$1
+    local remuxed="$media.remux.mkv"
+
+    # Matroska muxing needs a copy pass to persist transfer and primaries
+    # alongside the encoder's range, matrix, and centered chroma metadata.
+    ffmpeg -hide_banner -loglevel error \
+        -i "$media" -map 0 -c copy \
+        -color_range tv -colorspace bt709 -color_primaries bt709 \
+        -color_trc bt709 -chroma_sample_location center \
+        -fflags +bitexact -flags:v +bitexact -flags:a +bitexact \
+        "$remuxed"
+    mv "$remuxed" "$media"
+}
+
 ffmpeg -hide_banner -loglevel error \
     -f lavfi -i 'testsrc2=size=320x180:rate=30:duration=2' \
     -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=2' \
@@ -54,9 +82,10 @@ ffmpeg -hide_banner -loglevel error \
     -f lavfi -i 'sine=frequency=550:sample_rate=48000:duration=2' \
     -map 0:v:0 -map 1:a:0 -t 2 \
     -c:v libvpx-vp9 -crf 32 -b:v 0 -deadline good -cpu-used 0 -row-mt 0 -threads 1 \
-    -pix_fmt yuv420p -c:a libopus -b:a 96k -ar 48000 -ac 2 \
+    "${common_sdr_color[@]}" -c:a libopus -b:a 96k -ar 48000 -ac 2 \
     "${common_output[@]}" \
     "$generated_dir/vp9-opus.mkv"
+remux_sdr_metadata "$generated_dir/vp9-opus.mkv"
 
 ffmpeg -hide_banner -loglevel error \
     -f lavfi -i 'testsrc2=size=320x180:rate=30:duration=2' \
@@ -72,6 +101,7 @@ ffmpeg -hide_banner -loglevel error \
     -disposition:a:0 default -disposition:a:1 0 \
     "${common_output[@]}" \
     "$generated_dir/dual-aac.mkv"
+remux_sdr_metadata "$generated_dir/dual-aac.mkv"
 
 generate_hls() {
     local playlist_type=$1
@@ -110,15 +140,18 @@ generate_hls event "$generated_dir/hls-live" 12
     echo "sha256sum: $sha256sum_version"
     echo
     echo "## Media stream probes"
+    probe_streams() {
+        ffprobe -v error \
+            -show_entries stream=index,codec_type,codec_name,width,height,channels,pix_fmt,color_range,color_space,color_transfer,color_primaries,chroma_location \
+            -of compact=p=0:nk=1 "$1"
+    }
     for media in h264-aac.mp4 vp9-opus.mkv dual-aac.mkv; do
         echo "$media:"
-        ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,channels \
-            -of compact=p=0:nk=1 "$generated_dir/$media" | sed 's/^/  /'
+        probe_streams "$generated_dir/$media" | sed 's/^/  /'
     done
     for playlist in hls-vod/index.m3u8 hls-live/index.m3u8; do
         echo "$playlist:"
-        ffprobe -v error -show_entries stream=index,codec_type,codec_name,width,height,channels \
-            -of compact=p=0:nk=1 "$generated_dir/$playlist" | sed 's/^/  /'
+        probe_streams "$generated_dir/$playlist" | sed 's/^/  /'
     done
     echo
     echo "## SHA256 (all generated files)"
