@@ -17,7 +17,7 @@ use std::mem::ManuallyDrop;
 use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Sender, TrySendError};
 
 pub use lumina_video_core::video::{VideoError, VideoMetadata, VideoPlayerHandle, VideoState};
 
@@ -164,11 +164,23 @@ impl CpuMemory {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[doc(hidden)]
-    fn from_recyclable(planes: Vec<CpuPlane>, recycle: Sender<Vec<CpuPlane>>) -> Self {
+    pub fn new_recyclable(planes: Vec<CpuPlane>, recycle: Sender<Vec<CpuPlane>>) -> Self {
         Self {
             planes,
             recycle: Some(recycle),
         }
+    }
+
+    /// Takes the owned planes out of this memory value without recycling them.
+    ///
+    /// This is the narrow escape hatch for callers that need to consume the
+    /// public `planes` field by value. A pooled payload is deliberately
+    /// detached from its generation rather than returning an empty vector to
+    /// the pool.
+    pub fn into_planes(mut self) -> Vec<CpuPlane> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.recycle.take();
+        std::mem::take(&mut self.planes)
     }
 }
 
@@ -197,51 +209,8 @@ impl Drop for CpuMemory {
         let planes = std::mem::take(&mut self.planes);
         match recycle.try_send(planes) {
             Ok(()) => {}
-            Err(TrySendError::Full(_planes)) => {
-                debug_assert!(false, "CPU frame recycle pool was full");
-            }
+            Err(TrySendError::Full(_planes)) => {}
             Err(TrySendError::Disconnected(_planes)) => {}
-        }
-    }
-}
-
-/// Exactly-two-payload CPU RGBA pool used by the GStreamer worker.
-///
-/// This is intentionally a narrow native seam rather than a general pool:
-/// each generation allocates two complete one-plane RGBA payloads, and every
-/// acquired payload is returned by [`CpuMemory::drop`]. `try_acquire` never
-/// allocates or blocks; exhaustion is a frame drop at the worker.
-#[cfg(not(target_arch = "wasm32"))]
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct CpuMemoryPool {
-    recycle: Sender<Vec<CpuPlane>>,
-    available: Receiver<Vec<CpuPlane>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl CpuMemoryPool {
-    /// Allocates the two complete payloads for one negotiated extent.
-    pub fn new(extent: FrameExtent) -> Option<Self> {
-        let width = usize::try_from(extent.width).ok()?;
-        let height = usize::try_from(extent.height).ok()?;
-        let stride = width.checked_mul(4)?;
-        let bytes = stride.checked_mul(height)?;
-        let (recycle, available) = crossbeam_channel::bounded(2);
-        for _ in 0..2 {
-            let payload = vec![CpuPlane::new(vec![0; bytes], stride)];
-            if recycle.send(payload).is_err() {
-                return None;
-            }
-        }
-        Some(Self { recycle, available })
-    }
-
-    /// Acquires one complete payload without waiting or allocating.
-    pub fn try_acquire(&self) -> Option<CpuMemory> {
-        match self.available.try_recv() {
-            Ok(planes) => Some(CpuMemory::from_recyclable(planes, self.recycle.clone())),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
     }
 }
@@ -277,92 +246,33 @@ mod plane_layout_tests {
         assert_eq!(planes.first().map(|plane| plane.stride), Some(4));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn cpu_pool_has_two_identities_and_recycles_without_a_third_allocation() {
-        let Some(pool) = CpuMemoryPool::new(FrameExtent::new(2, 2)) else {
-            panic!("small RGBA pool must configure");
-        };
-        let Some(first) = pool.try_acquire() else {
-            panic!("first payload must be available");
-        };
-        let Some(second) = pool.try_acquire() else {
-            panic!("second payload must be available");
-        };
-        assert!(pool.try_acquire().is_none());
-        let first_identity = first
-            .planes
-            .first()
-            .map(|plane| (plane.bytes.as_ptr(), plane.bytes.capacity()));
-        let second_identity = second
-            .planes
-            .first()
-            .map(|plane| (plane.bytes.as_ptr(), plane.bytes.capacity()));
-        assert_ne!(first_identity, second_identity);
-        drop(first);
-        let Some(recycled_first) = pool.try_acquire() else {
-            panic!("dropped payload must recycle");
-        };
+    fn cpu_memory_into_planes_preserves_owned_payload() {
+        let memory = CpuMemory::new(vec![CpuPlane::new(vec![1, 2, 3, 4], 4)]);
+        let planes = memory.into_planes();
         assert_eq!(
-            recycled_first
-                .planes
-                .first()
-                .map(|plane| (plane.bytes.as_ptr(), plane.bytes.capacity())),
-            first_identity
+            planes.first().map(|plane| plane.bytes.as_slice()),
+            Some([1, 2, 3, 4].as_slice())
         );
-        drop(recycled_first);
-        drop(second);
-        assert!(pool.try_acquire().is_some());
-        assert!(pool.try_acquire().is_some());
-        assert!(pool.try_acquire().is_none());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn cpu_pool_returns_payload_on_lease_success_and_error_drop_paths() {
-        let Some(pool) = CpuMemoryPool::new(FrameExtent::new(1, 1)) else {
-            panic!("small RGBA pool must configure");
-        };
-        let Some(memory) = pool.try_acquire() else {
-            panic!("payload must be available");
-        };
-        let lease = NativeFrameLease::new(
-            NativeFrameDescriptor {
-                frame_id: 1,
-                stream_generation: 1,
-                pts: Duration::ZERO,
-                duration: None,
-                extent: FrameExtent::new(1, 1),
-                format: video::PixelFormat::Rgba,
-                color: ColorMetadata::default(),
-                color_transform: None,
-            },
-            NativeMemory::Cpu(memory),
-            AcquireSync::None,
-        );
-        assert!(lease.is_ok());
-        drop(lease);
-        assert!(pool.try_acquire().is_some());
+    fn cpu_memory_drop_safely_discards_full_or_disconnected_recycles() {
+        let (recycle, available) = crossbeam_channel::bounded(1);
+        assert!(recycle.try_send(vec![CpuPlane::new(vec![1], 1)]).is_ok());
+        drop(CpuMemory::new_recyclable(
+            vec![CpuPlane::new(vec![2], 1)],
+            recycle,
+        ));
+        assert!(available.try_recv().is_ok());
 
-        let Some(memory) = pool.try_acquire() else {
-            panic!("recycled payload must be available");
-        };
-        let invalid = NativeFrameLease::new(
-            NativeFrameDescriptor {
-                frame_id: 2,
-                stream_generation: 1,
-                pts: Duration::ZERO,
-                duration: None,
-                extent: FrameExtent::new(0, 1),
-                format: video::PixelFormat::Rgba,
-                color: ColorMetadata::default(),
-                color_transform: None,
-            },
-            NativeMemory::Cpu(memory),
-            AcquireSync::None,
-        );
-        assert!(invalid.is_err());
-        assert!(pool.try_acquire().is_some());
+        let (recycle, available) = crossbeam_channel::bounded(1);
+        drop(available);
+        drop(CpuMemory::new_recyclable(
+            vec![CpuPlane::new(vec![3], 1)],
+            recycle,
+        ));
     }
 }
 
@@ -621,11 +531,6 @@ pub struct NativeFrameDescriptor {
     pub extent: FrameExtent,
     pub format: PixelFormat,
     pub color: ColorMetadata,
-    /// Worker-selected matrix for the fixed GPUI NV12 shader. `None` means
-    /// the frame is RGBA or uses the worker CPU path; this prevents the UI
-    /// boundary from recomputing a color decision for every frame.
-    #[doc(hidden)]
-    pub color_transform: Option<[[f32; 4]; 4]>,
 }
 
 /// A decoded frame and every producer resource required to keep it valid.

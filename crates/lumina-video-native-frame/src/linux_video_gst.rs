@@ -51,6 +51,9 @@ pub struct NativeDecodedFrame {
     pub extent: FrameExtent,
     pub format: PixelFormat,
     pub color: ColorMetadata,
+    /// Color decision cached when caps are mapped, so the worker does not
+    /// recompute it for the same negotiated generation.
+    pub color_decision: ColorRenderDecision,
     pub memory: NativeMemory,
 }
 
@@ -560,7 +563,7 @@ pub struct GStreamerDecoder {
     /// of this decoder instead of retrying DMABuf on every frame.
     native_layout_failed: bool,
     /// Cached native/GPU color eligibility for the current caps tuple.
-    native_color_generation: Option<(FrameExtent, ColorMetadata, bool)>,
+    native_color_generation: Option<(FrameExtent, ColorMetadata, ColorRenderDecision)>,
     metadata: VideoMetadata,
     position: Duration,
     eof: bool,
@@ -1592,19 +1595,19 @@ impl GStreamerDecoder {
         let color = color_metadata_from_video_info(&video_info);
 
         let extent = FrameExtent::new(width, height);
-        let native_color_supported = match self.native_color_generation {
-            Some((cached_extent, cached_color, supported))
+        let color_decision = match self.native_color_generation {
+            Some((cached_extent, cached_color, decision))
                 if cached_extent == extent && cached_color == color =>
             {
-                supported
+                decision
             }
             _ => {
-                let supported = matches!(render_decision(color), ColorRenderDecision::Gpu(_));
-                self.native_color_generation = Some((extent, color, supported));
-                supported
+                let decision = render_decision(color);
+                self.native_color_generation = Some((extent, color, decision));
+                decision
             }
         };
-        if native_color_supported
+        if matches!(color_decision, ColorRenderDecision::Gpu(_))
             && should_attempt_native(self.requested_tier, self.native_layout_failed)
         {
             match self.try_dmabuf_memory(buffer, &video_info, &sample) {
@@ -1619,6 +1622,7 @@ impl GStreamerDecoder {
                         extent: FrameExtent::new(width, height),
                         format,
                         color,
+                        color_decision,
                         memory: NativeMemory::DmaBuf(memory),
                     });
                 }
@@ -1655,6 +1659,7 @@ impl GStreamerDecoder {
             extent: FrameExtent::new(width, height),
             format,
             color,
+            color_decision,
             memory: NativeMemory::Cpu(crate::CpuMemory::new(into_cpu_planes(planes))),
         })
     }

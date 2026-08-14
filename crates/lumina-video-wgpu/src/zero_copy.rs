@@ -3014,13 +3014,16 @@ pub mod android {
                 };
             };
             let yuv_offset = match range {
-                lumina_video_native_frame::ColorRange::Limited => [16.0 / 255.0, 0.5, 0.5],
-                lumina_video_native_frame::ColorRange::Full => [0.0, 0.5, 0.5],
+                lumina_video_native_frame::ColorRange::Limited => {
+                    [16.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0]
+                }
+                lumina_video_native_frame::ColorRange::Full => [0.0, 128.0 / 255.0, 128.0 / 255.0],
                 lumina_video_native_frame::ColorRange::Unknown
                 | lumina_video_native_frame::ColorRange::Unsupported => [0.0; 3],
             };
+            let [y_column, cb_column, cr_column, _offset] = matrix;
             Self {
-                yuv_to_rgb: [matrix[0], matrix[1], matrix[2]],
+                yuv_to_rgb: [y_column, cb_column, cr_column],
                 yuv_offset,
                 _padding: 0.0,
             }

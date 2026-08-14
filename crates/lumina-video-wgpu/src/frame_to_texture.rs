@@ -98,6 +98,13 @@ pub enum GpuFrameTextures {
 }
 
 fn default_nv12_color_transform() -> [[f32; 4]; 4] {
+    match yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Full) {
+        Some(transform) => transform,
+        None => [[0.0; 4]; 4],
+    }
+}
+
+fn legacy_cpu_nv12_color_transform() -> [[f32; 4]; 4] {
     match yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Limited) {
         Some(transform) => transform,
         None => [[0.0; 4]; 4],
@@ -301,7 +308,10 @@ pub fn native_frame_lease_to_textures(
         descriptor.format,
     );
     if descriptor.format == PixelFormat::Nv12 {
-        let Some(transform) = descriptor.color_transform else {
+        // The worker has already selected the GPU contract for this metadata;
+        // the renderer only derives the shared affine coefficients here.
+        let Some(transform) = yuv_to_rgb_matrix(descriptor.color.matrix, descriptor.color.range)
+        else {
             return Err(NativeFrameIngestionError::UnsupportedColorMetadata(
                 NativeFrameLease {
                     descriptor,
@@ -970,7 +980,7 @@ fn cpu_frame_ref_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
 }
 
 fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
-    let [r, g, b] = apply_yuv_matrix(&default_nv12_color_transform(), y, u, v);
+    let [r, g, b] = apply_yuv_matrix(&legacy_cpu_nv12_color_transform(), y, u, v);
     (r, g, b)
 }
 
@@ -1042,7 +1052,7 @@ fn yuv420p_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
         v_plane,
         v_stride,
         lumina_video_native_frame::FrameExtent::new(frame.width, frame.height),
-        &default_nv12_color_transform(),
+        &legacy_cpu_nv12_color_transform(),
         &mut rgba,
     );
     rgba
@@ -1050,7 +1060,7 @@ fn yuv420p_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
 
 fn nv12_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     let mut rgba = Vec::new();
-    cpu_frame_ref_to_rgba_into(frame, &mut rgba, default_nv12_color_transform());
+    cpu_frame_ref_to_rgba_into(frame, &mut rgba, legacy_cpu_nv12_color_transform());
     rgba
 }
 
@@ -1179,7 +1189,6 @@ mod tests {
                 extent: FrameExtent::new(1, 1),
                 format: PixelFormat::Rgba,
                 color: lumina_video_native_frame::ColorMetadata::default(),
-                color_transform: None,
             },
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(bytes, 4)])),
             AcquireSync::None,
@@ -1208,7 +1217,6 @@ mod tests {
                 extent: FrameExtent::new(1, 1),
                 format: PixelFormat::Rgba,
                 color: lumina_video_native_frame::ColorMetadata::default(),
-                color_transform: None,
             },
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(vec![0; 4], 4)])),
             AcquireSync::SyncFile(OwnedFd::from(file)),
@@ -1244,7 +1252,6 @@ mod tests {
                     extent: FrameExtent::new(1, 1),
                     format,
                     color: lumina_video_native_frame::ColorMetadata::default(),
-                    color_transform: None,
                 },
                 NativeMemory::Cpu(CpuMemory::new(planes)),
                 AcquireSync::None,
@@ -1283,7 +1290,6 @@ mod tests {
                 extent: FrameExtent::new(1, 1),
                 format: PixelFormat::Rgba,
                 color: lumina_video_native_frame::ColorMetadata::default(),
-                color_transform: None,
             },
             NativeMemory::DmaBuf(DmaBufMemory::new(
                 vec![DmaBufObject {

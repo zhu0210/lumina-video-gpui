@@ -212,16 +212,27 @@ pub fn yuv_to_rgb_matrix(matrix: ColorMatrix, range: ColorRange) -> Option<[[f32
 
 /// Returns the matrix element applied by the fixed GPUI shader for one pixel.
 pub fn apply_yuv_matrix(matrix: &[[f32; 4]; 4], y: u8, cb: u8, cr: u8) -> [u8; 3] {
-    let [y_column, cb_column, cr_column, offset] = *matrix;
-    let y_sample = f32::from(y) / 255.0;
-    let cb_sample = f32::from(cb) / 255.0;
-    let cr_sample = f32::from(cr) / 255.0;
-    let values = [
-        y_column[0] * y_sample + cb_column[0] * cb_sample + cr_column[0] * cr_sample + offset[0],
-        y_column[1] * y_sample + cb_column[1] * cb_sample + cr_column[1] * cr_sample + offset[1],
-        y_column[2] * y_sample + cb_column[2] * cb_sample + cr_column[2] * cr_sample + offset[2],
-    ];
-    values.map(to_rgb_code)
+    apply_yuv_matrix_f32(
+        matrix,
+        f32::from(y) / 255.0,
+        f32::from(cb) / 255.0,
+        f32::from(cr) / 255.0,
+    )
+    .map(to_rgb_code)
+}
+
+/// Applies the shared affine matrix without quantizing its RGB result.
+///
+/// The CPU downgrade uses this same float core after bilinear chroma
+/// resampling, so its result is quantized only once at the final RGBA write.
+fn apply_yuv_matrix_f32(matrix: &[[f32; 4]; 4], y: f32, cb: f32, cr: f32) -> [f32; 3] {
+    let [[y_red, y_green, y_blue, _], [cb_red, cb_green, cb_blue, _], [cr_red, cr_green, cr_blue, _], [offset_red, offset_green, offset_blue, _]] =
+        *matrix;
+    [
+        y_red * y + cb_red * cb + cr_red * cr + offset_red,
+        y_green * y + cb_green * cb + cr_green * cr + offset_green,
+        y_blue * y + cb_blue * cb + cr_blue * cr + offset_blue,
+    ]
 }
 
 /// Selects the one-time worker/GPU path for a negotiated color tuple.
@@ -261,6 +272,9 @@ pub fn render_decision(color: ColorMetadata) -> ColorRenderDecision {
             ColorRenderDecision::UnsupportedSdrColor
         };
     }
+    if !matches!(color.matrix, ColorMatrix::Bt601 | ColorMatrix::Bt709) {
+        return ColorRenderDecision::UnsupportedSdrColor;
+    }
     let Some(matrix) = yuv_to_rgb_matrix(color.matrix, color.range) else {
         return ColorRenderDecision::Unsupported;
     };
@@ -272,7 +286,6 @@ pub fn render_decision(color: ColorMetadata) -> ColorRenderDecision {
         ColorTransfer::Srgb
             | ColorTransfer::Bt601
             | ColorTransfer::Bt709
-            | ColorTransfer::Smpte240m
             | ColorTransfer::Gamma10
             | ColorTransfer::Gamma18
             | ColorTransfer::Gamma20
@@ -365,6 +378,8 @@ pub fn nv12_bytes_to_rgba_into(
     }
     let width = usize::try_from(extent.width).map_err(|_| ColorConvertError::OutputTooSmall)?;
     let height = usize::try_from(extent.height).map_err(|_| ColorConvertError::OutputTooSmall)?;
+    let chroma_width = width.saturating_add(1) / 2;
+    let chroma_height = height.saturating_add(1) / 2;
     let byte_count = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
@@ -385,6 +400,8 @@ pub fn nv12_bytes_to_rgba_into(
                 true,
                 color.chroma_horizontal,
                 color.chroma_vertical,
+                chroma_width,
+                chroma_height,
             );
             let cr = sample_chroma(
                 uv_bytes,
@@ -394,17 +411,18 @@ pub fn nv12_bytes_to_rgba_into(
                 false,
                 color.chroma_horizontal,
                 color.chroma_vertical,
+                chroma_width,
+                chroma_height,
             );
-            let cb_code = to_code(cb);
-            let cr_code = to_code(cr);
-            let mut rgb = apply_yuv_matrix(matrix, y_value, cb_code, cr_code);
+            let mut rgb =
+                apply_yuv_matrix_f32(matrix, f32::from(y_value) / 255.0, cb / 255.0, cr / 255.0);
             if !matches!(transfer, ColorTransfer::Srgb) {
                 for channel in &mut rgb {
-                    let encoded = f32::from(*channel) / 255.0;
-                    *channel = to_rgb_code(encode_srgb(decode_transfer(encoded, transfer)));
+                    let encoded = channel.clamp(0.0, 1.0);
+                    *channel = encode_srgb(decode_transfer(encoded, transfer));
                 }
             }
-            let [red, green, blue] = rgb;
+            let [red, green, blue] = rgb.map(to_rgb_code);
             let output_index = y.saturating_mul(width).saturating_add(x).saturating_mul(4);
             if let Some(pixel) = output.get_mut(output_index..output_index.saturating_add(4)) {
                 pixel.copy_from_slice(&[red, green, blue, 255]);
@@ -471,6 +489,8 @@ fn sample_chroma(
     cb: bool,
     horizontal: ChromaHorizontal,
     vertical: ChromaVertical,
+    width: usize,
+    height: usize,
 ) -> f32 {
     let x_position = siting_position(x, horizontal);
     let y_position = siting_position(
@@ -484,8 +504,8 @@ fn sample_chroma(
             | ChromaVertical::Unsupported => ChromaHorizontal::Unknown,
         },
     );
-    let width = stride.saturating_div(2).max(1);
-    let height = bytes.len().saturating_div(stride.max(1)).max(1);
+    let width = width.max(1);
+    let height = height.max(1);
     let x_max = width.saturating_sub(1) as f32;
     let y_max = height.saturating_sub(1) as f32;
     let x_position = x_position.clamp(0.0, x_max);
@@ -524,7 +544,7 @@ fn plane_value(bytes: &[u8], stride: usize, x: usize, y: usize, channel: usize) 
 
 fn decode_transfer(value: f32, transfer: ColorTransfer) -> f32 {
     match transfer {
-        ColorTransfer::Bt601 | ColorTransfer::Bt709 | ColorTransfer::Smpte240m => {
+        ColorTransfer::Bt601 | ColorTransfer::Bt709 => {
             if value < 0.081 {
                 value / 4.5
             } else {
@@ -649,6 +669,10 @@ mod tests {
             let Some(transform) = yuv_to_rgb_matrix(matrix, range) else {
                 panic!("SDR fixture transform must exist");
             };
+            assert!(matches!(
+                render_decision(metadata(matrix, range)),
+                ColorRenderDecision::Gpu(gpu_transform) if gpu_transform == transform
+            ));
             let mut rgba = vec![0_u8; 4 * 2 * 4];
             let result = nv12_to_rgba_into(
                 &planes,
@@ -673,7 +697,10 @@ mod tests {
                     let Some(pixel) = rgba.get(output_index..output_index + 3) else {
                         panic!("fixture output pixel must exist");
                     };
-                    let actual = [pixel[0], pixel[1], pixel[2]];
+                    let actual = match pixel {
+                        [red, green, blue] => [*red, *green, *blue],
+                        _ => panic!("fixture pixel must have three RGB bytes"),
+                    };
                     assert!(
                         actual
                             .iter()
@@ -692,15 +719,12 @@ mod tests {
         let bt709 = yuv_to_rgb_matrix(ColorMatrix::Bt709, ColorRange::Limited);
         assert_ne!(bt601, bt709);
         let mut color = metadata(ColorMatrix::Bt601, ColorRange::Limited);
-        assert!(matches!(
-            render_decision(color),
-            ColorRenderDecision::Gpu(_)
-        ));
         color.primaries = ColorPrimaries::Bt709;
         assert!(matches!(
             render_decision(color),
             ColorRenderDecision::Gpu(_)
         ));
+        assert_eq!(yuv_to_rgb_matrix(color.matrix, color.range), bt601);
         color.transfer = ColorTransfer::Bt709;
         assert!(matches!(
             render_decision(color),
@@ -753,5 +777,22 @@ mod tests {
         )
         .is_ok());
         assert_ne!(centered, cosited);
+    }
+
+    #[test]
+    fn bilinear_chroma_keeps_fractional_samples_until_final_quantization() {
+        let bytes = [0, 0, 255, 255, 255, 255, 0, 0];
+        let sample = sample_chroma(
+            &bytes,
+            4,
+            1,
+            1,
+            true,
+            ChromaHorizontal::Centered,
+            ChromaVertical::Centered,
+            2,
+            2,
+        );
+        assert!(sample.fract() > 0.0);
     }
 }
