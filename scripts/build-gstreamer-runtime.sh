@@ -71,6 +71,30 @@ capture_path() {
     printf -v "$result_var" '%s' "$captured"
 }
 
+validate_symlink_target() {
+    local source=$1
+    local boundary_path=$2
+    local description=$3
+    local result_var=$4
+    local target source_parent resolved_target
+
+    capture_path target "$description target at $source" readlink -- "$source"
+    [[ "$target" != /* ]] || {
+        fail "absolute $description target at $source: $target"
+    }
+    source_parent=${source%/*}
+    capture_path resolved_target "$description resolution at $source" \
+        realpath -m -- "$source_parent/$target"
+    case "$resolved_target/" in
+        "$boundary_path/"*)
+            ;;
+        *)
+            fail "$description escapes boundary at $source: $target -> $resolved_target"
+            ;;
+    esac
+    printf -v "$result_var" '%s' "$target"
+}
+
 lock_file=$(realpath "$lock_file")
 output_dir=$(realpath -m "$output_dir")
 
@@ -338,12 +362,21 @@ merge_tree() {
     local source_root=$1
     local destination_root=$2
     local source_list=$3
-    local source_root_path root_mode source_mode destination_mode source source_parent rel destination source_kind source_target destination_target resolved_target
+    local source_boundary=$4
+    local source_boundary_path root_mode source_mode destination_mode source rel destination source_kind source_target destination_target
+
+    (($# == 4)) || fail "package merge requires a source boundary"
+    [[ -d "$source_boundary" && ! -L "$source_boundary" ]] || {
+        fail "package merge source boundary is not a real directory: $source_boundary"
+    }
+    capture_path source_boundary_path "package merge source boundary" realpath -m -- "$source_boundary"
+    [[ -d "$source_boundary_path" && ! -L "$source_boundary_path" ]] || {
+        fail "package merge canonical source boundary is not a real directory: $source_boundary_path"
+    }
 
     [[ -d "$source_root" && ! -L "$source_root" ]] || {
         fail "package merge source root is not a real directory: $source_root"
     }
-    capture_path source_root_path "package merge source root" realpath -m -- "$source_root"
     if ! root_mode=$(stat -c '%a' -- "$source_root"); then
         fail "cannot read package merge source root mode: $source_root"
     fi
@@ -377,19 +410,8 @@ merge_tree() {
 
         if [[ -L "$source" ]]; then
             source_kind=symlink
-            capture_path source_target "package symlink target at $source" readlink -- "$source"
-            [[ "$source_target" != /* ]] || {
-                fail "absolute package symlink target at $source: $source_target"
-            }
-            source_parent=${source%/*}
-            capture_path resolved_target "package symlink resolution at $source" realpath -m -- "$source_parent/$source_target"
-            case "$resolved_target/" in
-                "$source_root_path/"*)
-                    ;;
-                *)
-                    fail "package symlink escapes source root at $source: $source_target -> $resolved_target"
-                    ;;
-            esac
+            validate_symlink_target "$source" "$source_boundary_path" \
+                "package symlink" source_target
         elif [[ -d "$source" ]]; then
             source_kind=directory
         elif [[ -f "$source" ]]; then
@@ -452,6 +474,26 @@ merge_tree() {
     fi
 }
 
+assert_symlink_tree() {
+    local root=$1
+    local root_path symlink_list source source_target
+
+    [[ -d "$root" && ! -L "$root" ]] || {
+        fail "runtime symlink root is not a real directory: $root"
+    }
+    capture_path root_path "runtime symlink root" realpath -m -- "$root"
+    [[ -d "$root_path" && ! -L "$root_path" ]] || {
+        fail "canonical runtime symlink root is not a real directory: $root_path"
+    }
+    symlink_list="$work_dir/runtime-symlinks"
+    if ! find -P "$root" -type l -print0 >"$symlink_list"; then
+        fail "cannot enumerate runtime symlinks: $root"
+    fi
+    while IFS= read -r -d '' source; do
+        validate_symlink_target "$source" "$root_path" "runtime symlink" source_target
+    done <"$symlink_list"
+}
+
 package_count=0
 if ! chmod 0755 "$runtime_root"; then
     fail "cannot set runtime root mode: $runtime_root"
@@ -502,13 +544,15 @@ for package in "${packages[@]}"; do
         fail "cannot read package staging roots: $roots_list"
     fi
     for root in "${actual_roots[@]}"; do
-        merge_tree "$staging/$root" "$runtime_root/$root" "$work_dir/package-$package_count-$root.sources"
+        merge_tree "$staging/$root" "$runtime_root/$root" \
+            "$work_dir/package-$package_count-$root.sources" "$staging"
     done
 done
 [[ "$package_count" == 2 ]] || fail "expected exactly two lock packages, got $package_count"
 if ! chmod 0755 "$runtime_root"; then
     fail "cannot finalize runtime root mode: $runtime_root"
 fi
+assert_symlink_tree "$runtime_root"
 
 launcher="$runtime_root/bin/lumina-gstreamer-runtime"
 mkdir -p "$(dirname -- "$launcher")"
