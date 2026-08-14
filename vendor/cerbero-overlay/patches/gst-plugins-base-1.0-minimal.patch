@@ -32,11 +32,11 @@
 -        Platform.LINUX: ['alsa', 'libdrm', 'x11'],
 +        Platform.LINUX: ['alsa'],
      }
- 
+
      files_bins = ['gst-discoverer-1.0', 'gst-play-1.0', 'gst-device-monitor-1.0']
 @@ -174,9 +171,6 @@
      ]
- 
+
      def prepare(self):
 -        self.enable_plugin('cdparanoia', 'sys', 'cdparanoia', dep='cdparanoia')
 -        self.enable_plugin('ximagesink', 'sys', 'x11', option='x11')

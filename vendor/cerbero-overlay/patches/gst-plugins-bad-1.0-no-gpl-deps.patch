@@ -13,6 +13,6 @@
 -            # These need plugins
 -            self.enable_plugin('frei0r', 'effects', dep='frei0r-plugins')
 +        # Keep the audited closure free of optional codec dependencies.
- 
+
          if self.config.target_platform == Platform.WINDOWS:
              self.meson_options['wasapi'] = 'enabled'

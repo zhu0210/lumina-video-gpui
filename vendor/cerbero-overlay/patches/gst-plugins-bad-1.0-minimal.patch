@@ -94,21 +94,21 @@
      }
 @@ -532,12 +528,8 @@
      }
- 
+
      def prepare(self):
 -        # Enable hardware codecs if variants are enabled since they have
 -        # external dependencies such as SDKs.
 -        self.enable_plugin('msdk', 'codecs', 'intelmsdk')
          self.enable_plugin('va', 'codecs', 'va', dep='libva')
- 
+
 -        self.enable_plugin('rsvg', 'codecs', variant='rust', dep='librsvg')
- 
+
          if self.config.target_subsystem == Subsystem.TVOS_SIMULATOR and self.config.target_arch == Architecture.X86_64:
              # svtav1 plugin fails to link with the static svt-av1 lib on tvOS
 @@ -608,20 +600,6 @@
              self.enable_plugin('mediafoundation', 'sys')
              self.enable_plugin('wasapi2', 'sys')
- 
+
 -        if self.config.target_platform in (Platform.LINUX, Platform.WINDOWS):
 -            self.enable_plugin('nvcodec', 'codecs')
 -            self.files_plugins_devel += [
@@ -125,11 +125,11 @@
 -
          if self.config.target_platform not in (Platform.ANDROID, Platform.WINDOWS):
              self.meson_options['shm'] = 'enabled'
- 
+
 @@ -650,10 +628,6 @@
          if self.config.variants.nodebug:
              self.append_env('CFLAGS', '-DGST_LEVEL_MAX=GST_LEVEL_FIXME')
- 
+
 -        if self.config.target_platform in (Platform.WINDOWS, Platform.LINUX):
 -            if self.config.target_arch == Architecture.X86_64:
 -                self.enable_plugin('svtjpegxs', 'codecs', dep='svt-jpeg-xs')
@@ -140,7 +140,7 @@
 @@ -662,9 +636,6 @@
              # Needs libiconv, which uses Autotools
              self.disable_plugin('zbar', 'codecs', dep='zbar')
- 
+
 -        if self.config.target_platform != Platform.WINDOWS:
 -            self.enable_plugin('unixfd', 'effects')
 -
