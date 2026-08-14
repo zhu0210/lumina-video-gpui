@@ -78,6 +78,11 @@ ffmpeg -hide_banner -loglevel error \
     "$generated_dir/h264-aac.mp4"
 
 ffmpeg -hide_banner -loglevel error \
+    -i "$generated_dir/h264-aac.mp4" -map 0:a:0 -vn -c:a copy \
+    -map_metadata -1 -fflags +bitexact -movflags +faststart \
+    "$generated_dir/audio-aac.m4a"
+
+ffmpeg -hide_banner -loglevel error \
     -f lavfi -i 'testsrc2=size=320x180:rate=30:duration=2' \
     -f lavfi -i 'sine=frequency=550:sample_rate=48000:duration=2' \
     -map 0:v:0 -map 1:a:0 -t 2 \
@@ -149,7 +154,7 @@ generate_hls event "$generated_dir/hls-live" 12
             -show_entries stream=index,codec_type,codec_name,width,height,channels,pix_fmt,color_range,color_space,color_transfer,color_primaries,chroma_location \
             -of compact=p=0:nk=1 "$1"
     }
-    for media in h264-aac.mp4 vp9-opus.mkv vp9-opus.webm dual-aac.mkv; do
+    for media in h264-aac.mp4 audio-aac.m4a vp9-opus.mkv vp9-opus.webm dual-aac.mkv; do
         echo "$media:"
         probe_streams "$generated_dir/$media" | sed 's/^/  /'
     done

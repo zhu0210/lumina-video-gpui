@@ -42,14 +42,23 @@ registry_path=$("$launcher" bash -c 'printf "%s" "$GST_REGISTRY_1_0"')
 case "$registry_path/" in "$runtime/"*|/app/*) exit 1 ;; esac
 [[ "$registry_path" == "$XDG_CACHE_HOME"/*/gstreamer-1.0.registry ]] || exit 1
 
-if [[ "$source_uri" == audio: ]]; then
-    "$launcher" "$runtime/bin/gst-launch-1.0" -e audiotestsrc num-buffers=20 ! audioconvert ! audioresample ! fakesink
-elif [[ "$source_uri" == *hls-live* ]]; then
+if [[ "$source_uri" == *hls-live* ]]; then
+    live_log="$runtime_cache/live-hls.log"
     set +e
-    timeout 15 "$launcher" "$runtime/bin/gst-launch-1.0" -e playbin3 uri="$source_uri" video-sink=fakesink audio-sink=fakesink
+    timeout 15 "$launcher" "$runtime/bin/gst-launch-1.0" -e -v playbin3 uri="$source_uri" \
+        video-sink='fakesink silent=false' audio-sink='fakesink silent=false' \
+        >"$live_log" 2>&1
     status=$?
     set -e
-    [[ "$status" == 0 || "$status" == 124 ]] || exit "$status"
+    if [[ "$status" != 0 && "$status" != 124 ]]; then
+        cat "$live_log" >&2
+        exit "$status"
+    fi
+    if ! grep -F 'last-message = chain' "$live_log" >/dev/null; then
+        echo "live HLS produced no fakesink buffer; gst-launch log: $live_log" >&2
+        cat "$live_log" >&2
+        exit 1
+    fi
 else
     "$launcher" "$runtime/bin/gst-launch-1.0" -e playbin3 uri="$source_uri" video-sink=fakesink audio-sink=fakesink
 fi

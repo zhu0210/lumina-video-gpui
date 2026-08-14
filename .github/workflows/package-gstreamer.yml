@@ -137,8 +137,6 @@ jobs:
 
       - name: Install Flatpak 25.08 toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder jq
           sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           sudo flatpak install -y flathub \
             org.freedesktop.Platform//25.08 \

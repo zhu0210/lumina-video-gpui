@@ -11,6 +11,7 @@ records the tool versions, stream probes, and SHA-256 for every generated file.
 | Fixture | Expected contents |
 | --- | --- |
 | `generated/h264-aac.mp4` | 320x180 H.264 video, AAC-LC stereo, 2 seconds |
+| `generated/audio-aac.m4a` | AAC-LC stereo-only stream copied from the MP4 fixture |
 | `generated/vp9-opus.mkv` | 320x180 VP9 video, Opus stereo, 2 seconds |
 | `generated/vp9-opus.webm` | 320x180 VP9 video, Opus stereo, 2 seconds |
 | `generated/dual-aac.mkv` | 320x180 H.264 video, two AAC-LC stereo tracks, 2 seconds |

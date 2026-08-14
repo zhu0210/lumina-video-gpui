@@ -48,7 +48,7 @@ required_elements=$(jq -er '[.audit.plugin_allowlist[].element] | join(" ")' "$l
 [[ "$builder_image" =~ ^ubuntu@sha256:[[:xdigit:]]{64}$ ]] || exit 1
 [[ "$runtime_libdir" == lib/x86_64-linux-gnu ]] || exit 1
 
-for fixture in h264-aac.mp4 vp9-opus.mkv vp9-opus.webm dual-aac.mkv hls-vod/index.m3u8 hls-live/index.m3u8; do
+for fixture in h264-aac.mp4 audio-aac.m4a vp9-opus.mkv vp9-opus.webm dual-aac.mkv hls-vod/index.m3u8 hls-live/index.m3u8; do
     [[ -f "$fixtures_dir/$fixture" ]] || {
         echo "missing matrix fixture: $fixtures_dir/$fixture" >&2
         exit 1
@@ -146,7 +146,7 @@ matrix_cases=(
     "matroska-vp9-opus|file://$file_root/vp9-opus.mkv|none"
     "webm-vp9-opus|file://$file_root/vp9-opus.webm|none"
     "dual-track-mkv|file://$file_root/dual-aac.mkv|none"
-    "audio|audio:|none"
+    "audio-aac|file://$file_root/audio-aac.m4a|none"
     "hls-vod-http|http://127.0.0.1:$port/hls-vod/index.m3u8|host"
     "hls-live-http|http://127.0.0.1:$port/hls-live/index.m3u8|host"
 )
