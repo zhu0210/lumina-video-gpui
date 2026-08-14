@@ -861,38 +861,37 @@ fn ensure_color_generation(
     color: ColorMetadata,
     decision: ColorRenderDecision,
 ) -> Result<&mut ColorGeneration, ColorGenerationError> {
-    if let Some(current) = generation.as_mut() {
-        if current.extent == extent && current.color == color {
-            return Ok(current);
+    let matches_current = generation
+        .as_ref()
+        .is_some_and(|current| current.extent == extent && current.color == color);
+    if !matches_current {
+        let rgba_pool = match decision {
+            ColorRenderDecision::CpuRgba(_) => RgbaPool::new(extent),
+            ColorRenderDecision::Gpu(_)
+            | ColorRenderDecision::Unsupported
+            | ColorRenderDecision::UnsupportedSdrColor => None,
+        };
+        match decision {
+            ColorRenderDecision::Unsupported => return Err(ColorGenerationError::Unsupported),
+            ColorRenderDecision::UnsupportedSdrColor => {
+                return Err(ColorGenerationError::UnsupportedSdrColor)
+            }
+            ColorRenderDecision::Gpu(_) => {}
+            ColorRenderDecision::CpuRgba(_) if rgba_pool.is_none() => {
+                return Err(ColorGenerationError::UnsupportedSdrColor)
+            }
+            ColorRenderDecision::CpuRgba(_) => {}
         }
+        *generation = Some(ColorGeneration {
+            extent,
+            color,
+            decision,
+            rgba_pool,
+        });
     }
-    let rgba_pool = match decision {
-        ColorRenderDecision::CpuRgba(_) => RgbaPool::new(extent),
-        ColorRenderDecision::Gpu(_)
-        | ColorRenderDecision::Unsupported
-        | ColorRenderDecision::UnsupportedSdrColor => None,
-    };
-    match decision {
-        ColorRenderDecision::Unsupported => return Err(ColorGenerationError::Unsupported),
-        ColorRenderDecision::UnsupportedSdrColor => {
-            return Err(ColorGenerationError::UnsupportedSdrColor)
-        }
-        ColorRenderDecision::Gpu(_) => {}
-        ColorRenderDecision::CpuRgba(_) if rgba_pool.is_none() => {
-            return Err(ColorGenerationError::UnsupportedSdrColor)
-        }
-        ColorRenderDecision::CpuRgba(_) => {}
-    }
-    *generation = Some(ColorGeneration {
-        extent,
-        color,
-        decision,
-        rgba_pool,
-    });
-    match generation.as_mut() {
-        Some(current) => Ok(current),
-        None => Err(ColorGenerationError::UnsupportedSdrColor),
-    }
+    generation
+        .as_mut()
+        .ok_or(ColorGenerationError::UnsupportedSdrColor)
 }
 
 #[derive(Debug)]
