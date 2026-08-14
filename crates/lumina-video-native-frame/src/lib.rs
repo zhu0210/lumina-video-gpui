@@ -407,7 +407,6 @@ pub struct DmaBufFormatPlane {
 /// plane descriptors without allocating or copying them. It validates both
 /// reference layers; allocation and pooling remain producer responsibilities.
 #[cfg(target_os = "linux")]
-#[derive(Clone)]
 pub struct ProducerOwner(Arc<dyn Send + Sync>);
 
 #[cfg(target_os = "linux")]
@@ -415,6 +414,13 @@ impl ProducerOwner {
     /// Retains an opaque producer resource until the native frame lease drops.
     pub fn new<T: Send + Sync + 'static>(owner: T) -> Self {
         Self(Arc::new(owner))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Clone for ProducerOwner {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
     }
 }
 

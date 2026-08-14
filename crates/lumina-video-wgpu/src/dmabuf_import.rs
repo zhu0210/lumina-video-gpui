@@ -1,8 +1,8 @@
-//! Ready Linux DMABuf import for one native NV12 texture.
+//! Linux external DMABuf import for one native NV12 texture.
 //!
-//! This seam only accepts [`AcquireSync::None`]. The producer is therefore
-//! responsible for completing its writes and handing over an ownership-ready
-//! DMABuf. Synchronization and presentation policy stay above this crate.
+//! This seam accepts an exported [`AcquireSync::SyncFile`] without waiting on
+//! it. The normal renderer submission consumes that producer-write snapshot
+//! before sampling the externally owned image.
 
 use crate::zero_copy::linux::{
     find_memory_type_index, EXT_EXTERNAL_MEMORY_DMA_BUF, EXT_IMAGE_DRM_FORMAT_MODIFIER,
@@ -10,9 +10,12 @@ use crate::zero_copy::linux::{
 };
 use ash::vk;
 use lumina_video_native_frame::video::PixelFormat;
-use lumina_video_native_frame::{AcquireSync, DmaBufMemory, NativeFrameLease, NativeMemory};
+use lumina_video_native_frame::{
+    render_decision, AcquireSync, ColorRenderDecision, DmaBufMemory, NativeFrameLease, NativeMemory,
+};
 use std::fmt;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::Arc;
 
 const DRM_FORMAT_NV12: u32 = 0x3231_564e;
 const PLANE_COUNT: usize = 2;
@@ -244,15 +247,17 @@ impl fmt::Display for Nv12ImportPlanError {
 
 impl std::error::Error for Nv12ImportPlanError {}
 
-/// The one Vulkan texture and its two shader-readable plane views.
+/// One imported multiplanar NV12 texture and the renderer acquire fence.
 #[derive(Debug)]
 pub struct ImportedNv12Texture {
-    pub texture: wgpu::Texture,
-    pub plane0: wgpu::TextureView,
-    pub plane1: wgpu::TextureView,
+    pub texture: Arc<wgpu::Texture>,
+    pub sync_file: OwnedFd,
+    pub width: u32,
+    pub height: u32,
+    pub color_transform: [[f32; 4]; 4],
 }
 
-/// Failure from [`import_ready_dmabuf_nv12`]. Every variant retains the source lease.
+/// Failure from [`import_external_dmabuf_nv12`]. Every variant retains the source lease.
 #[derive(Debug)]
 pub enum Nv12ImportError {
     UnsupportedAcquireSync(NativeFrameLease),
@@ -284,9 +289,11 @@ impl fmt::Display for Nv12ImportError {
         match self {
             Self::UnsupportedAcquireSync(_) => write!(
                 f,
-                "ready DMABuf NV12 import accepts only producer-complete AcquireSync::None"
+                "external DMABuf NV12 import requires AcquireSync::SyncFile"
             ),
-            Self::UnsupportedFrame(_) => write!(f, "ready DMABuf NV12 import requires NV12 DMABuf"),
+            Self::UnsupportedFrame(_) => {
+                write!(f, "external DMABuf NV12 import requires NV12 DMABuf")
+            }
             Self::InvalidLayout { reason, .. } => {
                 write!(f, "invalid NV12 DMABuf layout: {reason}")
             }
@@ -304,7 +311,7 @@ struct ValidatedTextureWrap {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadyPreflightError {
+enum ExternalPreflightError {
     UnsupportedAcquireSync,
     UnsupportedFrame,
 }
@@ -334,14 +341,14 @@ fn nv12_memory_plane_aspects() -> [vk::ImageAspectFlags; PLANE_COUNT] {
     ]
 }
 
-fn validate_ready_preflight(
+fn validate_external_preflight(
     acquire: &AcquireSync,
     format: PixelFormat,
     width: u32,
     height: u32,
-) -> Result<(), ReadyPreflightError> {
-    if !matches!(acquire, AcquireSync::None) {
-        return Err(ReadyPreflightError::UnsupportedAcquireSync);
+) -> Result<(), ExternalPreflightError> {
+    if !matches!(acquire, AcquireSync::SyncFile(_)) {
+        return Err(ExternalPreflightError::UnsupportedAcquireSync);
     }
     if format != PixelFormat::Nv12
         || width == 0
@@ -349,7 +356,7 @@ fn validate_ready_preflight(
         || !width.is_multiple_of(2)
         || !height.is_multiple_of(2)
     {
-        return Err(ReadyPreflightError::UnsupportedFrame);
+        return Err(ExternalPreflightError::UnsupportedFrame);
     }
     Ok(())
 }
@@ -364,36 +371,37 @@ fn validated_texture_wrap() -> ValidatedTextureWrap {
     }
 }
 
-/// Imports an ownership-ready NV12 DMABuf as one native wgpu NV12 texture.
+/// Imports an externally owned NV12 DMABuf as one native wgpu NV12 texture.
 ///
-/// The producer must have completed all writes and transferred external
-/// ownership before passing [`AcquireSync::None`]. This function does not make
-/// a Media Session capability claim and does not consume a sync file.
+/// The producer-write snapshot in [`AcquireSync::SyncFile`] is handed to the
+/// renderer; this function never waits for producer completion. The imported
+/// image is externally owned in `GENERAL` through `FOREIGN`, while wgpu tracks
+/// it as [`wgpu::TextureUses::RESOURCE`] until the normal renderer acquire.
 ///
 /// # Safety
 ///
-/// The caller must guarantee that the producer has completed all writes, that
-/// [`AcquireSync::None`] means there is no pending producer fence, and that
-/// queue-family ownership is already renderer-ready. At the moment of this
-/// call, the imported image's actual Vulkan layout and usage must both match
-/// [`wgpu::TextureUses::RESOURCE`]. The lease's descriptor and FD payload must
-/// remain stable and truthful for the duration of the call.
+/// The caller must guarantee that the producer has handed the image to foreign
+/// external ownership in actual Vulkan layout `GENERAL`, and that the
+/// [`AcquireSync::SyncFile`] snapshots unfinished producer writes. The normal
+/// renderer submission consumes that fence before sampling; this importer does
+/// not wait or submit work. The lease's descriptor and FD payload must remain
+/// stable and truthful for the duration of the call.
 #[allow(clippy::result_large_err)]
-pub unsafe fn import_ready_dmabuf_nv12(
+pub unsafe fn import_external_dmabuf_nv12(
     lease: NativeFrameLease,
     device: &wgpu::Device,
 ) -> Result<ImportedNv12Texture, Nv12ImportError> {
-    match validate_ready_preflight(
+    match validate_external_preflight(
         &lease.acquire,
         lease.descriptor.format,
         lease.descriptor.extent.width,
         lease.descriptor.extent.height,
     ) {
         Ok(()) => {}
-        Err(ReadyPreflightError::UnsupportedAcquireSync) => {
+        Err(ExternalPreflightError::UnsupportedAcquireSync) => {
             return Err(Nv12ImportError::UnsupportedAcquireSync(lease));
         }
-        Err(ReadyPreflightError::UnsupportedFrame) => {
+        Err(ExternalPreflightError::UnsupportedFrame) => {
             return Err(Nv12ImportError::UnsupportedFrame(lease));
         }
     }
@@ -726,8 +734,11 @@ fn import_vulkan_nv12(
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
         .usage(vk::ImageUsageFlags::SAMPLED)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        // Vulkan image creation permits UNDEFINED here; this is not the wgpu
-        // tracker state, which is passed explicitly to create_texture_from_hal.
+        // The producer's actual externally owned image is GENERAL/FOREIGN at
+        // this seam. Vulkan image creation permits UNDEFINED here as a
+        // creation-only value; it is not the wgpu tracker state, which is
+        // passed explicitly to create_texture_from_hal, and no transition is
+        // submitted by this importer.
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut external_memory_info)
         .push_next(&mut modifier_info);
@@ -884,13 +895,39 @@ fn import_vulkan_nv12(
         });
     }
 
+    let color_transform = match render_decision(descriptor.color) {
+        ColorRenderDecision::Gpu(transform) => transform,
+        _ => {
+            return Err(Nv12ImportError::ImportFailed {
+                lease: NativeFrameLease {
+                    descriptor,
+                    memory: NativeMemory::DmaBuf(memory),
+                    acquire,
+                },
+                reason: "NV12 external import requires supported SDR color metadata".into(),
+            });
+        }
+    };
+    let sync_file = match acquire {
+        AcquireSync::SyncFile(sync_file) => sync_file,
+        AcquireSync::None => {
+            return Err(Nv12ImportError::UnsupportedAcquireSync(NativeFrameLease {
+                descriptor,
+                memory: NativeMemory::DmaBuf(memory),
+                acquire: AcquireSync::None,
+            }));
+        }
+    };
     let lease = NativeFrameLease {
         descriptor,
         memory: NativeMemory::DmaBuf(memory),
-        acquire,
+        // The original producer fence is moved to ImportedNv12Texture for the
+        // renderer boundary; the HAL callback retains the full backing lease
+        // but must not retain a redundant second fence descriptor.
+        acquire: AcquireSync::None,
     };
     let hal_descriptor = wgpu::hal::TextureDescriptor {
-        label: Some("ready DMABuf NV12"),
+        label: Some("external DMABuf NV12"),
         size: wgpu::Extent3d {
             width,
             height,
@@ -920,7 +957,7 @@ fn import_vulkan_nv12(
         )
     };
     let texture_descriptor = wgpu::TextureDescriptor {
-        label: Some("ready DMABuf NV12"),
+        label: Some("external DMABuf NV12"),
         size: wgpu::Extent3d {
             width,
             height,
@@ -942,20 +979,12 @@ fn import_vulkan_nv12(
             wrap.initial_state,
         )
     };
-    let plane0_view = texture.create_view(&wgpu::TextureViewDescriptor {
-        format: Some(wgpu::TextureFormat::R8Unorm),
-        aspect: wgpu::TextureAspect::Plane0,
-        ..Default::default()
-    });
-    let plane1_view = texture.create_view(&wgpu::TextureViewDescriptor {
-        format: Some(wgpu::TextureFormat::Rg8Unorm),
-        aspect: wgpu::TextureAspect::Plane1,
-        ..Default::default()
-    });
     Ok(ImportedNv12Texture {
-        texture,
-        plane0: plane0_view,
-        plane1: plane1_view,
+        texture: Arc::new(texture),
+        sync_file,
+        width,
+        height,
+        color_transform,
     })
 }
 
@@ -1202,20 +1231,24 @@ mod tests {
     }
 
     #[test]
-    fn ready_preflight_rejects_fences_zero_and_odd_extents(
+    fn external_preflight_rejects_missing_fences_zero_and_odd_extents(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let sync_file = AcquireSync::SyncFile(OwnedFd::from(File::open("/dev/null")?));
         assert_eq!(
-            validate_ready_preflight(&sync_file, PixelFormat::Nv12, 2, 2),
-            Err(ReadyPreflightError::UnsupportedAcquireSync)
+            validate_external_preflight(&sync_file, PixelFormat::Nv12, 2, 2),
+            Ok(())
         );
         assert_eq!(
-            validate_ready_preflight(&AcquireSync::None, PixelFormat::Nv12, 0, 2),
-            Err(ReadyPreflightError::UnsupportedFrame)
+            validate_external_preflight(&sync_file, PixelFormat::Nv12, 0, 2),
+            Err(ExternalPreflightError::UnsupportedFrame)
         );
         assert_eq!(
-            validate_ready_preflight(&AcquireSync::None, PixelFormat::Nv12, 3, 2),
-            Err(ReadyPreflightError::UnsupportedFrame)
+            validate_external_preflight(&AcquireSync::None, PixelFormat::Nv12, 2, 2),
+            Err(ExternalPreflightError::UnsupportedAcquireSync)
+        );
+        assert_eq!(
+            validate_external_preflight(&sync_file, PixelFormat::Nv12, 3, 2),
+            Err(ExternalPreflightError::UnsupportedFrame)
         );
         Ok(())
     }

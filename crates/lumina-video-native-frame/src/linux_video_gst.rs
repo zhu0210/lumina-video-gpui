@@ -300,21 +300,6 @@ fn pixel_format_from_drm_fourcc(fourcc: u32) -> Option<PixelFormat> {
     }
 }
 
-fn drm_fourcc_name(name: &str) -> Option<u32> {
-    match name.trim().to_ascii_uppercase().as_str() {
-        "NV12" => Some(drm_fourcc::DrmFourcc::Nv12 as u32),
-        "YU12" | "I420" => Some(drm_fourcc::DrmFourcc::Yuv420 as u32),
-        "YV12" => Some(drm_fourcc::DrmFourcc::Yvu420 as u32),
-        "ARGB" | "AR24" => Some(drm_fourcc::DrmFourcc::Argb8888 as u32),
-        "ABGR" | "AB24" => Some(drm_fourcc::DrmFourcc::Abgr8888 as u32),
-        "XRGB" | "XR24" => Some(drm_fourcc::DrmFourcc::Xrgb8888 as u32),
-        "XBGR" | "XB24" => Some(drm_fourcc::DrmFourcc::Xbgr8888 as u32),
-        "RGBA" => Some(drm_fourcc::DrmFourcc::Rgba8888 as u32),
-        "BGRA" => Some(drm_fourcc::DrmFourcc::Bgra8888 as u32),
-        _ => None,
-    }
-}
-
 fn drm_fourcc_for_video_format(format: gst_video::VideoFormat) -> Option<u32> {
     match format {
         gst_video::VideoFormat::Bgra | gst_video::VideoFormat::Bgrx => {
@@ -348,12 +333,12 @@ fn native_layout(
 ) -> Option<(PixelFormat, u32, Option<u64>)> {
     let caps = sample.caps()?;
     let structure = caps.structure(0)?;
-    let dma_drm = gst_video::is_dma_drm_caps(caps.as_ref())
+    let dma_drm = gst_video::is_dma_drm_caps(caps)
         || structure
             .get::<String>("format")
             .is_ok_and(|format| format == "DMA_DRM");
     if dma_drm {
-        let info = gst_video::VideoInfoDmaDrm::from_caps(caps.as_ref()).ok()?;
+        let info = gst_video::VideoInfoDmaDrm::from_caps(caps).ok()?;
         let fourcc = info.fourcc();
         let format = pixel_format_from_drm_fourcc(fourcc)?;
         let modifier = structure
@@ -406,6 +391,7 @@ fn negotiated_video_caps() -> gst::Caps {
 fn pipeline_has_hardware_video_decoder(pipeline: &gst::Pipeline) -> bool {
     pipeline
         .iterate_recurse()
+        .into_iter()
         .filter_map(Result::ok)
         .any(|element| {
             element.factory().is_some_and(|factory| {
@@ -1407,7 +1393,7 @@ impl GStreamerDecoder {
         let mut initial_selected_audio_stream_id = None;
         let mut initial_selected_video_stream_ids = Vec::new();
         let mut initial_pipeline_observation = GstPipelineObservation::default();
-        let mut hardware_decoder_selected = false;
+        let hardware_decoder_selected;
 
         // Track buffering during init (in case 100% is reached before decode loop starts)
         let mut init_buffering_percent = 0i32;
@@ -1438,10 +1424,9 @@ impl GStreamerDecoder {
             match msg.view() {
                 gst::MessageView::AsyncDone(_) => {
                     Self::query_pipeline_observation(&pipeline, &mut initial_pipeline_observation);
-                    hardware_decoder_selected = pipeline_has_hardware_video_decoder(&pipeline);
-                    if requested_tier != CapabilityTier::SystemMemoryUpload
-                        && !hardware_decoder_selected
-                    {
+                    let selected = pipeline_has_hardware_video_decoder(&pipeline);
+                    hardware_decoder_selected = selected;
+                    if requested_tier != CapabilityTier::SystemMemoryUpload && !selected {
                         appsink.set_caps(Some(&system_memory_caps()));
                         if let Some(sink_pad) = appsink.static_pad("sink") {
                             if !sink_pad.push_event(gst::event::Reconfigure::new()) {

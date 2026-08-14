@@ -207,7 +207,12 @@ struct SnapshotState {
 }
 
 impl SnapshotState {
-    fn new(capability: CapabilityTier) -> Self {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::with_capability(CapabilityTier::SystemMemoryUpload)
+    }
+
+    fn with_capability(capability: CapabilityTier) -> Self {
         Self {
             snapshot: RwLock::new(SessionSnapshot::new(capability)),
             position_us: AtomicU64::new(0),
@@ -1696,7 +1701,7 @@ impl GstMediaSession {
         let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let frame_drop_receiver = frame_receiver.clone();
-        let state = Arc::new(SnapshotState::new(requested_tier));
+        let state = Arc::new(SnapshotState::with_capability(requested_tier));
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
         let lifecycle_control = GstLifecycleControl::new();
