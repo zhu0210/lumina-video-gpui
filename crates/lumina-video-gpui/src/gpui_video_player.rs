@@ -91,6 +91,45 @@ impl PresentationTransition {
 }
 
 #[cfg(target_os = "linux")]
+fn active_playback_state(state: &VideoState) -> bool {
+    matches!(
+        state,
+        VideoState::Playing { .. } | VideoState::Buffering { .. }
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn sync_downgrade_budget(
+    active: bool,
+    remaining: Option<Duration>,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> (Option<Duration>, Option<Instant>) {
+    if active {
+        if deadline.is_some() {
+            return (remaining, deadline);
+        }
+        let Some(remaining) = remaining else {
+            return (None, None);
+        };
+        (
+            Some(remaining),
+            Some(now.checked_add(remaining).unwrap_or(now)),
+        )
+    } else {
+        let remaining = deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .or(remaining);
+        (remaining, None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn downgrade_budget_expired(active: bool, deadline: Option<Instant>, now: Instant) -> bool {
+    active && deadline.is_some_and(|deadline| now >= deadline)
+}
+
+#[cfg(target_os = "linux")]
 struct DirectImportWorker {
     input: Sender<lumina_video_native_frame::NativeFrameLease>,
     input_drop: Receiver<lumina_video_native_frame::NativeFrameLease>,
@@ -297,6 +336,8 @@ pub struct GpuiVideoPlayer {
     #[cfg(target_os = "linux")]
     transition_deadline: Option<Instant>,
     #[cfg(target_os = "linux")]
+    remaining_downgrade_budget: Option<Duration>,
+    #[cfg(target_os = "linux")]
     pending_external: Option<ExternalPresentation>,
     #[cfg(target_os = "linux")]
     direct_display: Option<ExternalPresentation>,
@@ -399,6 +440,8 @@ impl GpuiVideoPlayer {
             presentation_transition: PresentationTransition::Direct,
             #[cfg(target_os = "linux")]
             transition_deadline: None,
+            #[cfg(target_os = "linux")]
+            remaining_downgrade_budget: None,
             #[cfg(target_os = "linux")]
             pending_external: None,
             #[cfg(target_os = "linux")]
@@ -525,6 +568,7 @@ impl GpuiVideoPlayer {
             self.direct_alias_supported = None;
             self.presentation_transition = PresentationTransition::Direct;
             self.transition_deadline = None;
+            self.remaining_downgrade_budget = None;
             self.request_external_retirement();
         }
     }
@@ -591,6 +635,7 @@ impl GpuiVideoPlayer {
             self.direct_alias_supported = None;
             self.presentation_transition = PresentationTransition::Direct;
             self.transition_deadline = None;
+            self.remaining_downgrade_budget = None;
             self.request_external_retirement();
             self.session = Some(
                 GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
@@ -627,6 +672,7 @@ impl GpuiVideoPlayer {
             self.direct_alias_supported = None;
             self.presentation_transition = PresentationTransition::Direct;
             self.transition_deadline = None;
+            self.remaining_downgrade_budget = None;
             self.request_external_retirement();
             self.session = Some(
                 GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
@@ -866,10 +912,7 @@ impl GpuiVideoPlayer {
 
     #[cfg(target_os = "linux")]
     pub fn frame_realization(&self) -> Option<FrameRealization> {
-        self.session
-            .as_ref()
-            .and_then(GstMediaSession::frame_realization)
-            .or(self.frame_realization)
+        self.frame_realization
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -880,7 +923,15 @@ impl GpuiVideoPlayer {
     #[cfg(target_os = "linux")]
     /// Returns the capability tier last committed by the renderer.
     pub fn capability(&self) -> Option<CapabilityTier> {
-        self.session.as_ref().map(GstMediaSession::capability)
+        self.frame_realization
+            .map(FrameRealization::capability_tier)
+            .or(match self.presentation_transition {
+                PresentationTransition::Direct | PresentationTransition::Downgrading => {
+                    Some(CapabilityTier::DirectAlias)
+                }
+                PresentationTransition::SystemMemory => Some(CapabilityTier::SystemMemoryUpload),
+                PresentationTransition::Fatal => Some(CapabilityTier::DirectAlias),
+            })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -939,7 +990,6 @@ impl GpuiVideoPlayer {
         self.pending_external_retirement = false;
         self.pending_external = None;
         self.direct_display = None;
-        self.frame_realization = None;
     }
 
     #[cfg(target_os = "linux")]
@@ -962,14 +1012,22 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
-    fn report_renderer_outcome(
-        &self,
-        outcome: RendererOutcome,
-        realization: Option<FrameRealization>,
-    ) {
+    fn report_renderer_outcome(&self, outcome: RendererOutcome) {
         if let Some(session) = self.session.as_ref() {
-            session.report_renderer_outcome(outcome, realization);
+            session.report_renderer_outcome(outcome);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_realization(&mut self, realization: FrameRealization) -> bool {
+        if self.frame_realization == Some(realization) {
+            return false;
+        }
+        self.frame_realization = Some(realization);
+        if let Some(session) = self.session.as_ref() {
+            session.commit_realization(realization);
+        }
+        true
     }
 
     #[cfg(target_os = "linux")]
@@ -991,6 +1049,7 @@ impl GpuiVideoPlayer {
         let reason = reason.into();
         self.presentation_transition = PresentationTransition::Fatal;
         self.transition_deadline = None;
+        self.remaining_downgrade_budget = None;
         self.direct_alias_supported = Some(false);
         self.direct_import = None;
         self.pending_external = None;
@@ -1007,6 +1066,22 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
+    fn set_video_state(&mut self, state: VideoState) {
+        self.state = state;
+        if self.presentation_transition != PresentationTransition::Downgrading {
+            return;
+        }
+        let (remaining, deadline) = sync_downgrade_budget(
+            active_playback_state(&self.state),
+            self.remaining_downgrade_budget,
+            self.transition_deadline,
+            Instant::now(),
+        );
+        self.remaining_downgrade_budget = remaining;
+        self.transition_deadline = deadline;
+    }
+
+    #[cfg(target_os = "linux")]
     fn begin_system_memory_downgrade(
         &mut self,
         outcome: Option<RendererOutcome>,
@@ -1016,13 +1091,17 @@ impl GpuiVideoPlayer {
         match self.presentation_transition {
             PresentationTransition::Direct => {
                 self.presentation_transition = self.presentation_transition.after_downgrade();
-                let now = Instant::now();
-                self.transition_deadline = Some(
-                    now.checked_add(self.config.lifecycle_timeout)
-                        .unwrap_or(now),
+                self.remaining_downgrade_budget = Some(self.config.lifecycle_timeout);
+                let (remaining, deadline) = sync_downgrade_budget(
+                    active_playback_state(&self.state),
+                    self.remaining_downgrade_budget,
+                    None,
+                    Instant::now(),
                 );
+                self.remaining_downgrade_budget = remaining;
+                self.transition_deadline = deadline;
                 if let Some(outcome) = outcome {
-                    self.report_renderer_outcome(outcome, None);
+                    self.report_renderer_outcome(outcome);
                 }
                 self.report_downgrade_reason(downgrade_reason);
                 self.direct_alias_supported = Some(false);
@@ -1039,7 +1118,7 @@ impl GpuiVideoPlayer {
             }
             PresentationTransition::Downgrading | PresentationTransition::SystemMemory => {
                 if let Some(outcome) = outcome {
-                    self.report_renderer_outcome(outcome, None);
+                    self.report_renderer_outcome(outcome);
                 }
                 self.fail_presentation_transition(
                     Some(downgrade_reason),
@@ -1052,13 +1131,12 @@ impl GpuiVideoPlayer {
 
     #[cfg(target_os = "linux")]
     fn check_presentation_transition_timeout(&mut self) {
-        if self.presentation_transition != PresentationTransition::Downgrading {
+        if self.presentation_transition != PresentationTransition::Downgrading
+            || !active_playback_state(&self.state)
+        {
             return;
         }
-        if self
-            .transition_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        if downgrade_budget_expired(true, self.transition_deadline, Instant::now()) {
             self.fail_presentation_transition(
                 Some(CapabilityDowngradeReason::TransitionTimeout),
                 "system-memory presentation transition timed out",
@@ -1082,8 +1160,10 @@ impl GpuiVideoPlayer {
             reason,
             CapabilityDowngradeReason::HardwareOpenFailure
                 | CapabilityDowngradeReason::HardwareDecodeFailure
+                | CapabilityDowngradeReason::HardwareUnavailable
                 | CapabilityDowngradeReason::UnsafeSync
                 | CapabilityDowngradeReason::UnsupportedImport
+                | CapabilityDowngradeReason::UnsupportedColor
         ) {
             self.begin_system_memory_downgrade(None, reason, false);
         }
@@ -1093,9 +1173,9 @@ impl GpuiVideoPlayer {
     fn commit_cpu_frame(&mut self, window: &mut Window, realization: FrameRealization) {
         self.presentation_transition = PresentationTransition::SystemMemory;
         self.transition_deadline = None;
+        self.remaining_downgrade_budget = None;
         self.retire_external_frame_now(window);
-        self.frame_realization = Some(realization);
-        self.report_renderer_outcome(RendererOutcome::Accepted, Some(realization));
+        let _ = self.commit_realization(realization);
     }
 
     #[cfg(target_os = "linux")]
@@ -1168,30 +1248,23 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
-    fn renderer_outcome(outcome: gpui_wgpu::ExternalFrameOutcome) -> RendererOutcome {
-        match outcome {
-            gpui_wgpu::ExternalFrameOutcome::Accepted => RendererOutcome::Accepted,
-            gpui_wgpu::ExternalFrameOutcome::Unsupported => RendererOutcome::Unsupported,
-            gpui_wgpu::ExternalFrameOutcome::TransientFailure => RendererOutcome::TransientFailure,
-            gpui_wgpu::ExternalFrameOutcome::FatalFailure => RendererOutcome::FatalFailure,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn renderer_downgrade_reason(
+    fn renderer_feedback(
         outcome: gpui_wgpu::ExternalFrameOutcome,
-    ) -> Option<CapabilityDowngradeReason> {
+    ) -> (RendererOutcome, Option<CapabilityDowngradeReason>) {
         match outcome {
-            gpui_wgpu::ExternalFrameOutcome::Accepted => None,
-            gpui_wgpu::ExternalFrameOutcome::Unsupported => {
-                Some(CapabilityDowngradeReason::RendererUnsupported)
-            }
-            gpui_wgpu::ExternalFrameOutcome::TransientFailure => {
-                Some(CapabilityDowngradeReason::RendererTransientFailure)
-            }
-            gpui_wgpu::ExternalFrameOutcome::FatalFailure => {
-                Some(CapabilityDowngradeReason::RendererFatalFailure)
-            }
+            gpui_wgpu::ExternalFrameOutcome::Accepted => (RendererOutcome::Accepted, None),
+            gpui_wgpu::ExternalFrameOutcome::Unsupported => (
+                RendererOutcome::Unsupported,
+                Some(CapabilityDowngradeReason::RendererUnsupported),
+            ),
+            gpui_wgpu::ExternalFrameOutcome::TransientFailure => (
+                RendererOutcome::TransientFailure,
+                Some(CapabilityDowngradeReason::RendererTransientFailure),
+            ),
+            gpui_wgpu::ExternalFrameOutcome::FatalFailure => (
+                RendererOutcome::FatalFailure,
+                Some(CapabilityDowngradeReason::RendererFatalFailure),
+            ),
         }
     }
 
@@ -1241,19 +1314,20 @@ impl GpuiVideoPlayer {
             self.direct_display = Some(pending);
             let Some(realization) = self.direct_frame_realization() else {
                 self.fail_presentation_transition(
-                    Some(CapabilityDowngradeReason::RendererFatalFailure),
+                    None,
                     "decoder mode unavailable for direct frame",
                 );
                 return;
             };
-            self.frame_realization = Some(realization);
-            self.report_renderer_outcome(RendererOutcome::Accepted, Some(realization));
+            if self.commit_realization(realization) {
+                self.report_renderer_outcome(RendererOutcome::Accepted);
+            }
         } else {
             self.pending_external = None;
-            let Some(reason) = Self::renderer_downgrade_reason(outcome) else {
+            let (renderer_outcome, Some(reason)) = Self::renderer_feedback(outcome) else {
                 return;
             };
-            self.disable_direct_import(Self::renderer_outcome(outcome), reason);
+            self.disable_direct_import(renderer_outcome, reason);
         }
     }
 
@@ -1297,10 +1371,10 @@ impl GpuiVideoPlayer {
             gpui_wgpu::ExternalFrameOutcome::Unsupported
             | gpui_wgpu::ExternalFrameOutcome::TransientFailure
             | gpui_wgpu::ExternalFrameOutcome::FatalFailure => {
-                let Some(reason) = Self::renderer_downgrade_reason(outcome) else {
+                let (renderer_outcome, Some(reason)) = Self::renderer_feedback(outcome) else {
                     return;
                 };
-                self.disable_direct_import(Self::renderer_outcome(outcome), reason);
+                self.disable_direct_import(renderer_outcome, reason);
             }
         }
     }
@@ -1566,7 +1640,7 @@ impl GpuiVideoPlayer {
                             PresentationDecision::Hold
                         }
                         SessionEvent::StateChanged { state } => {
-                            self.state = video_state(&state);
+                            self.set_video_state(video_state(&state));
                             if !self.initialized && matches!(state, CoreSessionState::Ready) {
                                 self.initialized = true;
                                 if self.config.autoplay {
@@ -1586,7 +1660,7 @@ impl GpuiVideoPlayer {
                             PresentationDecision::Advanced(frame)
                         }
                         SessionEvent::Ended => {
-                            self.state = VideoState::Ended;
+                            self.set_video_state(VideoState::Ended);
                             if self.has_presented_frame {
                                 PresentationDecision::Hold
                             } else {
@@ -1594,7 +1668,7 @@ impl GpuiVideoPlayer {
                             }
                         }
                         SessionEvent::Error(error) => {
-                            self.state = VideoState::Error(video_error(&error));
+                            self.set_video_state(VideoState::Error(video_error(&error)));
                             if self.presentation_transition == PresentationTransition::Downgrading
                                 || matches!(&error, SessionError::Fatal(_))
                             {
@@ -1619,7 +1693,7 @@ impl GpuiVideoPlayer {
                 }
             }
             Err(error) => {
-                self.state = VideoState::Error(video_error(&error));
+                self.set_video_state(VideoState::Error(video_error(&error)));
                 if self.presentation_transition == PresentationTransition::Downgrading {
                     self.fail_presentation_transition(
                         None,
@@ -1661,7 +1735,7 @@ impl GpuiVideoPlayer {
                         self.frame_textures = Some(textures);
                         let Some(realization) = realization else {
                             self.fail_presentation_transition(
-                                Some(CapabilityDowngradeReason::RendererFatalFailure),
+                                None,
                                 "decoder mode unavailable for CPU frame",
                             );
                             return;
@@ -2132,6 +2206,7 @@ mod direct_route_state_tests {
     use crossbeam_channel::bounded;
     use gpui_wgpu::ExternalFrameOutcome;
     use lumina_video_core::session::{CapabilityDowngradeReason, RendererOutcome};
+    use std::time::Duration;
 
     #[test]
     fn delayed_acceptance_is_the_only_direct_alias_certification() {
@@ -2159,37 +2234,64 @@ mod direct_route_state_tests {
     #[test]
     fn renderer_outcomes_map_without_collapsing_failure_kinds() {
         assert_eq!(
-            GpuiVideoPlayer::renderer_outcome(ExternalFrameOutcome::Accepted),
-            RendererOutcome::Accepted
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::Accepted),
+            (RendererOutcome::Accepted, None)
         );
         assert_eq!(
-            GpuiVideoPlayer::renderer_outcome(ExternalFrameOutcome::Unsupported),
-            RendererOutcome::Unsupported
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::Unsupported),
+            (
+                RendererOutcome::Unsupported,
+                Some(CapabilityDowngradeReason::RendererUnsupported)
+            )
         );
         assert_eq!(
-            GpuiVideoPlayer::renderer_outcome(ExternalFrameOutcome::TransientFailure),
-            RendererOutcome::TransientFailure
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::TransientFailure),
+            (
+                RendererOutcome::TransientFailure,
+                Some(CapabilityDowngradeReason::RendererTransientFailure)
+            )
         );
         assert_eq!(
-            GpuiVideoPlayer::renderer_outcome(ExternalFrameOutcome::FatalFailure),
-            RendererOutcome::FatalFailure
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::FatalFailure),
+            (
+                RendererOutcome::FatalFailure,
+                Some(CapabilityDowngradeReason::RendererFatalFailure)
+            )
         );
-        assert_eq!(
-            GpuiVideoPlayer::renderer_downgrade_reason(ExternalFrameOutcome::Unsupported),
-            Some(CapabilityDowngradeReason::RendererUnsupported)
-        );
-        assert_eq!(
-            GpuiVideoPlayer::renderer_downgrade_reason(ExternalFrameOutcome::TransientFailure),
-            Some(CapabilityDowngradeReason::RendererTransientFailure)
-        );
-        assert_eq!(
-            GpuiVideoPlayer::renderer_downgrade_reason(ExternalFrameOutcome::FatalFailure),
-            Some(CapabilityDowngradeReason::RendererFatalFailure)
-        );
-        assert_eq!(
-            GpuiVideoPlayer::renderer_downgrade_reason(ExternalFrameOutcome::Accepted),
-            None
-        );
+    }
+
+    #[test]
+    fn downgrade_budget_pauses_and_resumes_without_background_expiry() {
+        let base = std::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+        let (remaining, deadline) = super::sync_downgrade_budget(false, Some(timeout), None, base);
+        assert_eq!(remaining, Some(timeout));
+        assert!(deadline.is_none());
+
+        let (remaining, deadline) = super::sync_downgrade_budget(true, remaining, deadline, base);
+        assert_eq!(deadline, Some(base + timeout));
+
+        let pause_at = base + Duration::from_millis(750);
+        let (remaining, deadline) =
+            super::sync_downgrade_budget(false, remaining, deadline, pause_at);
+        assert_eq!(remaining, Some(Duration::from_millis(1250)));
+        assert!(deadline.is_none());
+
+        let resume_at = pause_at + Duration::from_millis(500);
+        let (remaining, deadline) =
+            super::sync_downgrade_budget(true, remaining, deadline, resume_at);
+        assert_eq!(remaining, Some(Duration::from_millis(1250)));
+        assert_eq!(deadline, Some(resume_at + Duration::from_millis(1250)));
+        assert!(!super::downgrade_budget_expired(
+            false,
+            deadline,
+            resume_at + timeout
+        ));
+        assert!(super::downgrade_budget_expired(
+            true,
+            deadline,
+            resume_at + Duration::from_millis(1250)
+        ));
     }
 
     #[test]

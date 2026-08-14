@@ -7,7 +7,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -194,7 +194,9 @@ impl PresentationDecision {
 #[derive(Debug)]
 struct SnapshotState {
     snapshot: RwLock<SessionSnapshot>,
-    decode_mode: RwLock<Option<DecodeMode>>,
+    decode_mode: AtomicU8,
+    latest_renderer_outcome: AtomicU8,
+    latest_downgrade_reason: AtomicU8,
     position_us: AtomicU64,
     audio_connected: AtomicBool,
     audio_buffers_seen: AtomicU64,
@@ -217,7 +219,9 @@ impl SnapshotState {
     fn with_capability(capability: CapabilityTier) -> Self {
         Self {
             snapshot: RwLock::new(SessionSnapshot::new(capability)),
-            decode_mode: RwLock::new(None),
+            decode_mode: AtomicU8::new(0),
+            latest_renderer_outcome: AtomicU8::new(0),
+            latest_downgrade_reason: AtomicU8::new(0),
             position_us: AtomicU64::new(0),
             audio_connected: AtomicBool::new(false),
             audio_buffers_seen: AtomicU64::new(0),
@@ -247,21 +251,101 @@ fn publish_capability_if_changed(
 }
 
 fn record_downgrade_reason(state: &SnapshotState, reason: CapabilityDowngradeReason) {
-    state.snapshot.write().latest_downgrade_reason = Some(reason);
+    state
+        .latest_downgrade_reason
+        .store(encode_downgrade_reason(Some(reason)), Ordering::Relaxed);
 }
 
-fn record_renderer_outcome(
-    state: &SnapshotState,
-    outcome: RendererOutcome,
-    realization: Option<FrameRealization>,
-) {
+fn record_renderer_outcome(state: &SnapshotState, outcome: RendererOutcome) {
+    state
+        .latest_renderer_outcome
+        .store(encode_renderer_outcome(Some(outcome)), Ordering::Relaxed);
+}
+
+fn record_realization(state: &SnapshotState, realization: FrameRealization) {
     let mut snapshot = state.snapshot.write();
-    snapshot.latest_renderer_outcome = Some(outcome);
-    if matches!(outcome, RendererOutcome::Accepted) {
-        if let Some(realization) = realization {
-            snapshot.capability = realization.capability_tier();
-            snapshot.frame_realization = Some(realization);
-        }
+    snapshot.capability = realization.capability_tier();
+    snapshot.frame_realization = Some(realization);
+}
+
+const fn encode_decode_mode(mode: Option<DecodeMode>) -> u8 {
+    match mode {
+        None => 0,
+        Some(DecodeMode::Hardware) => 1,
+        Some(DecodeMode::Software) => 2,
+    }
+}
+
+const fn decode_decode_mode(value: u8) -> Option<DecodeMode> {
+    match value {
+        1 => Some(DecodeMode::Hardware),
+        2 => Some(DecodeMode::Software),
+        _ => None,
+    }
+}
+
+const fn encode_renderer_outcome(outcome: Option<RendererOutcome>) -> u8 {
+    match outcome {
+        None => 0,
+        Some(RendererOutcome::Accepted) => 1,
+        Some(RendererOutcome::Unsupported) => 2,
+        Some(RendererOutcome::TransientFailure) => 3,
+        Some(RendererOutcome::FatalFailure) => 4,
+    }
+}
+
+const fn decode_renderer_outcome(value: u8) -> Option<RendererOutcome> {
+    match value {
+        1 => Some(RendererOutcome::Accepted),
+        2 => Some(RendererOutcome::Unsupported),
+        3 => Some(RendererOutcome::TransientFailure),
+        4 => Some(RendererOutcome::FatalFailure),
+        _ => None,
+    }
+}
+
+const fn encode_downgrade_reason(reason: Option<CapabilityDowngradeReason>) -> u8 {
+    match reason {
+        None => 0,
+        Some(CapabilityDowngradeReason::HardwareOpenFailure) => 1,
+        Some(CapabilityDowngradeReason::HardwareDecodeFailure) => 2,
+        Some(CapabilityDowngradeReason::HardwareUnavailable) => 3,
+        Some(CapabilityDowngradeReason::RendererUnsupported) => 4,
+        Some(CapabilityDowngradeReason::RendererTransientFailure) => 5,
+        Some(CapabilityDowngradeReason::RendererFatalFailure) => 6,
+        Some(CapabilityDowngradeReason::UnsafeSync) => 7,
+        Some(CapabilityDowngradeReason::UnsupportedImport) => 8,
+        Some(CapabilityDowngradeReason::TransientImport) => 9,
+        Some(CapabilityDowngradeReason::UnsupportedColor) => 10,
+        Some(CapabilityDowngradeReason::TransitionTimeout) => 11,
+    }
+}
+
+const fn decode_downgrade_reason(value: u8) -> Option<CapabilityDowngradeReason> {
+    match value {
+        1 => Some(CapabilityDowngradeReason::HardwareOpenFailure),
+        2 => Some(CapabilityDowngradeReason::HardwareDecodeFailure),
+        3 => Some(CapabilityDowngradeReason::HardwareUnavailable),
+        4 => Some(CapabilityDowngradeReason::RendererUnsupported),
+        5 => Some(CapabilityDowngradeReason::RendererTransientFailure),
+        6 => Some(CapabilityDowngradeReason::RendererFatalFailure),
+        7 => Some(CapabilityDowngradeReason::UnsafeSync),
+        8 => Some(CapabilityDowngradeReason::UnsupportedImport),
+        9 => Some(CapabilityDowngradeReason::TransientImport),
+        10 => Some(CapabilityDowngradeReason::UnsupportedColor),
+        11 => Some(CapabilityDowngradeReason::TransitionTimeout),
+        _ => None,
+    }
+}
+
+impl SnapshotState {
+    fn snapshot_with_atomics(&self) -> SessionSnapshot {
+        let mut snapshot = self.snapshot.read().clone();
+        snapshot.latest_renderer_outcome =
+            decode_renderer_outcome(self.latest_renderer_outcome.load(Ordering::Relaxed));
+        snapshot.latest_downgrade_reason =
+            decode_downgrade_reason(self.latest_downgrade_reason.load(Ordering::Relaxed));
+        snapshot
     }
 }
 
@@ -1077,7 +1161,10 @@ fn seed_worker_spawn_failure(state: &Arc<SnapshotState>, control_sender: &Contro
 }
 
 fn publish_decode_mode(state: &Arc<SnapshotState>, decoder: &GStreamerDecoder) {
-    *state.decode_mode.write() = Some(decoder.decode_mode());
+    state.decode_mode.store(
+        encode_decode_mode(Some(decoder.decode_mode())),
+        Ordering::Relaxed,
+    );
 }
 
 fn is_decode_or_open_failure(error: &VideoError) -> bool {
@@ -1197,6 +1284,7 @@ fn run_worker(
     };
     let mut fallback_attempted = false;
     let mut automatic_downgrade_recorded = false;
+    let mut unsupported_color_recorded = false;
     let mut decoder =
         match GStreamerDecoder::new_with_requested_tier_and_audio_sink_and_timeouts_and_control_and_tls_ca_file(
             &source,
@@ -1251,6 +1339,12 @@ fn run_worker(
             }
         };
     publish_decode_mode(&state, &decoder);
+    if requested_tier == CapabilityTier::DirectAlias
+        && !fallback_attempted
+        && decoder.decode_mode() == DecodeMode::Software
+    {
+        record_downgrade_reason(&state, CapabilityDowngradeReason::HardwareUnavailable);
+    }
     let mut published_capability = requested_tier;
     if decoder.active_tier() != CapabilityTier::SystemMemoryUpload {
         publish_capability_if_changed(&state, &mut published_capability, decoder.active_tier());
@@ -1549,6 +1643,14 @@ fn run_worker(
                 } else {
                     CapabilityTier::SystemMemoryUpload
                 };
+                if !unsupported_color_recorded
+                    && active_tier != CapabilityTier::SystemMemoryUpload
+                    && settled_tier == CapabilityTier::SystemMemoryUpload
+                    && matches!(frame_color_decision, ColorRenderDecision::CpuRgba(_))
+                {
+                    unsupported_color_recorded = true;
+                    record_downgrade_reason(&state, CapabilityDowngradeReason::UnsupportedColor);
+                }
                 let acquire = if matches!(&memory, NativeMemory::DmaBuf(_)) {
                     frame_acquire
                 } else {
@@ -2050,17 +2152,17 @@ impl GstMediaSession {
 
     /// Returns the decoder mode selected by GStreamer after preroll.
     pub fn decode_mode(&self) -> Option<DecodeMode> {
-        *self.state.decode_mode.read()
+        decode_decode_mode(self.state.decode_mode.load(Ordering::Relaxed))
     }
 
-    /// Records one renderer outcome and commits a realization only after the
-    /// renderer accepted that frame.
-    pub fn report_renderer_outcome(
-        &self,
-        outcome: RendererOutcome,
-        realization: Option<FrameRealization>,
-    ) {
-        record_renderer_outcome(&self.state, outcome, realization);
+    /// Records one renderer outcome without committing frame realization.
+    pub fn report_renderer_outcome(&self, outcome: RendererOutcome) {
+        record_renderer_outcome(&self.state, outcome);
+    }
+
+    /// Commits a frame realization after its first successful presentation.
+    pub fn commit_realization(&self, realization: FrameRealization) {
+        record_realization(&self.state, realization);
     }
 
     /// Records the latest typed capability downgrade reason.
@@ -2080,12 +2182,12 @@ impl GstMediaSession {
 
     /// Returns the latest typed renderer outcome.
     pub fn latest_renderer_outcome(&self) -> Option<RendererOutcome> {
-        self.state.snapshot.read().latest_renderer_outcome
+        decode_renderer_outcome(self.state.latest_renderer_outcome.load(Ordering::Relaxed))
     }
 
     /// Returns the latest typed capability downgrade reason.
     pub fn latest_downgrade_reason(&self) -> Option<CapabilityDowngradeReason> {
-        self.state.snapshot.read().latest_downgrade_reason
+        decode_downgrade_reason(self.state.latest_downgrade_reason.load(Ordering::Relaxed))
     }
 
     /// Polls one event and maps it to the GPUI presentation decision.
@@ -2164,7 +2266,7 @@ impl MediaSession for GstMediaSession {
     type Frame = Frame;
 
     fn snapshot(&self) -> SessionSnapshot {
-        let mut snapshot = self.state.snapshot.read().clone();
+        let mut snapshot = self.state.snapshot_with_atomics();
         let position = Duration::from_micros(self.state.position_us.load(Ordering::Relaxed));
         snapshot.state = match snapshot.state {
             SessionState::Playing { .. } => SessionState::Playing { position },
@@ -3650,14 +3752,15 @@ mod tests {
     #[test]
     fn presentation_report_commits_capability_only_after_acceptance() {
         let state = SnapshotState::with_capability(CapabilityTier::DirectAlias);
-        record_renderer_outcome(&state, RendererOutcome::Unsupported, None);
+        record_renderer_outcome(&state, RendererOutcome::Unsupported);
         record_downgrade_reason(&state, CapabilityDowngradeReason::RendererUnsupported);
+        let snapshot = state.snapshot_with_atomics();
         assert_eq!(
-            state.snapshot.read().latest_renderer_outcome,
+            snapshot.latest_renderer_outcome,
             Some(RendererOutcome::Unsupported)
         );
         assert_eq!(
-            state.snapshot.read().latest_downgrade_reason,
+            snapshot.latest_downgrade_reason,
             Some(CapabilityDowngradeReason::RendererUnsupported)
         );
         assert_eq!(
@@ -3672,8 +3775,9 @@ mod tests {
             conversion: lumina_video_core::session::ConversionMode::YuvShader,
             synchronization: lumina_video_core::session::SynchronizationMode::CpuWait,
         };
-        record_renderer_outcome(&state, RendererOutcome::Accepted, Some(realization));
-        let snapshot = state.snapshot.read();
+        record_renderer_outcome(&state, RendererOutcome::Accepted);
+        record_realization(&state, realization);
+        let snapshot = state.snapshot_with_atomics();
         assert_eq!(snapshot.capability, CapabilityTier::SystemMemoryUpload);
         assert_eq!(snapshot.frame_realization, Some(realization));
         assert_eq!(

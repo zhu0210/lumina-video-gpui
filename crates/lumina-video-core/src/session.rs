@@ -75,12 +75,14 @@ pub enum RendererOutcome {
 pub enum CapabilityDowngradeReason {
     HardwareOpenFailure,
     HardwareDecodeFailure,
+    HardwareUnavailable,
     RendererUnsupported,
     RendererTransientFailure,
     RendererFatalFailure,
     UnsafeSync,
     UnsupportedImport,
     TransientImport,
+    UnsupportedColor,
     TransitionTimeout,
 }
 
