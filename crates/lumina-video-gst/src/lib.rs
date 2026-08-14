@@ -823,6 +823,8 @@ struct ColorGeneration {
 struct RgbaPool {
     recycle: Sender<Vec<CpuPlane>>,
     available: Receiver<Vec<CpuPlane>>,
+    stride: usize,
+    bytes: usize,
 }
 
 impl RgbaPool {
@@ -838,13 +840,37 @@ impl RgbaPool {
                 return None;
             }
         }
-        Some(Self { recycle, available })
+        Some(Self {
+            recycle,
+            available,
+            stride,
+            bytes,
+        })
     }
 
+    #[cfg(test)]
     fn try_acquire(&self) -> Option<CpuMemory> {
+        self.try_acquire_checked().ok().flatten()
+    }
+
+    fn try_acquire_checked(&self) -> Result<Option<CpuMemory>, &'static str> {
         match self.available.try_recv() {
-            Ok(planes) => Some(CpuMemory::new_recyclable(planes, self.recycle.clone())),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+            Ok(planes) => {
+                let Some(plane) = planes.first() else {
+                    return Err("RGBA recycle payload has no plane");
+                };
+                if planes.len() != 1
+                    || plane.stride != self.stride
+                    || plane.bytes.len() != self.bytes
+                {
+                    return Err("RGBA recycle payload shape changed");
+                }
+                Ok(Some(CpuMemory::new_recyclable(
+                    planes,
+                    self.recycle.clone(),
+                )))
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
         }
     }
 }
@@ -923,12 +949,16 @@ fn prepare_frame_memory(
             ColorGenerationError::UnsupportedSdrColor,
         )),
         ColorRenderDecision::CpuRgba(matrix) => {
-            let Some(mut output) = generation
+            let Some(pool) = generation
                 .as_ref()
                 .and_then(|current| current.rgba_pool.as_ref())
-                .and_then(RgbaPool::try_acquire)
             else {
                 return Ok(None);
+            };
+            let mut output = match pool.try_acquire_checked() {
+                Ok(Some(output)) => output,
+                Ok(None) => return Ok(None),
+                Err(error) => return Err(FramePreparationError::Decode(error.into())),
             };
             let NativeMemory::Cpu(input) = memory else {
                 return Err(FramePreparationError::Unsupported(
@@ -3164,6 +3194,25 @@ mod tests {
         assert!(pool.try_acquire().is_none());
         drop(final_first);
         drop(final_second);
+    }
+
+    #[test]
+    fn rgba_pool_rejects_mutated_recycled_shape() {
+        let Some(pool) = RgbaPool::new(FrameExtent::new(2, 2)) else {
+            panic!("small RGBA pool must configure");
+        };
+        let Some(mut memory) = pool.try_acquire() else {
+            panic!("payload must be available");
+        };
+        let Some(plane) = memory.planes.first_mut() else {
+            panic!("payload must have one plane");
+        };
+        let _ = plane.bytes.pop();
+        drop(memory);
+        assert!(matches!(
+            pool.try_acquire_checked(),
+            Err("RGBA recycle payload shape changed")
+        ));
     }
 
     #[test]

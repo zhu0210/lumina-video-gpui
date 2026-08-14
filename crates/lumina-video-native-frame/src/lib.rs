@@ -170,18 +170,6 @@ impl CpuMemory {
             recycle: Some(recycle),
         }
     }
-
-    /// Takes the owned planes out of this memory value without recycling them.
-    ///
-    /// This is the narrow escape hatch for callers that need to consume the
-    /// public `planes` field by value. A pooled payload is deliberately
-    /// detached from its generation rather than returning an empty vector to
-    /// the pool.
-    pub fn into_planes(mut self) -> Vec<CpuPlane> {
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = self.recycle.take();
-        std::mem::take(&mut self.planes)
-    }
 }
 
 impl fmt::Debug for CpuMemory {
@@ -244,16 +232,6 @@ mod plane_layout_tests {
             Some([1, 2, 3, 4].as_slice())
         );
         assert_eq!(planes.first().map(|plane| plane.stride), Some(4));
-    }
-
-    #[test]
-    fn cpu_memory_into_planes_preserves_owned_payload() {
-        let memory = CpuMemory::new(vec![CpuPlane::new(vec![1, 2, 3, 4], 4)]);
-        let planes = memory.into_planes();
-        assert_eq!(
-            planes.first().map(|plane| plane.bytes.as_slice()),
-            Some([1, 2, 3, 4].as_slice())
-        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

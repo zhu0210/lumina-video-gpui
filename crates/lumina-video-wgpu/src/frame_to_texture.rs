@@ -20,9 +20,10 @@ use lumina_video_native_frame::apply_yuv_matrix;
 use lumina_video_native_frame::video::Plane;
 use lumina_video_native_frame::video::{CpuFrame, DecodedFrame, PixelFormat};
 use lumina_video_native_frame::{
-    nv12_bytes_to_rgba_into, yuv420p_bytes_to_rgba_into, yuv_to_rgb_matrix, AcquireSync,
-    ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorRange, ColorTransfer,
-    CpuMemory, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
+    nv12_bytes_to_rgba_into, render_decision, yuv420p_bytes_to_rgba_into, yuv_to_rgb_matrix,
+    AcquireSync, ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorRange,
+    ColorRenderDecision, ColorTransfer, CpuMemory, NativeFrameDescriptor, NativeFrameLease,
+    NativeMemory,
 };
 use std::sync::Arc;
 
@@ -282,6 +283,15 @@ impl NativeFrameIngestionError {
     }
 }
 
+fn owned_nv12_color_transform(color: ColorMetadata) -> Option<[[f32; 4]; 4]> {
+    match render_decision(color) {
+        ColorRenderDecision::Gpu(transform) => Some(transform),
+        ColorRenderDecision::CpuRgba(_)
+        | ColorRenderDecision::Unsupported
+        | ColorRenderDecision::UnsupportedSdrColor => None,
+    }
+}
+
 /// Uploads an owned native frame without cloning its CPU planes.
 ///
 /// The GStreamer worker has already made the one-time color decision. This
@@ -297,17 +307,8 @@ pub fn native_frame_lease_to_textures(
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<GpuFrameTextures, NativeFrameIngestionError> {
     let (descriptor, memory) = classify_native_frame_lease(lease)?;
-    let frame = CpuFrameRef::from_memory(
-        &memory,
-        descriptor.extent.width,
-        descriptor.extent.height,
-        descriptor.format,
-    );
     if descriptor.format == PixelFormat::Nv12 {
-        // The worker has already selected the GPU contract for this metadata;
-        // the renderer only derives the shared affine coefficients here.
-        let Some(transform) = yuv_to_rgb_matrix(descriptor.color.matrix, descriptor.color.range)
-        else {
+        let Some(transform) = owned_nv12_color_transform(descriptor.color) else {
             return Err(NativeFrameIngestionError::UnsupportedColorMetadata(
                 NativeFrameLease {
                     descriptor,
@@ -316,10 +317,22 @@ pub fn native_frame_lease_to_textures(
                 },
             ));
         };
+        let frame = CpuFrameRef::from_memory(
+            &memory,
+            descriptor.extent.width,
+            descriptor.extent.height,
+            descriptor.format,
+        );
         return Ok(upload_nv12(
             frame, device, queue, y_cache, cbcr_cache, transform,
         ));
     }
+    let frame = CpuFrameRef::from_memory(
+        &memory,
+        descriptor.extent.width,
+        descriptor.extent.height,
+        descriptor.format,
+    );
     Ok(upload_cpu_frame_ref_as_textures(
         frame, device, queue, y_cache, cbcr_cache, rgba_cache,
     ))
@@ -1171,6 +1184,38 @@ mod tests {
             lumina_video_native_frame::render_decision(metadata),
             lumina_video_native_frame::ColorRenderDecision::Gpu(_)
         ));
+    }
+
+    #[test]
+    fn owned_nv12_boundary_rejects_non_shader_color_contracts() {
+        let centered = ColorMetadata {
+            matrix: ColorMatrix::Bt709,
+            primaries: ColorPrimaries::Bt709,
+            transfer: ColorTransfer::Srgb,
+            range: ColorRange::Limited,
+            chroma_horizontal: ChromaHorizontal::Centered,
+            chroma_vertical: ChromaVertical::Centered,
+        };
+        let Some(expected) = yuv_to_rgb_matrix(centered.matrix, centered.range) else {
+            panic!("BT.709 limited transform must exist");
+        };
+        assert_eq!(owned_nv12_color_transform(centered), Some(expected));
+
+        let mut cosited = centered;
+        cosited.chroma_horizontal = ChromaHorizontal::Cosited;
+        let mut non_srgb = centered;
+        non_srgb.transfer = ColorTransfer::Bt709;
+        let mut adobe = centered;
+        adobe.primaries = ColorPrimaries::Adobergb;
+        let hdr = ColorMetadata {
+            matrix: ColorMatrix::Bt2020,
+            primaries: ColorPrimaries::Bt2020,
+            transfer: ColorTransfer::Smpte2084,
+            ..centered
+        };
+        for rejected in [cosited, non_srgb, adobe, hdr] {
+            assert!(owned_nv12_color_transform(rejected).is_none());
+        }
     }
 
     #[test]

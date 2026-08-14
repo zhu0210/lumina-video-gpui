@@ -272,9 +272,6 @@ pub fn render_decision(color: ColorMetadata) -> ColorRenderDecision {
             ColorRenderDecision::UnsupportedSdrColor
         };
     }
-    if !matches!(color.matrix, ColorMatrix::Bt601 | ColorMatrix::Bt709) {
-        return ColorRenderDecision::UnsupportedSdrColor;
-    }
     let Some(matrix) = yuv_to_rgb_matrix(color.matrix, color.range) else {
         return ColorRenderDecision::Unsupported;
     };
@@ -750,6 +747,19 @@ mod tests {
             render_decision(color),
             ColorRenderDecision::UnsupportedSdrColor
         );
+    }
+
+    #[test]
+    fn fcc_and_smpte240m_use_exact_cpu_matrices() {
+        for matrix_kind in [ColorMatrix::Fcc, ColorMatrix::Smpte240m] {
+            let color = metadata(matrix_kind, ColorRange::Limited);
+            let Some(matrix) = yuv_to_rgb_matrix(matrix_kind, ColorRange::Limited) else {
+                panic!("FCC and SMPTE 240M matrices must exist");
+            };
+            assert_eq!(render_decision(color), ColorRenderDecision::CpuRgba(matrix));
+            assert_eq!(apply_yuv_matrix(&matrix, 16, 128, 128), [0, 0, 0]);
+            assert_eq!(apply_yuv_matrix(&matrix, 235, 128, 128), [255, 255, 255]);
+        }
     }
 
     #[test]
