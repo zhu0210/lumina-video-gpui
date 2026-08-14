@@ -289,7 +289,7 @@ assert_staging_prefix() {
 merge_package_prefix() {
     local prefix=$1
     local source_list=$2
-    local prefix_root prefix_mode source source_parent rel destination source_kind source_target destination_target resolved_target
+    local prefix_root prefix_mode source source_parent rel destination source_kind source_target destination_target resolved_target source_mode destination_mode
 
     capture_path prefix_root "package prefix path" realpath -m -- "$prefix"
     if ! prefix_mode=$(stat -c '%a' -- "$prefix"); then
@@ -350,7 +350,13 @@ merge_package_prefix() {
                 [[ ! -L "$destination" && -d "$destination" ]] || {
                     fail "package collision changes type at $destination"
                 }
-                [[ "$(stat -c '%a' -- "$source")" == "$(stat -c '%a' -- "$destination")" ]] || {
+                if ! source_mode=$(stat -c '%a' -- "$source"); then
+                    fail "cannot read source directory mode: $source"
+                fi
+                if ! destination_mode=$(stat -c '%a' -- "$destination"); then
+                    fail "cannot read destination directory mode: $destination"
+                fi
+                [[ "$source_mode" == "$destination_mode" ]] || {
                     fail "package collision changes directory mode at $destination"
                 }
                 ;;
@@ -361,7 +367,13 @@ merge_package_prefix() {
                 cmp -s -- "$source" "$destination" || {
                     fail "package collision changes file contents at $destination"
                 }
-                [[ "$(stat -c '%a' -- "$source")" == "$(stat -c '%a' -- "$destination")" ]] || {
+                if ! source_mode=$(stat -c '%a' -- "$source"); then
+                    fail "cannot read source file mode: $source"
+                fi
+                if ! destination_mode=$(stat -c '%a' -- "$destination"); then
+                    fail "cannot read destination file mode: $destination"
+                fi
+                [[ "$source_mode" == "$destination_mode" ]] || {
                     fail "package collision changes file mode at $destination"
                 }
                 ;;
