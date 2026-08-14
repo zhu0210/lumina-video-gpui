@@ -1,228 +1,411 @@
-//! Vendored runtime library initialization for Linux.
+//! Validate the launcher-established environment for the private GStreamer runtime.
 //!
-//! When the `vendored-runtime` feature is enabled, this module sets up the environment
-//! to load GStreamer libraries from the `vendor/` directory bundled with the executable.
-//!
-//! # How it works
-//!
-//! 1. Finds the executable's directory
-//! 2. Looks for `vendor/linux-x86_64/lib/` relative to that directory
-//! 3. Sets `GST_PLUGIN_PATH` and `LD_LIBRARY_PATH` before GStreamer initialization
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let runtime = VendoredRuntime::new();
-//! if !runtime.init() {
-//!     tracing::warn!("Vendor directory not found; falling back to system libraries");
-//! }
-//! ```
-//!
-//! # LGPL Compliance
-//!
-//! GStreamer is licensed under LGPL-2.1+. See `vendor/README.md` for:
-//! - Source availability
-//! - How to relink against system GStreamer
+//! The bundled launcher must run the process. Rust deliberately does not mutate
+//! process-wide environment variables: it only locates the bundle and rejects a
+//! process that was not started with the exact private runtime contract.
 
 use std::env;
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-/// Vendored runtime manager for loading bundled GStreamer libraries.
-///
-/// This struct manages the initialization of vendored runtime libraries,
-/// ensuring thread-safe single-run semantics via an internal `OnceLock`.
-///
-/// # Example
-///
-/// ```ignore
-/// let runtime = VendoredRuntime::new();
-/// if !runtime.init() {
-///     // Fall back to system libraries
-/// }
-/// ```
-#[derive(Debug, Default)]
-pub struct VendoredRuntime {
-    /// Cached initialization result. Uses OnceLock for thread-safe single-run semantics.
-    init_result: OnceLock<bool>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimePaths {
+    vendor_dir: PathBuf,
+    lib_dir: PathBuf,
+    plugin_dir: PathBuf,
+    scanner_path: PathBuf,
+    launcher_path: PathBuf,
 }
 
-impl VendoredRuntime {
-    /// Creates a new vendored runtime manager.
-    pub fn new() -> Self {
+impl RuntimePaths {
+    fn new(vendor_dir: PathBuf) -> Self {
+        let lib_dir = vendor_dir.join("lib");
         Self {
-            init_result: OnceLock::new(),
+            plugin_dir: lib_dir.join("gstreamer-1.0"),
+            scanner_path: vendor_dir.join("libexec/gstreamer-1.0/gst-plugin-scanner"),
+            launcher_path: vendor_dir.join("bin/lumina-gstreamer-runtime"),
+            lib_dir,
+            vendor_dir,
         }
     }
 
-    /// Initialize the vendored runtime environment.
-    ///
-    /// This method:
-    /// 1. Locates the vendor directory relative to the executable
-    /// 2. Sets `GST_PLUGIN_PATH` for GStreamer plugins (prepended to existing)
-    /// 3. Sets `LD_LIBRARY_PATH` for shared libraries (prepended to existing)
-    ///
-    /// Safe to call multiple times - initialization only happens once per instance.
-    /// Subsequent calls return the cached result from the first initialization.
-    ///
-    /// # Returns
-    ///
-    /// `true` if vendored libraries were found and environment was configured,
-    /// `false` if vendor directory was not found (will fall back to system libraries).
-    pub fn init(&self) -> bool {
-        *self.init_result.get_or_init(init_inner)
+    fn validate(&self) -> Result<(), String> {
+        if !is_non_empty_dir(&self.lib_dir) {
+            return Err(format!(
+                "vendored-runtime: library directory is missing or empty: {}",
+                self.lib_dir.display()
+            ));
+        }
+        if !is_non_empty_dir(&self.plugin_dir) {
+            return Err(format!(
+                "vendored-runtime: plugin directory is missing or empty: {}",
+                self.plugin_dir.display()
+            ));
+        }
+        if !self.scanner_path.is_file() {
+            return Err(format!(
+                "vendored-runtime: plugin scanner is missing: {}",
+                self.scanner_path.display()
+            ));
+        }
+        if !self.launcher_path.is_file() {
+            return Err(format!(
+                "vendored-runtime: runtime launcher is missing: {}",
+                self.launcher_path.display()
+            ));
+        }
+        Ok(())
     }
 
-    /// Returns the path to the vendored library directory, if found.
-    ///
-    /// Only returns a path if the directory exists and is non-empty.
-    /// Useful for debugging or advanced configuration.
-    pub fn vendor_lib_path(&self) -> Option<PathBuf> {
-        vendor_lib_path()
+    fn validate_environment(
+        &self,
+        getenv: &impl Fn(&str) -> Option<OsString>,
+    ) -> Result<(), String> {
+        self.require_path("GST_PLUGIN_PATH_1_0", &self.plugin_dir, getenv)?;
+        self.require_empty("GST_PLUGIN_SYSTEM_PATH_1_0", getenv)?;
+        self.require_empty("GST_PLUGIN_PATH", getenv)?;
+        self.require_empty("GST_PLUGIN_SYSTEM_PATH", getenv)?;
+        self.require_path("GST_PLUGIN_SCANNER_1_0", &self.scanner_path, getenv)?;
+        self.require_empty("GST_PLUGIN_SCANNER", getenv)?;
+        self.require_path("LD_LIBRARY_PATH", &self.lib_dir, getenv)?;
+        self.require_empty("GST_REGISTRY", getenv)?;
+        self.require_value("GST_REGISTRY_REUSE_PLUGIN_SCANNER", "no", getenv)?;
+
+        let registry_path = self.environment_path("GST_REGISTRY_1_0", getenv)?;
+        if registry_path.file_name() != Some(OsStr::new("gstreamer-1.0.registry")) {
+            return Err(format!(
+                "vendored-runtime: GST_REGISTRY_1_0 must end in gstreamer-1.0.registry, got {}",
+                registry_path.display()
+            ));
+        }
+        match fs::symlink_metadata(&registry_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "vendored-runtime: GST_REGISTRY_1_0 is a symbolic link: {}",
+                    registry_path.display()
+                ));
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(format!(
+                    "vendored-runtime: GST_REGISTRY_1_0 is not a regular file: {}",
+                    registry_path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "vendored-runtime: GST_REGISTRY_1_0 cannot be inspected ({}): {error}",
+                    registry_path.display()
+                ));
+            }
+        }
+        let registry_parent = registry_path.parent().ok_or_else(|| {
+            "vendored-runtime: GST_REGISTRY_1_0 has no parent directory".to_string()
+        })?;
+        let registry_parent = fs::canonicalize(registry_parent).map_err(|error| {
+            format!("vendored-runtime: GST_REGISTRY_1_0 parent is unavailable: {error}")
+        })?;
+        if !registry_parent.is_dir() {
+            return Err(format!(
+                "vendored-runtime: GST_REGISTRY_1_0 parent is not a directory: {}",
+                registry_parent.display()
+            ));
+        }
+        if registry_parent.starts_with(&self.vendor_dir) {
+            return Err(format!(
+                "vendored-runtime: GST_REGISTRY_1_0 points inside the runtime bundle: {}",
+                registry_path.display()
+            ));
+        }
+        let cache_root = self.environment_path("XDG_CACHE_HOME", getenv)?;
+        let cache_root = fs::canonicalize(&cache_root).map_err(|error| {
+            format!(
+                "vendored-runtime: XDG_CACHE_HOME is unavailable ({}): {error}",
+                cache_root.display()
+            )
+        })?;
+        if !cache_root.is_dir() {
+            return Err(format!(
+                "vendored-runtime: XDG_CACHE_HOME is not a directory: {}",
+                cache_root.display()
+            ));
+        }
+        if cache_root.starts_with(&self.vendor_dir) || !registry_parent.starts_with(&cache_root) {
+            return Err(format!(
+                "vendored-runtime: registry is outside XDG_CACHE_HOME: {}",
+                registry_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn environment_path(
+        &self,
+        name: &str,
+        getenv: &impl Fn(&str) -> Option<OsString>,
+    ) -> Result<PathBuf, String> {
+        let value = getenv(name).ok_or_else(|| {
+            format!("vendored-runtime: {name} is not established by the launcher")
+        })?;
+        if value.as_os_str().is_empty() {
+            return Err(format!("vendored-runtime: {name} is empty"));
+        }
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(format!(
+                "vendored-runtime: {name} is not absolute: {}",
+                path.display()
+            ));
+        }
+        Ok(path)
+    }
+
+    fn require_path(
+        &self,
+        name: &str,
+        expected: &Path,
+        getenv: &impl Fn(&str) -> Option<OsString>,
+    ) -> Result<(), String> {
+        let actual = self.environment_path(name, getenv)?;
+        let actual = fs::canonicalize(&actual).map_err(|error| {
+            format!(
+                "vendored-runtime: {name} path is unavailable ({}): {error}",
+                actual.display()
+            )
+        })?;
+        let expected = fs::canonicalize(expected).map_err(|error| {
+            format!(
+                "vendored-runtime: expected {name} path is unavailable ({}): {error}",
+                expected.display()
+            )
+        })?;
+        if actual != expected {
+            return Err(format!(
+                "vendored-runtime: {name} is {}, expected {}",
+                actual.display(),
+                expected.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_empty(
+        &self,
+        name: &str,
+        getenv: &impl Fn(&str) -> Option<OsString>,
+    ) -> Result<(), String> {
+        match getenv(name) {
+            Some(value) if value.is_empty() => Ok(()),
+            Some(value) => Err(format!(
+                "vendored-runtime: {name} must be empty, got {value:?}"
+            )),
+            None => Err(format!(
+                "vendored-runtime: {name} is not established by the launcher"
+            )),
+        }
+    }
+
+    fn require_value(
+        &self,
+        name: &str,
+        expected: &str,
+        getenv: &impl Fn(&str) -> Option<OsString>,
+    ) -> Result<(), String> {
+        match getenv(name) {
+            Some(value) if value.as_os_str() == OsStr::new(expected) => Ok(()),
+            Some(value) => Err(format!(
+                "vendored-runtime: {name} must be {expected:?}, got {value:?}"
+            )),
+            None => Err(format!(
+                "vendored-runtime: {name} is not established by the launcher"
+            )),
+        }
     }
 }
 
-/// Internal initialization logic.
-fn init_inner() -> bool {
-    // Find the executable's directory
-    let exe_path = match env::current_exe() {
-        Ok(path) => path,
-        Err(e) => {
-            warn!("vendored-runtime: failed to get executable path: {e}");
-            return false;
-        }
-    };
+/// Validate the complete private runtime established by the bundled launcher.
+///
+/// A missing bundle or an environment that was not established by the launcher
+/// is an error; callers must surface it as `VideoError::DecoderInit`.
+pub fn validate() -> Result<(), String> {
+    let paths = locate_runtime_paths()?;
+    paths.validate()?;
+    let getenv = |name: &str| env::var_os(name);
+    paths.validate_environment(&getenv)?;
 
-    let exe_dir = match exe_path.parent() {
-        Some(dir) => dir,
-        None => {
-            warn!("vendored-runtime: executable has no parent directory");
-            return false;
-        }
-    };
+    info!(
+        "vendored-runtime: validated private GStreamer bundle from {}",
+        paths.vendor_dir.display()
+    );
+    debug!(
+        plugin_path = %paths.plugin_dir.display(),
+        registry = ?env::var_os("GST_REGISTRY_1_0"),
+        scanner = %paths.scanner_path.display(),
+        launcher = %paths.launcher_path.display(),
+        "vendored-runtime: launcher contract validated"
+    );
+    Ok(())
+}
 
-    // Look for vendor directory in several locations:
-    // 1. Next to executable: ./vendor/linux-x86_64/
-    // 2. In parent (for development): ../vendor/linux-x86_64/
-    // 3. In workspace root (for cargo run): ../../vendor/linux-x86_64/
-    let vendor_paths = [
+fn locate_runtime_paths() -> Result<RuntimePaths, String> {
+    let exe_path = env::current_exe()
+        .map_err(|error| format!("vendored-runtime: failed to get executable path: {error}"))?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| "vendored-runtime: executable has no parent directory".to_string())?;
+    let exe_dir = fs::canonicalize(exe_dir).map_err(|error| {
+        format!("vendored-runtime: executable directory is unavailable: {error}")
+    })?;
+
+    let candidates = [
         exe_dir.join("vendor/linux-x86_64"),
         exe_dir.join("../vendor/linux-x86_64"),
         exe_dir.join("../../vendor/linux-x86_64"),
-        // For installed packages, check relative to /usr/bin
         PathBuf::from("/usr/share/lumina-video/vendor/linux-x86_64"),
     ];
-
-    // Find vendor directory with a non-empty lib/ subdirectory
-    let vendor_dir = vendor_paths
-        .iter()
-        .find(|p| is_non_empty_dir(&p.join("lib")));
-
-    let vendor_dir = match vendor_dir {
-        Some(dir) => dir.clone(),
-        None => {
-            debug!(
-                "vendored-runtime: no vendor directory found, using system libraries. \
-                Searched: {:?}",
-                vendor_paths
-            );
-            return false;
+    for candidate in &candidates {
+        let Ok(vendor_dir) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        let paths = RuntimePaths::new(vendor_dir);
+        if paths.validate().is_ok() {
+            return Ok(paths);
         }
-    };
-
-    let lib_dir = vendor_dir.join("lib");
-    let plugin_dir = lib_dir.join("gstreamer-1.0");
-
-    info!(
-        "vendored-runtime: using vendored GStreamer from {}",
-        vendor_dir.display()
-    );
-
-    // Set GST_PLUGIN_PATH for GStreamer plugins
-    if plugin_dir.exists() {
-        let current = env::var("GST_PLUGIN_PATH").unwrap_or_default();
-        let new_path = if current.is_empty() {
-            plugin_dir.to_string_lossy().to_string()
-        } else {
-            format!("{}:{}", plugin_dir.display(), current)
-        };
-        env::set_var("GST_PLUGIN_PATH", &new_path);
-        debug!("vendored-runtime: GST_PLUGIN_PATH={new_path}");
     }
-
-    // Set LD_LIBRARY_PATH for shared libraries
-    if lib_dir.exists() {
-        let current = env::var("LD_LIBRARY_PATH").unwrap_or_default();
-        let new_path = if current.is_empty() {
-            lib_dir.to_string_lossy().to_string()
-        } else {
-            format!("{}:{}", lib_dir.display(), current)
-        };
-        env::set_var("LD_LIBRARY_PATH", &new_path);
-        debug!("vendored-runtime: LD_LIBRARY_PATH={new_path}");
-    }
-
-    // Note: We intentionally do NOT set GST_PLUGIN_SYSTEM_PATH="" here.
-    // Vendored plugins are prepended to the search path, so they take priority.
-    // If the vendor bundle is incomplete, GStreamer can still fall back to
-    // system plugins. For strict vendor-only mode, set GST_PLUGIN_SYSTEM_PATH=""
-    // in your environment before running.
-
-    true
+    Err(format!(
+        "vendored-runtime: private bundle missing or incomplete; searched {:?}",
+        candidates
+    ))
 }
 
-/// Checks if a path is a directory with at least one entry.
-fn is_non_empty_dir(path: &PathBuf) -> bool {
+fn is_non_empty_dir(path: &Path) -> bool {
     path.is_dir()
         && path
             .read_dir()
-            .map(|mut d| d.next().is_some())
+            .map(|mut entries| entries.next().is_some())
             .unwrap_or(false)
-}
-
-/// Returns the path to the vendored library directory, if found.
-///
-/// Only returns a path if the directory exists and is non-empty.
-/// Useful for debugging or advanced configuration.
-pub fn vendor_lib_path() -> Option<PathBuf> {
-    let exe_path = env::current_exe().ok()?;
-    let exe_dir = exe_path.parent()?;
-
-    let vendor_paths = [
-        exe_dir.join("vendor/linux-x86_64/lib"),
-        exe_dir.join("../vendor/linux-x86_64/lib"),
-        exe_dir.join("../../vendor/linux-x86_64/lib"),
-        PathBuf::from("/usr/share/lumina-video/vendor/linux-x86_64/lib"),
-    ];
-
-    vendor_paths.into_iter().find(|p| is_non_empty_dir(p))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
-    #[test]
-    fn test_init_returns_consistent_result() {
-        let runtime = VendoredRuntime::new();
-        // All calls should return the same result (cached from first call)
-        let first = runtime.init();
-        let second = runtime.init();
-        let third = runtime.init();
-        assert_eq!(first, second);
-        assert_eq!(second, third);
+    struct TestDir(PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
-    fn test_separate_instances_init_independently() {
-        let runtime1 = VendoredRuntime::new();
-        let runtime2 = VendoredRuntime::new();
-        // Both should return the same result (same environment)
-        // but they initialize independently
-        let result1 = runtime1.init();
-        let result2 = runtime2.init();
-        assert_eq!(result1, result2);
+    fn validates_real_contract_without_process_environment_mutation() -> Result<(), String> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "lumina-gstreamer-runtime-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).map_err(|error| format!("create test root: {error}"))?;
+        let _cleanup = TestDir(root.clone());
+
+        let vendor_dir = root.join("vendor/linux-x86_64");
+        let lib_dir = vendor_dir.join("lib");
+        let plugin_dir = lib_dir.join("gstreamer-1.0");
+        let scanner_path = vendor_dir.join("libexec/gstreamer-1.0/gst-plugin-scanner");
+        let launcher_path = vendor_dir.join("bin/lumina-gstreamer-runtime");
+        let cache_root = root.join("cache");
+        let cache_dir = cache_root.join("lumina-video/gstreamer-1.0");
+        fs::create_dir_all(&plugin_dir).map_err(|error| format!("create plugin dir: {error}"))?;
+        fs::create_dir_all(
+            scanner_path
+                .parent()
+                .ok_or_else(|| "scanner parent".to_string())?,
+        )
+        .map_err(|error| format!("create scanner dir: {error}"))?;
+        fs::create_dir_all(
+            launcher_path
+                .parent()
+                .ok_or_else(|| "launcher parent".to_string())?,
+        )
+        .map_err(|error| format!("create launcher dir: {error}"))?;
+        fs::create_dir_all(&cache_dir).map_err(|error| format!("create cache dir: {error}"))?;
+        fs::create_dir_all(vendor_dir.join("registry"))
+            .map_err(|error| format!("create bundle registry dir: {error}"))?;
+        fs::write(lib_dir.join("libgstreamer-1.0.so.0"), [])
+            .map_err(|error| format!("write library marker: {error}"))?;
+        fs::write(plugin_dir.join("libgstcoreelements.so"), [])
+            .map_err(|error| format!("write plugin marker: {error}"))?;
+        fs::write(&scanner_path, []).map_err(|error| format!("write scanner marker: {error}"))?;
+        fs::write(&launcher_path, []).map_err(|error| format!("write launcher marker: {error}"))?;
+
+        let registry_path = cache_dir.join("gstreamer-1.0.registry");
+        let mut values = HashMap::from([
+            ("GST_PLUGIN_PATH_1_0", plugin_dir.clone().into_os_string()),
+            ("GST_PLUGIN_SYSTEM_PATH_1_0", OsString::new()),
+            ("GST_PLUGIN_PATH", OsString::new()),
+            ("GST_PLUGIN_SYSTEM_PATH", OsString::new()),
+            (
+                "GST_PLUGIN_SCANNER_1_0",
+                scanner_path.clone().into_os_string(),
+            ),
+            ("GST_PLUGIN_SCANNER", OsString::new()),
+            ("LD_LIBRARY_PATH", lib_dir.clone().into_os_string()),
+            ("GST_REGISTRY", OsString::new()),
+            ("GST_REGISTRY_REUSE_PLUGIN_SCANNER", OsString::from("no")),
+            ("GST_REGISTRY_1_0", registry_path.into_os_string()),
+            ("XDG_CACHE_HOME", cache_root.clone().into_os_string()),
+        ]);
+        let paths = RuntimePaths::new(vendor_dir.clone());
+        paths.validate()?;
+        {
+            let getenv = |name: &str| values.get(name).cloned();
+            paths.validate_environment(&getenv)?;
+        }
+
+        let marker_path = vendor_dir.join("registry/marker");
+        fs::write(&marker_path, []).map_err(|error| format!("write registry marker: {error}"))?;
+        symlink(&marker_path, &cache_dir.join("gstreamer-1.0.registry"))
+            .map_err(|error| format!("create registry symlink: {error}"))?;
+        let error = {
+            let getenv = |name: &str| values.get(name).cloned();
+            paths
+                .validate_environment(&getenv)
+                .err()
+                .ok_or_else(|| "registry symlink was accepted".to_string())?
+        };
+        if !error.contains("symbolic link") {
+            return Err(format!("unexpected registry symlink error: {error}"));
+        }
+        fs::remove_file(cache_dir.join("gstreamer-1.0.registry"))
+            .map_err(|error| format!("remove registry symlink: {error}"))?;
+        values.insert(
+            "GST_REGISTRY_1_0",
+            vendor_dir
+                .join("registry/gstreamer-1.0.registry")
+                .into_os_string(),
+        );
+        let error = {
+            let getenv = |name: &str| values.get(name).cloned();
+            paths
+                .validate_environment(&getenv)
+                .err()
+                .ok_or_else(|| "bundle-local registry was accepted".to_string())?
+        };
+        if !error.contains("inside the runtime bundle") {
+            return Err(format!("unexpected bundle-local registry error: {error}"));
+        }
+        Ok(())
     }
 }
