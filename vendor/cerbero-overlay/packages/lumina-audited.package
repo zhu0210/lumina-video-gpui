@@ -7,7 +7,7 @@ class Package(package.Package):
     shortdesc = 'Lumina audited GStreamer runtime closure'
     longdesc = 'A direct, LGPL-only recipe closure with no upstream meta package.'
     version = '1.28.6.1'
-    license = License.LGPL
+    license = License.LGPLv2_1Plus
     uuid = '2f855e2d-68c2-46f0-ae2b-96c5f4ed4b9b'
 
     # Keep this package self-contained. Cerbero's package API resolves these
