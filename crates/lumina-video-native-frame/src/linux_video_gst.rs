@@ -31,7 +31,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
-use lumina_video_core::session::{AudioTrack, CapabilityTier};
+use lumina_video_core::session::{AudioTrack, CapabilityTier, DecodeMode};
 
 use crate::linux_sync::export_acquire_sync;
 use crate::video::{
@@ -1706,6 +1706,15 @@ impl GStreamerDecoder {
     /// Returns the capability tier currently active on this worker.
     pub fn active_tier(&self) -> CapabilityTier {
         self.requested_tier
+    }
+
+    /// Returns the decoder selected by GStreamer after preroll.
+    pub const fn decode_mode(&self) -> DecodeMode {
+        if self.hardware_decoder_selected {
+            DecodeMode::Hardware
+        } else {
+            DecodeMode::Software
+        }
     }
 
     fn set_system_memory_caps(&mut self) {
