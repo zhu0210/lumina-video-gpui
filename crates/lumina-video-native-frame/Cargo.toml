@@ -87,7 +87,7 @@ drm-fourcc = { version = "2.2" }
 gstreamer = { version = "0.24" }
 gstreamer-allocators = { version = "0.24" }
 gstreamer-app = { version = "0.24", features = ["v1_24"] }
-gstreamer-video = { version = "0.24", features = ["v1_18"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
 libc = { version = "0.2" }
 opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }

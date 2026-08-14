@@ -13,15 +13,16 @@ lumina-video-core = { path = "../lumina-video-core" }
 lumina-video-native-frame = { path = "../lumina-video-native-frame" }
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e",
+  rev = "20fae946d580321947fb50dec0183e49879fae56",
   features = ["wgpu"]
 }
 gpui_wgpu = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e"
+  rev = "20fae946d580321947fb50dec0183e49879fae56"
 }
 lumina-video-wgpu = { path = "../lumina-video-wgpu" }
 tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lumina-video-gst = { path = "../lumina-video-gst" }

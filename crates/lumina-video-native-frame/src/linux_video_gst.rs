@@ -33,6 +33,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use lumina_video_core::session::{AudioTrack, CapabilityTier};
 
+use crate::linux_sync::export_acquire_sync;
 use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
@@ -42,6 +43,7 @@ use crate::{
     into_cpu_planes, render_decision, ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata,
     ColorPrimaries, ColorRange, ColorRenderDecision, ColorTransfer, CpuMemory, CpuPlane,
     DmaBufFormatPlane, DmaBufMemory, DmaBufMemoryPlane, DmaBufObject, FrameExtent, NativeMemory,
+    ProducerOwner,
 };
 
 /// A decoder result containing only owned native-frame data. No GStreamer
@@ -56,6 +58,7 @@ pub struct NativeDecodedFrame {
     /// recompute it for the same negotiated generation.
     pub color_decision: ColorRenderDecision,
     pub memory: NativeMemory,
+    pub acquire: crate::AcquireSync,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,14 +276,6 @@ fn should_attempt_native(requested: CapabilityTier, layout_failed: bool) -> bool
     requested != CapabilityTier::SystemMemoryUpload && !layout_failed
 }
 
-fn normalize_requested_tier(requested: CapabilityTier) -> CapabilityTier {
-    if requested == CapabilityTier::DirectAlias {
-        CapabilityTier::SystemMemoryUpload
-    } else {
-        requested
-    }
-}
-
 fn pixel_format_from_drm_fourcc(fourcc: u32) -> Option<PixelFormat> {
     match fourcc {
         x if x == drm_fourcc::DrmFourcc::Nv12 as u32 => Some(PixelFormat::Nv12),
@@ -301,21 +296,6 @@ fn pixel_format_from_drm_fourcc(fourcc: u32) -> Option<PixelFormat> {
         {
             Some(PixelFormat::Rgba)
         }
-        _ => None,
-    }
-}
-
-fn drm_fourcc_name(name: &str) -> Option<u32> {
-    match name.trim().to_ascii_uppercase().as_str() {
-        "NV12" => Some(drm_fourcc::DrmFourcc::Nv12 as u32),
-        "YU12" | "I420" => Some(drm_fourcc::DrmFourcc::Yuv420 as u32),
-        "YV12" => Some(drm_fourcc::DrmFourcc::Yvu420 as u32),
-        "ARGB" | "AR24" => Some(drm_fourcc::DrmFourcc::Argb8888 as u32),
-        "ABGR" | "AB24" => Some(drm_fourcc::DrmFourcc::Abgr8888 as u32),
-        "XRGB" | "XR24" => Some(drm_fourcc::DrmFourcc::Xrgb8888 as u32),
-        "XBGR" | "XB24" => Some(drm_fourcc::DrmFourcc::Xbgr8888 as u32),
-        "RGBA" => Some(drm_fourcc::DrmFourcc::Rgba8888 as u32),
-        "BGRA" => Some(drm_fourcc::DrmFourcc::Bgra8888 as u32),
         _ => None,
     }
 }
@@ -353,18 +333,74 @@ fn native_layout(
 ) -> Option<(PixelFormat, u32, Option<u64>)> {
     let caps = sample.caps()?;
     let structure = caps.structure(0)?;
-    if let Ok(drm_format) = structure.get::<String>("drm-format") {
-        let (name, modifier) = match drm_format.split_once(':') {
-            Some((name, modifier)) => (name, parse_modifier(modifier)),
-            None => (drm_format.as_str(), None),
-        };
-        let fourcc = drm_fourcc_name(name)?;
+    let dma_drm = gst_video::is_dma_drm_caps(caps)
+        || structure
+            .get::<String>("format")
+            .is_ok_and(|format| format == "DMA_DRM");
+    if dma_drm {
+        let info = gst_video::VideoInfoDmaDrm::from_caps(caps).ok()?;
+        let fourcc = info.fourcc();
         let format = pixel_format_from_drm_fourcc(fourcc)?;
+        let modifier = structure
+            .get::<String>("drm-format")
+            .ok()
+            .and_then(|value| {
+                value
+                    .split_once(':')
+                    .and_then(|(_, modifier)| parse_modifier(modifier))
+            })
+            .or_else(|| (info.modifier() != 0x00ff_ffff_ffff_ffff).then_some(info.modifier()))
+            .or_else(|| {
+                structure
+                    .get::<String>("drm-format")
+                    .ok()
+                    .filter(|value| !value.contains(':'))
+                    .map(|_| 0)
+            });
         return Some((format, fourcc, modifier));
     }
     let fourcc = drm_fourcc_for_video_format(video_info.format())?;
     let format = pixel_format_from_drm_fourcc(fourcc)?;
     Some((format, fourcc, None))
+}
+
+fn system_memory_caps() -> gst::Caps {
+    gst::Caps::builder("video/x-raw")
+        .field("format", "NV12")
+        .build()
+}
+
+fn negotiated_video_caps() -> gst::Caps {
+    gst::Caps::builder_full()
+        .structure_with_features(
+            gst::Structure::builder("video/x-raw")
+                .field("format", "DMA_DRM")
+                .build(),
+            gst::CapsFeatures::new(["memory:DMABuf"]),
+        )
+        .structure_with_features(
+            gst::Structure::builder("video/x-raw")
+                .field("format", "NV12")
+                .build(),
+            gst::CapsFeatures::new_empty(),
+        )
+        .build()
+}
+
+fn pipeline_has_hardware_video_decoder(pipeline: &gst::Pipeline) -> bool {
+    pipeline
+        .iterate_recurse()
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|element| {
+            element.factory().is_some_and(|factory| {
+                factory.has_type(
+                    gst::ElementFactoryType::DECODER
+                        | gst::ElementFactoryType::MEDIA_VIDEO
+                        | gst::ElementFactoryType::HARDWARE,
+                )
+            })
+        })
 }
 
 fn pixel_format_from_memory(memory: &DmaBufMemory) -> Option<PixelFormat> {
@@ -685,6 +721,10 @@ pub struct GStreamerDecoder {
     first_byte_seen: Arc<AtomicBool>,
     /// Capability requested by the explicit native-frame entry point.
     requested_tier: CapabilityTier,
+    /// True only after preroll confirms a real hardware video decoder.
+    hardware_decoder_selected: bool,
+    /// True after the worker has settled this decoder on system-memory caps.
+    system_memory_negotiated: bool,
     /// Once native layout negotiation fails, use CPU extraction for the rest
     /// of this decoder instead of retrying DMABuf on every frame.
     native_layout_failed: bool,
@@ -1123,7 +1163,6 @@ impl GStreamerDecoder {
         lifecycle_control: GstLifecycleControl,
         tls_ca_file: Option<String>,
     ) -> Result<Self, VideoError> {
-        let requested_tier = normalize_requested_tier(requested_tier);
         let init_now = Instant::now();
         let init_deadline = init_now.checked_add(open_timeout).unwrap_or(init_now);
         if lifecycle_control.is_cancelled() {
@@ -1159,7 +1198,7 @@ impl GStreamerDecoder {
                 gio::TlsFileDatabase::new(&path).map_err(|error| {
                     VideoError::DecoderInit(format!("Failed to load TLS CA database: {error}"))
                 })?;
-                Ok(path)
+                Ok::<_, VideoError>(path)
             })
             .transpose()?;
         if network_source {
@@ -1211,11 +1250,11 @@ impl GStreamerDecoder {
 
         // App sink to pull video frames - constrained buffering for better seek behavior
         let appsink = gst_app::AppSink::builder()
-            .caps(
-                &gst_video::VideoCapsBuilder::new()
-                    .format(gst_video::VideoFormat::Nv12)
-                    .build(),
-            )
+            .caps(&if requested_tier == CapabilityTier::SystemMemoryUpload {
+                system_memory_caps()
+            } else {
+                negotiated_video_caps()
+            })
             .max_buffers(1)
             .drop(true)
             .sync(true)
@@ -1353,6 +1392,7 @@ impl GStreamerDecoder {
         let mut initial_selected_audio_stream_id = None;
         let mut initial_selected_video_stream_ids = Vec::new();
         let mut initial_pipeline_observation = GstPipelineObservation::default();
+        let hardware_decoder_selected;
 
         // Track buffering during init (in case 100% is reached before decode loop starts)
         let mut init_buffering_percent = 0i32;
@@ -1383,6 +1423,18 @@ impl GStreamerDecoder {
             match msg.view() {
                 gst::MessageView::AsyncDone(_) => {
                     Self::query_pipeline_observation(&pipeline, &mut initial_pipeline_observation);
+                    let selected = pipeline_has_hardware_video_decoder(&pipeline);
+                    hardware_decoder_selected = selected;
+                    if requested_tier != CapabilityTier::SystemMemoryUpload && !selected {
+                        appsink.set_caps(Some(&system_memory_caps()));
+                        if let Some(sink_pad) = appsink.static_pad("sink") {
+                            if !sink_pad.push_event(gst::event::Reconfigure::new()) {
+                                tracing::debug!(
+                                    "GStreamer appsink sink pad rejected initial Reconfigure"
+                                );
+                            }
+                        }
+                    }
                     // Query duration
                     if let Some(dur) = pipeline.query_duration::<gst::ClockTime>() {
                         duration = Some(Duration::from_nanos(dur.nseconds()));
@@ -1567,14 +1619,21 @@ impl GStreamerDecoder {
             100 // Local files are immediately available
         };
 
+        let active_requested_tier = if !hardware_decoder_selected {
+            CapabilityTier::SystemMemoryUpload
+        } else {
+            requested_tier
+        };
         Ok(Self {
             pipeline,
             appsink,
             network_source,
             certificate_rejected,
             first_byte_seen,
-            requested_tier,
-            native_layout_failed: false,
+            requested_tier: active_requested_tier,
+            hardware_decoder_selected,
+            system_memory_negotiated: active_requested_tier == CapabilityTier::SystemMemoryUpload,
+            native_layout_failed: active_requested_tier == CapabilityTier::SystemMemoryUpload,
             native_color_generation: None,
             nv12_input_generation: None,
             metadata,
@@ -1632,6 +1691,48 @@ impl GStreamerDecoder {
         Self::query_pipeline_observation(&self.pipeline, &mut self.pipeline_observation);
     }
 
+    /// Moves this decoder to bounded system-memory output on the worker.
+    /// Repeating the request is intentionally a no-op.
+    pub fn renegotiate(&mut self, tier: CapabilityTier) -> Result<(), VideoError> {
+        if tier != CapabilityTier::SystemMemoryUpload {
+            return Err(VideoError::UnsupportedFormat(
+                "GStreamer only supports SystemMemoryUpload renegotiation".into(),
+            ));
+        }
+        self.set_system_memory_caps();
+        Ok(())
+    }
+
+    /// Returns the capability tier currently active on this worker.
+    pub fn active_tier(&self) -> CapabilityTier {
+        self.requested_tier
+    }
+
+    fn set_system_memory_caps(&mut self) {
+        if self.system_memory_negotiated {
+            self.requested_tier = CapabilityTier::SystemMemoryUpload;
+            self.native_layout_failed = true;
+            return;
+        }
+        self.system_memory_negotiated = true;
+        self.requested_tier = CapabilityTier::SystemMemoryUpload;
+        self.native_layout_failed = true;
+        self.appsink.set_caps(Some(&system_memory_caps()));
+        if let Some(sink_pad) = self.appsink.static_pad("sink") {
+            if !sink_pad.push_event(gst::event::Reconfigure::new()) {
+                tracing::debug!("GStreamer appsink sink pad rejected Reconfigure");
+            }
+        }
+        let _ = self
+            .appsink
+            .try_pull_sample(Self::clock_time(Duration::ZERO));
+        let _ = self
+            .appsink
+            .try_pull_preroll(Self::clock_time(Duration::ZERO));
+        self.preroll_sample = None;
+        self.eof = false;
+    }
+
     /// Stops the pipeline with the configured worker-side deadline.
     pub fn shutdown(&mut self) {
         let deadline = Self::earliest_deadline(
@@ -1674,6 +1775,16 @@ impl GStreamerDecoder {
     }
 
     /// Converts a GStreamer sample to an owned CPU VideoFrame.
+    fn video_info_from_caps(caps: &gst::CapsRef) -> Result<gst_video::VideoInfo, VideoError> {
+        if gst_video::is_dma_drm_caps(caps) {
+            return gst_video::VideoInfoDmaDrm::from_caps(caps)
+                .and_then(|info| info.to_video_info())
+                .map_err(|e| VideoError::DecodeFailed(format!("Invalid DMA_DRM caps: {e}")));
+        }
+        gst_video::VideoInfo::from_caps(caps)
+            .map_err(|e| VideoError::DecodeFailed(format!("Invalid video caps: {e}")))
+    }
+
     fn sample_to_frame(&self, sample: gst::Sample) -> Result<VideoFrame, VideoError> {
         let buffer = sample
             .buffer()
@@ -1683,8 +1794,7 @@ impl GStreamerDecoder {
             .caps()
             .ok_or_else(|| VideoError::DecodeFailed("Sample has no caps".to_string()))?;
 
-        let video_info = gst_video::VideoInfo::from_caps(caps)
-            .map_err(|e| VideoError::DecodeFailed(format!("Invalid video caps: {e}")))?;
+        let video_info = Self::video_info_from_caps(caps)?;
 
         let pts = buffer
             .pts()
@@ -1713,8 +1823,7 @@ impl GStreamerDecoder {
         let caps = sample
             .caps()
             .ok_or_else(|| VideoError::DecodeFailed("Sample has no caps".to_string()))?;
-        let video_info = gst_video::VideoInfo::from_caps(caps)
-            .map_err(|e| VideoError::DecodeFailed(format!("Invalid video caps: {e}")))?;
+        let video_info = Self::video_info_from_caps(caps)?;
         let pts = buffer
             .pts()
             .map(|time| Duration::from_nanos(time.nseconds()))
@@ -1737,15 +1846,26 @@ impl GStreamerDecoder {
             }
         };
         if matches!(color_decision, ColorRenderDecision::Gpu(_))
+            && self.hardware_decoder_selected
             && should_attempt_native(self.requested_tier, self.native_layout_failed)
         {
             match self.try_dmabuf_memory(buffer, &video_info, &sample) {
                 Ok(Some(memory)) => {
-                    let format = pixel_format_from_memory(&memory).ok_or_else(|| {
-                        VideoError::DecodeFailed(
+                    let Some(format) = pixel_format_from_memory(&memory) else {
+                        self.set_system_memory_caps();
+                        return Err(VideoError::UnsupportedFormat(
                             "DMABuf layout did not identify a supported pixel format".into(),
-                        )
-                    })?;
+                        ));
+                    };
+                    let acquire = match export_acquire_sync(&memory) {
+                        Ok(acquire) => acquire,
+                        Err(error) => {
+                            self.set_system_memory_caps();
+                            return Err(VideoError::UnsupportedFormat(format!(
+                                "DMABuf producer fence export failed: {error}"
+                            )));
+                        }
+                    };
                     return Ok(NativeDecodedFrame {
                         pts,
                         extent: FrameExtent::new(width, height),
@@ -1753,19 +1873,28 @@ impl GStreamerDecoder {
                         color,
                         color_decision,
                         memory: NativeMemory::DmaBuf(memory),
+                        acquire,
                     });
                 }
                 Ok(None) => {
                     self.native_layout_failed = true;
+                    self.set_system_memory_caps();
                     tracing::debug!(
                         "GStreamer native layout unavailable; downgrading this decoder to system memory"
                     );
+                    return Err(VideoError::UnsupportedFormat(
+                        "GStreamer native layout unavailable".into(),
+                    ));
                 }
                 Err(error) => {
                     self.native_layout_failed = true;
+                    self.set_system_memory_caps();
                     tracing::debug!(
                         "GStreamer native layout rejected ({error}); downgrading this decoder to system memory"
                     );
+                    return Err(VideoError::UnsupportedFormat(format!(
+                        "GStreamer native layout rejected: {error}"
+                    )));
                 }
             }
         }
@@ -1781,6 +1910,7 @@ impl GStreamerDecoder {
                 color,
                 color_decision,
                 memory: NativeMemory::Cpu(memory),
+                acquire: crate::AcquireSync::None,
             });
         }
         self.nv12_input_generation = None;
@@ -1805,6 +1935,7 @@ impl GStreamerDecoder {
             color,
             color_decision,
             memory: NativeMemory::Cpu(crate::CpuMemory::new(into_cpu_planes(planes))),
+            acquire: crate::AcquireSync::None,
         })
     }
 
@@ -2015,6 +2146,9 @@ impl GStreamerDecoder {
             });
         }
 
+        // The type-erased GstBuffer owner is the bounded producer lease required by
+        // the DMABuf callback; the capacity-one mailbox prevents this from becoming a cache.
+        let owner = ProducerOwner::new(buffer.to_owned());
         DmaBufMemory::new(
             objects,
             memory_planes,
@@ -2022,7 +2156,7 @@ impl GStreamerDecoder {
             Some(drm_fourcc),
             Some(modifier),
         )
-        .map(Some)
+        .map(|memory| Some(memory.with_owner(owner)))
         .map_err(|error| VideoError::DecodeFailed(error.to_string()))
     }
 
@@ -3044,7 +3178,7 @@ impl VideoDecoderBackend for GStreamerDecoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_gst_error, native_tier, normalize_requested_tier, should_attempt_native,
+        classify_gst_error, native_tier, negotiated_video_caps, should_attempt_native,
         AudioSelectionAttemptError, AudioTrackSelectionResult, GStreamerDecoder,
         GstLifecycleControl, Nv12InputLayout, Nv12InputPool,
     };
@@ -3052,12 +3186,37 @@ mod tests {
         ChromaHorizontal, ChromaVertical, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer,
     };
     use crate::video::VideoError;
-    use crate::FrameExtent;
+    use crate::{DmaBufMemory, FrameExtent, ProducerOwner};
     use gstreamer as gst;
     use gstreamer_video as gst_video;
     use lumina_video_core::session::{AudioTrack, CapabilityTier};
+    use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn producer_owner_is_opaque_send_sync_and_lives_until_memory_drop(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_send_sync::<gst::Buffer>();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let memory = DmaBufMemory::new(Vec::new(), Vec::new(), Vec::new(), None, None)?
+            .with_owner(ProducerOwner::new(DropProbe(dropped.clone())));
+        assert!(memory.owner.is_some());
+        drop(memory);
+        assert!(dropped.load(Ordering::Acquire));
+        Ok(())
+    }
 
     #[test]
     fn maps_sdr_colorimetry_and_chroma_without_crossing_gstreamer_types(
@@ -3252,15 +3411,46 @@ mod tests {
     }
 
     #[test]
-    fn direct_alias_request_is_clamped_before_native_selection() {
+    fn direct_alias_request_is_preserved_until_hardware_selection() {
+        assert!(should_attempt_native(CapabilityTier::DirectAlias, false));
         assert_eq!(
-            normalize_requested_tier(CapabilityTier::DirectAlias),
+            native_tier(CapabilityTier::DirectAlias, true),
+            CapabilityTier::DirectAlias
+        );
+        assert_eq!(
+            native_tier(CapabilityTier::DirectAlias, false),
             CapabilityTier::SystemMemoryUpload
         );
-        assert_eq!(
-            normalize_requested_tier(CapabilityTier::GpuConversion),
-            CapabilityTier::GpuConversion
-        );
+    }
+
+    #[test]
+    fn negotiated_caps_prefer_dma_drm_then_system_nv12() -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        let caps = negotiated_video_caps();
+        assert_eq!(caps.size(), 2);
+        let first = caps.structure(0).ok_or("missing DMA_DRM caps")?;
+        let second = caps.structure(1).ok_or("missing NV12 caps")?;
+        assert_eq!(first.name().as_str(), "video/x-raw");
+        assert_eq!(first.get::<String>("format")?, "DMA_DRM");
+        assert_eq!(second.get::<String>("format")?, "NV12");
+        assert!(caps
+            .features(0)
+            .is_some_and(|features| features.contains("memory:DMABuf")));
+        assert!(caps.features(1).is_some_and(|features| features.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn official_dma_drm_caps_parse_omitted_linear_modifier(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        let caps = gst::Caps::from_str(
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=4,height=4",
+        )?;
+        let info = gst_video::VideoInfoDmaDrm::from_caps(caps.as_ref())?;
+        assert_eq!(info.fourcc(), drm_fourcc::DrmFourcc::Nv12 as u32);
+        assert_eq!(info.modifier(), 0);
+        Ok(())
     }
 
     #[test]

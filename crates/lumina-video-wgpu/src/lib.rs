@@ -35,4 +35,4 @@ pub use frame_to_texture::{
 };
 
 #[cfg(target_os = "linux")]
-pub use dmabuf_import::{import_ready_dmabuf_nv12, ImportedNv12Texture, Nv12ImportError};
+pub use dmabuf_import::{import_external_dmabuf_nv12, ImportedNv12Texture, Nv12ImportError};

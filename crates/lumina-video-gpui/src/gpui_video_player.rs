@@ -9,13 +9,12 @@
 //! Linux: GstMediaSession (GStreamer decode + A/V timing), except MoQ URLs
 //! which use CorePlayer's native MoQ decoder.
 //!   │ one try_next_event() per animation tick
-//!   ▼
-//! native_frame_lease_to_textures()  ← lumina-video-wgpu
-//!   │
-//!   ├─ CorePlayer: decoded_frame_to_textures()
-//!   ▼
-//!   │ NV12: Y(R8) + CbCr(RG8)  →  surface((y, cbcr, size))  [GPU YUV→RGB]
-//!   │ RGBA: single RGBA8        →  surface((tex, desc))      [passthrough]
+//!   ├─ Intel Vulkan + NV12: Gst DMABuf + SyncFile
+//!   │    → bounded import worker → one multiplanar external texture
+//!   │    → same-frame pending surface → normal renderer acquire/render/release
+//!   └─ system fallback: native_frame_lease_to_textures()  ← lumina-video-wgpu
+//!        NV12: Y(R8) + CbCr(RG8) → surface((y, cbcr, size)) [GPU YUV→RGB]
+//!        RGBA: single RGBA8       → surface((tex, desc))     [passthrough]
 //!   ▼
 //! GPUI surface() element  ←  gpui renderer
 //! ```
@@ -30,10 +29,16 @@ use std::time::Duration;
 
 use gpui::*;
 use gpui_wgpu::wgpu;
+use lumina_video_core::session::FrameRealization;
 
 #[cfg(target_os = "linux")]
+use crossbeam_channel::{Receiver, Sender, TrySendError};
+#[cfg(target_os = "linux")]
+use gpui_wgpu::{ExternalFrameRequest, ExternalNv12Frame, ExternalOwnership};
+#[cfg(target_os = "linux")]
 use lumina_video_core::session::{
-    MediaSession, SessionError, SessionEvent, SessionState as CoreSessionState,
+    CapabilityTier, ConversionMode, DecodeMode, DecodeResidency, ImportMode, MediaSession,
+    SessionError, SessionEvent, SessionState as CoreSessionState, SynchronizationMode,
 };
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 #[cfg(target_os = "linux")]
@@ -47,7 +52,86 @@ use lumina_video_wgpu::GpuFrameTextures;
 #[cfg(any(not(target_os = "linux"), feature = "moq"))]
 use lumina_video_wgpu::LegacyFrameIngestionError;
 #[cfg(target_os = "linux")]
+use lumina_video_wgpu::{import_external_dmabuf_nv12, ImportedNv12Texture, Nv12ImportError};
+#[cfg(target_os = "linux")]
 use lumina_video_wgpu::{native_frame_lease_to_textures, NativeFrameIngestionError};
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ExternalPresentation {
+    // The local pending/display slot and GPUI's exact texture Arc are both
+    // required owners; the bounded mailbox/renderer slots prevent growth.
+    texture: Arc<wgpu::Texture>,
+    width: u32,
+    height: u32,
+    color_transform: [[f32; 4]; 4],
+}
+
+#[cfg(target_os = "linux")]
+struct DirectImportWorker {
+    input: Sender<lumina_video_native_frame::NativeFrameLease>,
+    input_drop: Receiver<lumina_video_native_frame::NativeFrameLease>,
+    output: Receiver<Result<ImportedNv12Texture, Nv12ImportError>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+fn try_send_drop_oldest<T>(sender: &Sender<T>, drop_receiver: &Receiver<T>, item: T) -> bool {
+    match sender.try_send(item) {
+        Ok(()) => true,
+        Err(TrySendError::Full(item)) => {
+            let _ = drop_receiver.try_recv();
+            sender.try_send(item).is_ok()
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl DirectImportWorker {
+    fn new(device: Arc<wgpu::Device>) -> Option<Self> {
+        let (input, input_receiver) = crossbeam_channel::bounded(1);
+        let input_drop = input_receiver.clone();
+        let (output, output_receiver) = crossbeam_channel::bounded(1);
+        let output_drop = output_receiver.clone();
+        let worker_output_drop = output_drop.clone();
+        let thread = std::thread::Builder::new()
+            .name("lumina-dmabuf-import".into())
+            .spawn(move || {
+                while let Ok(lease) = input_receiver.recv() {
+                    // SAFETY: this route enqueues only GStreamer-owned DMABuf leases whose
+                    // export supplied a producer-ready SyncFile and truthful NV12 layout;
+                    // the producer has handed the image to GENERAL/FOREIGN ownership and
+                    // `device` is the matching Vulkan device. The importer only validates
+                    // and wraps the image/fence; it never waits or submits GPU work.
+                    let imported = unsafe { import_external_dmabuf_nv12(lease, &device) };
+                    let _ = try_send_drop_oldest(&output, &worker_output_drop, imported);
+                }
+            })
+            .ok()?;
+        Some(Self {
+            input,
+            input_drop,
+            output: output_receiver,
+            thread: Some(thread),
+        })
+    }
+
+    fn enqueue(&self, lease: lumina_video_native_frame::NativeFrameLease) -> bool {
+        try_send_drop_oldest(&self.input, &self.input_drop, lease)
+    }
+
+    fn try_take(&self) -> Option<Result<ImportedNv12Texture, Nv12ImportError>> {
+        self.output.try_recv().ok()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DirectImportWorker {
+    fn drop(&mut self) {
+        let _ = self.thread.take();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration & response types
@@ -181,6 +265,20 @@ pub struct GpuiVideoPlayer {
     pending_frame: Option<lumina_video_native_frame::NativeFrameLease>,
     #[cfg(target_os = "linux")]
     has_presented_frame: bool,
+    #[cfg(target_os = "linux")]
+    direct_import: Option<DirectImportWorker>,
+    #[cfg(target_os = "linux")]
+    direct_alias_supported: Option<bool>,
+    #[cfg(target_os = "linux")]
+    direct_downgrade_requested: bool,
+    #[cfg(target_os = "linux")]
+    pending_external: Option<ExternalPresentation>,
+    #[cfg(target_os = "linux")]
+    direct_display: Option<ExternalPresentation>,
+    #[cfg(target_os = "linux")]
+    frame_realization: Option<FrameRealization>,
+    #[cfg(target_os = "linux")]
+    pending_external_retirement: bool,
     config: GpuiVideoPlayerConfig,
 
     // GPU state
@@ -240,13 +338,14 @@ impl GpuiVideoPlayer {
         #[cfg(target_os = "linux")]
         let session = match route {
             LinuxPlaybackRoute::Gst => Some(
-                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
                     url.clone(),
                     false,
                     lumina_video_gst::GstAudioSinkMode::Auto,
                     config.lifecycle_timeout,
                     config.open_timeout,
                     0,
+                    CapabilityTier::DirectAlias,
                 ),
             ),
             #[cfg(feature = "moq")]
@@ -267,6 +366,20 @@ impl GpuiVideoPlayer {
             pending_frame: None,
             #[cfg(target_os = "linux")]
             has_presented_frame: false,
+            #[cfg(target_os = "linux")]
+            direct_import: None,
+            #[cfg(target_os = "linux")]
+            direct_alias_supported: None,
+            #[cfg(target_os = "linux")]
+            direct_downgrade_requested: false,
+            #[cfg(target_os = "linux")]
+            pending_external: None,
+            #[cfg(target_os = "linux")]
+            direct_display: None,
+            #[cfg(target_os = "linux")]
+            frame_realization: None,
+            #[cfg(target_os = "linux")]
+            pending_external_retirement: false,
             config,
             gpu_context: None,
             frame_textures: None,
@@ -343,13 +456,14 @@ impl GpuiVideoPlayer {
         {
             self.session = match route {
                 LinuxPlaybackRoute::Gst => Some(
-                    GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
+                    GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
                         url.clone(),
                         false,
                         lumina_video_gst::GstAudioSinkMode::Auto,
                         self.config.lifecycle_timeout,
                         self.config.open_timeout,
                         next_generation,
+                        CapabilityTier::DirectAlias,
                     ),
                 ),
                 #[cfg(feature = "moq")]
@@ -380,6 +494,10 @@ impl GpuiVideoPlayer {
         {
             self.pending_frame = None;
             self.has_presented_frame = false;
+            self.direct_import = None;
+            self.direct_alias_supported = None;
+            self.direct_downgrade_requested = false;
+            self.request_external_retirement();
         }
     }
 
@@ -441,14 +559,19 @@ impl GpuiVideoPlayer {
             let old_session = self.session.take();
             drop(old_session);
             self.pending_frame = None;
+            self.direct_import = None;
+            self.direct_alias_supported = None;
+            self.direct_downgrade_requested = false;
+            self.request_external_retirement();
             self.session = Some(
-                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
                     self.url.clone(),
                     false,
                     lumina_video_gst::GstAudioSinkMode::Auto,
                     timeout,
                     self.config.open_timeout,
                     generation,
+                    CapabilityTier::DirectAlias,
                 ),
             );
             if let Some(session) = self.session.as_ref() {
@@ -471,14 +594,19 @@ impl GpuiVideoPlayer {
             let old_session = self.session.take();
             drop(old_session);
             self.pending_frame = None;
+            self.direct_import = None;
+            self.direct_alias_supported = None;
+            self.direct_downgrade_requested = false;
+            self.request_external_retirement();
             self.session = Some(
-                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
                     self.url.clone(),
                     false,
                     lumina_video_gst::GstAudioSinkMode::Auto,
                     self.config.lifecycle_timeout,
                     timeout,
                     generation,
+                    CapabilityTier::DirectAlias,
                 ),
             );
             if let Some(session) = self.session.as_ref() {
@@ -706,6 +834,244 @@ impl GpuiVideoPlayer {
         self.frame_textures.as_ref()
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn frame_realization(&self) -> Option<FrameRealization> {
+        self.frame_realization
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn frame_realization(&self) -> Option<FrameRealization> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_external_retirement(&mut self) {
+        self.pending_external_retirement = true;
+        self.pending_external = None;
+        self.direct_display = None;
+        self.frame_realization = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retire_external_frame_now(&mut self, window: &mut Window) {
+        let owns_external_frame = self.pending_external_retirement
+            || self.pending_external.is_some()
+            || self.direct_display.is_some();
+        if owns_external_frame {
+            let _ = window.clear_external_frame();
+            // clear_external_frame() reports Accepted through the same one-shot
+            // outcome channel; it must not certify a still-pending submission.
+            let _ = window.take_external_frame_outcome();
+        }
+        self.pending_external_retirement = false;
+        self.pending_external = None;
+        self.direct_display = None;
+        self.frame_realization = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drain_pending_external_retirement(&mut self, window: &mut Window) {
+        if self.pending_external_retirement {
+            self.retire_external_frame_now(window);
+        }
+    }
+
+    /// Retire renderer-owned external frames before replacing or dropping this player.
+    ///
+    /// `Drop` cannot access a [`Window`], so callers that still have one must use this
+    /// method before removing the player. The normal `Drop` implementation still releases
+    /// all local resources.
+    pub fn retire_external_frame(&mut self, window: &mut Window) {
+        #[cfg(target_os = "linux")]
+        self.retire_external_frame_now(window);
+        #[cfg(not(target_os = "linux"))]
+        let _ = window;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_system_memory_downgrade(&mut self) {
+        if self.direct_downgrade_requested {
+            return;
+        }
+        if let Some(session) = self.session.as_mut() {
+            let result = session.command(lumina_video_core::session::SessionCommand::Renegotiate {
+                tier: CapabilityTier::SystemMemoryUpload,
+            });
+            if result.is_ok() {
+                self.direct_downgrade_requested = true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn disable_direct_import(&mut self, window: &mut Window) {
+        self.direct_alias_supported = Some(false);
+        self.direct_import = None;
+        self.retire_external_frame_now(window);
+        self.request_system_memory_downgrade();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_direct_import_route(&mut self, window: &mut Window) {
+        if self.session.is_none() {
+            return;
+        }
+        if self.direct_alias_supported == Some(true) {
+            return;
+        }
+        if self.direct_alias_supported == Some(false) {
+            self.request_system_memory_downgrade();
+            return;
+        }
+        let Some(gpu) = self.gpu_context.as_ref() else {
+            return;
+        };
+        let adapter_info = gpu.adapter.get_info();
+        let supported = adapter_info.backend == wgpu::Backend::Vulkan
+            && adapter_info.vendor == 0x8086
+            && gpu
+                .device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_NV12);
+        if supported {
+            if let Some(worker) = DirectImportWorker::new(Arc::clone(&gpu.device)) {
+                self.direct_alias_supported = Some(true);
+                self.direct_import = Some(worker);
+            } else {
+                self.direct_alias_supported = Some(false);
+                self.retire_external_frame_now(window);
+                self.request_system_memory_downgrade();
+            }
+        } else {
+            self.direct_alias_supported = Some(false);
+            self.retire_external_frame_now(window);
+            self.request_system_memory_downgrade();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn external_frame_outcome_certifies(
+        pending_external: bool,
+        outcome: gpui_wgpu::ExternalFrameOutcome,
+    ) -> bool {
+        pending_external && matches!(outcome, gpui_wgpu::ExternalFrameOutcome::Accepted)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_external_outcome(&mut self, window: &mut Window) {
+        if self.pending_external.is_none() {
+            return;
+        }
+        let Some(outcome) = window.take_external_frame_outcome() else {
+            return;
+        };
+        if Self::external_frame_outcome_certifies(self.pending_external.is_some(), outcome) {
+            let Some(pending) = self.pending_external.take() else {
+                return;
+            };
+            self.direct_display = Some(pending);
+            self.frame_realization = Some(FrameRealization {
+                decode: DecodeMode::Hardware,
+                residency: DecodeResidency::NativeGpu,
+                import: ImportMode::DirectAlias,
+                conversion: ConversionMode::YuvShader,
+                synchronization: SynchronizationMode::Explicit,
+            });
+        } else {
+            self.pending_external = None;
+            self.disable_direct_import(window);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stage_imported_frame(&mut self, window: &mut Window, imported: ImportedNv12Texture) {
+        let presentation = ExternalPresentation {
+            texture: Arc::clone(&imported.texture),
+            width: imported.width,
+            height: imported.height,
+            color_transform: imported.color_transform,
+        };
+        // SAFETY: `imported.texture` is the exact NV12 Arc created on this window's
+        // matching Vulkan device, with wgpu RESOURCE tracking. Its imported image is
+        // GENERAL/FOREIGN, and `imported.sync_file` is the single producer fence moved
+        // into GPUI; this call only wraps those owned values for renderer submission.
+        let frame = match unsafe {
+            ExternalNv12Frame::new(
+                Arc::clone(&imported.texture),
+                imported.sync_file,
+                ExternalOwnership::Foreign,
+            )
+        } {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::warn!("external NV12 frame rejected before staging: {error}");
+                self.disable_direct_import(window);
+                return;
+            }
+        };
+        let outcome = window.submit_external_frame(ExternalFrameRequest::Prepared(frame));
+        // The immediate result is only the mailbox-stage echo. Drain it so
+        // the next tick observes only the renderer-produced outcome.
+        let _ = window.take_external_frame_outcome();
+        match outcome {
+            gpui_wgpu::ExternalFrameOutcome::Accepted => {
+                self.pending_external = Some(presentation);
+            }
+            gpui_wgpu::ExternalFrameOutcome::Unsupported
+            | gpui_wgpu::ExternalFrameOutcome::TransientFailure
+            | gpui_wgpu::ExternalFrameOutcome::FatalFailure => {
+                self.disable_direct_import(window);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_direct_import(&mut self, window: &mut Window) {
+        let result = self
+            .direct_import
+            .as_ref()
+            .and_then(DirectImportWorker::try_take);
+        match result {
+            Some(Ok(imported)) if self.pending_external.is_none() => {
+                self.stage_imported_frame(window, imported);
+            }
+            Some(Ok(_)) => {}
+            Some(Err(_error)) => {
+                self.disable_direct_import(window);
+            }
+            None => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn submit_linux_frame(
+        &mut self,
+        window: &mut Window,
+        frame: lumina_video_native_frame::NativeFrameLease,
+    ) {
+        if matches!(
+            &frame.memory,
+            lumina_video_native_frame::NativeMemory::DmaBuf(_)
+        ) {
+            if self.direct_alias_supported == Some(true) {
+                let enqueued = self
+                    .direct_import
+                    .as_ref()
+                    .is_some_and(|worker| worker.enqueue(frame));
+                if !enqueued {
+                    self.disable_direct_import(window);
+                }
+            } else if self.direct_alias_supported == Some(false) {
+                drop(frame);
+                self.request_system_memory_downgrade();
+            } else {
+                drop(frame);
+            }
+        } else {
+            self.pending_frame = Some(frame);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Per-frame update
     // -----------------------------------------------------------------------
@@ -713,6 +1079,10 @@ impl GpuiVideoPlayer {
     /// Must be called every frame. Polls the decode pipeline, uploads textures,
     /// and syncs playback state from the Linux GStreamer session or the
     /// non-Linux CorePlayer.
+    ///
+    /// Linux DirectAlias currently requires this player to be the sole active
+    /// presenter for `window`; GPUI exposes a Window-global one-shot outcome.
+    /// Multi-presenter correlation is deferred outside issue #16.
     pub fn update(&mut self, window: &mut Window, _cx: &mut App) {
         // Lazy GPU context init — retry every frame until available.
         if self.gpu_context.is_none() {
@@ -734,15 +1104,18 @@ impl GpuiVideoPlayer {
 
         #[cfg(target_os = "linux")]
         {
+            self.drain_pending_external_retirement(window);
+            self.ensure_direct_import_route(window);
+            self.poll_external_outcome(window);
             #[cfg(feature = "moq")]
             if self.core.is_some() {
                 self.update_core();
             } else {
-                self.update_linux();
+                self.update_linux(window);
             }
 
             #[cfg(not(feature = "moq"))]
-            self.update_linux();
+            self.update_linux(window);
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -841,7 +1214,7 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
-    fn update_linux(&mut self) {
+    fn update_linux(&mut self, window: &mut Window) {
         self.loading_started = true;
 
         // Exactly one session poll belongs to one GPUI animation tick. The
@@ -926,8 +1299,10 @@ impl GpuiVideoPlayer {
         };
 
         if let PresentationDecision::Advanced(frame) = decision {
-            self.pending_frame = Some(frame);
+            self.submit_linux_frame(window, frame);
         }
+
+        self.poll_direct_import(window);
 
         if let Some(gpu) = self.gpu_context.as_ref() {
             if let Some(frame) = self.pending_frame.take() {
@@ -939,7 +1314,10 @@ impl GpuiVideoPlayer {
                     &mut self.cbcr_cache,
                     &mut self.rgba_cache,
                 ) {
-                    Ok(textures) => self.frame_textures = Some(textures),
+                    Ok(textures) => {
+                        self.retire_external_frame_now(window);
+                        self.frame_textures = Some(textures);
+                    }
                     Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease))
                     | Err(NativeFrameIngestionError::UnsupportedDmaBuf(lease))
                     | Err(NativeFrameIngestionError::UnsupportedCpuFormat(lease))
@@ -966,10 +1344,34 @@ impl GpuiVideoPlayer {
     ///
     /// Uses `surface()` for GPU compositing:
     /// - GPU NV12 frames: `surface((y_tex, cbcr_tex, size, transform))`
+    /// - Staged external NV12 frames: one multiplanar texture during the
+    ///   renderer ownership window, before realization is certified
     /// - CPU-fallback NV12 frames: RGBA passthrough
     /// - RGBA frames: `surface((tex, desc))` — passthrough
     /// - No frame: black placeholder
     pub fn surface_element(&self) -> impl IntoElement {
+        #[cfg(target_os = "linux")]
+        if let Some(frame) = self
+            .pending_external
+            .as_ref()
+            .or(self.direct_display.as_ref())
+        {
+            let native_size = size(
+                DevicePixels(frame.width as i32),
+                DevicePixels(frame.height as i32),
+            );
+            let color_transform = gpui::Nv12ColorTransform {
+                yuv_to_rgb: frame.color_transform,
+            };
+            return div()
+                .size_full()
+                .child(
+                    surface((frame.texture.clone(), native_size, color_transform))
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_element();
+        }
         if let Some(ref textures) = self.frame_textures {
             match textures {
                 GpuFrameTextures::Nv12 {
@@ -1304,6 +1706,15 @@ impl GpuiVideoPlayer {
 
 impl Drop for GpuiVideoPlayer {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            // Drop has no Window: it releases local/session resources here, while Zed may
+            // retain at most its bounded latest + displayed external slots (<=2 leases)
+            // until an explicit window-aware retire, replacement, or window teardown.
+            self.pending_frame = None;
+            self.pending_external = None;
+            self.direct_import.take();
+        }
         #[cfg(any(not(target_os = "linux"), feature = "moq"))]
         if let Some(core) = self.core.take() {
             self.background_executor
@@ -1352,5 +1763,45 @@ mod color_boundary_tests {
         ];
         let copied = gpui::Nv12ColorTransform { yuv_to_rgb: source };
         assert_eq!(copied.yuv_to_rgb, source);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod direct_route_state_tests {
+    use super::{try_send_drop_oldest, GpuiVideoPlayer};
+    use crossbeam_channel::bounded;
+    use gpui_wgpu::ExternalFrameOutcome;
+
+    #[test]
+    fn delayed_acceptance_is_the_only_direct_alias_certification() {
+        assert!(GpuiVideoPlayer::external_frame_outcome_certifies(
+            true,
+            ExternalFrameOutcome::Accepted
+        ));
+        assert!(!GpuiVideoPlayer::external_frame_outcome_certifies(
+            false,
+            ExternalFrameOutcome::Accepted
+        ));
+        assert!(!GpuiVideoPlayer::external_frame_outcome_certifies(
+            true,
+            ExternalFrameOutcome::TransientFailure
+        ));
+    }
+
+    #[test]
+    fn bounded_import_mailbox_drops_oldest_without_waiting() {
+        let (sender, receiver) = bounded(1);
+        let drop_receiver = receiver.clone();
+        assert!(try_send_drop_oldest(&sender, &drop_receiver, 1));
+        assert!(try_send_drop_oldest(&sender, &drop_receiver, 2));
+        assert_eq!(receiver.try_recv(), Ok(2));
+    }
+
+    #[test]
+    fn queue_send_reports_disconnected_without_retry_loop() {
+        let (sender, receiver) = bounded::<u8>(1);
+        drop(receiver);
+        let (_drop_sender, drop_receiver) = bounded::<u8>(1);
+        assert!(!try_send_drop_oldest(&sender, &drop_receiver, 1));
     }
 }

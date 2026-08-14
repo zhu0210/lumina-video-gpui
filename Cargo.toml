@@ -15,12 +15,12 @@ members = [
 # wgpu — shared with GPUI (must match the pinned Zed-compatible fork)
 wgpu = {
   git = "https://github.com/zhu0210/wgpu.git",
-  rev = "b544e9c585d91f5548f96577f3f547e920e38fd5"
+  rev = "4e18c6630ec587d5b6491858fa725b82f4502b4e"
 }
 # wgpu-hal for zero-copy platform import
 wgpu-hal = {
   git = "https://github.com/zhu0210/wgpu.git",
-  rev = "b544e9c585d91f5548f96577f3f547e920e38fd5"
+  rev = "4e18c6630ec587d5b6491858fa725b82f4502b4e"
 }
 
 # Video/audio dependencies

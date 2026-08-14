@@ -14,6 +14,7 @@
 
 use std::fmt;
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,6 +51,8 @@ pub mod macos_video;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod video_decoder;
 
+#[cfg(target_os = "linux")]
+pub mod linux_sync;
 #[cfg(target_os = "linux")]
 pub mod linux_video;
 #[cfg(target_os = "linux")]
@@ -404,6 +407,31 @@ pub struct DmaBufFormatPlane {
 /// plane descriptors without allocating or copying them. It validates both
 /// reference layers; allocation and pooling remain producer responsibilities.
 #[cfg(target_os = "linux")]
+pub struct ProducerOwner(Arc<dyn Send + Sync>);
+
+#[cfg(target_os = "linux")]
+impl ProducerOwner {
+    /// Retains an opaque producer resource until the native frame lease drops.
+    pub fn new<T: Send + Sync + 'static>(owner: T) -> Self {
+        Self(Arc::new(owner))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Clone for ProducerOwner {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for ProducerOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProducerOwner").finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DmaBufMemory {
     pub objects: Vec<DmaBufObject>,
@@ -413,6 +441,8 @@ pub struct DmaBufMemory {
     pub drm_fourcc: Option<u32>,
     /// DRM modifier shared by the image's memory layout.
     pub modifier: Option<u64>,
+    /// Opaque producer resource retained through renderer completion.
+    pub owner: Option<ProducerOwner>,
 }
 
 #[cfg(target_os = "linux")]
@@ -433,7 +463,14 @@ impl DmaBufMemory {
             format_planes,
             drm_fourcc,
             modifier,
+            owner: None,
         })
+    }
+
+    /// Attaches an opaque producer owner without exposing its framework type.
+    pub fn with_owner(mut self, owner: ProducerOwner) -> Self {
+        self.owner = Some(owner);
+        self
     }
 
     /// Validates both reference layers after construction.

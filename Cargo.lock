@@ -1461,7 +1461,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "gpui_util",
  "indexmap 2.14.0",
@@ -1951,7 +1951,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2894,7 +2894,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2977,7 +2977,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -3028,7 +3028,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3076,7 +3076,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -3087,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3097,7 +3097,7 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "anyhow",
  "log",
@@ -3106,7 +3106,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "anyhow",
  "ash",
@@ -3136,7 +3136,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -3545,7 +3545,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4315,6 +4315,7 @@ dependencies = [
 name = "lumina-video-gpui"
 version = "0.2.2"
 dependencies = [
+ "crossbeam-channel",
  "gpui",
  "gpui_wgpu",
  "lumina-video-core",
@@ -4527,7 +4528,7 @@ dependencies = [
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "anyhow",
  "bindgen 0.71.1",
@@ -4690,7 +4691,7 @@ checksum = "956787520e75e9bd233246045d19f42fb73242759cc57fba9611d940ae96d4b0"
 [[package]]
 name = "naga"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -4715,7 +4716,7 @@ dependencies = [
 [[package]]
 name = "naga-types"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap 2.14.0",
@@ -5702,7 +5703,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "collections",
  "serde",
@@ -6398,7 +6399,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "derive_refineable",
 ]
@@ -6771,7 +6772,7 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "async-task",
  "backtrace",
@@ -7406,7 +7407,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "heapless",
  "log",
@@ -8515,7 +8516,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "util"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -8554,7 +8555,7 @@ dependencies = [
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "perf",
  "quote",
@@ -9055,7 +9056,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",
@@ -9084,7 +9085,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -9117,7 +9118,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-apple"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "wgpu-hal",
 ]
@@ -9125,7 +9126,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-emscripten"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "wgpu-hal",
 ]
@@ -9133,7 +9134,7 @@ dependencies = [
 [[package]]
 name = "wgpu-core-deps-windows-linux-android"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "wgpu-hal",
 ]
@@ -9141,7 +9142,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -9196,7 +9197,7 @@ dependencies = [
 [[package]]
 name = "wgpu-naga-bridge"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "naga",
  "wgpu-types",
@@ -9205,7 +9206,7 @@ dependencies = [
 [[package]]
 name = "wgpu-types"
 version = "30.0.0"
-source = "git+https://github.com/zhu0210/wgpu.git?rev=b544e9c585d91f5548f96577f3f547e920e38fd5#b544e9c585d91f5548f96577f3f547e920e38fd5"
+source = "git+https://github.com/zhu0210/wgpu.git?rev=4e18c6630ec587d5b6491858fa725b82f4502b4e#4e18c6630ec587d5b6491858fa725b82f4502b4e"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
@@ -10440,7 +10441,7 @@ dependencies = [
 [[package]]
 name = "zlog"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10457,7 +10458,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -10468,7 +10469,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/zhu0210/zed.git?rev=a26bef2a211cce93bf393d184009aa4b89d3d58e#a26bef2a211cce93bf393d184009aa4b89d3d58e"
+source = "git+https://github.com/zhu0210/zed.git?rev=20fae946d580321947fb50dec0183e49879fae56#20fae946d580321947fb50dec0183e49879fae56"
 
 [[package]]
 name = "zune-core"
