@@ -61,6 +61,31 @@ pub enum SynchronizationMode {
     CpuWait,
 }
 
+/// The latest renderer outcome observed for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererOutcome {
+    Accepted,
+    Unsupported,
+    TransientFailure,
+    FatalFailure,
+}
+
+/// Why the session left its preferred presentation capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityDowngradeReason {
+    HardwareOpenFailure,
+    HardwareDecodeFailure,
+    HardwareUnavailable,
+    RendererUnsupported,
+    RendererTransientFailure,
+    RendererFatalFailure,
+    UnsafeSync,
+    UnsupportedImport,
+    TransientImport,
+    UnsupportedColor,
+    TransitionTimeout,
+}
+
 /// Observable description of how a frame reached presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameRealization {
@@ -69,6 +94,17 @@ pub struct FrameRealization {
     pub import: ImportMode,
     pub conversion: ConversionMode,
     pub synchronization: SynchronizationMode,
+}
+
+impl FrameRealization {
+    /// Returns the capability tier represented by this realized frame.
+    pub const fn capability_tier(self) -> CapabilityTier {
+        match self.import {
+            ImportMode::DirectAlias => CapabilityTier::DirectAlias,
+            ImportMode::GpuCopy => CapabilityTier::GpuConversion,
+            ImportMode::CpuUpload => CapabilityTier::SystemMemoryUpload,
+        }
+    }
 }
 
 /// Current lifecycle state of a media session.
@@ -216,6 +252,9 @@ pub struct SessionSnapshot {
     pub state: SessionState,
     pub metadata: Option<SessionMetadata>,
     pub capability: CapabilityTier,
+    pub frame_realization: Option<FrameRealization>,
+    pub latest_renderer_outcome: Option<RendererOutcome>,
+    pub latest_downgrade_reason: Option<CapabilityDowngradeReason>,
     pub audio_tracks: Vec<AudioTrack>,
     pub selected_audio_track_id: Option<String>,
 }
@@ -227,9 +266,17 @@ impl SessionSnapshot {
             state: SessionState::Loading,
             metadata: None,
             capability,
+            frame_realization: None,
+            latest_renderer_outcome: None,
+            latest_downgrade_reason: None,
             audio_tracks: Vec::new(),
             selected_audio_track_id: None,
         }
+    }
+
+    /// Returns the capability currently committed by the presentation path.
+    pub const fn current_capability(&self) -> CapabilityTier {
+        self.capability
     }
 }
 
@@ -254,4 +301,33 @@ pub trait MediaSession: Send {
 
     /// Polls one queued event without blocking; events are FIFO.
     fn try_next_event(&mut self) -> Result<Option<SessionEvent<Self::Frame>>, SessionError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CapabilityTier, ConversionMode, DecodeMode, DecodeResidency, FrameRealization, ImportMode,
+        SynchronizationMode,
+    };
+
+    #[test]
+    fn realization_commits_its_capability_tier() {
+        let direct = FrameRealization {
+            decode: DecodeMode::Hardware,
+            residency: DecodeResidency::NativeGpu,
+            import: ImportMode::DirectAlias,
+            conversion: ConversionMode::YuvShader,
+            synchronization: SynchronizationMode::Explicit,
+        };
+        assert_eq!(direct.capability_tier(), CapabilityTier::DirectAlias);
+
+        let cpu = FrameRealization {
+            decode: DecodeMode::Software,
+            residency: DecodeResidency::SystemMemory,
+            import: ImportMode::CpuUpload,
+            conversion: ConversionMode::None,
+            synchronization: SynchronizationMode::CpuWait,
+        };
+        assert_eq!(cpu.capability_tier(), CapabilityTier::SystemMemoryUpload);
+    }
 }

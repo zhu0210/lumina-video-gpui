@@ -26,10 +26,14 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use gpui::*;
 use gpui_wgpu::wgpu;
-use lumina_video_core::session::FrameRealization;
+use lumina_video_core::session::{
+    CapabilityDowngradeReason, CapabilityTier, FrameRealization, RendererOutcome,
+};
 
 #[cfg(target_os = "linux")]
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -37,8 +41,8 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use gpui_wgpu::{ExternalFrameRequest, ExternalNv12Frame, ExternalOwnership};
 #[cfg(target_os = "linux")]
 use lumina_video_core::session::{
-    CapabilityTier, ConversionMode, DecodeMode, DecodeResidency, ImportMode, MediaSession,
-    SessionError, SessionEvent, SessionState as CoreSessionState, SynchronizationMode,
+    ConversionMode, DecodeResidency, ImportMode, MediaSession, SessionError, SessionEvent,
+    SessionState as CoreSessionState, SynchronizationMode,
 };
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 #[cfg(target_os = "linux")]
@@ -65,6 +69,64 @@ struct ExternalPresentation {
     width: u32,
     height: u32,
     color_transform: [[f32; 4]; 4],
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationTransition {
+    Direct,
+    Downgrading,
+    SystemMemory,
+    Fatal,
+}
+
+#[cfg(target_os = "linux")]
+impl PresentationTransition {
+    fn after_downgrade(self) -> Self {
+        match self {
+            Self::Direct => Self::Downgrading,
+            Self::Downgrading | Self::SystemMemory | Self::Fatal => Self::Fatal,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn active_playback_state(state: &VideoState) -> bool {
+    matches!(
+        state,
+        VideoState::Playing { .. } | VideoState::Buffering { .. }
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn sync_downgrade_budget(
+    active: bool,
+    remaining: Option<Duration>,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> (Option<Duration>, Option<Instant>) {
+    if active {
+        if deadline.is_some() {
+            return (remaining, deadline);
+        }
+        let Some(remaining) = remaining else {
+            return (None, None);
+        };
+        (
+            Some(remaining),
+            Some(now.checked_add(remaining).unwrap_or(now)),
+        )
+    } else {
+        let remaining = deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .or(remaining);
+        (remaining, None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn downgrade_budget_expired(active: bool, deadline: Option<Instant>, now: Instant) -> bool {
+    active && deadline.is_some_and(|deadline| now >= deadline)
 }
 
 #[cfg(target_os = "linux")]
@@ -270,7 +332,11 @@ pub struct GpuiVideoPlayer {
     #[cfg(target_os = "linux")]
     direct_alias_supported: Option<bool>,
     #[cfg(target_os = "linux")]
-    direct_downgrade_requested: bool,
+    presentation_transition: PresentationTransition,
+    #[cfg(target_os = "linux")]
+    transition_deadline: Option<Instant>,
+    #[cfg(target_os = "linux")]
+    remaining_downgrade_budget: Option<Duration>,
     #[cfg(target_os = "linux")]
     pending_external: Option<ExternalPresentation>,
     #[cfg(target_os = "linux")]
@@ -371,7 +437,11 @@ impl GpuiVideoPlayer {
             #[cfg(target_os = "linux")]
             direct_alias_supported: None,
             #[cfg(target_os = "linux")]
-            direct_downgrade_requested: false,
+            presentation_transition: PresentationTransition::Direct,
+            #[cfg(target_os = "linux")]
+            transition_deadline: None,
+            #[cfg(target_os = "linux")]
+            remaining_downgrade_budget: None,
             #[cfg(target_os = "linux")]
             pending_external: None,
             #[cfg(target_os = "linux")]
@@ -496,7 +566,9 @@ impl GpuiVideoPlayer {
             self.has_presented_frame = false;
             self.direct_import = None;
             self.direct_alias_supported = None;
-            self.direct_downgrade_requested = false;
+            self.presentation_transition = PresentationTransition::Direct;
+            self.transition_deadline = None;
+            self.remaining_downgrade_budget = None;
             self.request_external_retirement();
         }
     }
@@ -561,7 +633,9 @@ impl GpuiVideoPlayer {
             self.pending_frame = None;
             self.direct_import = None;
             self.direct_alias_supported = None;
-            self.direct_downgrade_requested = false;
+            self.presentation_transition = PresentationTransition::Direct;
+            self.transition_deadline = None;
+            self.remaining_downgrade_budget = None;
             self.request_external_retirement();
             self.session = Some(
                 GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
@@ -596,7 +670,9 @@ impl GpuiVideoPlayer {
             self.pending_frame = None;
             self.direct_import = None;
             self.direct_alias_supported = None;
-            self.direct_downgrade_requested = false;
+            self.presentation_transition = PresentationTransition::Direct;
+            self.transition_deadline = None;
+            self.remaining_downgrade_budget = None;
             self.request_external_retirement();
             self.session = Some(
                 GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
@@ -845,6 +921,54 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
+    /// Returns the capability tier last committed by the renderer.
+    pub fn capability(&self) -> Option<CapabilityTier> {
+        self.frame_realization
+            .map(FrameRealization::capability_tier)
+            .or(match self.presentation_transition {
+                PresentationTransition::Direct | PresentationTransition::Downgrading => {
+                    Some(CapabilityTier::DirectAlias)
+                }
+                PresentationTransition::SystemMemory => Some(CapabilityTier::SystemMemoryUpload),
+                PresentationTransition::Fatal => Some(CapabilityTier::DirectAlias),
+            })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    /// Returns the capability tier last committed by the renderer.
+    pub fn capability(&self) -> Option<CapabilityTier> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Returns the latest typed renderer outcome.
+    pub fn latest_renderer_outcome(&self) -> Option<RendererOutcome> {
+        self.session
+            .as_ref()
+            .and_then(GstMediaSession::latest_renderer_outcome)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    /// Returns the latest typed renderer outcome.
+    pub fn latest_renderer_outcome(&self) -> Option<RendererOutcome> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Returns the latest typed capability downgrade reason.
+    pub fn latest_downgrade_reason(&self) -> Option<CapabilityDowngradeReason> {
+        self.session
+            .as_ref()
+            .and_then(GstMediaSession::latest_downgrade_reason)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    /// Returns the latest typed capability downgrade reason.
+    pub fn latest_downgrade_reason(&self) -> Option<CapabilityDowngradeReason> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
     fn request_external_retirement(&mut self) {
         self.pending_external_retirement = true;
         self.pending_external = None;
@@ -866,7 +990,6 @@ impl GpuiVideoPlayer {
         self.pending_external_retirement = false;
         self.pending_external = None;
         self.direct_display = None;
-        self.frame_realization = None;
     }
 
     #[cfg(target_os = "linux")]
@@ -889,38 +1012,201 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "linux")]
-    fn request_system_memory_downgrade(&mut self) {
-        if self.direct_downgrade_requested {
+    fn report_renderer_outcome(&self, outcome: RendererOutcome) {
+        if let Some(session) = self.session.as_ref() {
+            session.report_renderer_outcome(outcome);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_realization(&mut self, realization: FrameRealization) -> bool {
+        if self.frame_realization == Some(realization) {
+            return false;
+        }
+        self.frame_realization = Some(realization);
+        if let Some(session) = self.session.as_ref() {
+            session.commit_realization(realization);
+        }
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn report_downgrade_reason(&self, reason: CapabilityDowngradeReason) {
+        if let Some(session) = self.session.as_ref() {
+            session.report_downgrade_reason(reason);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fail_presentation_transition(
+        &mut self,
+        downgrade_reason: Option<CapabilityDowngradeReason>,
+        reason: impl Into<String>,
+    ) {
+        if self.presentation_transition == PresentationTransition::Fatal {
             return;
         }
+        let reason = reason.into();
+        self.presentation_transition = PresentationTransition::Fatal;
+        self.transition_deadline = None;
+        self.remaining_downgrade_budget = None;
+        self.direct_alias_supported = Some(false);
+        self.direct_import = None;
+        self.pending_external = None;
+        self.pending_frame = None;
+        if let Some(downgrade_reason) = downgrade_reason {
+            self.report_downgrade_reason(downgrade_reason);
+        }
         if let Some(session) = self.session.as_mut() {
-            let result = session.command(lumina_video_core::session::SessionCommand::Renegotiate {
-                tier: CapabilityTier::SystemMemoryUpload,
-            });
-            if result.is_ok() {
-                self.direct_downgrade_requested = true;
+            let _ = session.command(lumina_video_core::session::SessionCommand::Stop);
+        }
+        self.state = VideoState::Error(lumina_video_native_frame::video::VideoError::Generic(
+            reason,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_video_state(&mut self, state: VideoState) {
+        self.state = state;
+        if self.presentation_transition != PresentationTransition::Downgrading {
+            return;
+        }
+        let (remaining, deadline) = sync_downgrade_budget(
+            active_playback_state(&self.state),
+            self.remaining_downgrade_budget,
+            self.transition_deadline,
+            Instant::now(),
+        );
+        self.remaining_downgrade_budget = remaining;
+        self.transition_deadline = deadline;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn begin_system_memory_downgrade(
+        &mut self,
+        outcome: Option<RendererOutcome>,
+        downgrade_reason: CapabilityDowngradeReason,
+        request_command: bool,
+    ) {
+        match self.presentation_transition {
+            PresentationTransition::Direct => {
+                self.presentation_transition = self.presentation_transition.after_downgrade();
+                self.remaining_downgrade_budget = Some(self.config.lifecycle_timeout);
+                let (remaining, deadline) = sync_downgrade_budget(
+                    active_playback_state(&self.state),
+                    self.remaining_downgrade_budget,
+                    None,
+                    Instant::now(),
+                );
+                self.remaining_downgrade_budget = remaining;
+                self.transition_deadline = deadline;
+                if let Some(outcome) = outcome {
+                    self.report_renderer_outcome(outcome);
+                }
+                self.report_downgrade_reason(downgrade_reason);
+                self.direct_alias_supported = Some(false);
+                self.direct_import = None;
+                // The renderer's currently displayed direct frame is the
+                // transition placeholder; retire it only after CPU upload.
+                self.pending_external = None;
+                if request_command && !self.request_system_memory_downgrade() {
+                    self.fail_presentation_transition(
+                        Some(downgrade_reason),
+                        "system-memory downgrade command was rejected",
+                    );
+                }
             }
+            PresentationTransition::Downgrading | PresentationTransition::SystemMemory => {
+                if let Some(outcome) = outcome {
+                    self.report_renderer_outcome(outcome);
+                }
+                self.fail_presentation_transition(
+                    Some(downgrade_reason),
+                    "renderer failed during system-memory downgrade",
+                );
+            }
+            PresentationTransition::Fatal => {}
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn disable_direct_import(&mut self, window: &mut Window) {
-        self.direct_alias_supported = Some(false);
-        self.direct_import = None;
-        self.retire_external_frame_now(window);
-        self.request_system_memory_downgrade();
+    fn check_presentation_transition_timeout(&mut self) {
+        if self.presentation_transition != PresentationTransition::Downgrading
+            || !active_playback_state(&self.state)
+        {
+            return;
+        }
+        if downgrade_budget_expired(true, self.transition_deadline, Instant::now()) {
+            self.fail_presentation_transition(
+                Some(CapabilityDowngradeReason::TransitionTimeout),
+                "system-memory presentation transition timed out",
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
-    fn ensure_direct_import_route(&mut self, window: &mut Window) {
+    fn observe_worker_downgrade(&mut self) {
+        if self.presentation_transition != PresentationTransition::Direct {
+            return;
+        }
+        let Some(reason) = self
+            .session
+            .as_ref()
+            .and_then(GstMediaSession::latest_downgrade_reason)
+        else {
+            return;
+        };
+        if matches!(
+            reason,
+            CapabilityDowngradeReason::HardwareOpenFailure
+                | CapabilityDowngradeReason::HardwareDecodeFailure
+                | CapabilityDowngradeReason::HardwareUnavailable
+                | CapabilityDowngradeReason::UnsafeSync
+                | CapabilityDowngradeReason::UnsupportedImport
+                | CapabilityDowngradeReason::UnsupportedColor
+        ) {
+            self.begin_system_memory_downgrade(None, reason, false);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_cpu_frame(&mut self, window: &mut Window, realization: FrameRealization) {
+        self.presentation_transition = PresentationTransition::SystemMemory;
+        self.transition_deadline = None;
+        self.remaining_downgrade_budget = None;
+        self.retire_external_frame_now(window);
+        let _ = self.commit_realization(realization);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn request_system_memory_downgrade(&mut self) -> bool {
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        let result = session.command(lumina_video_core::session::SessionCommand::Renegotiate {
+            tier: CapabilityTier::SystemMemoryUpload,
+        });
+        result.is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn disable_direct_import(
+        &mut self,
+        outcome: RendererOutcome,
+        downgrade_reason: CapabilityDowngradeReason,
+    ) {
+        self.begin_system_memory_downgrade(Some(outcome), downgrade_reason, true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_direct_import_route(&mut self) {
+        if self.presentation_transition != PresentationTransition::Direct {
+            return;
+        }
         if self.session.is_none() {
             return;
         }
-        if self.direct_alias_supported == Some(true) {
-            return;
-        }
-        if self.direct_alias_supported == Some(false) {
-            self.request_system_memory_downgrade();
+        if self.direct_alias_supported.is_some() {
             return;
         }
         let Some(gpu) = self.gpu_context.as_ref() else {
@@ -938,14 +1224,18 @@ impl GpuiVideoPlayer {
                 self.direct_alias_supported = Some(true);
                 self.direct_import = Some(worker);
             } else {
-                self.direct_alias_supported = Some(false);
-                self.retire_external_frame_now(window);
-                self.request_system_memory_downgrade();
+                self.begin_system_memory_downgrade(
+                    Some(RendererOutcome::TransientFailure),
+                    CapabilityDowngradeReason::TransientImport,
+                    true,
+                );
             }
         } else {
-            self.direct_alias_supported = Some(false);
-            self.retire_external_frame_now(window);
-            self.request_system_memory_downgrade();
+            self.begin_system_memory_downgrade(
+                Some(RendererOutcome::Unsupported),
+                CapabilityDowngradeReason::RendererUnsupported,
+                true,
+            );
         }
     }
 
@@ -955,6 +1245,58 @@ impl GpuiVideoPlayer {
         outcome: gpui_wgpu::ExternalFrameOutcome,
     ) -> bool {
         pending_external && matches!(outcome, gpui_wgpu::ExternalFrameOutcome::Accepted)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn renderer_feedback(
+        outcome: gpui_wgpu::ExternalFrameOutcome,
+    ) -> (RendererOutcome, Option<CapabilityDowngradeReason>) {
+        match outcome {
+            gpui_wgpu::ExternalFrameOutcome::Accepted => (RendererOutcome::Accepted, None),
+            gpui_wgpu::ExternalFrameOutcome::Unsupported => (
+                RendererOutcome::Unsupported,
+                Some(CapabilityDowngradeReason::RendererUnsupported),
+            ),
+            gpui_wgpu::ExternalFrameOutcome::TransientFailure => (
+                RendererOutcome::TransientFailure,
+                Some(CapabilityDowngradeReason::RendererTransientFailure),
+            ),
+            gpui_wgpu::ExternalFrameOutcome::FatalFailure => (
+                RendererOutcome::FatalFailure,
+                Some(CapabilityDowngradeReason::RendererFatalFailure),
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn import_failure_classification(
+        error: &Nv12ImportError,
+    ) -> (RendererOutcome, CapabilityDowngradeReason) {
+        match error {
+            Nv12ImportError::UnsupportedAcquireSync(_) => (
+                RendererOutcome::Unsupported,
+                CapabilityDowngradeReason::UnsafeSync,
+            ),
+            Nv12ImportError::UnsupportedFrame(_) | Nv12ImportError::InvalidLayout { .. } => (
+                RendererOutcome::Unsupported,
+                CapabilityDowngradeReason::UnsupportedImport,
+            ),
+            Nv12ImportError::ImportFailed { .. } => (
+                RendererOutcome::TransientFailure,
+                CapabilityDowngradeReason::TransientImport,
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn direct_frame_realization(&self) -> Option<FrameRealization> {
+        Some(FrameRealization {
+            decode: self.session.as_ref()?.decode_mode()?,
+            residency: DecodeResidency::NativeGpu,
+            import: ImportMode::DirectAlias,
+            conversion: ConversionMode::YuvShader,
+            synchronization: SynchronizationMode::Explicit,
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -970,16 +1312,22 @@ impl GpuiVideoPlayer {
                 return;
             };
             self.direct_display = Some(pending);
-            self.frame_realization = Some(FrameRealization {
-                decode: DecodeMode::Hardware,
-                residency: DecodeResidency::NativeGpu,
-                import: ImportMode::DirectAlias,
-                conversion: ConversionMode::YuvShader,
-                synchronization: SynchronizationMode::Explicit,
-            });
+            let Some(realization) = self.direct_frame_realization() else {
+                self.fail_presentation_transition(
+                    None,
+                    "decoder mode unavailable for direct frame",
+                );
+                return;
+            };
+            if self.commit_realization(realization) {
+                self.report_renderer_outcome(RendererOutcome::Accepted);
+            }
         } else {
             self.pending_external = None;
-            self.disable_direct_import(window);
+            let (renderer_outcome, Some(reason)) = Self::renderer_feedback(outcome) else {
+                return;
+            };
+            self.disable_direct_import(renderer_outcome, reason);
         }
     }
 
@@ -1005,7 +1353,10 @@ impl GpuiVideoPlayer {
             Ok(frame) => frame,
             Err(error) => {
                 tracing::warn!("external NV12 frame rejected before staging: {error}");
-                self.disable_direct_import(window);
+                self.disable_direct_import(
+                    RendererOutcome::Unsupported,
+                    CapabilityDowngradeReason::UnsupportedImport,
+                );
                 return;
             }
         };
@@ -1020,7 +1371,10 @@ impl GpuiVideoPlayer {
             gpui_wgpu::ExternalFrameOutcome::Unsupported
             | gpui_wgpu::ExternalFrameOutcome::TransientFailure
             | gpui_wgpu::ExternalFrameOutcome::FatalFailure => {
-                self.disable_direct_import(window);
+                let (renderer_outcome, Some(reason)) = Self::renderer_feedback(outcome) else {
+                    return;
+                };
+                self.disable_direct_import(renderer_outcome, reason);
             }
         }
     }
@@ -1036,40 +1390,62 @@ impl GpuiVideoPlayer {
                 self.stage_imported_frame(window, imported);
             }
             Some(Ok(_)) => {}
-            Some(Err(_error)) => {
-                self.disable_direct_import(window);
+            Some(Err(error)) => {
+                let (outcome, reason) = Self::import_failure_classification(&error);
+                self.disable_direct_import(outcome, reason);
             }
             None => {}
         }
     }
 
     #[cfg(target_os = "linux")]
-    fn submit_linux_frame(
-        &mut self,
-        window: &mut Window,
-        frame: lumina_video_native_frame::NativeFrameLease,
-    ) {
+    fn submit_linux_frame(&mut self, frame: lumina_video_native_frame::NativeFrameLease) {
+        if self.presentation_transition == PresentationTransition::Fatal {
+            drop(frame);
+            return;
+        }
         if matches!(
             &frame.memory,
             lumina_video_native_frame::NativeMemory::DmaBuf(_)
         ) {
-            if self.direct_alias_supported == Some(true) {
+            if self.presentation_transition == PresentationTransition::Direct
+                && self.direct_alias_supported == Some(true)
+            {
                 let enqueued = self
                     .direct_import
                     .as_ref()
                     .is_some_and(|worker| worker.enqueue(frame));
                 if !enqueued {
-                    self.disable_direct_import(window);
+                    self.disable_direct_import(
+                        RendererOutcome::TransientFailure,
+                        CapabilityDowngradeReason::TransientImport,
+                    );
                 }
-            } else if self.direct_alias_supported == Some(false) {
-                drop(frame);
-                self.request_system_memory_downgrade();
             } else {
                 drop(frame);
             }
         } else {
             self.pending_frame = Some(frame);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cpu_frame_realization(
+        &self,
+        frame: &lumina_video_native_frame::NativeFrameLease,
+    ) -> Option<FrameRealization> {
+        let decode = self.session.as_ref()?.decode_mode()?;
+        Some(FrameRealization {
+            decode,
+            residency: DecodeResidency::SystemMemory,
+            import: ImportMode::CpuUpload,
+            conversion: if frame.descriptor.format.is_yuv() {
+                ConversionMode::YuvShader
+            } else {
+                ConversionMode::None
+            },
+            synchronization: SynchronizationMode::CpuWait,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1104,9 +1480,26 @@ impl GpuiVideoPlayer {
 
         #[cfg(target_os = "linux")]
         {
+            if self.presentation_transition == PresentationTransition::Fatal {
+                return;
+            }
+            self.observe_worker_downgrade();
+            if self.presentation_transition == PresentationTransition::Fatal {
+                return;
+            }
             self.drain_pending_external_retirement(window);
-            self.ensure_direct_import_route(window);
+            self.check_presentation_transition_timeout();
+            if self.presentation_transition == PresentationTransition::Fatal {
+                return;
+            }
+            self.ensure_direct_import_route();
+            if self.presentation_transition == PresentationTransition::Fatal {
+                return;
+            }
             self.poll_external_outcome(window);
+            if self.presentation_transition == PresentationTransition::Fatal {
+                return;
+            }
             #[cfg(feature = "moq")]
             if self.core.is_some() {
                 self.update_core();
@@ -1216,6 +1609,9 @@ impl GpuiVideoPlayer {
     #[cfg(target_os = "linux")]
     fn update_linux(&mut self, window: &mut Window) {
         self.loading_started = true;
+        if self.presentation_transition == PresentationTransition::Fatal {
+            return;
+        }
 
         // Exactly one session poll belongs to one GPUI animation tick. The
         // session's frame mailbox already drops stale frames, so draining
@@ -1244,7 +1640,7 @@ impl GpuiVideoPlayer {
                             PresentationDecision::Hold
                         }
                         SessionEvent::StateChanged { state } => {
-                            self.state = video_state(&state);
+                            self.set_video_state(video_state(&state));
                             if !self.initialized && matches!(state, CoreSessionState::Ready) {
                                 self.initialized = true;
                                 if self.config.autoplay {
@@ -1264,7 +1660,7 @@ impl GpuiVideoPlayer {
                             PresentationDecision::Advanced(frame)
                         }
                         SessionEvent::Ended => {
-                            self.state = VideoState::Ended;
+                            self.set_video_state(VideoState::Ended);
                             if self.has_presented_frame {
                                 PresentationDecision::Hold
                             } else {
@@ -1272,7 +1668,15 @@ impl GpuiVideoPlayer {
                             }
                         }
                         SessionEvent::Error(error) => {
-                            self.state = VideoState::Error(video_error(&error));
+                            self.set_video_state(VideoState::Error(video_error(&error)));
+                            if self.presentation_transition == PresentationTransition::Downgrading
+                                || matches!(&error, SessionError::Fatal(_))
+                            {
+                                self.fail_presentation_transition(
+                                    None,
+                                    format!("presentation transition failed: {error}"),
+                                );
+                            }
                             if self.has_presented_frame {
                                 PresentationDecision::Hold
                             } else {
@@ -1289,7 +1693,13 @@ impl GpuiVideoPlayer {
                 }
             }
             Err(error) => {
-                self.state = VideoState::Error(video_error(&error));
+                self.set_video_state(VideoState::Error(video_error(&error)));
+                if self.presentation_transition == PresentationTransition::Downgrading {
+                    self.fail_presentation_transition(
+                        None,
+                        format!("presentation transition failed: {error}"),
+                    );
+                }
                 if self.has_presented_frame {
                     PresentationDecision::Hold
                 } else {
@@ -1299,13 +1709,20 @@ impl GpuiVideoPlayer {
         };
 
         if let PresentationDecision::Advanced(frame) = decision {
-            self.submit_linux_frame(window, frame);
+            self.submit_linux_frame(frame);
+        }
+        if self.presentation_transition == PresentationTransition::Fatal {
+            return;
         }
 
         self.poll_direct_import(window);
+        if self.presentation_transition == PresentationTransition::Fatal {
+            return;
+        }
 
         if let Some(gpu) = self.gpu_context.as_ref() {
             if let Some(frame) = self.pending_frame.take() {
+                let realization = self.cpu_frame_realization(&frame);
                 match native_frame_lease_to_textures(
                     frame,
                     &gpu.device,
@@ -1315,14 +1732,31 @@ impl GpuiVideoPlayer {
                     &mut self.rgba_cache,
                 ) {
                     Ok(textures) => {
-                        self.retire_external_frame_now(window);
                         self.frame_textures = Some(textures);
+                        let Some(realization) = realization else {
+                            self.fail_presentation_transition(
+                                None,
+                                "decoder mode unavailable for CPU frame",
+                            );
+                            return;
+                        };
+                        self.commit_cpu_frame(window, realization);
                     }
-                    Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease))
-                    | Err(NativeFrameIngestionError::UnsupportedDmaBuf(lease))
+                    Err(NativeFrameIngestionError::UnsupportedAcquireSync(lease)) => {
+                        drop(lease);
+                        self.fail_presentation_transition(
+                            Some(CapabilityDowngradeReason::UnsafeSync),
+                            "CPU frame upload acquire synchronization is unsupported",
+                        );
+                    }
+                    Err(NativeFrameIngestionError::UnsupportedDmaBuf(lease))
                     | Err(NativeFrameIngestionError::UnsupportedCpuFormat(lease))
                     | Err(NativeFrameIngestionError::UnsupportedColorMetadata(lease)) => {
                         drop(lease);
+                        self.fail_presentation_transition(
+                            Some(CapabilityDowngradeReason::UnsupportedImport),
+                            "CPU frame upload failed",
+                        );
                     }
                 }
             }
@@ -1768,9 +2202,11 @@ mod color_boundary_tests {
 
 #[cfg(all(test, target_os = "linux"))]
 mod direct_route_state_tests {
-    use super::{try_send_drop_oldest, GpuiVideoPlayer};
+    use super::{try_send_drop_oldest, GpuiVideoPlayer, PresentationTransition};
     use crossbeam_channel::bounded;
     use gpui_wgpu::ExternalFrameOutcome;
+    use lumina_video_core::session::{CapabilityDowngradeReason, RendererOutcome};
+    use std::time::Duration;
 
     #[test]
     fn delayed_acceptance_is_the_only_direct_alias_certification() {
@@ -1785,6 +2221,76 @@ mod direct_route_state_tests {
         assert!(!GpuiVideoPlayer::external_frame_outcome_certifies(
             true,
             ExternalFrameOutcome::TransientFailure
+        ));
+    }
+
+    #[test]
+    fn downgrade_transition_is_one_shot() {
+        let transition = PresentationTransition::Direct.after_downgrade();
+        assert_eq!(transition, PresentationTransition::Downgrading);
+        assert_eq!(transition.after_downgrade(), PresentationTransition::Fatal);
+    }
+
+    #[test]
+    fn renderer_outcomes_map_without_collapsing_failure_kinds() {
+        assert_eq!(
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::Accepted),
+            (RendererOutcome::Accepted, None)
+        );
+        assert_eq!(
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::Unsupported),
+            (
+                RendererOutcome::Unsupported,
+                Some(CapabilityDowngradeReason::RendererUnsupported)
+            )
+        );
+        assert_eq!(
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::TransientFailure),
+            (
+                RendererOutcome::TransientFailure,
+                Some(CapabilityDowngradeReason::RendererTransientFailure)
+            )
+        );
+        assert_eq!(
+            GpuiVideoPlayer::renderer_feedback(ExternalFrameOutcome::FatalFailure),
+            (
+                RendererOutcome::FatalFailure,
+                Some(CapabilityDowngradeReason::RendererFatalFailure)
+            )
+        );
+    }
+
+    #[test]
+    fn downgrade_budget_pauses_and_resumes_without_background_expiry() {
+        let base = std::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+        let (remaining, deadline) = super::sync_downgrade_budget(false, Some(timeout), None, base);
+        assert_eq!(remaining, Some(timeout));
+        assert!(deadline.is_none());
+
+        let (remaining, deadline) = super::sync_downgrade_budget(true, remaining, deadline, base);
+        assert_eq!(deadline, Some(base + timeout));
+
+        let pause_at = base + Duration::from_millis(750);
+        let (remaining, deadline) =
+            super::sync_downgrade_budget(false, remaining, deadline, pause_at);
+        assert_eq!(remaining, Some(Duration::from_millis(1250)));
+        assert!(deadline.is_none());
+
+        let resume_at = pause_at + Duration::from_millis(500);
+        let (remaining, deadline) =
+            super::sync_downgrade_budget(true, remaining, deadline, resume_at);
+        assert_eq!(remaining, Some(Duration::from_millis(1250)));
+        assert_eq!(deadline, Some(resume_at + Duration::from_millis(1250)));
+        assert!(!super::downgrade_budget_expired(
+            false,
+            deadline,
+            resume_at + timeout
+        ));
+        assert!(super::downgrade_budget_expired(
+            true,
+            deadline,
+            resume_at + Duration::from_millis(1250)
         ));
     }
 
