@@ -246,7 +246,9 @@ assert_staging_prefix() {
 
 merge_package_prefix() {
     local prefix=$1
-    local source rel destination source_kind source_target destination_target
+    local prefix_root source source_parent rel destination source_kind source_target destination_target resolved_target
+
+    prefix_root=$(realpath -m -- "$prefix")
 
     while IFS= read -r -d '' source; do
         rel=${source#"$prefix"/}
@@ -254,6 +256,21 @@ merge_package_prefix() {
 
         if [[ -L "$source" ]]; then
             source_kind=symlink
+            source_target=$(readlink -- "$source")
+            [[ "$source_target" != /* ]] || {
+                fail "absolute package symlink target at $source: $source_target"
+            }
+            source_parent=${source%/*}
+            if ! resolved_target=$(realpath -m -- "$source_parent/$source_target"); then
+                fail "cannot resolve package symlink target at $source: $source_target"
+            fi
+            case "$resolved_target/" in
+                "$prefix_root/"*)
+                    ;;
+                *)
+                    fail "package symlink escapes prefix at $source: $source_target -> $resolved_target"
+                    ;;
+            esac
         elif [[ -d "$source" ]]; then
             source_kind=directory
         elif [[ -f "$source" ]]; then
@@ -280,6 +297,9 @@ merge_package_prefix() {
             directory)
                 [[ ! -L "$destination" && -d "$destination" ]] || {
                     fail "package collision changes type at $destination"
+                }
+                [[ "$(stat -c '%a' -- "$source")" == "$(stat -c '%a' -- "$destination")" ]] || {
+                    fail "package collision changes directory mode at $destination"
                 }
                 ;;
             file)
