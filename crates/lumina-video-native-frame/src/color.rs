@@ -356,7 +356,9 @@ pub fn nv12_to_rgba_into(
 
 /// Borrowed-plane form used by the legacy renderer path. It has the same
 /// production math and sampling semantics as [`nv12_to_rgba_into`] but does
-/// not manufacture an owning plane container.
+/// not manufacture an owning plane container. The separate byte/stride
+/// arguments intentionally preserve the zero-copy plane seam.
+#[allow(clippy::too_many_arguments)]
 pub fn nv12_bytes_to_rgba_into(
     y_bytes: &[u8],
     y_stride: usize,
@@ -398,10 +400,8 @@ pub fn nv12_bytes_to_rgba_into(
                 x,
                 y,
                 true,
-                color.chroma_horizontal,
-                color.chroma_vertical,
-                chroma_width,
-                chroma_height,
+                (color.chroma_horizontal, color.chroma_vertical),
+                (chroma_width, chroma_height),
             );
             let cr = sample_chroma(
                 uv_bytes,
@@ -409,10 +409,8 @@ pub fn nv12_bytes_to_rgba_into(
                 x,
                 y,
                 false,
-                color.chroma_horizontal,
-                color.chroma_vertical,
-                chroma_width,
-                chroma_height,
+                (color.chroma_horizontal, color.chroma_vertical),
+                (chroma_width, chroma_height),
             );
             let mut rgb =
                 apply_yuv_matrix_f32(matrix, f32::from(y_value) / 255.0, cb / 255.0, cr / 255.0);
@@ -434,7 +432,9 @@ pub fn nv12_bytes_to_rgba_into(
 
 /// Converts borrowed planar 4:2:0 bytes for the legacy CPU compatibility
 /// path. The matrix application remains the same production function used by
-/// NV12 and GPU fixtures.
+/// NV12 and GPU fixtures. The separate byte/stride arguments intentionally
+/// preserve the zero-copy plane seam.
+#[allow(clippy::too_many_arguments)]
 pub fn yuv420p_bytes_to_rgba_into(
     y_bytes: &[u8],
     y_stride: usize,
@@ -487,11 +487,11 @@ fn sample_chroma(
     x: usize,
     y: usize,
     cb: bool,
-    horizontal: ChromaHorizontal,
-    vertical: ChromaVertical,
-    width: usize,
-    height: usize,
+    siting: (ChromaHorizontal, ChromaVertical),
+    dimensions: (usize, usize),
 ) -> f32 {
+    let (horizontal, vertical) = siting;
+    let (width, height) = dimensions;
     let x_position = siting_position(x, horizontal);
     let y_position = siting_position(
         y,
@@ -795,10 +795,8 @@ mod tests {
             1,
             1,
             true,
-            ChromaHorizontal::Centered,
-            ChromaVertical::Centered,
-            2,
-            2,
+            (ChromaHorizontal::Centered, ChromaVertical::Centered),
+            (2, 2),
         );
         assert!(sample.fract() > 0.0);
     }

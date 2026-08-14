@@ -109,9 +109,9 @@ fn color_metadata_from_video_info(video_info: &gst_video::VideoInfo) -> ColorMet
         (ChromaHorizontal::Unknown, ChromaVertical::Unknown)
     } else if site == gst_video::VideoChromaSite::JPEG {
         (ChromaHorizontal::Centered, ChromaVertical::Centered)
-    } else if site == gst_video::VideoChromaSite::MPEG2 {
-        (ChromaHorizontal::Cosited, ChromaVertical::Centered)
-    } else if site == gst_video::VideoChromaSite::H_COSITED {
+    } else if site == gst_video::VideoChromaSite::MPEG2
+        || site == gst_video::VideoChromaSite::H_COSITED
+    {
         (ChromaHorizontal::Cosited, ChromaVertical::Centered)
     } else if site == gst_video::VideoChromaSite::V_COSITED {
         (ChromaHorizontal::Centered, ChromaVertical::Cosited)
