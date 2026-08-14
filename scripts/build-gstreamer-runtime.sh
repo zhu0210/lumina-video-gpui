@@ -42,6 +42,35 @@ fail() {
     exit 1
 }
 
+capture_path() {
+    local result_var=$1
+    local description=$2
+    local marker=$'\x1fLUMINA_PATH_STATUS_'
+    local captured status
+    shift 2
+
+    captured=$(
+        set +e
+        "$@"
+        command_status=$?
+        printf '%s%s' "$marker" "$command_status"
+    )
+    case "$captured" in
+        *"$marker"*)
+            status=${captured##*"$marker"}
+            captured=${captured%"$marker$status"}
+            ;;
+        *)
+            fail "$description produced no status marker"
+            ;;
+    esac
+    [[ "$status" =~ ^[0-9]+$ ]] || fail "$description produced an invalid status"
+    [[ "$status" == 0 ]] || fail "$description failed with status $status"
+    [[ "$captured" == *$'\n' ]] || fail "$description produced no terminating newline"
+    captured=${captured%$'\n'}
+    printf -v "$result_var" '%s' "$captured"
+}
+
 lock_file=$(realpath "$lock_file")
 output_dir=$(realpath -m "$output_dir")
 
@@ -224,10 +253,18 @@ validate_package_archive() {
 assert_staging_prefix() {
     local staging=$1
     local prefix="$staging/opt/gstreamer-1.0"
+    local list_stem="$work_dir/${staging##*/}"
+    local roots_list="$list_stem.roots"
+    local opt_children_list="$list_stem.opt-children"
     local -a roots=()
     local -a opt_children=()
 
-    mapfile -d '' -t roots < <(find -P "$staging" -mindepth 1 -maxdepth 1 -printf '%f\0')
+    if ! find -P "$staging" -mindepth 1 -maxdepth 1 -printf '%f\0' >"$roots_list"; then
+        fail "cannot enumerate package staging roots: $staging"
+    fi
+    if ! mapfile -d '' -t roots <"$roots_list"; then
+        fail "cannot read package staging roots: $roots_list"
+    fi
     [[ ${#roots[@]} -eq 1 && "${roots[0]}" == opt ]] || {
         fail "package staging has roots outside opt: $staging"
     }
@@ -235,7 +272,12 @@ assert_staging_prefix() {
         fail "package staging opt prefix is not a directory: $staging/opt"
     }
 
-    mapfile -d '' -t opt_children < <(find -P "$staging/opt" -mindepth 1 -maxdepth 1 -printf '%f\0')
+    if ! find -P "$staging/opt" -mindepth 1 -maxdepth 1 -printf '%f\0' >"$opt_children_list"; then
+        fail "cannot enumerate opt package staging roots: $staging/opt"
+    fi
+    if ! mapfile -d '' -t opt_children <"$opt_children_list"; then
+        fail "cannot read opt package staging roots: $opt_children_list"
+    fi
     [[ ${#opt_children[@]} -eq 1 && "${opt_children[0]}" == gstreamer-1.0 ]] || {
         fail "package staging has roots outside opt/gstreamer-1.0: $staging"
     }
@@ -246,9 +288,22 @@ assert_staging_prefix() {
 
 merge_package_prefix() {
     local prefix=$1
-    local prefix_root source source_parent rel destination source_kind source_target destination_target resolved_target
+    local source_list=$2
+    local prefix_root prefix_mode source source_parent rel destination source_kind source_target destination_target resolved_target
 
-    prefix_root=$(realpath -m -- "$prefix")
+    capture_path prefix_root "package prefix path" realpath -m -- "$prefix"
+    if ! prefix_mode=$(stat -c '%a' -- "$prefix"); then
+        fail "cannot read package prefix mode: $prefix"
+    fi
+    if [[ -z "$expected_prefix_mode" ]]; then
+        expected_prefix_mode=$prefix_mode
+    elif [[ "$expected_prefix_mode" != "$prefix_mode" ]]; then
+        fail "package prefix mode differs: $prefix ($prefix_mode), expected $expected_prefix_mode"
+    fi
+
+    if ! find -P "$prefix" -mindepth 1 -print0 >"$source_list"; then
+        fail "cannot enumerate package prefix: $prefix"
+    fi
 
     while IFS= read -r -d '' source; do
         rel=${source#"$prefix"/}
@@ -256,14 +311,12 @@ merge_package_prefix() {
 
         if [[ -L "$source" ]]; then
             source_kind=symlink
-            source_target=$(readlink -- "$source")
+            capture_path source_target "package symlink target at $source" readlink -- "$source"
             [[ "$source_target" != /* ]] || {
                 fail "absolute package symlink target at $source: $source_target"
             }
             source_parent=${source%/*}
-            if ! resolved_target=$(realpath -m -- "$source_parent/$source_target"); then
-                fail "cannot resolve package symlink target at $source: $source_target"
-            fi
+            capture_path resolved_target "package symlink resolution at $source" realpath -m -- "$source_parent/$source_target"
             case "$resolved_target/" in
                 "$prefix_root/"*)
                     ;;
@@ -288,8 +341,7 @@ merge_package_prefix() {
                 [[ -L "$destination" ]] || {
                     fail "package collision changes type at $destination"
                 }
-                source_target=$(readlink -- "$source")
-                destination_target=$(readlink -- "$destination")
+                capture_path destination_target "destination symlink target at $destination" readlink -- "$destination"
                 [[ "$source_target" == "$destination_target" ]] || {
                     fail "package collision changes symlink target at $destination"
                 }
@@ -314,23 +366,33 @@ merge_package_prefix() {
                 }
                 ;;
         esac
-    done < <(find -P "$prefix" -mindepth 1 -print0)
+    done <"$source_list"
 
     cp -a -- "$prefix"/. "$runtime_root"/
 }
 
 package_count=0
+expected_prefix_mode=
+package_list="$work_dir/package-tarballs.list"
+if ! find -P "$package_dir" -type f -name '*.tar.xz' -print0 | sort -z >"$package_list"; then
+    fail "cannot discover Cerbero package tarballs"
+fi
 while IFS= read -r -d '' package_tarball; do
     package_count=$((package_count + 1))
     staging="$work_dir/package-staging-$package_count"
     member_list="$work_dir/package-$package_count.members"
+    source_list="$work_dir/package-$package_count.sources"
     mkdir -p "$staging"
     validate_package_archive "$package_tarball" "$member_list"
     tar -xJf "$package_tarball" -C "$staging" --no-same-owner
     assert_staging_prefix "$staging"
-    merge_package_prefix "$staging/opt/gstreamer-1.0"
-done < <(find "$package_dir" -type f -name '*.tar.xz' -print0 | sort -z)
+    merge_package_prefix "$staging/opt/gstreamer-1.0" "$source_list"
+done <"$package_list"
 [[ "$package_count" == 2 ]] || { echo "expected two Cerbero package tarballs, got $package_count" >&2; exit 1; }
+[[ -n "$expected_prefix_mode" ]] || fail "package prefix mode was not established"
+if ! chmod "$expected_prefix_mode" "$runtime_root"; then
+    fail "cannot set runtime root mode: $runtime_root"
+fi
 
 launcher="$runtime_root/bin/lumina-gstreamer-runtime"
 mkdir -p "$(dirname -- "$launcher")"
