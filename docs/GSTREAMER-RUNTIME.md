@@ -1,57 +1,70 @@
-# Lumina GStreamer runtime research
+# Audited Linux GStreamer runtime
 
-Snapshot: 2026-08-14. This note records the primary upstream facts used by
-`vendor/gstreamer-1.0.lock.json`; the lock is the build authority.
+`vendor/gstreamer-1.0.lock.json` (schema 2) is the only build authority. The
+formal workflow fetches the lock-owned sources, builds with the pinned
+[Cerbero release](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html),
+then switches to offline mode for bootstrap, packaging, audit, and artifact
+assembly. All Cerbero jobs use two workers.
 
-## Upstream facts
+The lock fixes GStreamer 1.28.6, gst-libav, FFmpeg 7.1, zlib, PipeWire 1.6.8,
+the Ubuntu builder image, the exact variant set `norust,alsa,pulse,va`,
+recipe/plugin audit allowlists, and the system ELF ABI allowlist.
+`vendor/cerbero-overlay` is a small repo-owned `localconf.cbc` plus
+policy/package closure; it is included in the corresponding-source archive
+rather than being an unreviewed local patch.
 
-| Decision | Primary source | Recorded result |
-| --- | --- | --- |
-| Linux installation/build route | [GStreamer download](https://gstreamer.freedesktop.org/download/) and [Cerbero build guide](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html) | GStreamer documents package-manager installation for Linux and Cerbero for building/deploying releases. The official download page does not provide a standalone Linux runtime binary for this use case, so Lumina builds one with Cerbero. |
-| Exact GStreamer source | [official source index](https://gstreamer.freedesktop.org/src/gstreamer/) and [1.28.6 checksum sidecar](https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz.sha256sum) | `gstreamer-1.28.6.tar.xz`, SHA-256 `62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca`. |
-| Exact libav source | [official gst-libav source index](https://gstreamer.freedesktop.org/src/gst-libav/) and [1.28.6 checksum sidecar](https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.28.6.tar.xz.sha256sum) | `gst-libav-1.28.6.tar.xz`, SHA-256 `71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51`. |
-| Cerbero release selection | [Cerbero GitLab repository](https://gitlab.freedesktop.org/gstreamer/cerbero), [tag API](https://gitlab.freedesktop.org/api/v4/projects/gstreamer%2Fcerbero/repository/tags/1.28.6), [locked archive](https://gitlab.freedesktop.org/gstreamer/cerbero/-/archive/1.28.6/cerbero-1.28.6.tar.gz) | Annotated tag object `78666745b34b6245a85510ac47a03a5033af4711`, peeled commit `59548269f4fd0f701818f0bafdb102959ec81e65`, archive SHA-256 `16cea2f8c34370f7f1e5774c4c4f66927659c354f6f90ce0e13d41cf80cc34da`. |
-| Cerbero package/artifact model | [Cerbero build guide](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html) | Cerbero documents `package gstreamer-1.0`, tarball artifacts from 1.28 onward, variants, and fetch/bootstrap/package offline staging. #18 uses only the approved `gstreamer-1.0` and `gstreamer-1.0-libav` packages with `norust`. |
-| Runtime isolation | [GStreamer environment variables](https://gstreamer.freedesktop.org/documentation/gstreamer/running.html) | The versioned `GST_PLUGIN_PATH_1_0`, empty `GST_PLUGIN_SYSTEM_PATH_1_0`, and `GST_REGISTRY_1_0` variables are the supported private-plugin/registry controls. GStreamer’s 1.28 test setup also records `GST_PLUGIN_SCANNER_1_0`; Lumina sets it to the bundle scanner. |
-| Builder identity | [Docker Registry API](https://docs.docker.com/reference/api/registry/latest/) and [Ubuntu official image metadata](https://raw.githubusercontent.com/docker-library/official-images/master/library/ubuntu) | The workflow uses the immutable Ubuntu 24.04 amd64 OCI manifest `ubuntu@sha256:019e8eb29a85e74d64925745884f2ec79aa27e3feab36353d24656f4d6b89467`. glibc 2.39 is verified in the job and is Lumina’s deployment policy. |
+## License and codec policy
 
-The required MP4 smoke elements are derived from the locked Cerbero 1.28.6
-package recipes and are recorded as filename-to-element pairs in the lock:
-`playbin3`, `qtdemux`, `h264parse`, `avdec_h264`, `aacparse`, `avdec_aac`, and
-`fakesink`. The smoke checks both the plugin filename and GStreamer’s reported
-`Filename` before running `playbin3` to EOS.
+The audited configuration keeps FFmpeg's `--disable-gpl`,
+`--disable-nonfree`, and `--disable-version3` settings and excludes
+`gst-plugins-ugly` and x264. H.264 and AAC software fallback is explicitly
+`avdec_h264` and `avdec_aac`; VA-API is an optional acceleration path. Plugin
+effective licenses, component source URLs/checksums, bundled-file hashes, and
+recursive `DT_NEEDED` closure are emitted in `runtime-manifest.json`.
 
-## Reproducibility boundary
+This is a build configuration and provenance record, not legal certification.
+Distribution owners must perform their own copyright/license review using the
+[GStreamer license information](https://gstreamer.freedesktop.org/documentation/additional/licensing.html),
+[FFmpeg legal page](https://ffmpeg.org/legal.html), and the full texts in the
+runtime `licenses/` directory and corresponding-source archive. H.264/AAC
+patent, regional, and distribution obligations are outside this repository's
+technical audit and require separate legal review.
 
-`scripts/discover-gstreamer-lock.sh` is the only moving-metadata path. It reads
-the official 1.28.x download/source metadata, the official Cerbero tag API and
-Git references, and the Docker registry manifest, computes archive checksums,
-then atomically writes the lock. `scripts/build-gstreamer-runtime.sh` rejects
-moving `latest` values, reads only that lock, verifies the two source checksums,
-fetches the remaining Cerbero recipe closure, and runs the package phase
-offline.
+## Artifacts and isolation
 
-The lock's `artifact.compression: xz` describes the two Cerbero package
-tarballs; the build combines them and emits the standalone runtime as a
-`.tar.gz` artifact while preserving Cerbero's native `lib/` tree.
-`lib/x86_64-linux-gnu` and `lib/python3.12` remain siblings, so Python purelib
-stays at `lib/python3.12/site-packages`; the path is kept as-is.
+The build emits one audited `gstreamer-runtime-linux-x86_64.tar.xz` used by
+standalone packaging and Flatpak, plus the exact corresponding
+`gstreamer-runtime-linux-x86_64.sources.tar.xz`. The source archive contains
+the complete fetched Cerbero source cache, the pinned Cerbero archive, and the
+repo overlay. `scripts/audit-gstreamer-runtime.sh` checks archive safety,
+manifest hashes, policy flags, closure inventory, and source/runtime
+correspondence.
 
-The artifact includes `bin/lumina-gstreamer-runtime`. Applications must use
-that launcher as their entrypoint: it establishes exact private
-`LD_LIBRARY_PATH`, versioned GStreamer plugin/scanner paths, empty system and
-unversioned plugin variables, and a writable registry/cache outside the bundle.
-The Rust vendored-runtime seam validates this contract and reports
-`DecoderInit` when it is absent or mismatched; it does not mutate process-wide
-environment state. Final Lumina executable packaging/integration is deferred
-to issue #19.
+Run the standalone launcher as the process entrypoint:
 
-The lock fixes the source archives, Cerbero revision, OCI image, package set,
-variants, and required components. Those locked inputs make the build
-inputs reproducible, but do not promise byte-identical output across
-toolchains, filesystems, or archive implementations.
+```text
+vendor/linux-x86_64/bin/lumina-gstreamer-runtime /path/to/lumina-video
+```
 
-This is intentionally an upstream meta-package bootstrap, not a claim that the
-result is a recursively pruned or fully inventoried distribution. Recursive
-closure pruning, ugly/GPL classification, complete license/source inventory,
-and the associated compliance review are deferred to issue #19.
+It establishes private library/plugin/scanner paths and a writable registry
+under external `XDG_CACHE_HOME` (or `$HOME/.cache`). No host plugin path or
+bundle-local registry is accepted. Flatpak uses Freedesktop Platform/Sdk and
+`rust-stable` 25.08, exposes only the PulseAudio socket, and does not pass a
+broad `XDG_RUNTIME_DIR`; PipeWire is checked as native closure/presence only.
+The workflow records the actual OSTree commits used by the build as
+provenance, without claiming a permanent user-runtime pin.
+
+## Smoke matrix
+
+The clean-container smoke script runs isolated registries for MP4 H.264/AAC,
+Matroska/WebM VP9/Opus, dual-track MKV, audio, HLS VOD/live over loopback HTTP
+and HTTPS, and ALSA/Pulse/PipeWire/VA element presence. It does not cover
+session semantics or hardware certification; those remain separate scopes.
+
+Primary references: [GStreamer source index](https://gstreamer.freedesktop.org/src/gstreamer/),
+[FFmpeg configure options](https://ffmpeg.org/ffmpeg-all.html#toc-Advanced-options),
+[PipeWire 1.6.8 tag](https://gitlab.freedesktop.org/pipewire/pipewire/-/tags/1.6.8),
+[PipeWire 1.6.8 archive](https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz),
+[PipeWire 1.6.8 documentation](https://docs.pipewire.org/),
+[Flatpak runtime documentation](https://docs.flatpak.org/en/latest/available-runtimes.html),
+and the [Flathub Freedesktop Platform manifest](https://github.com/flathub/org.freedesktop.Platform).

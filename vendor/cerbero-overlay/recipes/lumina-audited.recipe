@@ -1,0 +1,8 @@
+# Review recipe for the repository-owned audited closure. The upstream
+# recipes remain the source of truth; this recipe provides the named closure
+# that the local package can fetch without introducing another implementation.
+class Recipe(recipe.Recipe):
+    name = 'lumina-audited'
+    version = '1'
+    licenses = [License.LGPLv2_1Plus]
+    deps = ['gstreamer-1.0', 'gst-libav-1.0']

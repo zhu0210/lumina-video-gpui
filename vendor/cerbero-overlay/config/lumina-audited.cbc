@@ -1,0 +1,14 @@
+# Minimal localconf.cbc consumed with the pinned Cerbero release.
+# The command line still supplies the lock's exact variant CSV.
+variants = ['norust', 'alsa', 'pulse', 'va']
+
+# Keep the source/build closure on the two lock-owned meta packages. This is
+# intentionally a policy marker as well as a reviewable Cerbero config.
+lumina_recipe_allowlist = ['gstreamer-1.0', 'gstreamer-1.0-libav']
+lumina_disable_gpl = True
+lumina_disable_nonfree = True
+lumina_disable_version3 = True
+lumina_disable_ugly = True
+lumina_disable_x264 = True
+gst_plugins_bad_options = ['-Dgpl=disabled', '-Dugly=disabled']
+gst_libav_ffmpeg_options = ['--disable-gpl', '--disable-nonfree', '--disable-version3', '--disable-libx264']

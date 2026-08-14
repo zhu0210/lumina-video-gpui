@@ -30,7 +30,7 @@ while (($#)); do
     esac
 done
 
-for command_name in curl jq sha256sum tar xz gzip find sort awk grep sed mktemp realpath chmod cmp cp readlink stat; do
+for command_name in curl jq sha256sum tar xz find sort awk grep sed mktemp realpath chmod cmp cp readlink stat readelf; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -114,6 +114,12 @@ zlib_version=$(jq -er '.sources.zlib.version' "$lock_file")
 zlib_filename=$(jq -er '.sources.zlib.filename' "$lock_file")
 zlib_url=$(jq -er '.sources.zlib.url' "$lock_file")
 zlib_sha=$(jq -er '.sources.zlib.sha256' "$lock_file")
+pipewire_version=$(jq -er '.sources.pipewire.version' "$lock_file")
+pipewire_tag=$(jq -er '.sources.pipewire.tag' "$lock_file")
+pipewire_tag_commit=$(jq -er '.sources.pipewire.tag_commit' "$lock_file")
+pipewire_url=$(jq -er '.sources.pipewire.url' "$lock_file")
+pipewire_sha=$(jq -er '.sources.pipewire.sha256' "$lock_file")
+pipewire_license=$(jq -er '.sources.pipewire.license' "$lock_file")
 cerbero_tag=$(jq -er '.cerbero.tag' "$lock_file")
 cerbero_tag_object=$(jq -er '.cerbero.tag_object' "$lock_file")
 cerbero_commit=$(jq -er '.cerbero.commit' "$lock_file")
@@ -134,8 +140,23 @@ archive_source_libdir=$(jq -er '.artifact.archive_layout.source_libdir' "$lock_f
 archive_runtime_libdir=$(jq -er '.artifact.archive_layout.runtime_libdir' "$lock_file")
 mapfile -t packages < <(jq -er '.packages[]' "$lock_file")
 mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
+mapfile -t recipe_allowlist < <(jq -er '.audit.recipe_allowlist[]' "$lock_file")
+mapfile -t system_elf_allowlist < <(jq -er '.audit.system_elf_allowlist[]' "$lock_file")
+mapfile -t forbidden_components < <(jq -er '.audit.policy.forbidden_components[]' "$lock_file")
+mapfile -t license_texts < <(jq -er '.license_texts[]' "$lock_file")
+flatpak_runtime=$(jq -er '.flatpak.runtime' "$lock_file")
+flatpak_runtime_version=$(jq -er '.flatpak.runtime_version' "$lock_file")
+flatpak_runtime_ref=$(jq -er '.flatpak.runtime_ref' "$lock_file")
+flatpak_sdk=$(jq -er '.flatpak.sdk' "$lock_file")
+flatpak_sdk_version=$(jq -er '.flatpak.sdk_version' "$lock_file")
+flatpak_sdk_ref=$(jq -er '.flatpak.sdk_ref' "$lock_file")
+flatpak_rust_extension=$(jq -er '.flatpak.rust_extension' "$lock_file")
+flatpak_rust_ref=$(jq -er '.flatpak.rust_extension_ref' "$lock_file")
+ffmpeg_version=$(jq -er '.components[] | select(.name == "FFmpeg") | .version' "$lock_file")
+ffmpeg_url=$(jq -er '.components[] | select(.name == "FFmpeg") | .source_url' "$lock_file")
+ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock_file")
 
-[[ "$schema_version" == 1 ]] || { echo "unsupported lock schema" >&2; exit 1; }
+[[ "$schema_version" == 2 ]] || { echo "unsupported lock schema" >&2; exit 1; }
 [[ "$gstreamer_version" =~ ^1\.28\.[0-9]+$ ]] || { echo "unsupported GStreamer version" >&2; exit 1; }
 [[ "$gstreamer_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid GStreamer checksum" >&2; exit 1; }
 [[ "$libav_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid gst-libav checksum" >&2; exit 1; }
@@ -147,6 +168,30 @@ mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
 }
 [[ "$zlib_sha" == 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23 ]] || {
     echo "unsupported zlib checksum" >&2
+    exit 1
+}
+[[ "$pipewire_version" == 1.6.8 && "$pipewire_tag" == 1.6.8 ]] || {
+    echo "unsupported PipeWire version/tag" >&2
+    exit 1
+}
+[[ "$pipewire_tag_commit" == b741e0c74f5436f0c925f7741140db0efd32cf4e ]] || {
+    echo "unsupported PipeWire tag commit" >&2
+    exit 1
+}
+[[ "$pipewire_url" == https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz ]] || {
+    echo "unsupported PipeWire source URL" >&2
+    exit 1
+}
+[[ "$pipewire_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid PipeWire checksum" >&2; exit 1; }
+[[ "$pipewire_license" == MIT/LGPL-2.1-or-later ]] || { echo "unsupported PipeWire license metadata" >&2; exit 1; }
+[[ "$ffmpeg_version" == 7.1 ]] || { echo "unsupported FFmpeg version" >&2; exit 1; }
+[[ "$ffmpeg_url" == https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz ]] || { echo "unsupported FFmpeg source URL" >&2; exit 1; }
+[[ "$ffmpeg_sha" == 40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6 ]] || {
+    echo "unsupported FFmpeg checksum" >&2
+    exit 1
+}
+[[ "$(jq -er '.components[] | select(.name == "PipeWire") | .tag_commit' "$lock_file")" == "$pipewire_tag_commit" ]] || {
+    echo "PipeWire component/tag metadata disagrees" >&2
     exit 1
 }
 [[ "$cerbero_archive_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid Cerbero archive checksum" >&2; exit 1; }
@@ -184,7 +229,59 @@ mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
     echo "package set is not the approved #18 pair" >&2
     exit 1
 }
-[[ "${variants[*]}" == norust ]] || { echo "variants are not the approved minimal set" >&2; exit 1; }
+[[ "${variants[*]}" == "norust alsa pulse va" ]] || { echo "variants are not the audited set" >&2; exit 1; }
+[[ "${recipe_allowlist[*]}" == "gstreamer-1.0 gstreamer-1.0-libav" ]] || {
+    echo "recipe allowlist does not match the package set" >&2
+    exit 1
+}
+[[ "${flatpak_runtime}:${flatpak_runtime_version}:${flatpak_sdk}:${flatpak_sdk_version}" == \
+    "org.freedesktop.Platform:25.08:org.freedesktop.Sdk:25.08" ]] || {
+    echo "Flatpak is not locked to Freedesktop 25.08" >&2
+    exit 1
+}
+[[ "$flatpak_rust_extension" == org.freedesktop.Sdk.Extension.rust-stable ]] || {
+    echo "Flatpak Rust extension is not the approved stable extension" >&2
+    exit 1
+}
+[[ "$flatpak_runtime_ref:$flatpak_sdk_ref:$flatpak_rust_ref" == \
+    "org.freedesktop.Platform//25.08:org.freedesktop.Sdk//25.08:org.freedesktop.Sdk.Extension.rust-stable//25.08" ]] || {
+    echo "Flatpak refs are not the audited 25.08 refs" >&2
+    exit 1
+}
+jq -e '
+    any(.flatpak.source_metadata[]; .name == "freedesktop-platform" and .source_url == "https://github.com/flathub/org.freedesktop.Platform" and .license == "MIT") and
+    any(.flatpak.source_metadata[]; .name == "freedesktop-sdk" and .source_url == "https://gitlab.com/freedesktop-sdk/freedesktop-sdk" and (.license | startswith("LGPL")))
+' "$lock_file" >/dev/null || {
+    echo "Flatpak source/license metadata is incomplete" >&2
+    exit 1
+}
+for policy_key in gst_bad_gpl gst_bad_ugly gst_libav_ffmpeg_gpl \
+    gst_libav_ffmpeg_nonfree gst_libav_ffmpeg_version3; do
+    [[ "$(jq -er --arg key "$policy_key" '.audit.policy[$key]' "$lock_file")" == false ]] || {
+        echo "audited policy must disable $policy_key" >&2
+        exit 1
+    }
+done
+[[ "$(jq -er '.audit.policy.software_fallback.video' "$lock_file")" == avdec_h264 ]] || {
+    echo "H.264 fallback is not avdec_h264" >&2
+    exit 1
+}
+[[ "$(jq -er '.audit.policy.software_fallback.audio' "$lock_file")" == avdec_aac ]] || {
+    echo "AAC fallback is not avdec_aac" >&2
+    exit 1
+}
+jq -e 'all(.components[]; (.name and .version and .source_url and (.sha256 | test("^[[:xdigit:]]{64}$")) and .license))' "$lock_file" >/dev/null || {
+    echo "component inventory is incomplete" >&2
+    exit 1
+}
+jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT"))))' "$lock_file" >/dev/null || {
+    echo "component license policy rejects a non-LGPL/Zlib/MIT component" >&2
+    exit 1
+}
+jq -e 'all(.audit.plugin_allowlist[]; (.filename and .element and .source and (.license | test("^LGPL"))))' "$lock_file" >/dev/null || {
+    echo "plugin effective-license inventory is incomplete" >&2
+    exit 1
+}
 
 layout_keys=$(jq -er '.artifact.archive_layout.package_roots | keys[]' "$lock_file" | sort)
 package_keys=$(printf '%s\n' "${packages[@]}" | sort)
@@ -248,8 +345,44 @@ tar -xzf "$cerbero_archive" -C "$work_dir"
 cerbero_dir="$work_dir/$cerbero_root"
 [[ -x "$cerbero_dir/cerbero-uninstalled" ]] || { echo "Cerbero entrypoint missing" >&2; exit 1; }
 
+overlay_dir="$repo_root/vendor/cerbero-overlay"
+overlay_config="$overlay_dir/config/lumina-audited.cbc"
+[[ -d "$overlay_dir" && -f "$overlay_config" ]] || fail "audited Cerbero overlay is missing"
+[[ -f "$overlay_dir/patches/ffmpeg-lgpl-only.conf" ]] || fail "FFmpeg license policy patch is missing"
+overlay_package="$overlay_dir/packages/lumina-audited.package"
+[[ -f "$overlay_package" ]] || fail "audited Cerbero package is missing"
+overlay_recipe="$overlay_dir/recipes/lumina-audited.recipe"
+[[ -f "$overlay_recipe" ]] || fail "audited Cerbero recipe is missing"
+for ffmpeg_option in --disable-gpl --disable-nonfree --disable-version3 --disable-libx264; do
+    grep -Fx -- "$ffmpeg_option" "$overlay_dir/patches/ffmpeg-lgpl-only.conf" >/dev/null || {
+        fail "FFmpeg LGPL policy is missing $ffmpeg_option"
+    }
+done
+cp -a -- "$overlay_package" "$cerbero_dir/packages/lumina-audited.package"
+cp -a -- "$overlay_recipe" "$cerbero_dir/recipes/lumina-audited.recipe"
+
 grep -F "tarball_checksum = '$gstreamer_sha'" "$cerbero_dir/recipes/gstreamer-1.0.recipe" >/dev/null
 grep -F "tarball_checksum = '$libav_sha'" "$cerbero_dir/recipes/gst-libav-1.0.recipe" >/dev/null
+ffmpeg_recipe="$cerbero_dir/recipes/ffmpeg.recipe"
+ffmpeg_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$ffmpeg_recipe")
+ffmpeg_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$ffmpeg_recipe")
+[[ "$ffmpeg_recipe_version" == "$ffmpeg_version" ]] || fail "Cerbero FFmpeg recipe version disagrees with lock"
+[[ "$ffmpeg_recipe_sha" == "$ffmpeg_sha" ]] || fail "Cerbero FFmpeg recipe checksum disagrees with lock"
+grep -F "url = 'https://ffmpeg.org/releases/%(name)s-%(version)s.tar.xz'" "$ffmpeg_recipe" >/dev/null || {
+    fail "Cerbero FFmpeg recipe source URL disagrees with lock"
+}
+grep -F "licenses = [License.LGPLv2_1Plus]" "$ffmpeg_recipe" >/dev/null || {
+    fail "Cerbero FFmpeg recipe is not LGPLv2.1+"
+}
+grep -F "'nonfree': 'disabled'" "$ffmpeg_recipe" >/dev/null || {
+    fail "Cerbero FFmpeg recipe does not disable nonfree code"
+}
+grep -F "'version3': 'disabled'" "$ffmpeg_recipe" >/dev/null || {
+    fail "Cerbero FFmpeg recipe does not disable version 3 code"
+}
+if grep -Eq "['\"]gpl['\"][[:space:]]*:[[:space:]]*['\"]enabled['\"]" "$ffmpeg_recipe"; then
+    fail "Cerbero FFmpeg recipe enables GPL code"
+fi
 zlib_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 [[ "$zlib_recipe_version" == "$zlib_version" ]] || {
@@ -261,7 +394,7 @@ zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "
     exit 1
 }
 
-# Seed Cerbero's source cache with the two lock-owned release tarballs. The
+# Seed Cerbero's source cache with the lock-owned release tarballs. The
 # remaining closure is fetched by Cerbero's pinned recipes in the fetch phase.
 download_and_verify "$gstreamer_url" "$gstreamer_sha" \
     "$XDG_CACHE_HOME/cerbero-sources/gstreamer-1.0/gstreamer-${gstreamer_version}.tar.xz"
@@ -269,12 +402,20 @@ download_and_verify "$libav_url" "$libav_sha" \
     "$XDG_CACHE_HOME/cerbero-sources/$libav_package/$libav_filename"
 download_and_verify "$zlib_url" "$zlib_sha" \
     "$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz"
+download_and_verify "$pipewire_url" "$pipewire_sha" \
+    "$XDG_CACHE_HOME/cerbero-sources/pipewire-$pipewire_version/pipewire-$pipewire_version.tar.gz"
 
-cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive -c "$cerbero_dir/config/linux.config" -v norust)
+variant_csv=$(IFS=,; printf '%s' "${variants[*]}")
+cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive \
+    -c "$cerbero_dir/config/linux.config" -c "$overlay_config" -v "$variant_csv")
 "${cerbero[@]}" fetch-bootstrap --system=no --toolchains=no --build-tools=yes --jobs=2
 for package in "${packages[@]}"; do
     "${cerbero[@]}" fetch-package "$package" --deps --jobs=2
 done
+# Parse the repository-owned package as part of the locked fetch closure. The
+# two upstream packages remain the only artifact inputs below, preserving the
+# #18 layout while making the local package policy executable by Cerbero.
+"${cerbero[@]}" fetch-package lumina-audited --deps --jobs=2
 "${cerbero[@]}" bootstrap --system=no --toolchains=no --build-tools=yes --offline --assume-yes --jobs=2
 
 package_dir="$work_dir/packages"
@@ -638,17 +779,123 @@ jq -r '.required_elements[] | .filename' "$lock_file" | while IFS= read -r filen
     }
 done
 
+# The allowlist is the set of elements exercised and license-mapped by the
+# matrix. Cerbero's selected LGPL package groups may include helper plugins
+# (for example core tracers); they remain subject to the recipe/license and
+# forbidden-component checks below rather than being treated as host plugins.
+for forbidden in "${forbidden_components[@]}"; do
+    if find -P "$runtime_root" -iname "*$forbidden*" -print -quit | grep -q .; then
+        fail "forbidden component is present in the runtime: $forbidden"
+    fi
+done
+
+is_allowed_system_elf() {
+    local candidate=$1 allowed_name
+    for allowed_name in "${system_elf_allowlist[@]}"; do
+        [[ "$candidate" == "$allowed_name" ]] && return 0
+    done
+    return 1
+}
+
+# Walk DT_NEEDED recursively. Internal dependencies must resolve inside the
+# bundle; only the explicit glibc/loader/GPU/audio ABI contract may be external.
+closure_tsv="$work_dir/elf-closure.tsv"
+: >"$closure_tsv"
+elf_queue="$work_dir/elf-queue"
+find -P "$runtime_root" -type f -print0 |
+    while IFS= read -r -d '' file; do
+        if readelf -h "$file" >/dev/null 2>&1; then
+            printf '%s\n' "$file"
+        fi
+    done | sort >"$elf_queue"
+declare -A seen_elf=()
+while IFS= read -r elf; do
+    [[ -n "$elf" ]] || continue
+    [[ -n "${seen_elf[$elf]:-}" ]] && continue
+    seen_elf["$elf"]=1
+    relative_elf=${elf#"$runtime_root"/}
+    while IFS= read -r needed; do
+        [[ -n "$needed" ]] || continue
+        internal_path=$(find -P "$runtime_root" -name "$needed" -print -quit)
+        if [[ -n "$internal_path" ]]; then
+            printf '%s\t%s\tbundled\n' "$relative_elf" "$needed" >>"$closure_tsv"
+            if [[ -z "${seen_elf[$internal_path]:-}" ]]; then
+                printf '%s\n' "$internal_path" >>"$elf_queue"
+            fi
+        elif is_allowed_system_elf "$needed"; then
+            printf '%s\t%s\tsystem-abi\n' "$relative_elf" "$needed" >>"$closure_tsv"
+        else
+            fail "ELF DT_NEEDED dependency is outside bundle/ABI allowlist: $relative_elf -> $needed"
+        fi
+    done < <(readelf -d "$elf" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')
+done <"$elf_queue"
+
+sort -t $'\t' -k1,1 -k2,2 -k3,3 "$closure_tsv" -o "$closure_tsv"
+closure_json=$(jq -Rn '[inputs | split("\t") | {object: .[0], needed: .[1], scope: .[2]}]' <"$closure_tsv")
+
+license_dir="$bundle/licenses"
+mkdir -p "$license_dir"
+# Cerbero packages normally carry these under share; retain every applicable
+# license/notice text and add the overlay's policy text verbatim.
+if [[ -d "$runtime_root/share" ]]; then
+    while IFS= read -r -d '' license_file; do
+        relative_license=${license_file#"$runtime_root/share"/}
+        mkdir -p "$license_dir/share/$(dirname -- "$relative_license")"
+        cp -a -- "$license_file" "$license_dir/share/$relative_license"
+    done < <(find -P "$runtime_root/share" -type f \( -iname '*copying*' -o -iname '*license*' -o -iname '*notice*' \) -print0)
+fi
+extract_license() {
+    local archive=$1
+    local member_pattern=$2
+    local destination=$3
+    local temporary="$work_dir/license.$RANDOM"
+    tar -xOf "$archive" --wildcards "$member_pattern" >"$temporary" 2>/dev/null || {
+        rm -f -- "$temporary"
+        fail "license text is missing from $archive: $member_pattern"
+    }
+    [[ -s "$temporary" ]] || {
+        rm -f -- "$temporary"
+        fail "license text is empty in $archive: $member_pattern"
+    }
+    chmod 0644 -- "$temporary"
+    cp -a -- "$temporary" "$destination"
+    rm -f -- "$temporary"
+}
+
+gstreamer_source_archive="$XDG_CACHE_HOME/cerbero-sources/gstreamer-1.0/gstreamer-${gstreamer_version}.tar.xz"
+libav_source_archive="$XDG_CACHE_HOME/cerbero-sources/$libav_package/$libav_filename"
+zlib_source_archive="$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz"
+pipewire_source_archive="$XDG_CACHE_HOME/cerbero-sources/pipewire-$pipewire_version/pipewire-$pipewire_version.tar.gz"
+ffmpeg_source_archive=$(find -P "$XDG_CACHE_HOME/cerbero-sources" -type f \
+    -name "ffmpeg-${ffmpeg_version}.tar.xz" -print -quit)
+[[ -f "$ffmpeg_source_archive" ]] || fail "FFmpeg source archive is missing from the fetched cache"
+extract_license "$gstreamer_source_archive" '*/COPYING' "$license_dir/gstreamer-COPYING"
+extract_license "$libav_source_archive" '*/COPYING.LGPL' "$license_dir/gst-libav-COPYING.LGPL"
+extract_license "$ffmpeg_source_archive" '*/COPYING.LGPLv2.1' "$license_dir/FFmpeg-COPYING.LGPLv2.1"
+extract_license "$zlib_source_archive" '*/README' "$license_dir/zlib-README"
+extract_license "$pipewire_source_archive" '*/LICENSE' "$license_dir/PipeWire-LICENSE"
+mkdir -p "$license_dir/overlay"
+cp -a -- "$overlay_dir/LICENSE.md" "$license_dir/overlay/LICENSE.md"
+jq -n --argjson components "$(jq -c '.components' "$lock_file")" \
+    --argjson declared "$(printf '%s\n' "${license_texts[@]}" | jq -R . | jq -s .)" \
+    '{components: $components, declared_texts: $declared, note: "Source archives carry the complete upstream texts; runtime copies are retained when packaged."}' \
+    >"$license_dir/metadata.json"
+
 cat >"$runtime_root/VERSION" <<EOF
 GSTREAMER_VERSION=$gstreamer_version
 CERBERO_TAG=$cerbero_tag
 CERBERO_COMMIT=$cerbero_commit
+PIPEWIRE_VERSION=$pipewire_version
 TARGET=linux-x86_64
 GLIBC_FLOOR=$target_glibc
 EOF
 cat >"$bundle/NOTICE" <<'EOF'
-This standalone runtime is the union of upstream Cerbero packages named in
-vendor/gstreamer-1.0.lock.json. It is an upstream meta-package bootstrap for
-Lumina, not the recursive closure/license/source inventory planned for #19.
+This audited runtime contains only lock-approved LGPL-compatible GStreamer
+plugins and the explicitly documented system ABI closure. H.264/AAC use the
+software avdec_h264/avdec_aac fallback when VA-API is unavailable. This build
+does not include gst-plugins-ugly, x264, GPL, nonfree, or unknown components.
+The corresponding-source archive contains the complete fetched source cache,
+the Cerbero overlay, and policy files.
 EOF
 
 # Normalize the generated vendor tree before hashing so the tree digest covers
@@ -657,20 +904,51 @@ find "$runtime_root" -exec touch -h -d '@0' {} +
 (cd "$bundle" && find vendor -type f -print0 | sort -z |
     while IFS= read -r -d '' file; do sha256sum "$file"; done) >"$bundle/tree.sha256"
 tree_sha=$(sha256sum "$bundle/tree.sha256" | awk '{ print $1 }')
+file_inventory=$(cd "$bundle" &&
+    find . -type f ! -name inventory.json -print0 | sort -z |
+    while IFS= read -r -d '' file; do
+        printf '%s\t%s\n' "$file" "$(sha256sum "$file" | awk '{ print $1 }')"
+    done | jq -Rn '[inputs | split("\t") | {path: .[0], sha256: .[1]}]')
+plugin_inventory=$(jq -c '.audit.plugin_allowlist' "$lock_file")
+component_inventory=$(jq -c '.components' "$lock_file")
+closure_json=$(jq -Rn '[inputs | split("\t") | {object: .[0], needed: .[1], scope: .[2]}]' <"$closure_tsv")
 jq -n \
     --arg version "$gstreamer_version" \
     --arg commit "$cerbero_commit" \
+    --arg pipewire "$pipewire_version" \
     --arg tree_sha "$tree_sha" \
-    '{gstreamer_version: $version, cerbero_commit: $commit, tree_sha256: $tree_sha, packages: ["gstreamer-1.0", "gstreamer-1.0-libav"]}' \
+    --argjson variants "$(printf '%s\n' "${variants[@]}" | jq -R . | jq -s .)" \
+    --argjson components "$component_inventory" \
+    --argjson plugins "$plugin_inventory" \
+    --argjson files "$file_inventory" \
+    --argjson closure "$closure_json" \
+    --argjson system_abi "$(printf '%s\n' "${system_elf_allowlist[@]}" | jq -R . | jq -s .)" \
+    '{schema_version: 2, gstreamer_version: $version, pipewire_version: $pipewire, cerbero_commit: $commit, tree_sha256: $tree_sha, packages: ["gstreamer-1.0", "gstreamer-1.0-libav"], variants: $variants, components: $components, plugin_effective_license: $plugins, bundled_files: $files, recursive_dt_needed: $closure, system_abi_allowlist: $system_abi, policy: {gpl: false, nonfree: false, unknown: false, ugly: false, h264_aac: "avdec_h264/avdec_aac"}}' \
     >"$bundle/runtime-manifest.json"
+
+source_bundle_root="$work_dir/source-bundle"
+mkdir -p "$source_bundle_root/archives" "$source_bundle_root/overlay" "$source_bundle_root/cerbero"
+cp -a -- "$XDG_CACHE_HOME/cerbero-sources/." "$source_bundle_root/archives/"
+cp -a -- "$overlay_dir/." "$source_bundle_root/overlay/"
+cp -a -- "$cerbero_archive" "$source_bundle_root/cerbero/"
+jq -n --arg runtime_tree_sha "$tree_sha" \
+    --arg pipewire "$pipewire_version" \
+    --argjson components "$component_inventory" \
+    '{schema_version: 2, runtime_tree_sha256: $runtime_tree_sha, pipewire_version: $pipewire, components: $components, source_kind: "complete fetched Cerbero cache plus repository overlay"}' \
+    >"$source_bundle_root/source-manifest.json"
+find "$source_bundle_root" -exec touch -h -d '@0' {} +
+source_artifact_name=gstreamer-runtime-linux-x86_64.sources.tar.xz
+XZ_OPT='-T2 -6' tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+    -cJf "$output_dir/$source_artifact_name" -C "$source_bundle_root" .
+(cd "$output_dir" && sha256sum "$source_artifact_name" >"$source_artifact_name.sha256")
 
 # Normalize metadata after writing the manifest; vendor contents and tree.sha256
 # are unchanged, so tree_sha still describes the final vendor tree.
 find "$bundle" -maxdepth 1 -exec touch -h -d '@0' {} +
 
-artifact_name=gstreamer-runtime-linux-x86_64.tar.gz
-tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-    -czf "$output_dir/$artifact_name" -C "$bundle" .
+artifact_name=gstreamer-runtime-linux-x86_64.tar.xz
+XZ_OPT='-T2 -6' tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+    -cJf "$output_dir/$artifact_name" -C "$bundle" .
 (cd "$output_dir" && sha256sum "$artifact_name" >"$artifact_name.sha256")
 printf '%s  tree\n' "$tree_sha" >"$output_dir/$artifact_name.tree.sha256"
 echo "created $output_dir/$artifact_name"

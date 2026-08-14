@@ -1,27 +1,27 @@
-# Locked GStreamer runtime
+# Audited GStreamer runtime inputs
 
-Lumina's Linux `vendored-runtime` bundle is built from the exact lock in
-[`gstreamer-1.0.lock.json`](gstreamer-1.0.lock.json). The approved #18 input
-is upstream Cerbero 1.28.6's `gstreamer-1.0` meta package plus
-`gstreamer-1.0-libav`; it is not a hand-copied Ubuntu package tree.
+`gstreamer-1.0.lock.json` is schema 2 and pins every moving input used by the
+runtime build: GStreamer 1.28.6, gst-libav/FFmpeg 7.1, zlib, PipeWire 1.6.8,
+Cerbero, Ubuntu 24.04/glibc 2.39, the exact `norust,alsa,pulse,va` variants,
+and Freedesktop 25.08 Flatpak refs.
 
-GStreamer publishes Linux source tarballs and uses Cerbero for deployment
-packages; it does not publish a standalone Linux binary. The workflow therefore
-uses the digest-pinned Ubuntu 24.04/glibc 2.39 builder recorded in the lock.
-The glibc floor is Lumina's deployment policy, not an upstream GStreamer
-guarantee.
+The audited closure is intentionally narrow: only the lock's recipes are
+built, and the lock's matrix plugin allowlist records the effective
+license/source for every exercised element. Helper plugins that Cerbero's
+selected LGPL groups bring along remain inside that recipe closure and are
+checked for forbidden components/licenses. GPL/nonfree/version-3 FFmpeg
+options, gst-plugins-ugly, x264, and unknown licenses are rejected. H.264/AAC
+software fallback is `avdec_h264`/`avdec_aac`. The system ELF allowlist is
+limited to the explicit glibc/loader/GPU/audio runtime ABI contract.
 
-## Discovery and build
-
-Discovery is an intentional manual operation and is the only code allowed to
-read moving upstream metadata:
+Discovery is the only moving-metadata path:
 
 ```bash
 ./scripts/discover-gstreamer-lock.sh
 ```
 
-The formal build reads only the lock, verifies its checksums, fetches the
-locked sources and Cerbero archive, then packages offline:
+The formal build reads only the lock, fetches sources, then runs Cerbero
+fetch/bootstrap/package offline with two workers:
 
 ```bash
 ./scripts/build-gstreamer-runtime.sh \
@@ -29,67 +29,22 @@ locked sources and Cerbero archive, then packages offline:
   --output dist/gstreamer-runtime
 ```
 
-The lock also pins the Cerbero `DistTarball` flat archive layout. The
-meta package may contain only the top-level roots `bin`, `etc`, `lib`,
-`libexec`, and `share`; the libav package may contain only `lib`. The package
-archives use Debian's native `lib/x86_64-linux-gnu` directory, and the
-standalone runtime preserves the entire native `lib/` tree. The
-`lib/x86_64-linux-gnu` and `lib/python3.12` directories remain siblings, so
-Python purelib stays at `lib/python3.12/site-packages`; no path components are
-stripped, and `/opt` roots are rejected. These package-specific allowlists are
-the #18 bootstrap boundary, not the recursive closure audit planned for #19.
+It emits one audited `gstreamer-runtime-linux-x86_64.tar.xz` for standalone and
+Flatpak, plus the corresponding-source `*.sources.tar.xz`, full applicable
+license texts/metadata, and deterministic `runtime-manifest.json` inventory.
+The manifest records every bundled-file SHA, plugin effective license/source,
+and recursive `DT_NEEDED` closure. Use `scripts/audit-gstreamer-runtime.sh`
+before publishing.
 
-Cerbero 1.28.6 routes one required dependency, zlib 1.3.1, through its
-recipe URL rather than the GStreamer mirror. Discovery reads that exact pinned
-recipe and records its checksum while constructing only the official GStreamer
-mirror URL; the formal build verifies the recipe again and pre-seeds
-`$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz` before the
-dependency-aware Cerbero fetch. This is one locked acquisition exception, not
-the recursive closure/license/source inventory deferred to issue #19.
+`vendor/cerbero-overlay` is deliberately small and reviewable. It contains the
+Cerbero `localconf.cbc`, policy fragment, custom closure marker, and its own
+license text; the entire overlay is copied into corresponding-source.tar.xz.
 
-The generated standalone artifact has this runtime layout:
+The launcher establishes private `LD_LIBRARY_PATH`, GStreamer plugin/scanner
+paths, and an external registry/cache. It never falls back to host plugins.
+Flatpak uses only `--socket=pulseaudio`; PipeWire is a native closure/presence
+check, not a broad `XDG_RUNTIME_DIR` passthrough. Flatpak build provenance
+records actual OSTree commits but does not permanently pin a user's runtime.
 
-```text
-vendor/linux-x86_64/
-├── bin/
-│   └── lumina-gstreamer-runtime
-├── lib/
-│   ├── x86_64-linux-gnu/
-│   │   └── gstreamer-1.0/
-│   └── python3.12/
-│       └── site-packages/
-└── libexec/gstreamer-1.0/gst-plugin-scanner
-```
-
-Run the bundled launcher as the process entrypoint:
-
-```bash
-vendor/linux-x86_64/bin/lumina-gstreamer-runtime /path/to/lumina-video [args]
-```
-
-The launcher derives paths from its own runtime root, sets the exact private
-library/plugin/scanner contract, clears unversioned and system plugin paths,
-and creates a versioned registry under external `XDG_CACHE_HOME` (or
-`$HOME/.cache`). It refuses a missing or unwritable cache and never writes the
-bundle. The Rust seam only validates that launcher-established contract; a
-missing or incomplete bundle is a decoder initialization error and never falls
-back to host plugins. Final Lumina executable packaging/integration is deferred
-to issue #19.
-
-## Scope boundary
-
-This release deliberately accepts Cerbero's upstream meta-package closure as
-the reproducibility/bootstrap boundary. Recursive closure pruning, ugly/GPL
-classification, license/source inventory, and any compliance claim beyond the
-upstream package metadata are deferred to issue #19. The lock pins the source
-archives, Cerbero revision, OCI image, packages, and components; it does not
-promise byte-identical artifacts across toolchains or filesystems.
-
-The smoke script checks GStreamer 1.28.6, the locked MP4 elements, private
-registry/plugin/scanner paths, and a deterministic H.264/AAC MP4 reaching EOS:
-
-```bash
-./fixtures/generate.sh
-./scripts/smoke-gstreamer-runtime.sh \
-  dist/gstreamer-runtime/gstreamer-runtime-linux-x86_64.tar.gz
-```
+See [docs/GSTREAMER-RUNTIME.md](../docs/GSTREAMER-RUNTIME.md) for official
+upstream links and the copyright/patent/legal-review boundary.

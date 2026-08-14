@@ -1,0 +1,17 @@
+from cerbero.enums import License
+from cerbero.packages import package
+
+
+class Package(package.Package):
+    name = 'lumina-audited'
+    shortdesc = 'Lumina audited GStreamer closure'
+    longdesc = 'The lock-approved LGPL GStreamer runtime closure.'
+    version = '1'
+    license = License.LGPL
+    uuid = '2f855e2d-68c2-46f0-ae2b-96c5f4ed4b9b'
+    deps = ['gstreamer-1.0', 'gstreamer-1.0-libav']
+    files = [
+        'gstreamer-1.0:libs',
+        'gstreamer-1.0:bins',
+        'gst-libav-1.0:plugins_codecs_restricted',
+    ]

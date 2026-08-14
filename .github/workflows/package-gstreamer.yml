@@ -1,4 +1,4 @@
-name: Package locked GStreamer runtime
+name: Package audited GStreamer runtime
 
 on:
   workflow_dispatch:
@@ -6,17 +6,16 @@ on:
     paths:
       - .github/workflows/package-gstreamer.yml
       - vendor/gstreamer-1.0.lock.json
+      - vendor/cerbero-overlay/**
       - scripts/discover-gstreamer-lock.sh
       - scripts/build-gstreamer-runtime.sh
+      - scripts/audit-gstreamer-runtime.sh
       - scripts/smoke-gstreamer-runtime.sh
-      - crates/lumina-video-native-frame/src/vendored_runtime.rs
-      - crates/lumina-video-native-frame/src/linux_video.rs
-      - crates/lumina-video-native-frame/src/linux_video_gst.rs
-      - crates/lumina-video-native-frame/src/moq_decoder.rs
+      - flatpak/io.github.lumina_video.Demo.yml
       - fixtures/generate.sh
 
 concurrency:
-  group: package-gstreamer-runtime
+  group: package-audited-gstreamer-runtime
   cancel-in-progress: false
 
 permissions:
@@ -25,10 +24,12 @@ permissions:
 env:
   LOCK_FILE: vendor/gstreamer-1.0.lock.json
   BUILDER_IMAGE: ubuntu@sha256:019e8eb29a85e74d64925745884f2ec79aa27e3feab36353d24656f4d6b89467
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
 
 jobs:
   package:
-    name: Build locked GStreamer 1.28.6 runtime
+    name: Build and audit locked runtime
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     container:
@@ -47,13 +48,12 @@ jobs:
             autoconf automake autopoint autotools-dev binutils bison build-essential \
             ccache cmake curl flex g++ gettext git gperf jq libasound2-dev \
             libclang-dev libcurl4-openssl-dev libdrm-dev libegl1-mesa-dev \
-            libgl1-mesa-dev libglu1-mesa-dev libpulse-dev libssl-dev libtool \
-            libva-dev libx11-dev libx11-xcb-dev libxcomposite-dev libxdamage-dev \
-            libxext-dev libxfixes-dev libxi-dev libxrandr-dev libxrender-dev \
-            libxtst-dev libxv-dev make nasm ninja-build pkg-config python3 \
-            python3-distro \
-            python3-dev python3-pip python3-setuptools python3-venv x11proto-record-dev \
-            xutils-dev xz-utils
+            libgl1-mesa-dev libglu1-mesa-dev libpipewire-0.3-dev libpulse-dev \
+            libssl-dev libtool libva-dev libx11-dev libx11-xcb-dev libxcomposite-dev \
+            libxdamage-dev libxext-dev libxfixes-dev libxi-dev libxrandr-dev \
+            libxrender-dev libxtst-dev libxv-dev make nasm ninja-build pkg-config \
+            python3 python3-distro python3-dev python3-pip python3-setuptools \
+            python3-venv x11proto-record-dev xutils-dev xz-utils
 
       - name: Verify builder identity
         run: |
@@ -66,7 +66,14 @@ jobs:
           mkdir -p artifacts
           ./scripts/build-gstreamer-runtime.sh --lock "$LOCK_FILE" --output artifacts
 
-      - name: Upload standalone artifact and hashes
+      - name: Audit runtime and corresponding source bundle
+        run: |
+          ./scripts/audit-gstreamer-runtime.sh \
+            artifacts/gstreamer-runtime-linux-x86_64.tar.xz \
+            artifacts/gstreamer-runtime-linux-x86_64.sources.tar.xz \
+            "$LOCK_FILE"
+
+      - name: Upload standalone runtime, source, inventory and hashes
         uses: actions/upload-artifact@v4
         with:
           name: gstreamer-runtime-linux-x86_64
@@ -74,31 +81,114 @@ jobs:
           if-no-files-found: error
 
   smoke:
-    name: Smoke standalone runtime in a clean container
+    name: Smoke runtime matrix in clean containers
     needs: package
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout triggering ref
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
 
-      - name: Download runtime artifact
+      - name: Download audited runtime artifact
         uses: actions/download-artifact@v4
         with:
           name: gstreamer-runtime-linux-x86_64
           path: artifacts
 
-      - name: Generate deterministic MP4 fixture
+      - name: Generate deterministic fixture matrix
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg jq
+          sudo apt-get install -y --no-install-recommends ffmpeg jq openssl python3
           ./fixtures/generate.sh
 
-      - name: Run isolated GStreamer smoke
+      - name: Run isolated MP4/Matroska/WebM/dual-track/HLS/audio matrix
         run: |
           ./scripts/smoke-gstreamer-runtime.sh \
-            artifacts/gstreamer-runtime-linux-x86_64.tar.gz \
+            artifacts/gstreamer-runtime-linux-x86_64.tar.xz \
             "$LOCK_FILE" \
-            fixtures/generated/h264-aac.mp4
+            fixtures/generated
+
+  flatpak:
+    name: Build Flatpak from the audited runtime tarball
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout triggering ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download standalone runtime artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gstreamer-runtime-linux-x86_64
+          path: artifacts
+
+      - name: Install demo build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libspeechd-dev libxkbcommon-dev libssl-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
+            libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
+            libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build demo binary for the Flatpak manifest
+        run: |
+          cargo build --release --locked --package lumina-video-demo
+          cp target/release/lumina-video-demo flatpak/lumina-video-demo
+
+      - name: Install Flatpak 25.08 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder jq
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub \
+            org.freedesktop.Platform//25.08 \
+            org.freedesktop.Sdk//25.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
+
+      - name: Record actual OSTree commits as build provenance
+        run: |
+          platform_commit=$(flatpak info --system --show-commit org.freedesktop.Platform//25.08)
+          sdk_commit=$(flatpak info --system --show-commit org.freedesktop.Sdk//25.08)
+          rust_commit=$(flatpak info --system --show-commit org.freedesktop.Sdk.Extension.rust-stable//25.08)
+          jq -n --arg platform "$platform_commit" --arg sdk "$sdk_commit" --arg rust "$rust_commit" \
+            '{runtime: "org.freedesktop.Platform", runtime_version: "25.08", platform_ostree_commit: $platform, sdk_ostree_commit: $sdk, rust_extension_ostree_commit: $rust, note: "provenance only; manifest does not permanently pin user runtimes"}' \
+            > artifacts/flatpak-provenance.json
+
+      - name: Build Flatpak with the same audited runtime tarball
+        run: |
+          cp artifacts/gstreamer-runtime-linux-x86_64.tar.xz flatpak/
+          flatpak-builder --force-clean --repo=repo flatpak-build flatpak/io.github.lumina_video.Demo.yml
+          flatpak build-bundle repo lumina-video-demo.flatpak io.github.lumina_video.Demo
+
+      - name: Smoke Flatpak registry isolation
+        run: |
+          flatpak install --user -y --bundle lumina-video-demo.flatpak
+          launcher=/app/vendor/linux-x86_64/bin/lumina-gstreamer-runtime
+          inspect=/app/vendor/linux-x86_64/bin/gst-inspect-1.0
+          flatpak run --user --command="$launcher" io.github.lumina_video.Demo \
+            "$inspect" fakesink >/dev/null
+          registry=$(flatpak run --user --command="$launcher" \
+            io.github.lumina_video.Demo bash -c 'printf "%s" "$GST_REGISTRY_1_0"')
+          case "$registry" in
+            /app/vendor/*|/app/*) exit 1 ;;
+          esac
+          test -f "$registry"
+
+      - name: Upload Flatpak and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumina-video-demo-flatpak
+          path: |
+            lumina-video-demo.flatpak
+            artifacts/flatpak-provenance.json
+          if-no-files-found: error

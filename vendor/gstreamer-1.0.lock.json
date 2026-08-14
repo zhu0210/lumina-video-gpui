@@ -1,10 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "gstreamer": {
     "version": "1.28.6",
     "source": {
       "url": "https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz",
-      "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca"
+      "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca",
+      "license": "LGPL-2.1-or-later"
     }
   },
   "sources": {
@@ -12,13 +13,24 @@
       "package": "gst-libav-1.0",
       "filename": "gst-libav-1.28.6.tar.xz",
       "url": "https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.28.6.tar.xz",
-      "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51"
+      "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51",
+      "license": "LGPL-2.1-or-later"
     },
     "zlib": {
       "version": "1.3.1",
       "filename": "zlib-1.3.1.tar.gz",
       "url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz",
-      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+      "license": "Zlib"
+    },
+    "pipewire": {
+      "version": "1.6.8",
+      "tag": "1.6.8",
+      "tag_commit": "b741e0c74f5436f0c925f7741140db0efd32cf4e",
+      "url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz",
+      "sha256": "a28f12524d69a8b47feffe31309a6702e45ca4ee54494ff1343d766abf2ec58b",
+      "license": "MIT/LGPL-2.1-or-later",
+      "license_url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/1.6.8/LICENSE"
     }
   },
   "cerbero": {
@@ -46,6 +58,71 @@
     "gstreamer-1.0",
     "gstreamer-1.0-libav"
   ],
+  "variants": [
+    "norust",
+    "alsa",
+    "pulse",
+    "va"
+  ],
+  "audit": {
+    "recipe_allowlist": [
+      "gstreamer-1.0",
+      "gstreamer-1.0-libav"
+    ],
+    "plugin_allowlist": [
+      {"element": "playbin3", "filename": "libgstplayback.so", "source": "gstreamer", "license": "LGPL-2.1-or-later"},
+      {"element": "qtdemux", "filename": "libgstisomp4.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
+      {"element": "h264parse", "filename": "libgstvideoparsersbad.so", "source": "gst-plugins-bad", "license": "LGPL-2.1-or-later"},
+      {"element": "avdec_h264", "filename": "libgstlibav.so", "source": "gst-libav/FFmpeg", "license": "LGPL-2.1-or-later"},
+      {"element": "aacparse", "filename": "libgstaudioparsers.so", "source": "gst-plugins-base", "license": "LGPL-2.1-or-later"},
+      {"element": "avdec_aac", "filename": "libgstlibav.so", "source": "gst-libav/FFmpeg", "license": "LGPL-2.1-or-later"},
+      {"element": "fakesink", "filename": "libgstcoreelements.so", "source": "gstreamer", "license": "LGPL-2.1-or-later"},
+      {"element": "matroskademux", "filename": "libgstmatroska.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
+      {"element": "vp9dec", "filename": "libgstvpx.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
+      {"element": "opusdec", "filename": "libgstopus.so", "source": "gst-plugins-base", "license": "LGPL-2.1-or-later"},
+      {"element": "hlsdemux", "filename": "libgsthls.so", "source": "gst-plugins-bad", "license": "LGPL-2.1-or-later"},
+      {"element": "souphttpsrc", "filename": "libgstsoup.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
+      {"element": "alsasink", "filename": "libgstalsa.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
+      {"element": "pulsesink", "filename": "libgstpulse.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
+      {"element": "pipewiresink", "filename": "libgstpipewire.so", "source": "gst-plugins-good", "license": "LGPL-2.1-or-later"},
+      {"element": "va", "filename": "libgstva.so", "source": "gst-plugins-bad", "license": "LGPL-2.1-or-later"}
+    ],
+    "policy": {
+      "gst_bad_gpl": false,
+      "gst_bad_ugly": false,
+      "gst_libav_ffmpeg_gpl": false,
+      "gst_libav_ffmpeg_nonfree": false,
+      "gst_libav_ffmpeg_version3": false,
+      "software_fallback": {"video": "avdec_h264", "audio": "avdec_aac"},
+      "forbidden_components": ["gst-plugins-ugly", "x264"],
+      "forbidden_licenses": ["GPL", "GPL-2.0", "GPL-3.0", "nonfree", "unknown"]
+    },
+    "system_elf_allowlist": [
+      "ld-linux-x86-64.so.2", "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
+      "libgcc_s.so.1", "libstdc++.so.6", "libasound.so.2", "libpulse.so.0", "libpipewire-0.3.so.0", "libva.so.2",
+      "libva-drm.so.2", "libdrm.so.2", "libEGL.so.1", "libGL.so.1", "libGLX.so.0", "libX11.so.6", "libXext.so.6",
+      "libXfixes.so.3", "libXdamage.so.1", "libXrender.so.1", "libXi.so.6", "libXrandr.so.2", "libXcomposite.so.1",
+      "libxcb.so.1", "libxcb-shm.so.0", "libxcb-render.so.0", "libxcb-randr.so.0", "libxcb-xfixes.so.0", "libwayland-client.so.0",
+      "libwayland-egl.so.1", "libwayland-cursor.so.0", "libz.so.1", "libbz2.so.1.0", "libffi.so.8", "libpcre2-8.so.0",
+      "libfontconfig.so.1", "libfreetype.so.6", "libexpat.so.1", "libpng16.so.16", "libjpeg.so.8", "libcap.so.2",
+      "libmount.so.1", "libselinux.so.1", "libsystemd.so.0", "libdbus-1.so.3", "libudev.so.1", "libcrypt.so.1", "libresolv.so.2"
+    ]
+  },
+  "components": [
+    {"name": "gstreamer", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz", "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca", "license": "LGPL-2.1-or-later"},
+    {"name": "gst-libav", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.28.6.tar.xz", "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51", "license": "LGPL-2.1-or-later"},
+    {"name": "FFmpeg", "version": "7.1", "source_url": "https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz", "sha256": "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6", "license": "LGPL-2.1-or-later (gpl/nonfree/version3 disabled)"},
+    {"name": "zlib", "version": "1.3.1", "source_url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz", "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23", "license": "Zlib"},
+    {"name": "PipeWire", "version": "1.6.8", "tag": "1.6.8", "tag_commit": "b741e0c74f5436f0c925f7741140db0efd32cf4e", "source_url": "https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz", "sha256": "a28f12524d69a8b47feffe31309a6702e45ca4ee54494ff1343d766abf2ec58b", "license": "MIT/LGPL-2.1-or-later"}
+  ],
+  "license_texts": [
+    "gstreamer/COPYING",
+    "gst-libav/COPYING.LGPL",
+    "FFmpeg/COPYING.LGPLv2.1",
+    "zlib/README",
+    "PipeWire/LICENSE",
+    "overlay/LICENSE.md"
+  ],
   "artifact": {
     "type": "tarball",
     "compression": "xz",
@@ -54,57 +131,34 @@
       "source_libdir": "lib/x86_64-linux-gnu",
       "runtime_libdir": "lib/x86_64-linux-gnu",
       "package_roots": {
-        "gstreamer-1.0": [
-          "bin",
-          "etc",
-          "lib",
-          "libexec",
-          "share"
-        ],
-        "gstreamer-1.0-libav": [
-          "lib"
-        ]
+        "gstreamer-1.0": ["bin", "etc", "lib", "libexec", "share"],
+        "gstreamer-1.0-libav": ["lib"]
       }
     }
   },
-  "variants": [
-    "norust"
-  ],
+  "flatpak": {
+    "runtime": "org.freedesktop.Platform",
+    "runtime_version": "25.08",
+    "runtime_ref": "org.freedesktop.Platform//25.08",
+    "sdk": "org.freedesktop.Sdk",
+    "sdk_version": "25.08",
+    "sdk_ref": "org.freedesktop.Sdk//25.08",
+    "rust_extension": "org.freedesktop.Sdk.Extension.rust-stable",
+    "rust_extension_ref": "org.freedesktop.Sdk.Extension.rust-stable//25.08",
+    "source_metadata": [
+      {"name": "freedesktop-platform", "source_url": "https://github.com/flathub/org.freedesktop.Platform", "license": "MIT"},
+      {"name": "freedesktop-sdk", "source_url": "https://gitlab.com/freedesktop-sdk/freedesktop-sdk", "license": "LGPL-2.1-or-later"},
+      {"name": "rust-stable-extension", "source_url": "https://gitlab.com/freedesktop-sdk/freedesktop-sdk", "license": "Apache-2.0/MIT"}
+    ],
+    "provenance": "record actual OSTree commits with flatpak info --show-commit; do not pin user runtime"
+  },
   "required_elements": [
-    {
-      "name": "playbin3",
-      "filename": "libgstplayback.so",
-      "purpose": "playback graph"
-    },
-    {
-      "name": "qtdemux",
-      "filename": "libgstisomp4.so",
-      "purpose": "MP4 demux"
-    },
-    {
-      "name": "h264parse",
-      "filename": "libgstvideoparsersbad.so",
-      "purpose": "H.264 parser"
-    },
-    {
-      "name": "avdec_h264",
-      "filename": "libgstlibav.so",
-      "purpose": "H.264 decoder"
-    },
-    {
-      "name": "aacparse",
-      "filename": "libgstaudioparsers.so",
-      "purpose": "AAC parser"
-    },
-    {
-      "name": "avdec_aac",
-      "filename": "libgstlibav.so",
-      "purpose": "AAC decoder"
-    },
-    {
-      "name": "fakesink",
-      "filename": "libgstcoreelements.so",
-      "purpose": "headless smoke sink"
-    }
+    {"name": "playbin3", "filename": "libgstplayback.so", "purpose": "playback graph"},
+    {"name": "qtdemux", "filename": "libgstisomp4.so", "purpose": "MP4 demux"},
+    {"name": "h264parse", "filename": "libgstvideoparsersbad.so", "purpose": "H.264 parser"},
+    {"name": "avdec_h264", "filename": "libgstlibav.so", "purpose": "LGPL H.264 software decoder"},
+    {"name": "aacparse", "filename": "libgstaudioparsers.so", "purpose": "AAC parser"},
+    {"name": "avdec_aac", "filename": "libgstlibav.so", "purpose": "LGPL AAC software decoder"},
+    {"name": "fakesink", "filename": "libgstcoreelements.so", "purpose": "headless smoke sink"}
   ]
 }

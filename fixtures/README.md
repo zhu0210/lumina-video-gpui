@@ -12,6 +12,7 @@ records the tool versions, stream probes, and SHA-256 for every generated file.
 | --- | --- |
 | `generated/h264-aac.mp4` | 320x180 H.264 video, AAC-LC stereo, 2 seconds |
 | `generated/vp9-opus.mkv` | 320x180 VP9 video, Opus stereo, 2 seconds |
+| `generated/vp9-opus.webm` | 320x180 VP9 video, Opus stereo, 2 seconds |
 | `generated/dual-aac.mkv` | 320x180 H.264 video, two AAC-LC stereo tracks, 2 seconds |
 | `generated/hls-vod/index.m3u8` | H.264/AAC VOD playlist with `#EXT-X-ENDLIST` |
 | `generated/hls-live/index.m3u8` | H.264/AAC sequential EVENT media (12 seconds, no `#EXT-X-ENDLIST`) |
