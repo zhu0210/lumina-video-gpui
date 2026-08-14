@@ -49,7 +49,23 @@
   "artifact": {
     "type": "tarball",
     "compression": "xz",
-    "split": false
+    "split": false,
+    "archive_layout": {
+      "source_libdir": "lib/x86_64-linux-gnu",
+      "runtime_libdir": "lib",
+      "package_roots": {
+        "gstreamer-1.0": [
+          "bin",
+          "etc",
+          "lib",
+          "libexec",
+          "share"
+        ],
+        "gstreamer-1.0-libav": [
+          "lib"
+        ]
+      }
+    }
   },
   "variants": [
     "norust"

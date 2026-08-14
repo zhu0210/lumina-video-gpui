@@ -102,6 +102,15 @@ zlib_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" <<<"$zli
 zlib_filename="zlib-${zlib_version}.tar.gz"
 zlib_url="https://gstreamer.freedesktop.org/src/mirror/zlib/${zlib_filename}"
 
+archive_layout='{
+  "source_libdir": "lib/x86_64-linux-gnu",
+  "runtime_libdir": "lib",
+  "package_roots": {
+    "gstreamer-1.0": ["bin", "etc", "lib", "libexec", "share"],
+    "gstreamer-1.0-libav": ["lib"]
+  }
+}'
+
 registry=https://registry-1.docker.io
 token=$(curl -fsSL --retry 3 \
     'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/ubuntu:pull' |
@@ -145,6 +154,7 @@ jq -n \
     --arg cerbero_archive_url "$cerbero_archive_url" \
     --arg cerbero_archive_sha "$cerbero_archive_sha" \
     --arg ubuntu_digest "$ubuntu_digest" \
+    --argjson archive_layout "$archive_layout" \
     --argjson required_elements "$required_elements" \
     '{
       schema_version: 1,
@@ -157,7 +167,7 @@ jq -n \
       target: {os: "linux", architecture: "x86_64", distribution: "ubuntu", distribution_version: "24.04", glibc: "2.39"},
       builder: {image: ("ubuntu@" + $ubuntu_digest), platform: "linux/amd64"},
       packages: ["gstreamer-1.0", "gstreamer-1.0-libav"],
-      artifact: {type: "tarball", compression: "xz", split: false},
+      artifact: {type: "tarball", compression: "xz", split: false, archive_layout: $archive_layout},
       variants: ["norust"],
       required_elements: $required_elements
     }' >"$lock_tmp"

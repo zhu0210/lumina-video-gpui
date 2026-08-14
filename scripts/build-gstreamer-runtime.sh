@@ -106,6 +106,8 @@ target_glibc=$(jq -er '.target.glibc' "$lock_file")
 artifact_type=$(jq -er '.artifact.type' "$lock_file")
 artifact_compression=$(jq -er '.artifact.compression' "$lock_file")
 artifact_split=$(jq -r '.artifact.split' "$lock_file")
+archive_source_libdir=$(jq -er '.artifact.archive_layout.source_libdir' "$lock_file")
+archive_runtime_libdir=$(jq -er '.artifact.archive_layout.runtime_libdir' "$lock_file")
 mapfile -t packages < <(jq -er '.packages[]' "$lock_file")
 mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
 
@@ -142,11 +144,65 @@ mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
     echo "unsupported Cerbero artifact format" >&2
     exit 1
 }
+[[ "$archive_source_libdir" == lib/x86_64-linux-gnu ]] || {
+    echo "unsupported Cerbero source library directory" >&2
+    exit 1
+}
+[[ "$archive_runtime_libdir" == lib ]] || {
+    echo "unsupported runtime library directory" >&2
+    exit 1
+}
 [[ "${packages[*]}" == "gstreamer-1.0 gstreamer-1.0-libav" ]] || {
     echo "package set is not the approved #18 pair" >&2
     exit 1
 }
 [[ "${variants[*]}" == norust ]] || { echo "variants are not the approved minimal set" >&2; exit 1; }
+
+layout_keys=$(jq -er '.artifact.archive_layout.package_roots | keys[]' "$lock_file" | sort)
+package_keys=$(printf '%s\n' "${packages[@]}" | sort)
+[[ "$layout_keys" == "$package_keys" ]] || {
+    echo "archive layout package roots do not match the package set" >&2
+    exit 1
+}
+
+for package in "${packages[@]}"; do
+    package_roots_text=$(jq -er --arg package "$package" \
+        '.artifact.archive_layout.package_roots[$package][]' "$lock_file")
+    mapfile -t package_roots <<<"$package_roots_text"
+    [[ ${#package_roots[@]} -gt 0 ]] || {
+        echo "archive layout has no roots for $package" >&2
+        exit 1
+    }
+    for ((root_index = 0; root_index < ${#package_roots[@]}; root_index++)); do
+        root=${package_roots[$root_index]}
+        case "$root" in
+            ''|.|..|*/*|*\\*)
+                echo "unsafe archive layout root for $package: $root" >&2
+                exit 1
+                ;;
+        esac
+        for ((other_index = root_index + 1; other_index < ${#package_roots[@]}; other_index++)); do
+            [[ "$root" != "${package_roots[$other_index]}" ]] || {
+                echo "duplicate archive layout root for $package: $root" >&2
+                exit 1
+            }
+        done
+    done
+    case "$package" in
+        gstreamer-1.0)
+            [[ "${package_roots[*]}" == "bin etc lib libexec share" ]] || {
+                echo "unexpected archive layout roots for $package" >&2
+                exit 1
+            }
+            ;;
+        gstreamer-1.0-libav)
+            [[ "${package_roots[*]}" == lib ]] || {
+                echo "unexpected archive layout roots for $package" >&2
+                exit 1
+            }
+            ;;
+    esac
+done
 
 if [[ -e "$output_dir" ]] && [[ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
     echo "output directory is not empty: $output_dir" >&2
@@ -228,7 +284,12 @@ mkdir -p "$runtime_root"
 validate_package_archive() {
     local archive=$1
     local member_list=$2
+    local package=$3
+    local top_root allowed
+    local -a allowed_roots=()
     local member
+    shift 3
+    allowed_roots=("$@")
 
     if ! tar -tJf "$archive" --quoting-style=escape >"$member_list"; then
         fail "cannot list package archive: $archive"
@@ -236,28 +297,36 @@ validate_package_archive() {
     [[ -s "$member_list" ]] || fail "package archive is empty: $archive"
     while IFS= read -r member; do
         case "$member" in
-            /*|./*|*/./*|*/.|..|../*|*/../*|*/..|*//* )
+            /*|./*|*/./*|*/.|.|..|../*|*/../*|*/..|*//* )
                 fail "unsafe package member in $archive: $member"
                 ;;
         esac
-        case "$member" in
-            opt|opt/|opt/gstreamer-1.0|opt/gstreamer-1.0/|opt/gstreamer-1.0/*)
-                ;;
-            *)
-                fail "package member outside opt/gstreamer-1.0 in $archive: $member"
-                ;;
-        esac
+        if [[ "$member" == */* ]]; then
+            top_root=${member%%/*}
+        else
+            top_root=$member
+        fi
+        allowed=0
+        for allowed_root in "${allowed_roots[@]}"; do
+            if [[ "$top_root" == "$allowed_root" ]]; then
+                allowed=1
+                break
+            fi
+        done
+        [[ "$allowed" == 1 ]] || {
+            fail "package member root is not allowed for $package: $member"
+        }
     done <"$member_list"
 }
 
-assert_staging_prefix() {
+assert_staging_roots() {
     local staging=$1
-    local prefix="$staging/opt/gstreamer-1.0"
-    local list_stem="$work_dir/${staging##*/}"
-    local roots_list="$list_stem.roots"
-    local opt_children_list="$list_stem.opt-children"
+    local roots_list=$2
+    local root allowed
     local -a roots=()
-    local -a opt_children=()
+    local -a allowed_roots=()
+    shift 2
+    allowed_roots=("$@")
 
     if ! find -P "$staging" -mindepth 1 -maxdepth 1 -printf '%f\0' >"$roots_list"; then
         fail "cannot enumerate package staging roots: $staging"
@@ -265,49 +334,90 @@ assert_staging_prefix() {
     if ! mapfile -d '' -t roots <"$roots_list"; then
         fail "cannot read package staging roots: $roots_list"
     fi
-    [[ ${#roots[@]} -eq 1 && "${roots[0]}" == opt ]] || {
-        fail "package staging has roots outside opt: $staging"
-    }
-    [[ -d "$staging/opt" && ! -L "$staging/opt" ]] || {
-        fail "package staging opt prefix is not a directory: $staging/opt"
-    }
+    [[ ${#roots[@]} -gt 0 ]] || fail "package staging has no top-level roots: $staging"
+    for root in "${roots[@]}"; do
+        allowed=0
+        for allowed_root in "${allowed_roots[@]}"; do
+            if [[ "$root" == "$allowed_root" ]]; then
+                allowed=1
+                break
+            fi
+        done
+        [[ "$allowed" == 1 ]] || {
+            fail "package staging has an unapproved top-level root: $staging/$root"
+        }
+    done
+}
 
-    if ! find -P "$staging/opt" -mindepth 1 -maxdepth 1 -printf '%f\0' >"$opt_children_list"; then
-        fail "cannot enumerate opt package staging roots: $staging/opt"
-    fi
-    if ! mapfile -d '' -t opt_children <"$opt_children_list"; then
-        fail "cannot read opt package staging roots: $opt_children_list"
-    fi
-    [[ ${#opt_children[@]} -eq 1 && "${opt_children[0]}" == gstreamer-1.0 ]] || {
-        fail "package staging has roots outside opt/gstreamer-1.0: $staging"
+assert_source_lib_layout() {
+    local staging=$1
+    local children_list=$2
+    local source_lib_name=${archive_source_libdir##*/}
+    local source_lib_parent=${archive_source_libdir%/*}
+    local source_lib="$staging/$archive_source_libdir"
+    local runtime_lib="$staging/$archive_runtime_libdir"
+    local -a children=()
+
+    [[ "$source_lib_parent" == "$archive_runtime_libdir" ]] || {
+        fail "source library directory is not under runtime library directory"
     }
-    [[ -d "$prefix" && ! -L "$prefix" ]] || {
-        fail "package staging prefix is not a directory: $prefix"
+    [[ -d "$runtime_lib" && ! -L "$runtime_lib" ]] || {
+        fail "package staging runtime library directory is not a real directory: $runtime_lib"
+    }
+    [[ -d "$source_lib" && ! -L "$source_lib" ]] || {
+        fail "package staging source library directory is not a real directory: $source_lib"
+    }
+    if ! find -P "$runtime_lib" -mindepth 1 -maxdepth 1 -printf '%f\0' >"$children_list"; then
+        fail "cannot enumerate package staging library directory: $runtime_lib"
+    fi
+    if ! mapfile -d '' -t children <"$children_list"; then
+        fail "cannot read package staging library directory: $children_list"
+    fi
+    [[ ${#children[@]} -eq 1 && "${children[0]}" == "$source_lib_name" ]] || {
+        fail "package staging library layout is not exactly $archive_source_libdir: $runtime_lib"
     }
 }
 
-merge_package_prefix() {
-    local prefix=$1
-    local source_list=$2
-    local prefix_root prefix_mode source source_parent rel destination source_kind source_target destination_target resolved_target source_mode destination_mode
+merge_tree() {
+    local source_root=$1
+    local destination_root=$2
+    local source_list=$3
+    local source_root_path root_mode source_mode destination_mode source source_parent rel destination source_kind source_target destination_target resolved_target
 
-    capture_path prefix_root "package prefix path" realpath -m -- "$prefix"
-    if ! prefix_mode=$(stat -c '%a' -- "$prefix"); then
-        fail "cannot read package prefix mode: $prefix"
-    fi
-    if [[ -z "$expected_prefix_mode" ]]; then
-        expected_prefix_mode=$prefix_mode
-    elif [[ "$expected_prefix_mode" != "$prefix_mode" ]]; then
-        fail "package prefix mode differs: $prefix ($prefix_mode), expected $expected_prefix_mode"
+    [[ -d "$source_root" && ! -L "$source_root" ]] || {
+        fail "package merge source root is not a real directory: $source_root"
+    }
+    capture_path source_root_path "package merge source root" realpath -m -- "$source_root"
+    if ! root_mode=$(stat -c '%a' -- "$source_root"); then
+        fail "cannot read package merge source root mode: $source_root"
     fi
 
-    if ! find -P "$prefix" -mindepth 1 -print0 >"$source_list"; then
-        fail "cannot enumerate package prefix: $prefix"
+    if [[ -L "$destination_root" ]]; then
+        fail "package merge destination root is a symlink: $destination_root"
+    elif [[ -e "$destination_root" ]]; then
+        [[ -d "$destination_root" ]] || fail "package merge destination root is not a directory: $destination_root"
+        if ! destination_mode=$(stat -c '%a' -- "$destination_root"); then
+            fail "cannot read package merge destination root mode: $destination_root"
+        fi
+        [[ "$root_mode" == "$destination_mode" ]] || {
+            fail "package merge root mode differs at $destination_root"
+        }
+    else
+        if ! mkdir -p -- "$destination_root"; then
+            fail "cannot create package merge destination root: $destination_root"
+        fi
+        if ! chmod "$root_mode" "$destination_root"; then
+            fail "cannot set package merge destination root mode: $destination_root"
+        fi
+    fi
+
+    if ! find -P "$source_root" -mindepth 1 -print0 >"$source_list"; then
+        fail "cannot enumerate package merge source root: $source_root"
     fi
 
     while IFS= read -r -d '' source; do
-        rel=${source#"$prefix"/}
-        destination="$runtime_root/$rel"
+        rel=${source#"$source_root"/}
+        destination="$destination_root/$rel"
 
         if [[ -L "$source" ]]; then
             source_kind=symlink
@@ -318,10 +428,10 @@ merge_package_prefix() {
             source_parent=${source%/*}
             capture_path resolved_target "package symlink resolution at $source" realpath -m -- "$source_parent/$source_target"
             case "$resolved_target/" in
-                "$prefix_root/"*)
+                "$source_root_path/"*)
                     ;;
                 *)
-                    fail "package symlink escapes prefix at $source: $source_target -> $resolved_target"
+                    fail "package symlink escapes source root at $source: $source_target -> $resolved_target"
                     ;;
             esac
         elif [[ -d "$source" ]]; then
@@ -329,7 +439,7 @@ merge_package_prefix() {
         elif [[ -f "$source" ]]; then
             source_kind=file
         else
-            fail "special file in package prefix: $source"
+            fail "special file in package merge source: $source"
         fi
 
         if [[ ! -L "$destination" && ! -e "$destination" ]]; then
@@ -380,30 +490,75 @@ merge_package_prefix() {
         esac
     done <"$source_list"
 
-    cp -a -- "$prefix"/. "$runtime_root"/
+    cp -a -- "$source_root"/. "$destination_root"/
+    if ! chmod "$root_mode" "$destination_root"; then
+        fail "cannot finalize package merge destination root mode: $destination_root"
+    fi
 }
 
 package_count=0
-expected_prefix_mode=
-package_list="$work_dir/package-tarballs.list"
-if ! find -P "$package_dir" -type f -name '*.tar.xz' -print0 | sort -z >"$package_list"; then
-    fail "cannot discover Cerbero package tarballs"
-fi
-while IFS= read -r -d '' package_tarball; do
-    package_count=$((package_count + 1))
-    staging="$work_dir/package-staging-$package_count"
-    member_list="$work_dir/package-$package_count.members"
-    source_list="$work_dir/package-$package_count.sources"
-    mkdir -p "$staging"
-    validate_package_archive "$package_tarball" "$member_list"
-    tar -xJf "$package_tarball" -C "$staging" --no-same-owner
-    assert_staging_prefix "$staging"
-    merge_package_prefix "$staging/opt/gstreamer-1.0" "$source_list"
-done <"$package_list"
-[[ "$package_count" == 2 ]] || { echo "expected two Cerbero package tarballs, got $package_count" >&2; exit 1; }
-[[ -n "$expected_prefix_mode" ]] || fail "package prefix mode was not established"
-if ! chmod "$expected_prefix_mode" "$runtime_root"; then
+if ! chmod 0755 "$runtime_root"; then
     fail "cannot set runtime root mode: $runtime_root"
+fi
+for package in "${packages[@]}"; do
+    package_count=$((package_count + 1))
+    package_path="$package_dir/$package"
+    [[ -d "$package_path" && ! -L "$package_path" ]] || {
+        fail "package output directory is missing or not a real directory: $package_path"
+    }
+    package_tarballs_list="$work_dir/package-$package_count.tarballs"
+    if ! find -P "$package_path" -type f -name '*.tar.xz' -print0 >"$package_tarballs_list"; then
+        fail "cannot discover package tarball: $package_path"
+    fi
+    package_tarballs=()
+    if ! mapfile -d '' -t package_tarballs <"$package_tarballs_list"; then
+        fail "cannot read package tarball list: $package_tarballs_list"
+    fi
+    [[ ${#package_tarballs[@]} -eq 1 ]] || {
+        fail "expected exactly one package tarball for $package, got ${#package_tarballs[@]}"
+    }
+    package_tarball=${package_tarballs[0]}
+    [[ -f "$package_tarball" && ! -L "$package_tarball" ]] || {
+        fail "package tarball is not a regular file: $package_tarball"
+    }
+
+    package_roots_text=$(jq -er --arg package "$package" \
+        '.artifact.archive_layout.package_roots[$package][]' "$lock_file")
+    mapfile -t package_roots <<<"$package_roots_text"
+    staging="$work_dir/package-staging-$package_count"
+    normalized="$work_dir/package-normalized-$package_count"
+    member_list="$work_dir/package-$package_count.members"
+    roots_list="$work_dir/package-$package_count.roots"
+    children_list="$work_dir/package-$package_count.lib-children"
+    if [[ -L "$staging" || -e "$staging" || -L "$normalized" || -e "$normalized" ]]; then
+        fail "package staging paths are not fresh: $package"
+    fi
+    validate_package_archive "$package_tarball" "$member_list" "$package" "${package_roots[@]}"
+    mkdir "$staging"
+    tar -xJf "$package_tarball" -C "$staging" --no-same-owner
+    assert_staging_roots "$staging" "$roots_list" "${package_roots[@]}"
+    assert_source_lib_layout "$staging" "$children_list"
+    mkdir "$normalized"
+    actual_roots=()
+    if ! mapfile -d '' -t actual_roots <"$roots_list"; then
+        fail "cannot read package staging roots: $roots_list"
+    fi
+    for root in "${actual_roots[@]}"; do
+        if [[ "$root" == "$archive_runtime_libdir" ]]; then
+            source_root="$staging/$archive_source_libdir"
+        else
+            source_root="$staging/$root"
+        fi
+        normalized_root="$normalized/$root"
+        merge_tree "$source_root" "$normalized_root" "$work_dir/package-$package_count-normalize-$root.sources"
+    done
+    for root in "${actual_roots[@]}"; do
+        merge_tree "$normalized/$root" "$runtime_root/$root" "$work_dir/package-$package_count-union-$root.sources"
+    done
+done
+[[ "$package_count" == 2 ]] || fail "expected exactly two lock packages, got $package_count"
+if ! chmod 0755 "$runtime_root"; then
+    fail "cannot finalize runtime root mode: $runtime_root"
 fi
 
 launcher="$runtime_root/bin/lumina-gstreamer-runtime"
