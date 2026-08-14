@@ -4,7 +4,7 @@
 //!
 //! | Path | Format | Textures | GPUI `surface()` call |
 //! |------|--------|----------|-----------------------|
-//! | **NV12 native** | NV12, YUV420p | Y (R8Unorm) + CbCr (Rg8Unorm) | `surface((y_tex, cbcr_tex, size))` — GPU-side YUV→RGB |
+//! | **NV12 native** | NV12, YUV420p | Y (R8Unorm) + CbCr (Rg8Unorm) | `surface((y_tex, cbcr_tex, size, transform))` — GPU-side YUV→RGB |
 //! | **RGBA passthrough** | RGBA, BGRA, RGB24 | Single RGBA8Unorm | `surface((tex, desc))` |
 //!
 //! YUV420p frames are cheaply interleaved (U+V → CbCr) to use the NV12 path,
@@ -15,10 +15,15 @@
 //! producers must hand an owned lease to [`native_frame_lease_to_textures`].
 
 #[cfg(test)]
+use lumina_video_native_frame::apply_yuv_matrix;
+#[cfg(test)]
 use lumina_video_native_frame::video::Plane;
 use lumina_video_native_frame::video::{CpuFrame, DecodedFrame, PixelFormat};
 use lumina_video_native_frame::{
-    AcquireSync, CpuMemory, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
+    nv12_bytes_to_rgba_into, render_decision, yuv420p_bytes_to_rgba_into, yuv_to_rgb_matrix,
+    AcquireSync, ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorRange,
+    ColorRenderDecision, ColorTransfer, CpuMemory, NativeFrameDescriptor, NativeFrameLease,
+    NativeMemory,
 };
 use std::sync::Arc;
 
@@ -73,17 +78,18 @@ fn safe_write_texture(
 /// GPU representation of a decoded video frame.
 ///
 /// Variants map directly to [`gpui::SurfaceSource`] conversions:
-/// - `Nv12` → `surface((y_tex, cbcr_tex, native_size))`
+/// - `Nv12` → `surface((y_tex, cbcr_tex, native_size, color_transform))`
 /// - `Rgba` → `surface((tex, descriptor))`
 #[derive(Clone)]
 pub enum GpuFrameTextures {
     /// Two-plane NV12: Y (R8Unorm) + interleaved CbCr (Rg8Unorm).
-    /// Use with `surface((y_texture, cb_cr_texture, native_size))`.
+    /// Use with `surface((y_texture, cb_cr_texture, native_size, color_transform))`.
     Nv12 {
         y_texture: Arc<wgpu::Texture>,
         cb_cr_texture: Arc<wgpu::Texture>,
         width: u32,
         height: u32,
+        color_transform: [[f32; 4]; 4],
     },
     /// Single RGBA8Unorm texture.
     /// Use with `surface((texture, descriptor))`.
@@ -92,6 +98,14 @@ pub enum GpuFrameTextures {
         width: u32,
         height: u32,
     },
+}
+
+fn default_nv12_color_transform() -> [[f32; 4]; 4] {
+    yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Full).unwrap_or([[0.0; 4]; 4])
+}
+
+fn legacy_cpu_nv12_color_transform() -> [[f32; 4]; 4] {
+    yuv_to_rgb_matrix(ColorMatrix::Bt601, ColorRange::Limited).unwrap_or([[0.0; 4]; 4])
 }
 
 #[derive(Clone, Copy)]
@@ -227,6 +241,9 @@ pub enum NativeFrameIngestionError {
     UnsupportedDmaBuf(NativeFrameLease),
     /// The direct upload seam intentionally accepts only owned RGBA or NV12 bytes.
     UnsupportedCpuFormat(NativeFrameLease),
+    /// The native frame carries color metadata outside the supported SDR
+    /// matrix/range contract.
+    UnsupportedColorMetadata(NativeFrameLease),
 }
 
 impl std::fmt::Display for NativeFrameIngestionError {
@@ -244,6 +261,10 @@ impl std::fmt::Display for NativeFrameIngestionError {
                 f,
                 "owned CPU ingestion supports only direct RGBA and NV12 uploads"
             ),
+            Self::UnsupportedColorMetadata(_) => write!(
+                f,
+                "owned NV12 ingestion requires supported SDR color metadata"
+            ),
         }
     }
 }
@@ -256,15 +277,26 @@ impl NativeFrameIngestionError {
         match self {
             Self::UnsupportedAcquireSync(lease)
             | Self::UnsupportedDmaBuf(lease)
-            | Self::UnsupportedCpuFormat(lease) => lease,
+            | Self::UnsupportedCpuFormat(lease)
+            | Self::UnsupportedColorMetadata(lease) => lease,
         }
+    }
+}
+
+fn owned_nv12_color_transform(color: ColorMetadata) -> Option<[[f32; 4]; 4]> {
+    match render_decision(color) {
+        ColorRenderDecision::Gpu(transform) => Some(transform),
+        ColorRenderDecision::CpuRgba(_)
+        | ColorRenderDecision::Unsupported
+        | ColorRenderDecision::UnsupportedSdrColor => None,
     }
 }
 
 /// Uploads an owned native frame without cloning its CPU planes.
 ///
-/// This is the renderer seam for #7 producers. Only owned RGBA and NV12 CPU
-/// leases are accepted until explicit external-memory synchronization exists.
+/// The GStreamer worker has already made the one-time color decision. This
+/// seam therefore only uploads worker-produced RGBA or an exact GPUI-shader
+/// NV12 frame; it never allocates a CPU conversion scratch buffer.
 #[allow(clippy::result_large_err)]
 pub fn native_frame_lease_to_textures(
     lease: NativeFrameLease,
@@ -275,18 +307,34 @@ pub fn native_frame_lease_to_textures(
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<GpuFrameTextures, NativeFrameIngestionError> {
     let (descriptor, memory) = classify_native_frame_lease(lease)?;
-    Ok(upload_cpu_frame_ref_as_textures(
-        CpuFrameRef::from_memory(
+    if descriptor.format == PixelFormat::Nv12 {
+        let Some(transform) = owned_nv12_color_transform(descriptor.color) else {
+            return Err(NativeFrameIngestionError::UnsupportedColorMetadata(
+                NativeFrameLease {
+                    descriptor,
+                    memory: NativeMemory::Cpu(memory),
+                    acquire: AcquireSync::None,
+                },
+            ));
+        };
+        let frame = CpuFrameRef::from_memory(
             &memory,
             descriptor.extent.width,
             descriptor.extent.height,
             descriptor.format,
-        ),
-        device,
-        queue,
-        y_cache,
-        cbcr_cache,
-        rgba_cache,
+        );
+        return Ok(upload_nv12(
+            frame, device, queue, y_cache, cbcr_cache, transform,
+        ));
+    }
+    let frame = CpuFrameRef::from_memory(
+        &memory,
+        descriptor.extent.width,
+        descriptor.extent.height,
+        descriptor.format,
+    );
+    Ok(upload_cpu_frame_ref_as_textures(
+        frame, device, queue, y_cache, cbcr_cache, rgba_cache,
     ))
 }
 
@@ -359,8 +407,22 @@ fn upload_cpu_frame_ref_as_textures(
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> GpuFrameTextures {
     match frame.format {
-        PixelFormat::Nv12 => upload_nv12(frame, device, queue, y_cache, cbcr_cache),
-        PixelFormat::Yuv420p => upload_yuv420p_as_nv12(frame, device, queue, y_cache, cbcr_cache),
+        PixelFormat::Nv12 => upload_nv12(
+            frame,
+            device,
+            queue,
+            y_cache,
+            cbcr_cache,
+            default_nv12_color_transform(),
+        ),
+        PixelFormat::Yuv420p => upload_yuv420p_as_nv12(
+            frame,
+            device,
+            queue,
+            y_cache,
+            cbcr_cache,
+            default_nv12_color_transform(),
+        ),
         PixelFormat::Rgba | PixelFormat::Bgra => upload_rgba(frame, device, queue, rgba_cache),
         PixelFormat::Rgb24 => upload_rgb24(frame, device, queue, rgba_cache),
     }
@@ -444,6 +506,7 @@ fn upload_nv12(
     queue: &wgpu::Queue,
     y_cache: &mut Option<Arc<wgpu::Texture>>,
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+    color_transform: [[f32; 4]; 4],
 ) -> GpuFrameTextures {
     let width = frame.width;
     let height = frame.height;
@@ -487,6 +550,7 @@ fn upload_nv12(
                 cb_cr_texture: cbcr_texture,
                 width,
                 height,
+                color_transform,
             };
         }
         if y_bytes_per_row != width {
@@ -530,6 +594,7 @@ fn upload_nv12(
                 cb_cr_texture: cbcr_texture,
                 width,
                 height,
+                color_transform,
             };
         }
         queue.write_texture(
@@ -558,6 +623,7 @@ fn upload_nv12(
         cb_cr_texture: cbcr_texture,
         width,
         height,
+        color_transform,
     }
 }
 
@@ -571,6 +637,7 @@ fn upload_yuv420p_as_nv12(
     queue: &wgpu::Queue,
     y_cache: &mut Option<Arc<wgpu::Texture>>,
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
+    color_transform: [[f32; 4]; 4],
 ) -> GpuFrameTextures {
     let width = frame.width;
     let height = frame.height;
@@ -614,6 +681,7 @@ fn upload_yuv420p_as_nv12(
                 cb_cr_texture: cbcr_texture,
                 width,
                 height,
+                color_transform,
             };
         }
         safe_write_texture(
@@ -692,6 +760,7 @@ fn upload_yuv420p_as_nv12(
         cb_cr_texture: cbcr_texture,
         width,
         height,
+        color_transform,
     }
 }
 
@@ -919,25 +988,10 @@ fn cpu_frame_ref_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     }
 }
 
-/// BT.601 limited-range YUV→RGB conversion with range expansion.
-///
-/// Y ∈ [16, 235], U/V ∈ [16, 240] → expanded to full range → R,G,B ∈ [0, 255].
+#[cfg(test)]
 fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
-    // Range expansion: limited → full
-    let y = ((y as f32 - 16.0) * 255.0 / 219.0).max(0.0);
-    let u = (u as f32 - 128.0) * 255.0 / 224.0;
-    let v = (v as f32 - 128.0) * 255.0 / 224.0;
-
-    // BT.601 coefficients (applied to full-range Y'CbCr)
-    let r = y + 1.402 * v;
-    let g = y - 0.344136 * u - 0.714136 * v;
-    let b = y + 1.772 * u;
-
-    (
-        r.clamp(0.0, 255.0) as u8,
-        g.clamp(0.0, 255.0) as u8,
-        b.clamp(0.0, 255.0) as u8,
-    )
+    let [r, g, b] = apply_yuv_matrix(&legacy_cpu_nv12_color_transform(), y, u, v);
+    (r, g, b)
 }
 
 fn bgra_to_rgba(data: &[u8]) -> Vec<u8> {
@@ -983,60 +1037,83 @@ fn rgb24_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
 fn yuv420p_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let Some(y_plane) = frame.plane(0).map(|plane| plane.data) else {
+    let Some(y_plane_ref) = frame.plane(0) else {
         return Vec::new();
     };
-    let Some(u_plane) = frame.plane(1).map(|plane| plane.data) else {
+    let Some(u_plane_ref) = frame.plane(1) else {
         return Vec::new();
     };
-    let Some(v_plane) = frame.plane(2).map(|plane| plane.data) else {
+    let Some(v_plane_ref) = frame.plane(2) else {
         return Vec::new();
     };
+    let y_plane = y_plane_ref.data;
+    let u_plane = u_plane_ref.data;
+    let v_plane = v_plane_ref.data;
+    let y_stride = y_plane_ref.stride;
+    let u_stride = u_plane_ref.stride;
+    let v_stride = v_plane_ref.stride;
 
     let mut rgba = vec![0u8; width * height * 4];
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            let uv_idx = (y / 2) * (width / 2) + (x / 2);
-            let y_value = y_plane.get(idx).copied().unwrap_or(0);
-            let u_value = u_plane.get(uv_idx).copied().unwrap_or(128);
-            let v_value = v_plane.get(uv_idx).copied().unwrap_or(128);
-            let (r, g, b) = yuv_to_rgb(y_value, u_value, v_value);
-            let out_idx = idx * 4;
-            if let Some(pixel) = rgba.get_mut(out_idx..out_idx.saturating_add(4)) {
-                pixel.copy_from_slice(&[r, g, b, 255]);
-            }
-        }
-    }
+    let _ = yuv420p_bytes_to_rgba_into(
+        y_plane,
+        y_stride,
+        u_plane,
+        u_stride,
+        v_plane,
+        v_stride,
+        lumina_video_native_frame::FrameExtent::new(frame.width, frame.height),
+        &legacy_cpu_nv12_color_transform(),
+        &mut rgba,
+    );
     rgba
 }
 
 fn nv12_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
+    let mut rgba = Vec::new();
+    cpu_frame_ref_to_rgba_into(frame, &mut rgba, legacy_cpu_nv12_color_transform());
+    rgba
+}
+
+fn cpu_frame_ref_to_rgba_into(
+    frame: CpuFrameRef<'_>,
+    rgba: &mut Vec<u8>,
+    transform: [[f32; 4]; 4],
+) {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let Some(y_plane) = frame.plane(0).map(|plane| plane.data) else {
-        return Vec::new();
+    let Some(pixel_count) = width.checked_mul(height) else {
+        rgba.clear();
+        return;
     };
-    let Some(uv_plane) = frame.plane(1).map(|plane| plane.data) else {
-        return Vec::new();
+    let Some(byte_count) = pixel_count.checked_mul(4) else {
+        rgba.clear();
+        return;
     };
-
-    let mut rgba = vec![0u8; width * height * 4];
-    for y in 0..height {
-        for x in 0..width {
-            let idx = y * width + x;
-            let uv_idx = (y / 2) * (width / 2) * 2 + (x / 2) * 2;
-            let y_value = y_plane.get(idx).copied().unwrap_or(0);
-            let u_value = uv_plane.get(uv_idx).copied().unwrap_or(128);
-            let v_value = uv_plane.get(uv_idx + 1).copied().unwrap_or(128);
-            let (r, g, b) = yuv_to_rgb(y_value, u_value, v_value);
-            let out_idx = idx * 4;
-            if let Some(pixel) = rgba.get_mut(out_idx..out_idx.saturating_add(4)) {
-                pixel.copy_from_slice(&[r, g, b, 255]);
-            }
-        }
-    }
-    rgba
+    rgba.resize(byte_count, 0);
+    let Some(y_plane) = frame.plane(0) else {
+        return;
+    };
+    let Some(uv_plane) = frame.plane(1) else {
+        return;
+    };
+    let color = ColorMetadata {
+        matrix: ColorMatrix::Bt601,
+        primaries: lumina_video_native_frame::ColorPrimaries::Bt709,
+        transfer: ColorTransfer::Srgb,
+        range: ColorRange::Limited,
+        chroma_horizontal: ChromaHorizontal::Centered,
+        chroma_vertical: ChromaVertical::Centered,
+    };
+    let _ = nv12_bytes_to_rgba_into(
+        y_plane.data,
+        y_plane.stride,
+        uv_plane.data,
+        uv_plane.stride,
+        lumina_video_native_frame::FrameExtent::new(frame.width, frame.height),
+        color,
+        &transform,
+        rgba,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,7 +1127,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use lumina_video_native_frame::video::LinuxGpuSurface;
-    use lumina_video_native_frame::{CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor};
+    use lumina_video_native_frame::{
+        ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorPrimaries, ColorRange,
+        ColorTransfer, CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor,
+    };
     #[cfg(target_os = "linux")]
     use lumina_video_native_frame::{
         DmaBufFormatPlane, DmaBufMemory, DmaBufMemoryPlane, DmaBufObject,
@@ -1091,6 +1171,54 @@ mod tests {
     }
 
     #[test]
+    fn owned_gpu_decision_is_consumed_as_a_plain_column_matrix() {
+        let metadata = ColorMetadata {
+            matrix: ColorMatrix::Bt709,
+            primaries: ColorPrimaries::Bt709,
+            transfer: ColorTransfer::Srgb,
+            range: ColorRange::Limited,
+            chroma_horizontal: ChromaHorizontal::Centered,
+            chroma_vertical: ChromaVertical::Centered,
+        };
+        assert!(matches!(
+            lumina_video_native_frame::render_decision(metadata),
+            lumina_video_native_frame::ColorRenderDecision::Gpu(_)
+        ));
+    }
+
+    #[test]
+    fn owned_nv12_boundary_rejects_non_shader_color_contracts() {
+        let centered = ColorMetadata {
+            matrix: ColorMatrix::Bt709,
+            primaries: ColorPrimaries::Bt709,
+            transfer: ColorTransfer::Srgb,
+            range: ColorRange::Limited,
+            chroma_horizontal: ChromaHorizontal::Centered,
+            chroma_vertical: ChromaVertical::Centered,
+        };
+        let Some(expected) = yuv_to_rgb_matrix(centered.matrix, centered.range) else {
+            panic!("BT.709 limited transform must exist");
+        };
+        assert_eq!(owned_nv12_color_transform(centered), Some(expected));
+
+        let mut cosited = centered;
+        cosited.chroma_horizontal = ChromaHorizontal::Cosited;
+        let mut non_srgb = centered;
+        non_srgb.transfer = ColorTransfer::Bt709;
+        let mut adobe = centered;
+        adobe.primaries = ColorPrimaries::Adobergb;
+        let hdr = ColorMetadata {
+            matrix: ColorMatrix::Bt2020,
+            primaries: ColorPrimaries::Bt2020,
+            transfer: ColorTransfer::Smpte2084,
+            ..centered
+        };
+        for rejected in [cosited, non_srgb, adobe, hdr] {
+            assert!(owned_nv12_color_transform(rejected).is_none());
+        }
+    }
+
+    #[test]
     fn owned_cpu_lease_view_borrows_plane_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = vec![1, 2, 3, 4];
         let bytes_ptr = bytes.as_ptr();
@@ -1102,6 +1230,7 @@ mod tests {
                 duration: None,
                 extent: FrameExtent::new(1, 1),
                 format: PixelFormat::Rgba,
+                color: lumina_video_native_frame::ColorMetadata::default(),
             },
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(bytes, 4)])),
             AcquireSync::None,
@@ -1129,6 +1258,7 @@ mod tests {
                 duration: None,
                 extent: FrameExtent::new(1, 1),
                 format: PixelFormat::Rgba,
+                color: lumina_video_native_frame::ColorMetadata::default(),
             },
             NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(vec![0; 4], 4)])),
             AcquireSync::SyncFile(OwnedFd::from(file)),
@@ -1163,6 +1293,7 @@ mod tests {
                     duration: None,
                     extent: FrameExtent::new(1, 1),
                     format,
+                    color: lumina_video_native_frame::ColorMetadata::default(),
                 },
                 NativeMemory::Cpu(CpuMemory::new(planes)),
                 AcquireSync::None,
@@ -1200,6 +1331,7 @@ mod tests {
                 duration: Some(Duration::from_millis(33)),
                 extent: FrameExtent::new(1, 1),
                 format: PixelFormat::Rgba,
+                color: lumina_video_native_frame::ColorMetadata::default(),
             },
             NativeMemory::DmaBuf(DmaBufMemory::new(
                 vec![DmaBufObject {

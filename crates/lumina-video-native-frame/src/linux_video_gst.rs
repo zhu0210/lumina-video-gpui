@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -38,8 +39,9 @@ use crate::video::{
 };
 
 use crate::{
-    into_cpu_planes, DmaBufFormatPlane, DmaBufMemory, DmaBufMemoryPlane, DmaBufObject, FrameExtent,
-    NativeMemory,
+    into_cpu_planes, render_decision, ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata,
+    ColorPrimaries, ColorRange, ColorRenderDecision, ColorTransfer, CpuMemory, CpuPlane,
+    DmaBufFormatPlane, DmaBufMemory, DmaBufMemoryPlane, DmaBufObject, FrameExtent, NativeMemory,
 };
 
 /// A decoder result containing only owned native-frame data. No GStreamer
@@ -49,7 +51,213 @@ pub struct NativeDecodedFrame {
     pub pts: Duration,
     pub extent: FrameExtent,
     pub format: PixelFormat,
+    pub color: ColorMetadata,
+    /// Color decision cached when caps are mapped, so the worker does not
+    /// recompute it for the same negotiated generation.
+    pub color_decision: ColorRenderDecision,
     pub memory: NativeMemory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Nv12InputLayout {
+    extent: FrameExtent,
+    y_stride: usize,
+    uv_stride: usize,
+    y_offset: usize,
+    uv_offset: usize,
+    y_size: usize,
+    uv_size: usize,
+}
+
+impl Nv12InputLayout {
+    fn from_video_info(
+        video_info: &gst_video::VideoInfo,
+        extent: FrameExtent,
+    ) -> Result<Self, VideoError> {
+        let width = usize::try_from(extent.width)
+            .map_err(|_| VideoError::DecodeFailed("NV12 width is too large".into()))?;
+        let height = usize::try_from(extent.height)
+            .map_err(|_| VideoError::DecodeFailed("NV12 height is too large".into()))?;
+        if width == 0 || height == 0 {
+            return Err(VideoError::DecodeFailed(
+                "NV12 extent must be non-zero".into(),
+            ));
+        }
+        let y_stride = usize::try_from(
+            *video_info
+                .stride()
+                .first()
+                .ok_or_else(|| VideoError::DecodeFailed("NV12: missing Y stride".into()))?,
+        )
+        .map_err(|_| VideoError::DecodeFailed("NV12: invalid Y stride".into()))?;
+        let uv_stride = usize::try_from(
+            *video_info
+                .stride()
+                .get(1)
+                .ok_or_else(|| VideoError::DecodeFailed("NV12: missing UV stride".into()))?,
+        )
+        .map_err(|_| VideoError::DecodeFailed("NV12: invalid UV stride".into()))?;
+        if y_stride < width || uv_stride < width {
+            return Err(VideoError::DecodeFailed(
+                "NV12: stride is smaller than the frame width".into(),
+            ));
+        }
+        let y_offset = *video_info
+            .offset()
+            .first()
+            .ok_or_else(|| VideoError::DecodeFailed("NV12: missing Y offset".into()))?;
+        let uv_offset = *video_info
+            .offset()
+            .get(1)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12: missing UV offset".into()))?;
+        let y_size = y_stride
+            .checked_mul(height)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12: Y layout is too large".into()))?;
+        let uv_height = height
+            .checked_add(1)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12: UV layout is too large".into()))?
+            / 2;
+        let uv_size = uv_stride
+            .checked_mul(uv_height)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12: UV layout is too large".into()))?;
+        Ok(Self {
+            extent,
+            y_stride,
+            uv_stride,
+            y_offset,
+            uv_offset,
+            y_size,
+            uv_size,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Nv12InputPool {
+    layout: Nv12InputLayout,
+    recycle: Sender<Vec<CpuPlane>>,
+    available: Receiver<Vec<CpuPlane>>,
+}
+
+impl Nv12InputPool {
+    fn new(layout: Nv12InputLayout) -> Option<Self> {
+        let (recycle, available) = crossbeam_channel::bounded(1);
+        let planes = vec![
+            CpuPlane::new(vec![0; layout.y_size], layout.y_stride),
+            CpuPlane::new(vec![0; layout.uv_size], layout.uv_stride),
+        ];
+        if recycle.try_send(planes).is_err() {
+            return None;
+        }
+        Some(Self {
+            layout,
+            recycle,
+            available,
+        })
+    }
+
+    fn valid_payload(&self, planes: &[CpuPlane]) -> bool {
+        let Some(y_plane) = planes.first() else {
+            return false;
+        };
+        let Some(uv_plane) = planes.get(1) else {
+            return false;
+        };
+        planes.len() == 2
+            && y_plane.stride == self.layout.y_stride
+            && y_plane.bytes.len() == self.layout.y_size
+            && uv_plane.stride == self.layout.uv_stride
+            && uv_plane.bytes.len() == self.layout.uv_size
+    }
+
+    fn try_acquire_checked(&self) -> Result<Option<CpuMemory>, &'static str> {
+        match self.available.try_recv() {
+            Ok(planes) if self.valid_payload(&planes) => Ok(Some(CpuMemory::new_recyclable(
+                planes,
+                self.recycle.clone(),
+            ))),
+            Ok(_) => Err("NV12 input recycle payload shape changed"),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err("NV12 input recycle lane disconnected"),
+        }
+    }
+}
+
+fn color_metadata_from_video_info(video_info: &gst_video::VideoInfo) -> ColorMetadata {
+    let colorimetry = video_info.colorimetry();
+    let matrix = match colorimetry.matrix() {
+        gst_video::VideoColorMatrix::Bt601 => ColorMatrix::Bt601,
+        gst_video::VideoColorMatrix::Bt709 => ColorMatrix::Bt709,
+        gst_video::VideoColorMatrix::Fcc => ColorMatrix::Fcc,
+        gst_video::VideoColorMatrix::Smpte240m => ColorMatrix::Smpte240m,
+        gst_video::VideoColorMatrix::Bt2020 => ColorMatrix::Bt2020,
+        gst_video::VideoColorMatrix::Rgb => ColorMatrix::Unsupported,
+        _ => ColorMatrix::Unknown,
+    };
+    let primaries = match colorimetry.primaries() {
+        gst_video::VideoColorPrimaries::Bt709 => ColorPrimaries::Bt709,
+        gst_video::VideoColorPrimaries::Bt470m => ColorPrimaries::Bt470m,
+        gst_video::VideoColorPrimaries::Bt470bg => ColorPrimaries::Bt470Bg,
+        gst_video::VideoColorPrimaries::Smpte170m => ColorPrimaries::Smpte170m,
+        gst_video::VideoColorPrimaries::Smpte240m => ColorPrimaries::Smpte240m,
+        gst_video::VideoColorPrimaries::Film => ColorPrimaries::Film,
+        gst_video::VideoColorPrimaries::Bt2020 => ColorPrimaries::Bt2020,
+        gst_video::VideoColorPrimaries::Adobergb => ColorPrimaries::Adobergb,
+        _ => ColorPrimaries::Unknown,
+    };
+    let transfer = match colorimetry.transfer() {
+        gst_video::VideoTransferFunction::Bt601 => ColorTransfer::Bt601,
+        gst_video::VideoTransferFunction::Bt709 => ColorTransfer::Bt709,
+        gst_video::VideoTransferFunction::Smpte240m => ColorTransfer::Smpte240m,
+        gst_video::VideoTransferFunction::Srgb => ColorTransfer::Srgb,
+        gst_video::VideoTransferFunction::Gamma10 => ColorTransfer::Gamma10,
+        gst_video::VideoTransferFunction::Gamma18 => ColorTransfer::Gamma18,
+        gst_video::VideoTransferFunction::Gamma20 => ColorTransfer::Gamma20,
+        gst_video::VideoTransferFunction::Gamma22 => ColorTransfer::Gamma22,
+        gst_video::VideoTransferFunction::Gamma28 => ColorTransfer::Gamma28,
+        gst_video::VideoTransferFunction::Log100 => ColorTransfer::Log100,
+        gst_video::VideoTransferFunction::Log316 => ColorTransfer::Log316,
+        gst_video::VideoTransferFunction::Adobergb => ColorTransfer::Adobergb,
+        gst_video::VideoTransferFunction::Bt202012 => ColorTransfer::Bt202012,
+        gst_video::VideoTransferFunction::Bt202010 => ColorTransfer::Bt202010,
+        gst_video::VideoTransferFunction::Smpte2084 => ColorTransfer::Smpte2084,
+        gst_video::VideoTransferFunction::AribStdB67 => ColorTransfer::AribStdB67,
+        _ => ColorTransfer::Unknown,
+    };
+    let range = match colorimetry.range() {
+        gst_video::VideoColorRange::Range0_255 => ColorRange::Full,
+        gst_video::VideoColorRange::Range16_235 => ColorRange::Limited,
+        gst_video::VideoColorRange::Unknown => ColorRange::Unknown,
+        _ => ColorRange::Unsupported,
+    };
+    let site = video_info.chroma_site();
+    let (chroma_horizontal, chroma_vertical) = if site.is_empty() {
+        (ChromaHorizontal::Unknown, ChromaVertical::Unknown)
+    } else if site == gst_video::VideoChromaSite::JPEG {
+        (ChromaHorizontal::Centered, ChromaVertical::Centered)
+    } else if site == gst_video::VideoChromaSite::MPEG2
+        || site == gst_video::VideoChromaSite::H_COSITED
+    {
+        (ChromaHorizontal::Cosited, ChromaVertical::Centered)
+    } else if site == gst_video::VideoChromaSite::V_COSITED {
+        (ChromaHorizontal::Centered, ChromaVertical::Cosited)
+    } else if site == gst_video::VideoChromaSite::COSITED {
+        (ChromaHorizontal::Cosited, ChromaVertical::Cosited)
+    } else if site.contains(gst_video::VideoChromaSite::DV) {
+        (ChromaHorizontal::Unsupported, ChromaVertical::Dv)
+    } else if site.contains(gst_video::VideoChromaSite::ALT_LINE) {
+        (ChromaHorizontal::Unsupported, ChromaVertical::AlternateLine)
+    } else {
+        (ChromaHorizontal::Unsupported, ChromaVertical::Unsupported)
+    };
+    ColorMetadata {
+        matrix,
+        primaries,
+        transfer,
+        range,
+        chroma_horizontal,
+        chroma_vertical,
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +688,10 @@ pub struct GStreamerDecoder {
     /// Once native layout negotiation fails, use CPU extraction for the rest
     /// of this decoder instead of retrying DMABuf on every frame.
     native_layout_failed: bool,
+    /// Cached native/GPU color eligibility for the current caps tuple.
+    native_color_generation: Option<(FrameExtent, ColorMetadata, ColorRenderDecision)>,
+    /// One reusable NV12 system-memory payload for the worker CPU downgrade.
+    nv12_input_generation: Option<Nv12InputPool>,
     metadata: VideoMetadata,
     position: Duration,
     eof: bool,
@@ -1363,6 +1575,8 @@ impl GStreamerDecoder {
             first_byte_seen,
             requested_tier,
             native_layout_failed: false,
+            native_color_generation: None,
+            nv12_input_generation: None,
             metadata,
             position: Duration::ZERO,
             eof: false,
@@ -1507,8 +1721,24 @@ impl GStreamerDecoder {
             .unwrap_or(self.position);
         let width = video_info.width();
         let height = video_info.height();
+        let color = color_metadata_from_video_info(&video_info);
 
-        if should_attempt_native(self.requested_tier, self.native_layout_failed) {
+        let extent = FrameExtent::new(width, height);
+        let color_decision = match self.native_color_generation {
+            Some((cached_extent, cached_color, decision))
+                if cached_extent == extent && cached_color == color =>
+            {
+                decision
+            }
+            _ => {
+                let decision = render_decision(color);
+                self.native_color_generation = Some((extent, color, decision));
+                decision
+            }
+        };
+        if matches!(color_decision, ColorRenderDecision::Gpu(_))
+            && should_attempt_native(self.requested_tier, self.native_layout_failed)
+        {
             match self.try_dmabuf_memory(buffer, &video_info, &sample) {
                 Ok(Some(memory)) => {
                     let format = pixel_format_from_memory(&memory).ok_or_else(|| {
@@ -1520,6 +1750,8 @@ impl GStreamerDecoder {
                         pts,
                         extent: FrameExtent::new(width, height),
                         format,
+                        color,
+                        color_decision,
                         memory: NativeMemory::DmaBuf(memory),
                     });
                 }
@@ -1538,6 +1770,21 @@ impl GStreamerDecoder {
             }
         }
 
+        if matches!(color_decision, ColorRenderDecision::CpuRgba(_))
+            && video_info.format() == gst_video::VideoFormat::Nv12
+        {
+            let memory = self.sample_to_cpu_nv12_memory(buffer, &video_info, extent)?;
+            return Ok(NativeDecodedFrame {
+                pts,
+                extent,
+                format: PixelFormat::Nv12,
+                color,
+                color_decision,
+                memory: NativeMemory::Cpu(memory),
+            });
+        }
+        self.nv12_input_generation = None;
+
         let VideoFrame { frame, .. } =
             self.sample_to_cpu_frame(buffer, &video_info, pts, width, height)?;
         let DecodedFrame::Cpu(CpuFrame {
@@ -1555,8 +1802,69 @@ impl GStreamerDecoder {
             pts,
             extent: FrameExtent::new(width, height),
             format,
+            color,
+            color_decision,
             memory: NativeMemory::Cpu(crate::CpuMemory::new(into_cpu_planes(planes))),
         })
+    }
+
+    /// Copies one NV12 system-memory frame into the decoder's reusable input
+    /// slot for the worker CPU color downgrade. This is the unavoidable pixel
+    /// copy for the SystemMemory fallback; no per-frame vectors are allocated.
+    fn sample_to_cpu_nv12_memory(
+        &mut self,
+        buffer: &gst::BufferRef,
+        video_info: &gst_video::VideoInfo,
+        extent: FrameExtent,
+    ) -> Result<CpuMemory, VideoError> {
+        let layout = Nv12InputLayout::from_video_info(video_info, extent)?;
+        let rebuild = !self
+            .nv12_input_generation
+            .as_ref()
+            .is_some_and(|pool| pool.layout == layout);
+        if rebuild {
+            self.nv12_input_generation = Nv12InputPool::new(layout);
+        }
+        let Some(pool) = self.nv12_input_generation.as_ref() else {
+            return Err(VideoError::DecodeFailed(
+                "NV12 input pool could not be allocated".into(),
+            ));
+        };
+        let Some(mut memory) = pool
+            .try_acquire_checked()
+            .map_err(|error| VideoError::DecodeFailed(error.into()))?
+        else {
+            return Err(VideoError::DecodeFailed("NV12 input pool exhausted".into()));
+        };
+        let map = buffer.map_readable().map_err(|error| {
+            VideoError::DecodeFailed(format!("Failed to map NV12 buffer: {error}"))
+        })?;
+        let data = map.as_slice();
+        let y_end = layout
+            .y_offset
+            .checked_add(layout.y_size)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12 Y layout overflows".into()))?;
+        let uv_end = layout
+            .uv_offset
+            .checked_add(layout.uv_size)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12 UV layout overflows".into()))?;
+        let y_source = data
+            .get(layout.y_offset..y_end)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12 Y plane out of bounds".into()))?;
+        let uv_source = data
+            .get(layout.uv_offset..uv_end)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12 UV plane out of bounds".into()))?;
+        let Some(y_plane) = memory.planes.first_mut() else {
+            return Err(VideoError::DecodeFailed("NV12 input has no Y plane".into()));
+        };
+        y_plane.bytes.copy_from_slice(y_source);
+        let Some(uv_plane) = memory.planes.get_mut(1) else {
+            return Err(VideoError::DecodeFailed(
+                "NV12 input has no UV plane".into(),
+            ));
+        };
+        uv_plane.bytes.copy_from_slice(uv_source);
+        Ok(memory)
     }
 
     /// Converts each GStreamer memory view into one owned descriptor, deduping
@@ -2738,13 +3046,168 @@ mod tests {
     use super::{
         classify_gst_error, native_tier, normalize_requested_tier, should_attempt_native,
         AudioSelectionAttemptError, AudioTrackSelectionResult, GStreamerDecoder,
-        GstLifecycleControl,
+        GstLifecycleControl, Nv12InputLayout, Nv12InputPool,
+    };
+    use super::{
+        ChromaHorizontal, ChromaVertical, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer,
     };
     use crate::video::VideoError;
+    use crate::FrameExtent;
     use gstreamer as gst;
+    use gstreamer_video as gst_video;
     use lumina_video_core::session::{AudioTrack, CapabilityTier};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn maps_sdr_colorimetry_and_chroma_without_crossing_gstreamer_types(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        let colorimetry = gst_video::VideoColorimetry::new(
+            gst_video::VideoColorRange::Range16_235,
+            gst_video::VideoColorMatrix::Bt601,
+            gst_video::VideoTransferFunction::Bt709,
+            gst_video::VideoColorPrimaries::Bt709,
+        );
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 2, 2)
+            .colorimetry(&colorimetry)
+            .chroma_site(gst_video::VideoChromaSite::MPEG2)
+            .build()?;
+        assert_eq!(
+            super::color_metadata_from_video_info(&info),
+            crate::ColorMetadata {
+                matrix: ColorMatrix::Bt601,
+                primaries: ColorPrimaries::Bt709,
+                transfer: ColorTransfer::Bt709,
+                range: ColorRange::Limited,
+                chroma_horizontal: ChromaHorizontal::Cosited,
+                chroma_vertical: ChromaVertical::Centered,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_asymmetric_and_interlaced_chroma_siting() -> Result<(), Box<dyn std::error::Error>>
+    {
+        gst::init()?;
+        for (site, horizontal, vertical) in [
+            (
+                gst_video::VideoChromaSite::H_COSITED,
+                ChromaHorizontal::Cosited,
+                ChromaVertical::Centered,
+            ),
+            (
+                gst_video::VideoChromaSite::V_COSITED,
+                ChromaHorizontal::Centered,
+                ChromaVertical::Cosited,
+            ),
+            (
+                gst_video::VideoChromaSite::ALT_LINE,
+                ChromaHorizontal::Unsupported,
+                ChromaVertical::AlternateLine,
+            ),
+            (
+                gst_video::VideoChromaSite::DV,
+                ChromaHorizontal::Unsupported,
+                ChromaVertical::Dv,
+            ),
+        ] {
+            let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 2, 2)
+                .chroma_site(site)
+                .build()?;
+            let color = super::color_metadata_from_video_info(&info);
+            assert_eq!(color.chroma_horizontal, horizontal);
+            assert_eq!(color.chroma_vertical, vertical);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maps_unknown_and_hdr_like_values_to_explicit_safe_states(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        let colorimetry = gst_video::VideoColorimetry::new(
+            gst_video::VideoColorRange::Unknown,
+            gst_video::VideoColorMatrix::Bt2020,
+            gst_video::VideoTransferFunction::Bt202012,
+            gst_video::VideoColorPrimaries::Bt2020,
+        );
+        let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, 2, 2)
+            .colorimetry(&colorimetry)
+            .build()?;
+        let color = super::color_metadata_from_video_info(&info);
+        assert_eq!(color.matrix, ColorMatrix::Bt2020);
+        assert_eq!(color.primaries, ColorPrimaries::Bt2020);
+        assert_eq!(color.transfer, ColorTransfer::Bt202012);
+        assert_eq!(color.range, ColorRange::Unknown);
+        assert_eq!(color.chroma_horizontal, ChromaHorizontal::Unknown);
+        assert_eq!(color.chroma_vertical, ChromaVertical::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn nv12_input_pool_reuses_one_exact_payload() {
+        let layout = Nv12InputLayout {
+            extent: FrameExtent::new(4, 4),
+            y_stride: 4,
+            uv_stride: 4,
+            y_offset: 0,
+            uv_offset: 16,
+            y_size: 16,
+            uv_size: 8,
+        };
+        let Some(pool) = Nv12InputPool::new(layout) else {
+            panic!("NV12 input pool must configure");
+        };
+        let Ok(Some(first)) = pool.try_acquire_checked() else {
+            panic!("first payload must be available");
+        };
+        let first_identity = first
+            .planes
+            .first()
+            .map(|plane| (plane.bytes.as_ptr(), plane.bytes.capacity()));
+        assert!(matches!(pool.try_acquire_checked(), Ok(None)));
+        drop(first);
+        let Ok(Some(second)) = pool.try_acquire_checked() else {
+            panic!("dropped payload must recycle");
+        };
+        assert_eq!(
+            second
+                .planes
+                .first()
+                .map(|plane| (plane.bytes.as_ptr(), plane.bytes.capacity())),
+            first_identity
+        );
+    }
+
+    #[test]
+    fn nv12_input_pool_rejects_mutated_recycled_shape() {
+        let layout = Nv12InputLayout {
+            extent: FrameExtent::new(2, 2),
+            y_stride: 2,
+            uv_stride: 2,
+            y_offset: 0,
+            uv_offset: 4,
+            y_size: 4,
+            uv_size: 2,
+        };
+        let Some(pool) = Nv12InputPool::new(layout) else {
+            panic!("NV12 input pool must configure");
+        };
+        let Ok(Some(mut memory)) = pool.try_acquire_checked() else {
+            panic!("payload must be available");
+        };
+        let Some(y_plane) = memory.planes.first_mut() else {
+            panic!("payload must have a Y plane");
+        };
+        let _ = y_plane.bytes.pop();
+        drop(memory);
+        assert!(matches!(
+            pool.try_acquire_checked(),
+            Err("NV12 input recycle payload shape changed")
+        ));
+    }
 
     #[test]
     fn unknown_modifier_downgrades_once_without_retry() -> Result<(), Box<dyn std::error::Error>> {

@@ -2986,69 +2986,46 @@ pub mod android {
     }
 
     impl YuvParams {
-        /// BT.709 limited range (16-235 Y, 16-240 UV)
-        /// Used for most HD content
-        const BT709_LIMITED: Self = Self {
-            // Matrix converts from offset-adjusted YUV to RGB
-            // Column 0: Y coefficients for R, G, B
-            // Column 1: U coefficients for R, G, B
-            // Column 2: V coefficients for R, G, B
-            yuv_to_rgb: [
-                [1.164, 1.164, 1.164, 0.0],  // Y contribution
-                [0.0, -0.1873, 1.8556, 0.0], // U contribution
-                [1.5748, -0.4681, 0.0, 0.0], // V contribution
-            ],
-            // Offsets: Y scaled from 16-235, UV centered at 128
-            yuv_offset: [16.0 / 255.0, 0.5, 0.5],
-            _padding: 0.0,
-        };
-
-        /// BT.709 full range (0-255 for all components)
-        /// Used when video is explicitly marked as full range
-        const BT709_FULL: Self = Self {
-            yuv_to_rgb: [
-                [1.0, 1.0, 1.0, 0.0],        // Y contribution (no scaling)
-                [0.0, -0.1873, 1.8556, 0.0], // U contribution
-                [1.5748, -0.4681, 0.0, 0.0], // V contribution
-            ],
-            // Offsets: Y at 0, UV centered at 128
-            yuv_offset: [0.0, 0.5, 0.5],
-            _padding: 0.0,
-        };
-
-        /// BT.601 limited range (16-235 Y, 16-240 UV)
-        /// Used for SD content (480i/576i)
-        const BT601_LIMITED: Self = Self {
-            // BT.601 coefficients differ from BT.709 in chroma contribution
-            yuv_to_rgb: [
-                [1.164, 1.164, 1.164, 0.0], // Y contribution (same scaling as BT.709 limited)
-                [0.0, -0.3917, 2.0172, 0.0], // U contribution (different from BT.709)
-                [1.5960, -0.8130, 0.0, 0.0], // V contribution (different from BT.709)
-            ],
-            // Offsets: Y scaled from 16-235, UV centered at 128
-            yuv_offset: [16.0 / 255.0, 0.5, 0.5],
-            _padding: 0.0,
-        };
-
-        /// BT.601 full range (0-255 for all components)
-        const BT601_FULL: Self = Self {
-            yuv_to_rgb: [
-                [1.0, 1.0, 1.0, 0.0],        // Y contribution (no scaling)
-                [0.0, -0.3917, 2.0172, 0.0], // U contribution
-                [1.5960, -0.8130, 0.0, 0.0], // V contribution
-            ],
-            // Offsets: Y at 0, UV centered at 128
-            yuv_offset: [0.0, 0.5, 0.5],
-            _padding: 0.0,
-        };
-
-        /// Get YuvParams for a given color space
+        /// Gets parameters from native-frame's one production matrix table.
         pub fn for_color_space(color_space: YuvColorSpace) -> Self {
-            match color_space {
-                YuvColorSpace::Bt709Limited => Self::BT709_LIMITED,
-                YuvColorSpace::Bt709Full => Self::BT709_FULL,
-                YuvColorSpace::Bt601Limited => Self::BT601_LIMITED,
-                YuvColorSpace::Bt601Full => Self::BT601_FULL,
+            let (matrix, range) = match color_space {
+                YuvColorSpace::Bt709Limited => (
+                    lumina_video_native_frame::ColorMatrix::Bt709,
+                    lumina_video_native_frame::ColorRange::Limited,
+                ),
+                YuvColorSpace::Bt709Full => (
+                    lumina_video_native_frame::ColorMatrix::Bt709,
+                    lumina_video_native_frame::ColorRange::Full,
+                ),
+                YuvColorSpace::Bt601Limited => (
+                    lumina_video_native_frame::ColorMatrix::Bt601,
+                    lumina_video_native_frame::ColorRange::Limited,
+                ),
+                YuvColorSpace::Bt601Full => (
+                    lumina_video_native_frame::ColorMatrix::Bt601,
+                    lumina_video_native_frame::ColorRange::Full,
+                ),
+            };
+            let Some(matrix) = lumina_video_native_frame::yuv_to_rgb_matrix(matrix, range) else {
+                return Self {
+                    yuv_to_rgb: [[0.0; 4]; 3],
+                    yuv_offset: [0.0; 3],
+                    _padding: 0.0,
+                };
+            };
+            let yuv_offset = match range {
+                lumina_video_native_frame::ColorRange::Limited => {
+                    [16.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0]
+                }
+                lumina_video_native_frame::ColorRange::Full => [0.0, 128.0 / 255.0, 128.0 / 255.0],
+                lumina_video_native_frame::ColorRange::Unknown
+                | lumina_video_native_frame::ColorRange::Unsupported => [0.0; 3],
+            };
+            let [y_column, cb_column, cr_column, _offset] = matrix;
+            Self {
+                yuv_to_rgb: [y_column, cb_column, cr_column],
+                yuv_offset,
+                _padding: 0.0,
             }
         }
     }
@@ -3403,7 +3380,7 @@ pub mod android {
                 })?;
 
             std::ptr::copy_nonoverlapping(
-                &YuvParams::BT709_LIMITED as *const YuvParams,
+                &YuvParams::for_color_space(YuvColorSpace::Bt709Limited) as *const YuvParams,
                 params_ptr as *mut YuvParams,
                 1,
             );

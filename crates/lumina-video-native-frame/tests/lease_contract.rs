@@ -2,12 +2,21 @@ use std::time::Duration;
 
 use lumina_video_native_frame::video::PixelFormat;
 use lumina_video_native_frame::{
-    AcquireSync, CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor, NativeFrameLease,
-    NativeMemory,
+    AcquireSync, ChromaHorizontal, ChromaVertical, ColorMatrix, ColorMetadata, ColorPrimaries,
+    ColorRange, ColorTransfer, CpuMemory, CpuPlane, FrameExtent, NativeFrameDescriptor,
+    NativeFrameLease, NativeMemory,
 };
 
 #[test]
 fn cpu_lease_owns_format_planes_and_timing() -> Result<(), Box<dyn std::error::Error>> {
+    let color = ColorMetadata {
+        matrix: ColorMatrix::Bt709,
+        primaries: ColorPrimaries::Bt709,
+        transfer: ColorTransfer::Bt709,
+        range: ColorRange::Limited,
+        chroma_horizontal: ChromaHorizontal::Cosited,
+        chroma_vertical: ChromaVertical::Centered,
+    };
     let lease = NativeFrameLease::new(
         NativeFrameDescriptor {
             frame_id: 4,
@@ -16,6 +25,7 @@ fn cpu_lease_owns_format_planes_and_timing() -> Result<(), Box<dyn std::error::E
             duration: Some(Duration::from_millis(33)),
             extent: FrameExtent::new(2, 1),
             format: PixelFormat::Rgba,
+            color,
         },
         NativeMemory::Cpu(CpuMemory::new(vec![CpuPlane::new(vec![1, 2, 3, 4], 8)])),
         AcquireSync::None,
@@ -24,6 +34,7 @@ fn cpu_lease_owns_format_planes_and_timing() -> Result<(), Box<dyn std::error::E
     assert_eq!(lease.descriptor.frame_id, 4);
     assert_eq!(lease.descriptor.stream_generation, 2);
     assert_eq!(lease.descriptor.extent, FrameExtent::new(2, 1));
+    assert_eq!(lease.descriptor.color, color);
     assert!(matches!(lease.memory, NativeMemory::Cpu(_)));
     Ok(())
 }
@@ -150,6 +161,7 @@ fn dmabuf_views_can_share_fd_or_use_disjoint_objects() -> Result<(), Box<dyn std
             duration: None,
             extent: FrameExtent::new(2, 1),
             format: PixelFormat::Nv12,
+            color: lumina_video_native_frame::ColorMetadata::default(),
         },
         NativeMemory::DmaBuf(memory),
         AcquireSync::None,
@@ -329,6 +341,7 @@ fn dmabuf_lease_move_arc_clone_and_final_fd_cleanup() -> Result<(), Box<dyn std:
             duration: None,
             extent: FrameExtent::new(1, 1),
             format: PixelFormat::Rgba,
+            color: lumina_video_native_frame::ColorMetadata::default(),
         },
         NativeMemory::DmaBuf(memory),
         AcquireSync::None,

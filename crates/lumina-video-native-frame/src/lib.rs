@@ -16,6 +16,9 @@ use std::fmt;
 use std::mem::ManuallyDrop;
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crossbeam_channel::{Sender, TrySendError};
+
 pub use lumina_video_core::video::{VideoError, VideoMetadata, VideoPlayerHandle, VideoState};
 
 // Shared runtime modules remain here until dedicated adapter crates take
@@ -31,7 +34,14 @@ pub mod frame_queue;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod player;
 
+pub mod color;
 pub mod video;
+pub use color::{
+    apply_yuv_matrix, nv12_bytes_to_rgba_into, nv12_to_rgba_into, render_decision,
+    yuv420p_bytes_to_rgba_into, yuv_to_rgb_matrix, ChromaHorizontal, ChromaVertical,
+    ColorConvertError, ColorMatrix, ColorMetadata, ColorPrimaries, ColorRange, ColorRenderDecision,
+    ColorTransfer,
+};
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod audio_decoder;
@@ -132,18 +142,76 @@ pub fn into_cpu_planes(planes: Vec<video::Plane>) -> Vec<CpuPlane> {
 /// Owned system-memory planes for one decoded frame.
 ///
 /// [`CpuMemory::new`] takes ownership of the supplied plane vector without
-/// allocating or copying it.  Allocation and pooling remain producer
-/// responsibilities, so constructing this wrapper does not imply a per-frame
-/// copy.
-#[derive(Debug, PartialEq, Eq)]
+/// allocating or copying it. A worker-created pool may attach a bounded,
+/// nonblocking recycle sender; dropping this value then returns the complete
+/// plane vector to that pool on every producer and consumer exit path.
 pub struct CpuMemory {
     pub planes: Vec<CpuPlane>,
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    recycle: Option<Sender<Vec<CpuPlane>>>,
 }
 
 impl CpuMemory {
     /// Takes ownership of `planes` without allocating or copying it.
     pub fn new(planes: Vec<CpuPlane>) -> Self {
-        Self { planes }
+        Self {
+            planes,
+            #[cfg(not(target_arch = "wasm32"))]
+            recycle: None,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn new_recyclable(planes: Vec<CpuPlane>, recycle: Sender<Vec<CpuPlane>>) -> Self {
+        Self {
+            planes,
+            recycle: Some(recycle),
+        }
+    }
+
+    /// Takes the owned planes out of this memory value without recycling them.
+    ///
+    /// This is the narrow escape hatch for callers that need to consume the
+    /// public `planes` field by value. A pooled payload is deliberately
+    /// detached from its generation rather than returning an empty vector to
+    /// the pool.
+    pub fn into_planes(mut self) -> Vec<CpuPlane> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.recycle.take();
+        std::mem::take(&mut self.planes)
+    }
+}
+
+impl fmt::Debug for CpuMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CpuMemory")
+            .field("planes", &self.planes)
+            .finish()
+    }
+}
+
+impl PartialEq for CpuMemory {
+    fn eq(&self, other: &Self) -> bool {
+        self.planes == other.planes
+    }
+}
+
+impl Eq for CpuMemory {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CpuMemory {
+    fn drop(&mut self) {
+        let Some(recycle) = self.recycle.take() else {
+            return;
+        };
+        let planes = std::mem::take(&mut self.planes);
+        match recycle.try_send(planes) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_planes)) => {}
+            Err(TrySendError::Disconnected(_planes)) => {}
+        }
     }
 }
 
@@ -176,6 +244,35 @@ mod plane_layout_tests {
             Some([1, 2, 3, 4].as_slice())
         );
         assert_eq!(planes.first().map(|plane| plane.stride), Some(4));
+    }
+
+    #[test]
+    fn cpu_memory_into_planes_preserves_owned_payload() {
+        let memory = CpuMemory::new(vec![CpuPlane::new(vec![1, 2, 3, 4], 4)]);
+        let planes = memory.into_planes();
+        assert_eq!(
+            planes.first().map(|plane| plane.bytes.as_slice()),
+            Some([1, 2, 3, 4].as_slice())
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cpu_memory_drop_safely_discards_full_or_disconnected_recycles() {
+        let (recycle, available) = crossbeam_channel::bounded(1);
+        assert!(recycle.try_send(vec![CpuPlane::new(vec![1], 1)]).is_ok());
+        drop(CpuMemory::new_recyclable(
+            vec![CpuPlane::new(vec![2], 1)],
+            recycle,
+        ));
+        assert!(available.try_recv().is_ok());
+
+        let (recycle, available) = crossbeam_channel::bounded(1);
+        drop(available);
+        drop(CpuMemory::new_recyclable(
+            vec![CpuPlane::new(vec![3], 1)],
+            recycle,
+        ));
     }
 }
 
@@ -423,8 +520,8 @@ pub enum NativeMemory {
     DmaBuf(DmaBufMemory),
 }
 
-/// Framework-neutral identity, timing, extent, and pixel format for one frame.
-/// This is not a complete color description.
+/// Framework-neutral identity, timing, extent, pixel format, and copy-only SDR
+/// color metadata for one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeFrameDescriptor {
     pub frame_id: u64,
@@ -433,6 +530,7 @@ pub struct NativeFrameDescriptor {
     pub duration: Option<MediaTime>,
     pub extent: FrameExtent,
     pub format: PixelFormat,
+    pub color: ColorMetadata,
 }
 
 /// A decoded frame and every producer resource required to keep it valid.

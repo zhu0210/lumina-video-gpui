@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 gpui_wgpu = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2"
+  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e"
 }
 lumina-video-gpui = { path = "../lumina-video-gpui" }
 tracing = { workspace = true }
@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2",
+  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e",
   features = [
     "wgpu",    # GpuContextHandle + surface() element
     "wayland", # Wayland display server protocol
@@ -43,7 +43,7 @@ gpui = {
 }
 gpui_linux = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2",
+  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e",
   features = [
     "wayland", # pulls in gpui_wgpu, wayland-client, etc.
     "x11",     # pulls in gpui_wgpu, x11rb, etc.
@@ -53,7 +53,7 @@ gpui_linux = {
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2",
+  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e",
   features = [
     "wgpu",     # GpuContextHandle + surface() element
     "font-kit", # font-kit text system (macOS default)
@@ -61,7 +61,7 @@ gpui = {
 }
 gpui_macos = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2",
+  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e",
   features = [
     "wgpu-renderer", # switches from Metal renderer → WgpuRenderer
     "font-kit",       # font-kit text system
@@ -71,7 +71,7 @@ gpui_macos = {
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2",
+  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e",
   features = [
     "wgpu", # GpuContextHandle + surface() element
     # text system: gpui_wgpu::CosmicTextSystem (from wgpu-renderer),
@@ -80,7 +80,7 @@ gpui = {
 }
 gpui_windows = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "e469840e4482bbaf3aa51ebcbcf054fb2b2447f2",
+  rev = "a26bef2a211cce93bf393d184009aa4b89d3d58e",
   features = [
     "wgpu-renderer", # switches from DirectX renderer → WgpuRenderer
   ]
