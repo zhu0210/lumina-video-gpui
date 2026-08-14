@@ -37,7 +37,7 @@ use lumina_video_core::session::{
 };
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 #[cfg(target_os = "linux")]
-use lumina_video_gst::{GstMediaSession, PresentationDecision};
+use lumina_video_gst::{GstMediaSession, PresentationDecision, DEFAULT_OPEN_TIMEOUT};
 #[cfg(any(not(target_os = "linux"), feature = "moq"))]
 use lumina_video_native_frame::player::CorePlayer;
 use lumina_video_native_frame::video::{VideoMetadata, VideoState};
@@ -73,6 +73,8 @@ pub struct GpuiVideoPlayerConfig {
     pub muted: bool,
     pub volume: f32,
     pub lifecycle_timeout: Duration,
+    #[cfg(target_os = "linux")]
+    pub open_timeout: Duration,
 }
 
 impl Default for GpuiVideoPlayerConfig {
@@ -84,6 +86,8 @@ impl Default for GpuiVideoPlayerConfig {
             muted: false,
             volume: 1.0,
             lifecycle_timeout: Duration::from_secs(2),
+            #[cfg(target_os = "linux")]
+            open_timeout: DEFAULT_OPEN_TIMEOUT,
         }
     }
 }
@@ -236,11 +240,12 @@ impl GpuiVideoPlayer {
         #[cfg(target_os = "linux")]
         let session = match route {
             LinuxPlaybackRoute::Gst => Some(
-                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
                     url.clone(),
                     false,
                     lumina_video_gst::GstAudioSinkMode::Auto,
                     config.lifecycle_timeout,
+                    config.open_timeout,
                     0,
                 ),
             ),
@@ -338,11 +343,12 @@ impl GpuiVideoPlayer {
         {
             self.session = match route {
                 LinuxPlaybackRoute::Gst => Some(
-                    GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                    GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
                         url.clone(),
                         false,
                         lumina_video_gst::GstAudioSinkMode::Auto,
                         self.config.lifecycle_timeout,
+                        self.config.open_timeout,
                         next_generation,
                     ),
                 ),
@@ -436,10 +442,41 @@ impl GpuiVideoPlayer {
             drop(old_session);
             self.pending_frame = None;
             self.session = Some(
-                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
                     self.url.clone(),
                     false,
                     lumina_video_gst::GstAudioSinkMode::Auto,
+                    timeout,
+                    self.config.open_timeout,
+                    generation,
+                ),
+            );
+            if let Some(session) = self.session.as_ref() {
+                let audio = session.audio_handle();
+                audio.set_muted(self.config.muted);
+                audio.set_volume((self.config.volume.clamp(0.0, 1.0) * 100.0) as u32);
+            }
+        }
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_open_timeout(mut self, timeout: Duration) -> Self {
+        self.config.open_timeout = timeout;
+        if self.session.is_some() {
+            let generation = self
+                .session
+                .as_ref()
+                .map_or(0, GstMediaSession::stream_generation);
+            let old_session = self.session.take();
+            drop(old_session);
+            self.pending_frame = None;
+            self.session = Some(
+                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
+                    self.url.clone(),
+                    false,
+                    lumina_video_gst::GstAudioSinkMode::Auto,
+                    self.config.lifecycle_timeout,
                     timeout,
                     generation,
                 ),

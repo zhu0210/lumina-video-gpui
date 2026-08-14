@@ -174,6 +174,22 @@ const LIFECYCLE_POLL: Duration = Duration::from_millis(50);
 /// Default bound for one seek/resync or decoder teardown operation.
 pub const DEFAULT_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Default bound for opening a GStreamer pipeline and obtaining its first
+/// media sample. This is separate from the lifecycle bound used after open.
+pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pipeline facts reported by GStreamer without inventing values when a
+/// query is unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GstPipelineObservation {
+    pub is_live: bool,
+    pub is_live_known: bool,
+    pub seekable: bool,
+    pub seekable_known: bool,
+    pub latency: Option<Duration>,
+    pub latency_known: bool,
+}
+
 fn gst_error_message(error: &gst::glib::Error, debug: Option<&str>) -> String {
     match debug {
         Some(debug) => format!("{error} ({debug})"),
@@ -368,6 +384,9 @@ pub struct GStreamerDecoder {
     selected_audio_stream_id: Option<String>,
     /// Set when public track metadata or the confirmed audio id changes.
     audio_tracks_changed: bool,
+    pipeline_observation: GstPipelineObservation,
+    pipeline_observation_refreshed_after_media: bool,
+    qos_events: AtomicU64,
     lifecycle_timeout: Duration,
     lifecycle_control: GstLifecycleControl,
     cleaned_up: bool,
@@ -547,6 +566,25 @@ impl GStreamerDecoder {
         }
     }
 
+    fn query_pipeline_observation(
+        pipeline: &gst::Pipeline,
+        observation: &mut GstPipelineObservation,
+    ) {
+        let mut latency_query = gst::query::Latency::new();
+        if pipeline.query(latency_query.query_mut()) {
+            let (is_live, min, _) = latency_query.result();
+            observation.is_live = is_live;
+            observation.is_live_known = true;
+            observation.latency = Some(Duration::from_nanos(min.nseconds()));
+            observation.latency_known = true;
+        }
+        let mut seeking_query = gst::query::Seeking::new(gst::Format::Time);
+        if pipeline.query(seeking_query.query_mut()) {
+            observation.seekable = seeking_query.result().0;
+            observation.seekable_known = true;
+        }
+    }
+
     fn cleanup_pipeline(pipeline: &gst::Pipeline, deadline: Instant) {
         let _ = pipeline.set_state(gst::State::Null);
         let remaining = deadline
@@ -565,6 +603,7 @@ impl GStreamerDecoder {
             false,
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
+            DEFAULT_OPEN_TIMEOUT,
             GstLifecycleControl::new(),
             None,
         )
@@ -581,6 +620,7 @@ impl GStreamerDecoder {
             true,
             GstAudioSinkMode::Auto,
             DEFAULT_LIFECYCLE_TIMEOUT,
+            DEFAULT_OPEN_TIMEOUT,
             GstLifecycleControl::new(),
             None,
         )
@@ -596,6 +636,7 @@ impl GStreamerDecoder {
             true,
             audio_sink,
             DEFAULT_LIFECYCLE_TIMEOUT,
+            DEFAULT_OPEN_TIMEOUT,
             GstLifecycleControl::new(),
             None,
         )
@@ -615,6 +656,7 @@ impl GStreamerDecoder {
             true,
             audio_sink,
             lifecycle_timeout,
+            DEFAULT_OPEN_TIMEOUT,
             lifecycle_control,
             None,
         )
@@ -635,6 +677,30 @@ impl GStreamerDecoder {
             true,
             audio_sink,
             lifecycle_timeout,
+            DEFAULT_OPEN_TIMEOUT,
+            lifecycle_control,
+            tls_ca_file,
+        )
+    }
+
+    /// Test-only/adapter entry point with separate opening and lifecycle
+    /// bounds. Opening a network pipeline may need more time than later
+    /// seek, resync, gap, or teardown operations.
+    #[doc(hidden)]
+    pub fn new_system_memory_with_audio_sink_and_timeouts_and_control_and_tls_ca_file(
+        url: &str,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        open_timeout: Duration,
+        lifecycle_control: GstLifecycleControl,
+        tls_ca_file: Option<String>,
+    ) -> Result<Self, VideoError> {
+        Self::new_with_memory_policy_and_audio_sink_and_timeout(
+            url,
+            true,
+            audio_sink,
+            lifecycle_timeout,
+            open_timeout,
             lifecycle_control,
             tls_ca_file,
         )
@@ -664,11 +730,12 @@ impl GStreamerDecoder {
         system_memory_only: bool,
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
+        open_timeout: Duration,
         lifecycle_control: GstLifecycleControl,
         tls_ca_file: Option<String>,
     ) -> Result<Self, VideoError> {
         let init_now = Instant::now();
-        let init_deadline = init_now.checked_add(lifecycle_timeout).unwrap_or(init_now);
+        let init_deadline = init_now.checked_add(open_timeout).unwrap_or(init_now);
         if lifecycle_control.is_cancelled() {
             return Err(VideoError::DecoderInit("lifecycle cancelled".into()));
         }
@@ -761,6 +828,8 @@ impl GStreamerDecoder {
             )
             .max_buffers(1)
             .drop(true)
+            .sync(true)
+            .qos(true)
             .build();
 
         // === Audio elements ===
@@ -893,6 +962,7 @@ impl GStreamerDecoder {
         let mut initial_preferred_video_stream_id = None;
         let mut initial_selected_audio_stream_id = None;
         let mut initial_selected_video_stream_ids = Vec::new();
+        let mut initial_pipeline_observation = GstPipelineObservation::default();
 
         // Track buffering during init (in case 100% is reached before decode loop starts)
         let mut init_buffering_percent = 0i32;
@@ -922,6 +992,7 @@ impl GStreamerDecoder {
             };
             match msg.view() {
                 gst::MessageView::AsyncDone(_) => {
+                    Self::query_pipeline_observation(&pipeline, &mut initial_pipeline_observation);
                     // Query duration
                     if let Some(dur) = pipeline.query_duration::<gst::ClockTime>() {
                         duration = Some(Duration::from_nanos(dur.nseconds()));
@@ -1133,6 +1204,9 @@ impl GStreamerDecoder {
             selected_video_stream_ids: initial_selected_video_stream_ids,
             selected_audio_stream_id: initial_selected_audio_stream_id,
             audio_tracks_changed: false,
+            pipeline_observation: initial_pipeline_observation,
+            pipeline_observation_refreshed_after_media: false,
+            qos_events: AtomicU64::new(0),
             lifecycle_timeout,
             lifecycle_control,
             cleaned_up: false,
@@ -1142,6 +1216,27 @@ impl GStreamerDecoder {
     /// Returns the audio handle for volume/mute control.
     pub fn audio_handle(&self) -> &GstAudioHandle {
         &self.audio_handle
+    }
+
+    /// Returns the latest pipeline facts queried from GStreamer.
+    pub fn pipeline_observation(&self) -> GstPipelineObservation {
+        self.pipeline_observation
+    }
+
+    /// Returns the GStreamer seeking result when the query has completed.
+    pub fn seekable(&self) -> Option<bool> {
+        self.pipeline_observation
+            .seekable_known
+            .then_some(self.pipeline_observation.seekable)
+    }
+
+    /// Number of QoS messages observed from the pipeline bus.
+    pub fn qos_events(&self) -> u64 {
+        self.qos_events.load(Ordering::Relaxed)
+    }
+
+    fn refresh_pipeline_observation(&mut self) {
+        Self::query_pipeline_observation(&self.pipeline, &mut self.pipeline_observation);
     }
 
     /// Stops the pipeline with the configured worker-side deadline.
@@ -2112,6 +2207,11 @@ impl GStreamerDecoder {
 
     /// Internal seek implementation (may be retried on transient errors).
     fn seek_internal(&mut self, position: Duration, deadline: Instant) -> Result<(), VideoError> {
+        if self.seekable() == Some(false) {
+            return Err(VideoError::UnsupportedFormat(
+                "GStreamer reported a non-seekable stream".into(),
+            ));
+        }
         if self.lifecycle_control.is_cancelled() || Self::remaining(deadline).is_zero() {
             return Err(VideoError::SeekFailed("Seek timed out".into()));
         }
@@ -2336,6 +2436,15 @@ impl GStreamerDecoder {
             gst::MessageView::StreamsSelected(selected) => {
                 self.capture_selected_streams(selected);
             }
+            gst::MessageView::Qos(_) => {
+                self.qos_events.fetch_add(1, Ordering::Relaxed);
+            }
+            gst::MessageView::Latency(_) => {
+                // GStreamer queries are synchronous; keep this observation
+                // refresh on the worker, outside frame-critical deadlines.
+                let _ = self.pipeline.recalculate_latency();
+                self.refresh_pipeline_observation();
+            }
             _ => {}
         }
         None
@@ -2471,6 +2580,10 @@ impl VideoDecoderBackend for GStreamerDecoder {
         // Return cached preroll sample on first call (consumed during init for dimensions)
         if let Some(sample) = self.preroll_sample.take() {
             let frame = self.sample_to_frame(sample)?;
+            if !self.pipeline_observation_refreshed_after_media {
+                self.refresh_pipeline_observation();
+                self.pipeline_observation_refreshed_after_media = true;
+            }
             tracing::debug!("Returning cached preroll frame at {:?}", frame.pts);
             self.position = frame.pts;
             self.seeking = false;
@@ -2537,6 +2650,10 @@ impl VideoDecoderBackend for GStreamerDecoder {
             };
 
             let frame = self.sample_to_frame(sample)?;
+            if !self.pipeline_observation_refreshed_after_media {
+                self.refresh_pipeline_observation();
+                self.pipeline_observation_refreshed_after_media = true;
+            }
 
             // Check for stale frames after seek
             if self.is_stale_frame(frame.pts, discarded, max_stale_frames) {
