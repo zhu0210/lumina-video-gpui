@@ -33,9 +33,9 @@ offline.
 
 The lock's `artifact.compression: xz` describes the two Cerbero package
 tarballs; the build combines them and emits the standalone runtime as a
-`.tar.gz` artifact while preserving Cerbero's native
-`lib/x86_64-linux-gnu` identity. Siblings such as Python site-packages remain
-under that directory, and the path is kept as-is.
+`.tar.gz` artifact while preserving Cerbero's native `lib/` tree.
+`lib/x86_64-linux-gnu` and `lib/python3.12` remain siblings, so Python purelib
+stays at `lib/python3.12/site-packages`; the path is kept as-is.
 
 The artifact includes `bin/lumina-gstreamer-runtime`. Applications must use
 that launcher as their entrypoint: it establishes exact private
