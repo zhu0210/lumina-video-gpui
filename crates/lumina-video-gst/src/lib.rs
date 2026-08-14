@@ -207,9 +207,9 @@ struct SnapshotState {
 }
 
 impl SnapshotState {
-    fn new() -> Self {
+    fn new(capability: CapabilityTier) -> Self {
         Self {
-            snapshot: RwLock::new(SessionSnapshot::new(CapabilityTier::SystemMemoryUpload)),
+            snapshot: RwLock::new(SessionSnapshot::new(capability)),
             position_us: AtomicU64::new(0),
             audio_connected: AtomicBool::new(false),
             audio_buffers_seen: AtomicU64::new(0),
@@ -782,17 +782,13 @@ fn process_command(
                 ),
             }
         }
-        SessionCommand::Renegotiate { .. } => {
-            let _ = publish_error(
-                state,
-                control_sender,
-                sequence,
-                SessionError::Unsupported(
-                    "GStreamer session is fixed to SystemMemoryUpload".into(),
-                ),
-            );
-            false
-        }
+        SessionCommand::Renegotiate { tier } => match decoder.renegotiate(tier) {
+            Ok(()) => {
+                state.snapshot.write().capability = CapabilityTier::SystemMemoryUpload;
+                true
+            }
+            Err(error) => publish_nonterminal_error(control_sender, sequence, session_error(error)),
+        },
     }
 }
 
@@ -1332,6 +1328,7 @@ fn run_worker(
                 let frame_extent = frame.extent;
                 let frame_pts = frame.pts;
                 let frame_format = frame.format;
+                let frame_acquire = frame.acquire;
                 let (format, memory) = match prepare_frame_memory(
                     frame_format,
                     frame_extent,
@@ -1376,14 +1373,20 @@ fn run_worker(
                     format,
                     color: frame_color,
                 };
-                let settled_tier = if requested_tier != CapabilityTier::SystemMemoryUpload
+                let active_tier = decoder.active_tier();
+                let settled_tier = if active_tier != CapabilityTier::SystemMemoryUpload
                     && matches!(&memory, NativeMemory::DmaBuf(_))
                 {
-                    requested_tier
+                    active_tier
                 } else {
                     CapabilityTier::SystemMemoryUpload
                 };
-                let lease = match NativeFrameLease::new(descriptor, memory, AcquireSync::None) {
+                let acquire = if matches!(&memory, NativeMemory::DmaBuf(_)) {
+                    frame_acquire
+                } else {
+                    AcquireSync::None
+                };
+                let lease = match NativeFrameLease::new(descriptor, memory, acquire) {
                     Ok(lease) => lease,
                     Err(error) => {
                         if lifecycle_control.is_stop_requested() {
@@ -1466,6 +1469,11 @@ fn run_worker(
                     return;
                 }
                 update_gst_observation(&state, &decoder, frame_sender.len());
+            }
+            Err(VideoError::UnsupportedFormat(_)) => {
+                state.snapshot.write().capability = CapabilityTier::SystemMemoryUpload;
+                dropped_frames.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             Err(error) => {
                 if lifecycle_control.is_stop_requested() {
@@ -1606,6 +1614,28 @@ impl GstMediaSession {
         )
     }
 
+    /// Starts a session with an explicit frame capability request.
+    pub fn new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
+        source: impl Into<String>,
+        autoplay: bool,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        open_timeout: Duration,
+        stream_generation: u64,
+        requested_tier: CapabilityTier,
+    ) -> Self {
+        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file_and_tier(
+            source,
+            autoplay,
+            audio_sink,
+            lifecycle_timeout,
+            open_timeout,
+            stream_generation,
+            None,
+            requested_tier,
+        )
+    }
+
     #[cfg(test)]
     fn new_for_test_with_tls_ca_file(
         source: impl Into<String>,
@@ -1658,11 +1688,6 @@ impl GstMediaSession {
         tls_ca_file: Option<String>,
         requested_tier: CapabilityTier,
     ) -> Self {
-        let requested_tier = if requested_tier == CapabilityTier::DirectAlias {
-            CapabilityTier::SystemMemoryUpload
-        } else {
-            requested_tier
-        };
         let source = source.into();
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
@@ -1671,7 +1696,7 @@ impl GstMediaSession {
         let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let frame_drop_receiver = frame_receiver.clone();
-        let state = Arc::new(SnapshotState::new());
+        let state = Arc::new(SnapshotState::new(requested_tier));
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
         let lifecycle_control = GstLifecycleControl::new();
@@ -1893,14 +1918,6 @@ impl MediaSession for GstMediaSession {
     }
 
     fn command(&mut self, command: SessionCommand) -> Result<(), SessionError> {
-        if let SessionCommand::Renegotiate { tier } = command {
-            if tier != CapabilityTier::SystemMemoryUpload {
-                return Err(SessionError::Unsupported(
-                    "Linux GStreamer session only supports SystemMemoryUpload".into(),
-                ));
-            }
-            return Ok(());
-        }
         if matches!(&command, SessionCommand::Stop) {
             // Stop must wake opening/decoding workers even when the command
             // FIFO is full. The FIFO send below is only a best-effort wake.
