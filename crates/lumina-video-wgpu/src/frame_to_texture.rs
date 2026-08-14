@@ -979,6 +979,7 @@ fn cpu_frame_ref_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     }
 }
 
+#[cfg(test)]
 fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     let [r, g, b] = apply_yuv_matrix(&legacy_cpu_nv12_color_transform(), y, u, v);
     (r, g, b)
