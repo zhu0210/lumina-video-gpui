@@ -169,25 +169,6 @@ for package in "${packages[@]}"; do
     package_roots_text=$(jq -er --arg package "$package" \
         '.artifact.archive_layout.package_roots[$package][]' "$lock_file")
     mapfile -t package_roots <<<"$package_roots_text"
-    [[ ${#package_roots[@]} -gt 0 ]] || {
-        echo "archive layout has no roots for $package" >&2
-        exit 1
-    }
-    for ((root_index = 0; root_index < ${#package_roots[@]}; root_index++)); do
-        root=${package_roots[$root_index]}
-        case "$root" in
-            ''|.|..|*/*|*\\*)
-                echo "unsafe archive layout root for $package: $root" >&2
-                exit 1
-                ;;
-        esac
-        for ((other_index = root_index + 1; other_index < ${#package_roots[@]}; other_index++)); do
-            [[ "$root" != "${package_roots[$other_index]}" ]] || {
-                echo "duplicate archive layout root for $package: $root" >&2
-                exit 1
-            }
-        done
-    done
     case "$package" in
         gstreamer-1.0)
             [[ "${package_roots[*]}" == "bin etc lib libexec share" ]] || {
