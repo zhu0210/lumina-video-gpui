@@ -1,0 +1,25 @@
+# The upstream Cerbero recipe is a SystemRecipe.  Keep only the Pulse client
+# library in the audited user-space closure; the server and optional backends
+# are intentionally not package inputs.  PulseAudio 17's meson_options.txt
+# declares these switches as booleans, so Cerbero receives the boolean form
+# 'false', not the feature-only value 'disabled'.
+class Recipe(recipe.Recipe):
+    name = 'libpulse'
+    version = '17.0'
+    stype = SourceType.TARBALL
+    btype = BuildType.MESON
+    url = 'https://freedesktop.org/software/pulseaudio/releases/pulseaudio-17.0.tar.xz'
+    tarball_checksum = '053794d6671a3e397d849e478a80b82a63cb9d8ca296bd35b73317bb5ceb87b5'
+    licenses = [License.LGPLv2Plus]
+    meson_options = {
+        'daemon': 'false',
+        'tests': 'false',
+        'man': 'false',
+        'doxygen': 'false',
+        'bluez5': 'false',
+        'alsa': 'false',
+        'jack': 'false',
+        'avahi': 'false',
+        'dbus': 'false',
+    }
+    files_libs = ['libpulse']

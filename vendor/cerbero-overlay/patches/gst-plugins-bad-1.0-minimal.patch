@@ -1,108 +1,86 @@
 --- a/recipes/gst-plugins-bad-1.0.recipe
 +++ b/recipes/gst-plugins-bad-1.0.recipe
-@@ -15,1 +15,1 @@
--                      'aes': 'enabled',
+@@ -14,42 +14,42 @@
+     # we error out if they weren't found.
+     meson_options = {'gpl': 'disabled',
+                      # enabled plugins
+-                     'aes': 'enabled',
+-                     'analyticsoverlay': 'enabled',
+-                     'assrender': 'enabled',
+-                     'bz2': 'enabled',
+-                     'closedcaption': 'enabled',
+-                     'codecalpha': 'enabled',
+-                     'codectimestamper': 'enabled',
+-                     'dash': 'enabled',
+-                     'decklink': 'enabled',
+-                     'dtls': 'enabled',
+-                     'dts': 'enabled',
 +                      'aes': 'disabled',
-@@ -16,1 +16,1 @@
--                      'analyticsoverlay': 'enabled',
 +                      'analyticsoverlay': 'disabled',
-@@ -17,1 +17,1 @@
--                      'assrender': 'enabled',
 +                      'assrender': 'disabled',
-@@ -18,1 +18,1 @@
--                      'bz2': 'enabled',
 +                      'bz2': 'disabled',
-@@ -19,1 +19,1 @@
--                      'closedcaption': 'enabled',
 +                      'closedcaption': 'disabled',
-@@ -20,1 +20,1 @@
--                      'codecalpha': 'enabled',
 +                      'codecalpha': 'disabled',
-@@ -21,1 +21,1 @@
--                      'codectimestamper': 'enabled',
 +                      'codectimestamper': 'disabled',
-@@ -22,1 +22,1 @@
--                      'dash': 'enabled',
 +                      'dash': 'disabled',
-@@ -23,1 +23,1 @@
--                      'decklink': 'enabled',
 +                      'decklink': 'disabled',
-@@ -24,1 +24,1 @@
--                      'dtls': 'enabled',
 +                      'dtls': 'disabled',
-@@ -25,1 +25,1 @@
--                      'dts': 'enabled',
 +                      'dts': 'disabled',
-@@ -29,1 +29,1 @@
--                      'ivfparse': 'enabled',
+                      'hls': 'enabled',
+                      'hls-crypto': 'openssl',
+-                     'ivfparse': 'enabled',
+-                     'ladspa': 'auto', # lrdf is optional
+-                     'lcevcdecoder': 'enabled',
+-                     'openh264': 'enabled',
+-                     'openjpeg': 'enabled',
+-                     'qroverlay': 'enabled',
+-                     'opus': 'enabled',
+-                     'rtmp': 'enabled',
+-                     'rtmp2': 'enabled',
+-                     'sbc': 'enabled',
+-                     'sctp': 'enabled',
+-                     'sctp-internal-usrsctp': 'enabled',
+-                     'soundtouch': 'enabled',
+-                     'srt': 'enabled',
+-                     'spandsp': 'enabled',
+-                     'srtp': 'enabled',
+-                     'resindvd': 'enabled',
+-                     'rist' : 'enabled',
+-                     'voaacenc': 'enabled',
+-                     'vulkan': 'enabled',
+-                     'webrtc': 'enabled',
+-                     'webrtcdsp': 'enabled',
+-                     'zbar': 'enabled',
 +                      'ivfparse': 'disabled',
-@@ -30,1 +30,1 @@
--                      'ladspa': 'auto', # lrdf is optional
 +                      'ladspa': 'disabled',
-@@ -31,1 +31,1 @@
--                      'lcevcdecoder': 'enabled',
 +                      'lcevcdecoder': 'disabled',
-@@ -32,1 +32,1 @@
--                      'openh264': 'enabled',
 +                      'openh264': 'disabled',
-@@ -33,1 +33,1 @@
--                      'openjpeg': 'enabled',
 +                      'openjpeg': 'disabled',
-@@ -34,1 +34,1 @@
--                      'qroverlay': 'enabled',
 +                      'qroverlay': 'disabled',
-@@ -35,1 +35,1 @@
--                      'opus': 'enabled',
 +                      'opus': 'disabled',
-@@ -36,1 +36,1 @@
--                      'rtmp': 'enabled',
 +                      'rtmp': 'disabled',
-@@ -37,1 +37,1 @@
--                      'rtmp2': 'enabled',
 +                      'rtmp2': 'disabled',
-@@ -38,1 +38,1 @@
--                      'sbc': 'enabled',
 +                      'sbc': 'disabled',
-@@ -39,1 +39,1 @@
--                      'sctp': 'enabled',
 +                      'sctp': 'disabled',
-@@ -40,1 +40,1 @@
--                      'sctp-internal-usrsctp': 'enabled',
 +                      'sctp-internal-usrsctp': 'disabled',
-@@ -41,1 +41,1 @@
--                      'soundtouch': 'enabled',
 +                      'soundtouch': 'disabled',
-@@ -42,1 +42,1 @@
--                      'srt': 'enabled',
 +                      'srt': 'disabled',
-@@ -43,1 +43,1 @@
--                      'spandsp': 'enabled',
 +                      'spandsp': 'disabled',
-@@ -44,1 +44,1 @@
--                      'srtp': 'enabled',
 +                      'srtp': 'disabled',
-@@ -45,1 +45,1 @@
--                      'resindvd': 'enabled',
 +                      'resindvd': 'disabled',
-@@ -46,1 +46,1 @@
--                      'rist' : 'enabled',
 +                      'rist' : 'disabled',
-@@ -47,1 +47,1 @@
--                      'voaacenc': 'enabled',
 +                      'voaacenc': 'disabled',
-@@ -48,1 +48,1 @@
--                      'vulkan': 'enabled',
 +                      'vulkan': 'disabled',
-@@ -49,1 +49,1 @@
--                      'webrtc': 'enabled',
 +                      'webrtc': 'disabled',
-@@ -50,1 +50,1 @@
--                      'webrtcdsp': 'enabled',
 +                      'webrtcdsp': 'disabled',
-@@ -51,1 +51,1 @@
--                      'zbar': 'enabled',
 +                      'zbar': 'disabled',
-@@ -86,6 +86,2 @@
+                      # disabled plugins
+                      'amfcodec': 'disabled',
+                      'asio': 'disabled',
+@@ -85,12 +85,8 @@
+                      'win32ipc': 'disabled',
+                      'wildmidi': 'disabled',
+                     }
 -    deps = ['gstreamer-1.0', 'gst-plugins-base-1.0', 'bzip2', 'libass',
 -            'zlib', 'openh264', 'opus', 'lcevcdec', 'librtmp', 'libxml2',
 -            'libsrtp', 'libdca', 'libdvdnav', 'libnice',
@@ -111,7 +89,12 @@
 -            'srt', 'zbar', 'libltc', 'qrencode', 'json-glib']
 +    deps = ['gstreamer-1.0', 'gst-plugins-base-1.0', 'zlib', 'libxml2',
 +            'openssl', 'libva']
-@@ -506,7 +506,3 @@
+     platform_deps = {
+         Platform.LINUX: ['libdrm']
+     }
+@@ -532,12 +528,8 @@
+     }
+ 
      def prepare(self):
 -        # Enable hardware codecs if variants are enabled since they have
 -        # external dependencies such as SDKs.
@@ -119,7 +102,13 @@
          self.enable_plugin('va', 'codecs', 'va', dep='libva')
  
 -        self.enable_plugin('rsvg', 'codecs', variant='rust', dep='librsvg')
-@@ -583,11 +583,1 @@
+ 
+         if self.config.target_subsystem == Subsystem.TVOS_SIMULATOR and self.config.target_arch == Architecture.X86_64:
+             # svtav1 plugin fails to link with the static svt-av1 lib on tvOS
+@@ -608,20 +600,6 @@
+             self.enable_plugin('mediafoundation', 'sys')
+             self.enable_plugin('wasapi2', 'sys')
+ 
 -        if self.config.target_platform in (Platform.LINUX, Platform.WINDOWS):
 -            self.enable_plugin('nvcodec', 'codecs')
 -            self.files_plugins_devel += [
@@ -130,19 +119,31 @@
 -                'GstHip-1.0',
 -                'GstHipGL-1.0',
 -            ]
-         if self.config.target_platform in (Platform.ANDROID):
-@@ -593,4 +583,1 @@
+-
 -        if not Platform.is_app_platform(self.config.target_platform):
 -            self.enable_plugin('curl', 'net', dep='curl')
 -
-         if self.config.target_platform in (Platform.ANDROID):
-@@ -620,5 +607,1 @@
+         if self.config.target_platform not in (Platform.ANDROID, Platform.WINDOWS):
+             self.meson_options['shm'] = 'enabled'
+ 
+@@ -650,10 +628,6 @@
+         if self.config.variants.nodebug:
+             self.append_env('CFLAGS', '-DGST_LEVEL_MAX=GST_LEVEL_FIXME')
+ 
 -        if self.config.target_platform in (Platform.WINDOWS, Platform.LINUX):
 -            if self.config.target_arch == Architecture.X86_64:
 -                self.enable_plugin('svtjpegxs', 'codecs', dep='svt-jpeg-xs')
 -
          if self.config.target_platform == Platform.WINDOWS:
-@@ -631,3 +615,1 @@
+             if self.config.target_arch != Architecture.X86_64:
+                 self.disable_plugin('lcevcdecoder', 'codecs', dep='lcevcdec')
+@@ -662,9 +636,6 @@
+             # Needs libiconv, which uses Autotools
+             self.disable_plugin('zbar', 'codecs', dep='zbar')
+ 
 -        if self.config.target_platform != Platform.WINDOWS:
 -            self.enable_plugin('unixfd', 'effects')
-         if self.config.target_platform == Platform.WINDOWS:
+-
+     def post_install(self):
+         LibtoolLibrary('gsturidownloader-1.0', None, None, None, self.config.libdir,
+                 self.config.target_platform, deps=['gstreamer-1.0', 'gstbase-1.0']).save()

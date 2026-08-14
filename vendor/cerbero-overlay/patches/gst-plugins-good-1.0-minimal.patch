@@ -1,6 +1,6 @@
 --- a/recipes/gst-plugins-good-1.0.recipe
 +++ b/recipes/gst-plugins-good-1.0.recipe
-@@ -3,40 +3,23 @@
+@@ -4,42 +4,25 @@
      name = 'gst-plugins-good-1.0'
      btype = BuildType.MESON
      tarball_checksum = 'b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df'
@@ -59,9 +59,12 @@
 -        Platform.LINUX: ['alsa', 'x11', 'libpulse'],
 +        Platform.LINUX: ['alsa', 'libpulse'],
      }
-@@ -224,16 +224,3 @@
+ 
+     files_lang = ['gst-plugins-good-1.0']
+@@ -238,20 +221,6 @@
      def prepare(self):
          self.append_env('CFLAGS', '-DLIBSOUP_DOES_NOT_STEAL_OUR_CONTEXT=1')
+ 
 -        if self.config.target_platform == Platform.WINDOWS:
 -            self.meson_options['directsound'] = 'enabled'
 -            self.enable_plugin('jack', 'sys')
@@ -73,6 +76,9 @@
 -            self.meson_options['osxaudio'] = 'enabled'
 -        elif self.config.target_platform == Platform.LINUX:
 -            self.enable_plugin('jack', 'sys')
+-
 -        self.enable_plugin('video4linux2', 'capture', variant='v4l2', option='v4l2')
 -        self.enable_plugin('ximagesrc', 'capture', variant='x11')
          self.enable_plugin('pulseaudio', 'sys', variant='pulse', option='pulse')
+ 
+         if self.using_msvc() and self.config.target_arch == Architecture.ARM64:

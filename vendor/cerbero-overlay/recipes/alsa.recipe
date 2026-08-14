@@ -1,0 +1,21 @@
+# The upstream Cerbero recipe is a SystemRecipe.  ALSA-lib 1.2.12 ships the
+# Autotools configure script (not a Meson build); these are its configure
+# switches for a client-only libasound build.
+class Recipe(recipe.Recipe):
+    name = 'alsa'
+    version = '1.2.12'
+    stype = SourceType.TARBALL
+    btype = BuildType.AUTOTOOLS
+    url = 'https://alsa-project.org/files/pub/lib/alsa-lib-1.2.12.tar.bz2'
+    tarball_checksum = '4868cd908627279da5a634f468701625be8cc251d84262c7e5b6a218391ad0d2'
+    licenses = [License.LGPLv2Plus]
+    configure_options = [
+        '--disable-python',
+        '--disable-alisp',
+        '--disable-ucm',
+        '--disable-topology',
+        '--disable-seq',
+        '--disable-rawmidi',
+        '--disable-hwdep',
+    ]
+    files_libs = ['libasound']

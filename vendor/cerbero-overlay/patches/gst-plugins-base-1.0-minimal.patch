@@ -1,6 +1,6 @@
 --- a/recipes/gst-plugins-base-1.0.recipe
 +++ b/recipes/gst-plugins-base-1.0.recipe
-@@ -3,21 +3,18 @@
+@@ -5,23 +5,20 @@
      name = 'gst-plugins-base-1.0'
      btype = BuildType.MESON
      tarball_checksum = '0ba699c7c6c66f4ba640be78cb38a24715add9683f3e3a199f5369dc5a4f04ac'
@@ -9,34 +9,34 @@
 -                     'gl-graphene': 'enabled',
 -                     'gl-png': 'enabled',
 -                     'gl-jpeg': 'enabled',
--                     'ogg': 'enabled',
--                     'opus': 'enabled',
--                     'pango': 'enabled',
--                     'theora': 'enabled',
--                     'vorbis': 'enabled',
--                     # disabled plugins
--                     'tremor': 'disabled'}
--    deps = ['glib', 'gstreamer-1.0', 'libogg', 'pango', 'libtheora',
--            'libvorbis', 'zlib', 'orc', 'opus', 'graphene',
--            'libjpeg-turbo', 'libpng']
 +    meson_options = {# only Ogg/Opus playback codecs are selected
 +                     'gl': 'disabled',
 +                     'gl-graphene': 'disabled',
 +                     'gl-png': 'disabled',
 +                     'gl-jpeg': 'disabled',
-+                     'ogg': 'enabled',
-+                     'opus': 'enabled',
+                      'ogg': 'enabled',
+                      'opus': 'enabled',
+-                     'pango': 'enabled',
+-                     'theora': 'enabled',
+-                     'vorbis': 'enabled',
+-                     # disabled plugins
 +                     'pango': 'disabled',
 +                     'theora': 'disabled',
 +                     'vorbis': 'disabled',
-+                     'tremor': 'disabled'}
+                      'tremor': 'disabled'}
+-    deps = ['glib', 'gstreamer-1.0', 'libogg', 'pango', 'libtheora',
+-            'libvorbis', 'zlib', 'orc', 'opus', 'graphene',
+-            'libjpeg-turbo', 'libpng']
 +    deps = ['glib', 'gstreamer-1.0', 'libogg', 'zlib', 'orc', 'opus']
      platform_deps = {
 -        Platform.LINUX: ['alsa', 'libdrm', 'x11'],
 +        Platform.LINUX: ['alsa'],
      }
-@@ -162,7 +162,4 @@
+ 
+     files_bins = ['gst-discoverer-1.0', 'gst-play-1.0', 'gst-device-monitor-1.0']
+@@ -174,9 +171,6 @@
      ]
+ 
      def prepare(self):
 -        self.enable_plugin('cdparanoia', 'sys', 'cdparanoia', dep='cdparanoia')
 -        self.enable_plugin('ximagesink', 'sys', 'x11', option='x11')

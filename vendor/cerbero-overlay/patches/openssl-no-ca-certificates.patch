@@ -1,0 +1,7 @@
+--- a/recipes/openssl.recipe
++++ b/recipes/openssl.recipe
+@@ -16,1 +16,3 @@
+-    deps = ['ca-certificates', 'zlib']
++    # The runtime supplies the fixture/system trust file explicitly; do not
++    # pull Cerbero's generated ca-certificates custom recipe into the bundle.
++    deps = ['zlib']

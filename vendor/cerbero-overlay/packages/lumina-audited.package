@@ -39,6 +39,13 @@ class Package(package.Package):
         'libva:libs',
         'libdrm:libs',
         'libsoup:libs',
+        # libsoup's official 1.28.6 closure: TLS GIO modules plus the
+        # runtime libraries used by the HTTPS source.
+        'glib-networking:plugins',
+        'libproxy:libs:backend',
+        'libpsl:libs',
+        'nghttp2:libs',
+        'sqlite3:libs',
         'bzip2:libs',
         'libxml2:libs',
         'openssl:libs',

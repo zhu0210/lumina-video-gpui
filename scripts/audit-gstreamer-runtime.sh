@@ -13,7 +13,7 @@ lock_file=${3:-$repo_root/vendor/gstreamer-1.0.lock.json}
     echo "Usage: $0 RUNTIME.tar.xz SOURCES.tar.xz [LOCK]" >&2
     exit 2
 }
-for command_name in jq tar sha256sum mktemp realpath grep awk sed find readelf tr sort; do
+for command_name in jq tar sha256sum mktemp realpath grep awk sed find readelf tr sort cmp; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -32,8 +32,12 @@ fail() {
 schema=$(jq -er '.schema_version' "$lock_file")
 [[ "$schema" == 2 ]] || fail "unsupported audit lock schema"
 [[ "$(jq -c '.packages' "$lock_file")" == '["lumina-audited"]' ]] || fail "lock package is not lumina-audited"
-jq -e '(.audit.recipe_allowlist | length == 23) and (all(.audit.recipe_allowlist[]; . != "lumina-audited"))' "$lock_file" >/dev/null || {
-    fail "recipe allowlist contains the custom package or has an unexpected closure"
+jq -e '
+    (.audit.recipe_allowlist | sort | unique) == ([.components[].recipe] | sort | unique) and
+    (all(.audit.recipe_allowlist[]; . != "lumina-audited")) and
+    (.audit.recipe_metadata | map(.recipe) | sort | unique) == (.audit.recipe_allowlist | sort | unique)
+' "$lock_file" >/dev/null || {
+    fail "recipe allowlist/metadata must equal the unique component recipe closure"
 }
 
 # Stream tar listing directly. Keeping the complete member list in a shell
@@ -92,9 +96,9 @@ source_manifest=$(jq -e . "$source_dir/source-manifest.json")
     fail "source bundle does not correspond to runtime tree"
 }
 jq -e --argjson expected "$(jq -c '.components' "$lock_file")" \
-    '(.components | map({name, version, source_url, sha256, cache_path})) == ($expected | map({name, version, source_url, sha256, cache_path}))' \
+    '(.components | map({name, recipe, version, source_url, sha256})) == ($expected | map({name, recipe, version, source_url, sha256}))' \
     <<<"$source_manifest" >/dev/null || fail "source manifest component inventory differs from lock"
-jq -e --argjson expected "$(jq -c '[.components[] | {name, version, source_url, sha256, cache_path}]' "$lock_file")" \
+jq -e --argjson expected "$(jq -c '[.components[] | . as $component | {name, recipe, version, source_url, sha256, filename: (.source_url | split("/") | last), path: ("archives/" + .recipe + "/" + (.source_url | split("/") | last))}]' "$lock_file")" \
     '.archives == $expected' <<<"$source_manifest" >/dev/null || fail "source manifest archive inventory differs from lock"
 cerbero_source_rel=$(jq -er '.cerbero_archive.path' <<<"$source_manifest")
 case "$cerbero_source_rel" in
@@ -112,13 +116,27 @@ jq -e --arg url "$(jq -er '.cerbero.archive.url' "$lock_file")" \
     fail "source manifest Cerbero archive metadata differs from lock"
 }
 
-while IFS=$'\t' read -r name version url sha cache_path; do
-    source_path="$source_dir/archives/$cache_path"
+while IFS=$'\t' read -r name recipe version url sha filename source_rel; do
+    case "$source_rel" in
+        archives/*/*) ;;
+        *) fail "corresponding source path is not normalized: $source_rel" ;;
+    esac
+    source_path="$source_dir/$source_rel"
     [[ -f "$source_path" ]] || fail "corresponding source archive is missing: $name"
     printf '%s  %s\n' "$sha" "$source_path" | sha256sum -c - >/dev/null || {
         fail "corresponding source archive hash mismatch: $name"
     }
-done < <(jq -er '.components[] | [.name, .version, .source_url, .sha256, .cache_path] | @tsv' "$lock_file")
+done < <(jq -er '.components[] | . as $component |
+    [$component.name, $component.recipe, $component.version, $component.source_url,
+     $component.sha256, ($component.source_url | split("/") | last),
+     ("archives/" + $component.recipe + "/" + ($component.source_url | split("/") | last))] | @tsv' "$lock_file")
+expected_source_paths="$source_dir/expected-source-paths"
+actual_source_paths="$source_dir/actual-source-paths"
+jq -er '.archives[].path' <<<"$source_manifest" | sort >"$expected_source_paths"
+find -P "$source_dir/archives" -type f -print | sed "s#^$source_dir/##" | sort >"$actual_source_paths"
+cmp -s "$expected_source_paths" "$actual_source_paths" || {
+    fail "corresponding source contains an extra or missing runtime archive"
+}
 [[ -d "$source_dir/overlay/patches" &&
    -f "$source_dir/overlay/patches/gst-plugins-bad-1.0-disable-gpl.patch" &&
    -f "$source_dir/overlay/patches/gst-plugins-bad-1.0-no-gpl-deps.patch" &&
@@ -127,8 +145,16 @@ done < <(jq -er '.components[] | [.name, .version, .source_url, .sha256, .cache_
    -f "$source_dir/overlay/patches/gst-plugins-good-1.0-minimal.patch" ]] || {
     fail "source bundle lacks the applied recipe patches"
 }
-[[ -f "$source_dir/overlay/recipes/pipewire.recipe" && -f "$source_dir/overlay/packages/lumina-audited.package" ]] || {
-    fail "source bundle lacks the custom PipeWire/package recipes"
+[[ -f "$source_dir/overlay/packages/lumina-audited.package" ]] || {
+    fail "source bundle lacks the custom audited package recipe"
+}
+while IFS= read -r overlay_recipe; do
+    [[ -f "$source_dir/overlay/recipes/$overlay_recipe.recipe" ]] || {
+        fail "source bundle lacks overlay recipe: $overlay_recipe"
+    }
+done < <(jq -er '.audit.recipe_metadata[] | select(.overlay == true) | .recipe' "$lock_file")
+[[ -f "$source_dir/overlay/patches/openssl-no-ca-certificates.patch" ]] || {
+    fail "source bundle lacks the applied OpenSSL dependency patch"
 }
 jq -e '
     .sources.pipewire.plugin_license == "MIT/X11" and

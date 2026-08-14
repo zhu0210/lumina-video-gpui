@@ -30,7 +30,7 @@ while (($#)); do
     esac
 done
 
-for command_name in curl jq sha256sum tar xz find sort awk grep sed tr mktemp realpath chmod cmp cp readlink stat readelf patch; do
+for command_name in curl jq sha256sum tar unzip xz find sort awk grep sed tr mktemp realpath chmod cmp cp readlink stat readelf patch python3; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -163,7 +163,7 @@ ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock
 [[ "$libav_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid gst-libav checksum" >&2; exit 1; }
 [[ "$zlib_version" == 1.3.1 ]] || { echo "unsupported zlib version" >&2; exit 1; }
 [[ "$zlib_filename" == zlib-1.3.1.tar.gz ]] || { echo "unsupported zlib filename" >&2; exit 1; }
-[[ "$zlib_url" == https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz ]] || {
+[[ "$zlib_url" == https://zlib.net/fossils/zlib-1.3.1.tar.gz ]] || {
     echo "unsupported zlib source URL" >&2
     exit 1
 }
@@ -283,7 +283,7 @@ jq -e 'all(.components[]; (.name and .version and .source_url and (.sha256 | tes
     echo "component inventory is incomplete" >&2
     exit 1
 }
-jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT")) or (.license | startswith("BSD")) or (.license == "BZIP2-1.0.6") or (.license == "Apache-2.0")))' "$lock_file" >/dev/null || {
+jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT")) or (.license | startswith("BSD")) or (.license == "BZIP2-1.0.6") or (.license == "Apache-2.0") or (.license == "Public Domain")))' "$lock_file" >/dev/null || {
     echo "component license policy rejects an unapproved component" >&2
     exit 1
 }
@@ -295,8 +295,12 @@ jq -e '(.packages == ["lumina-audited"]) and ([.audit.recipe_allowlist[] | selec
     echo "direct audited recipe closure is incomplete" >&2
     exit 1
 }
-jq -e '(.audit.recipe_allowlist | length == 23) and (all(.audit.recipe_allowlist[]; . != "lumina-audited"))' "$lock_file" >/dev/null || {
-    echo "recipe allowlist must contain only fetched lock recipes" >&2
+jq -e '
+    (.audit.recipe_allowlist | sort | unique) == ([.components[].recipe] | sort | unique) and
+    (all(.audit.recipe_allowlist[]; . != "lumina-audited")) and
+    (.audit.recipe_metadata | map(.recipe) | sort | unique) == (.audit.recipe_allowlist | sort | unique)
+' "$lock_file" >/dev/null || {
+    echo "recipe allowlist and recipe metadata must equal the unique fetched component recipes" >&2
     exit 1
 }
 
@@ -361,14 +365,21 @@ base_minimal_patch="$overlay_dir/patches/gst-plugins-base-1.0-minimal.patch"
 good_minimal_patch="$overlay_dir/patches/gst-plugins-good-1.0-minimal.patch"
 bad_no_gpl_deps_patch="$overlay_dir/patches/gst-plugins-bad-1.0-no-gpl-deps.patch"
 bad_minimal_patch="$overlay_dir/patches/gst-plugins-bad-1.0-minimal.patch"
+openssl_no_ca_patch="$overlay_dir/patches/openssl-no-ca-certificates.patch"
 [[ -f "$base_minimal_patch" && -f "$good_minimal_patch" &&
-   -f "$bad_no_gpl_deps_patch" && -f "$bad_minimal_patch" ]] || {
+   -f "$bad_no_gpl_deps_patch" && -f "$bad_minimal_patch" &&
+   -f "$openssl_no_ca_patch" ]] || {
     fail "minimal recipe patches are missing"
 }
 overlay_package="$overlay_dir/packages/lumina-audited.package"
 [[ -f "$overlay_package" ]] || fail "audited Cerbero package is missing"
 cp -a -- "$overlay_package" "$cerbero_dir/packages/lumina-audited.package"
-cp -a -- "$overlay_dir/recipes/pipewire.recipe" "$cerbero_dir/recipes/pipewire.recipe"
+while IFS= read -r overlay_recipe; do
+    [[ -n "$overlay_recipe" ]] || continue
+    overlay_recipe_file="$overlay_dir/recipes/$overlay_recipe.recipe"
+    [[ -f "$overlay_recipe_file" ]] || fail "missing repo-owned overlay recipe: $overlay_recipe"
+    cp -a -- "$overlay_recipe_file" "$cerbero_dir/recipes/$overlay_recipe.recipe"
+done < <(jq -er '.audit.recipe_metadata[] | select(.overlay == true) | .recipe' "$lock_file")
 grep -Eq '^[[:space:]]*files[[:space:]]*=' "$overlay_package" || fail "audited package has no direct files list"
 if grep -Eq '^[[:space:]]*deps[[:space:]]*=' "$overlay_package"; then
     fail "audited private package must not depend on an upstream package"
@@ -407,6 +418,9 @@ patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$bad_no_
 }
 patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$bad_minimal_patch" >/dev/null || {
     fail "could not apply the pinned gst-plugins-bad minimal plugin patch"
+}
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$openssl_no_ca_patch" >/dev/null || {
+    fail "could not apply the pinned OpenSSL CA dependency patch"
 }
 grep -F "'adaptivedemux2': 'enabled'" "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/dev/null || {
     fail "minimal gst-plugins-good recipe lost adaptivedemux2"
@@ -509,6 +523,64 @@ fi
 if grep -Eiq 'x264|libx264' "$ffmpeg_recipe"; then
     fail "Cerbero FFmpeg recipe names an external x264 input"
 fi
+
+recipe_facts() {
+    python3 - "$1" <<'PY'
+import ast
+import json
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+
+def strings(node):
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return [item.value for item in node.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)]
+    return []
+
+facts = {"version": None, "url": None, "sha256": None, "deps": [], "platform_deps": []}
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Assign):
+        continue
+    for target in node.targets:
+        if not isinstance(target, ast.Name):
+            continue
+        if target.id == "version" and isinstance(node.value, ast.Constant):
+            facts["version"] = node.value.value
+        elif target.id == "url" and isinstance(node.value, ast.Constant):
+            facts["url"] = node.value.value
+        elif target.id == "tarball_checksum" and isinstance(node.value, ast.Constant):
+            facts["sha256"] = node.value.value
+        elif target.id == "deps":
+            facts["deps"] = strings(node.value)
+        elif target.id == "platform_deps" and isinstance(node.value, ast.Dict):
+            for key, value in zip(node.value.keys, node.value.values):
+                if isinstance(key, ast.Attribute) and key.attr == "LINUX":
+                    facts["platform_deps"] = strings(value)
+print(json.dumps(facts, sort_keys=True))
+PY
+}
+
+# Verify every fetched recipe against the reviewed post-overlay closure. This
+# catches a stale Cerbero archive before fetch-package can add an unreviewed
+# dependency; the lock records final source URLs/checksums and Linux deps.
+while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expected_deps expected_platform; do
+    recipe_file="$cerbero_dir/recipes/$recipe.recipe"
+    [[ -f "$recipe_file" ]] || fail "pinned recipe is missing: $recipe"
+    facts=$(recipe_facts "$recipe_file")
+    actual_sha=$(jq -r '.sha256 // empty' <<<"$facts")
+    [[ "$actual_sha" == "$expected_sha" ]] || fail "recipe checksum disagrees with lock: $recipe"
+    actual_version=$(jq -r '.version // empty' <<<"$facts")
+    if [[ -n "$actual_version" && "$actual_version" != "$expected_version" ]]; then
+        fail "recipe version disagrees with lock: $recipe"
+    fi
+    [[ "$(jq -c '.deps' <<<"$facts")" == "$expected_deps" ]] || {
+        fail "recipe dependency closure disagrees with lock: $recipe"
+    }
+    [[ "$(jq -c '.platform_deps' <<<"$facts")" == "$expected_platform" ]] || {
+        fail "recipe Linux platform dependency closure disagrees with lock: $recipe"
+    }
+done < <(jq -er '.audit.recipe_metadata[] | [.recipe, .version, .source_url, .sha256, (.deps | tojson), (.platform_deps | tojson)] | @tsv' "$lock_file")
+
 zlib_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 [[ "$zlib_recipe_version" == "$zlib_version" ]] || {
@@ -520,33 +592,78 @@ zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "
     exit 1
 }
 
-# Seed every source archive named by the lock. Cerbero's dependency-resolution
-# fetch is checked against this exact cache, then bootstrap/package are offline;
-# the source bundle below is copied from the same cache.
-while IFS=$'\t' read -r component_name component_url component_sha component_cache_path; do
-    [[ -n "$component_name" && -n "$component_cache_path" ]] || fail "component source row is incomplete"
-    download_and_verify "$component_url" "$component_sha" \
-        "$XDG_CACHE_HOME/cerbero-sources/$component_cache_path"
-done < <(jq -er '.components[] | [.name, .source_url, .sha256, .cache_path] | @tsv' "$lock_file")
+grep -F "deps = ['zlib']" "$cerbero_dir/recipes/openssl.recipe" >/dev/null || {
+    fail "patched OpenSSL recipe still pulls the generated ca-certificates recipe"
+}
 
 variant_csv=$(IFS=,; printf '%s' "${variants[*]}")
 cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive \
     -c "$cerbero_dir/config/linux.config" -c "$overlay_config" -v "$variant_csv")
+source_cache_root="$XDG_CACHE_HOME/cerbero-sources"
+mkdir -p "$source_cache_root"
+snapshot_source_cache() {
+    local destination=$1 file relative digest
+    : >"$destination"
+    while IFS= read -r -d '' file; do
+        relative=${file#"$source_cache_root"/}
+        digest=$(sha256sum -- "$file" | awk '{print $1}')
+        printf '%s\t%s\n' "$relative" "$digest" >>"$destination"
+    done < <(find -P "$source_cache_root" -type f -print0 | sort -z)
+}
+
+# Bootstrap may populate its own source cache. Snapshot it first, then audit
+# package fetches by recipe, SHA, and archive basename. A component may reuse
+# a bootstrap-fetched archive, but every newly introduced/changed file must
+# still be one of the reviewed component archives.
 "${cerbero[@]}" fetch-bootstrap --system=no --toolchains=no --build-tools=yes --jobs=2
+bootstrap_source_snapshot="$work_dir/bootstrap-source-cache.tsv"
+snapshot_source_cache "$bootstrap_source_snapshot"
+before_runtime_source_snapshot="$work_dir/before-runtime-source-cache.tsv"
+cp -a -- "$bootstrap_source_snapshot" "$before_runtime_source_snapshot"
 for package in "${packages[@]}"; do
     "${cerbero[@]}" fetch-package "$package" --deps --jobs=2
 done
 [[ "${packages[*]}" == lumina-audited ]] || fail "only lumina-audited may be fetched"
-# A Cerbero fetch may resolve recipe dependencies, but it must not silently
-# add a source archive outside the reviewed component inventory. Compare the
-# cache as paths rather than storing an archive member list in one variable.
-expected_source_cache="$work_dir/expected-source-cache"
-actual_source_cache="$work_dir/actual-source-cache"
-jq -er '.components[].cache_path' "$lock_file" | sort >"$expected_source_cache"
-find -P "$XDG_CACHE_HOME/cerbero-sources" -type f -printf '%P\n' | sort >"$actual_source_cache"
-cmp -s "$expected_source_cache" "$actual_source_cache" || {
-    fail "Cerbero fetched a source archive outside the lock component inventory"
-}
+after_runtime_source_snapshot="$work_dir/after-runtime-source-cache.tsv"
+snapshot_source_cache "$after_runtime_source_snapshot"
+new_runtime_source_snapshot="$work_dir/new-runtime-source-cache.tsv"
+awk -F '\t' 'NR == FNR { before[$1] = $2; next }
+    !($1 in before) || before[$1] != $2 { print }' \
+    "$before_runtime_source_snapshot" "$after_runtime_source_snapshot" >"$new_runtime_source_snapshot"
+
+expected_source_rows="$work_dir/expected-source-rows.tsv"
+jq -er '.components[] | [.name, .recipe, .sha256, (.source_url | split("/") | last)] | @tsv' \
+    "$lock_file" >"$expected_source_rows"
+runtime_source_matches="$work_dir/runtime-source-matches.tsv"
+: >"$runtime_source_matches"
+declare -A component_archive=()
+declare -A component_source_rel=()
+while IFS=$'\t' read -r component_name component_recipe component_sha component_filename; do
+    [[ -n "$component_name" && -n "$component_recipe" && -n "$component_sha" && -n "$component_filename" ]] || {
+        fail "component source metadata is incomplete"
+    }
+    mapfile -t source_matches < <(awk -F '\t' -v expected_sha="$component_sha" \
+        -v expected_filename="$component_filename" \
+        '($2 == expected_sha) { n = split($1, parts, "/"); if (parts[n] == expected_filename) print $1 }' \
+        "$after_runtime_source_snapshot")
+    [[ ${#source_matches[@]} -eq 1 ]] || {
+        fail "Cerbero cache does not contain exactly one audited source archive for $component_name"
+    }
+    source_relative=${source_matches[0]}
+    component_archive["$component_name"]="$source_cache_root/$source_relative"
+    component_source_rel["$component_name"]="archives/$component_recipe/$component_filename"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$component_name" "$component_recipe" "$component_sha" "$component_filename" "$source_relative" \
+        >>"$runtime_source_matches"
+done <"$expected_source_rows"
+
+# Any newly fetched file not matched above is an unreviewed source input.
+while IFS=$'\t' read -r source_relative source_sha; do
+    [[ -n "$source_relative" ]] || continue
+    awk -F '\t' -v expected_sha="$source_sha" -v expected_path="$source_relative" \
+        '$3 == expected_sha && $5 == expected_path { found = 1 } END { exit(found ? 0 : 1) }' \
+        "$runtime_source_matches" || fail "Cerbero fetched an unmatched runtime source file: $source_relative"
+done <"$new_runtime_source_snapshot"
 "${cerbero[@]}" bootstrap --system=no --toolchains=no --build-tools=yes --offline --assume-yes --jobs=2
 
 package_dir="$work_dir/packages"
@@ -1032,7 +1149,11 @@ extract_license() {
     local member_pattern=$2
     local destination=$3
     local temporary="$work_dir/license.$RANDOM"
-    tar -xOf "$archive" --wildcards "$member_pattern" >"$temporary" 2>/dev/null || {
+    if [[ "$archive" == *.zip ]]; then
+        unzip -p "$archive" "$member_pattern" >"$temporary" 2>/dev/null
+    else
+        tar -xOf "$archive" --wildcards "$member_pattern" >"$temporary" 2>/dev/null
+    fi || {
         rm -f -- "$temporary"
         fail "license text is missing from $archive: $member_pattern"
     }
@@ -1045,14 +1166,16 @@ extract_license() {
     rm -f -- "$temporary"
 }
 
-while IFS=$'\t' read -r component_name component_cache_path license_member license_output; do
-    [[ -n "$component_name" && -n "$component_cache_path" && -n "$license_member" && -n "$license_output" ]] || {
+while IFS=$'\t' read -r component_name license_member license_output; do
+    [[ -n "$component_name" && -n "$license_member" && -n "$license_output" ]] || {
         fail "component license metadata is incomplete"
     }
-    component_archive="$XDG_CACHE_HOME/cerbero-sources/$component_cache_path"
-    [[ -f "$component_archive" ]] || fail "component archive is missing from source cache: $component_name"
-    extract_license "$component_archive" "$license_member" "$license_dir/$license_output"
-done < <(jq -er '.components[] | [.name, .cache_path, .license_member, .license_output] | @tsv' "$lock_file")
+    archive_path=${component_archive[$component_name]:-}
+    [[ -f "$archive_path" ]] || fail "component archive is missing from source cache: $component_name"
+    extract_license "$archive_path" "$license_member" "$license_dir/$license_output"
+done < <(jq -er '.components[] | . as $component |
+    (($component.license_members // [{member: $component.license_member, output: $component.license_output}])[] |
+     [$component.name, .member, .output] | @tsv)' "$lock_file")
 mkdir -p "$license_dir/overlay"
 cp -a -- "$overlay_dir/LICENSE.md" "$license_dir/overlay/LICENSE.md"
 jq -n --argjson components "$(jq -c '.components' "$lock_file")" \
@@ -1073,8 +1196,9 @@ This audited runtime contains only lock-approved LGPL-compatible GStreamer
 plugins and the explicitly documented system ABI closure. H.264/AAC use the
 software avdec_h264/avdec_aac fallback when VA-API is unavailable. This build
 does not include gst-plugins-ugly, x264, GPL, nonfree, or unknown components.
-The corresponding-source archive contains the complete fetched source cache,
-the Cerbero overlay, and policy files.
+The corresponding-source archive contains every audited runtime source
+archive at a normalized recipe path, the pinned Cerbero archive, and the
+Cerbero overlay/policy files. Bootstrap tool sources are excluded.
 EOF
 
 # Normalize the generated vendor tree before hashing so the tree digest covers
@@ -1117,7 +1241,13 @@ jq -n \
 
 source_bundle_root="$work_dir/source-bundle"
 mkdir -p "$source_bundle_root/archives" "$source_bundle_root/overlay" "$source_bundle_root/cerbero"
-cp -a -- "$XDG_CACHE_HOME/cerbero-sources/." "$source_bundle_root/archives/"
+while IFS=$'\t' read -r component_name component_recipe component_sha component_filename source_relative; do
+    archive_path=${component_archive[$component_name]:-}
+    source_path=${component_source_rel[$component_name]:-}
+    [[ -f "$archive_path" && -n "$source_path" ]] || fail "audited source mapping is incomplete: $component_name"
+    mkdir -p "$source_bundle_root/$(dirname -- "$source_path")"
+    cp -a -- "$archive_path" "$source_bundle_root/$source_path"
+done <"$runtime_source_matches"
 cp -a -- "$overlay_dir/." "$source_bundle_root/overlay/"
 cp -a -- "$cerbero_archive" "$source_bundle_root/cerbero/"
 jq -n --arg runtime_tree_sha "$tree_sha" \
@@ -1125,8 +1255,8 @@ jq -n --arg runtime_tree_sha "$tree_sha" \
     --arg cerbero_url "$cerbero_archive_url" \
     --arg cerbero_sha "$cerbero_archive_sha" \
     --argjson components "$component_inventory" \
-    --argjson archives "$(jq -c '[.components[] | {name, version, source_url, sha256, cache_path}]' "$lock_file")" \
-    '{schema_version: 2, runtime_tree_sha256: $runtime_tree_sha, pipewire_version: $pipewire, components: $components, archives: $archives, cerbero_archive: {source_url: $cerbero_url, sha256: $cerbero_sha, path: "cerbero/cerbero.tar.gz"}, source_kind: "exact lock archives plus pinned Cerbero archive and repository overlay/patches"}' \
+    --argjson archives "$(jq -c '[.components[] | . as $component | {name, recipe, version, source_url, sha256, filename: (.source_url | split("/") | last), path: ("archives/" + .recipe + "/" + (.source_url | split("/") | last))}]' "$lock_file")" \
+    '{schema_version: 2, runtime_tree_sha256: $runtime_tree_sha, pipewire_version: $pipewire, components: $components, archives: $archives, cerbero_archive: {source_url: $cerbero_url, sha256: $cerbero_sha, path: "cerbero/cerbero.tar.gz"}, source_kind: "exact audited runtime archives at normalized recipe paths plus pinned Cerbero archive and repository overlay/patches"}' \
     >"$source_bundle_root/source-manifest.json"
 find "$source_bundle_root" -exec touch -h -d '@0' {} +
 source_artifact_name=gstreamer-runtime-linux-x86_64.sources.tar.xz

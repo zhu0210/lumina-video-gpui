@@ -1,8 +1,8 @@
 # Audited Linux GStreamer runtime
 
 `vendor/gstreamer-1.0.lock.json` (schema 2) is the only build authority. The
-formal workflow seeds the lock-owned source cache, fetches only the selected
-Cerbero closure, and builds with the pinned
+formal workflow fetches only the selected lock-owned Cerbero closure and
+builds with the pinned
 [Cerbero release](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html),
 then switches to offline mode for bootstrap, packaging, audit, and artifact
 assembly. `lumina-audited` is the only Cerbero package output; its direct file
@@ -10,15 +10,22 @@ categories select the core/base/good/bad/libav plugins, the PipeWire-owned
 GStreamer plugin, and the explicitly bundled codec/audio/VA libraries. All
 Cerbero jobs use two workers.
 
-The lock fixes GStreamer 1.28.6, the base/good/bad/libav plugin archives,
-FFmpeg 7.1, the direct codec/audio/VA libraries, zlib, and PipeWire 1.6.8,
-the Ubuntu builder image, the exact variant set `norust,alsa,pulse,va`,
-recipe/plugin audit allowlists, and the system ELF ABI allowlist.
-`vendor/cerbero-overlay` is a small repo-owned `localconf.cbc`, direct package,
-PipeWire recipe, and applied base/good/bad recipe patches; all are included in
-the corresponding-source archive. The build verifies every patch against the
+The lock fixes 28 runtime/build components, including GStreamer 1.28.6,
+FFmpeg 7.1, the libsoup 3.6.6 HTTPS closure (glib-networking, libproxy,
+libpsl, nghttp2, and sqlite3), PipeWire 1.6.8, and the explicitly bundled
+audio/VA/DRM user-space libraries. It also fixes the Ubuntu builder image, the
+exact variant set `norust,alsa,pulse,va`, recipe/plugin audit allowlists, and
+the system ELF ABI allowlist. `vendor/cerbero-overlay` contains the direct
+package, source-backed audio/VA/DRM recipes, PipeWire recipe, and applied
+base/good/bad/OpenSSL recipe patches; all are included in the
+corresponding-source archive. The build verifies every patch against the
 pinned recipe, checks the actual FFmpeg options, and verifies actual plugin
 licenses with isolated `gst-inspect-1.0`.
+
+`scripts/discover-gstreamer-lock.sh` is metadata-only: it accepts a local
+extracted pinned Cerbero tree and local Cerbero/PipeWire archives, validates
+every locked recipe after the repo patches, and queries only small official
+tag/checksum endpoints. It refuses to download those archives itself.
 
 ## License and codec policy
 
@@ -37,13 +44,20 @@ runtime `licenses/` directory and corresponding-source archive. H.264/AAC
 patent, regional, and distribution obligations are outside this repository's
 technical audit and require separate legal review.
 
+The LGPL configuration is a copyright/license choice for the selected runtime
+files, not a conclusion about every source file in an upstream archive.
+H.264/AAC patent, codec-licensing, and regional distribution questions remain
+outside this technical audit and must be reviewed by the distributor.
+
 ## Artifacts and isolation
 
 The build emits one audited `gstreamer-runtime-linux-x86_64.tar.xz` used by
 standalone packaging and Flatpak, plus the exact corresponding
 `gstreamer-runtime-linux-x86_64.sources.tar.xz`. The source archive contains
-the complete fetched Cerbero source cache, the pinned Cerbero archive, and the
-repo overlay. `scripts/audit-gstreamer-runtime.sh` checks archive safety,
+exactly one SHA-verified runtime source archive per locked recipe at
+`archives/<recipe>/<filename>`, the pinned Cerbero archive, and the repo
+overlay; bootstrap tool sources and cache-directory guesses are excluded.
+`scripts/audit-gstreamer-runtime.sh` checks archive safety,
 manifest hashes, policy flags, closure inventory, and source/runtime
 correspondence.
 
@@ -76,6 +90,11 @@ Primary references: [GStreamer source index](https://gstreamer.freedesktop.org/s
 [pinned gst-plugins-base recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/gst-plugins-base-1.0.recipe),
 [pinned gst-plugins-good recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/gst-plugins-good-1.0.recipe),
 [pinned gst-plugins-bad recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/gst-plugins-bad-1.0.recipe),
+[pinned libsoup recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/libsoup.recipe),
+[pinned glib-networking recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/glib-networking.recipe),
+[pinned libproxy recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/libproxy.recipe),
+[pinned nghttp2 recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/nghttp2.recipe),
+[pinned sqlite3 recipe](https://raw.githubusercontent.com/GStreamer/cerbero/1.28.6/recipes/sqlite3.recipe),
 [FFmpeg configure options](https://ffmpeg.org/ffmpeg-all.html#toc-Advanced-options),
 [GStreamer HLS demuxer](https://gstreamer.freedesktop.org/documentation/adaptivedemux2/hlsdemux2.html),
 [PipeWire 1.6.8 Meson options](https://raw.githubusercontent.com/PipeWire/pipewire/1.6.8/meson_options.txt),

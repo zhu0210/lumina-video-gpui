@@ -1,0 +1,21 @@
+# The upstream Cerbero recipe is a SystemRecipe.  Bundle libdrm itself while
+# leaving the kernel/display driver ABI external and explicitly allowlisted.
+# libdrm 2.4.124's meson_options.txt uses boolean driver/test switches; use
+# 'false' rather than the feature-only 'disabled' value.
+class Recipe(recipe.Recipe):
+    name = 'libdrm'
+    version = '2.4.124'
+    stype = SourceType.TARBALL
+    btype = BuildType.MESON
+    url = 'https://dri.freedesktop.org/libdrm/libdrm-2.4.124.tar.xz'
+    tarball_checksum = 'ac36293f61ca4aafaf4b16a2a7afff312aa4f5c37c9fbd797de9e3c0863ca379'
+    licenses = [License.MIT]
+    meson_options = {
+        'tests': 'false',
+        'intel': 'false',
+        'amdgpu': 'false',
+        'nouveau': 'false',
+        'radeon': 'false',
+        'vmwgfx': 'false',
+    }
+    files_libs = ['libdrm']
