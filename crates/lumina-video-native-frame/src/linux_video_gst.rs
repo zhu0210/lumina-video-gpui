@@ -102,20 +102,14 @@ impl Nv12InputLayout {
                 "NV12: stride is smaller than the frame width".into(),
             ));
         }
-        let y_offset = usize::try_from(
-            *video_info
-                .offset()
-                .first()
-                .ok_or_else(|| VideoError::DecodeFailed("NV12: missing Y offset".into()))?,
-        )
-        .map_err(|_| VideoError::DecodeFailed("NV12: invalid Y offset".into()))?;
-        let uv_offset = usize::try_from(
-            *video_info
-                .offset()
-                .get(1)
-                .ok_or_else(|| VideoError::DecodeFailed("NV12: missing UV offset".into()))?,
-        )
-        .map_err(|_| VideoError::DecodeFailed("NV12: invalid UV offset".into()))?;
+        let y_offset = *video_info
+            .offset()
+            .first()
+            .ok_or_else(|| VideoError::DecodeFailed("NV12: missing Y offset".into()))?;
+        let uv_offset = *video_info
+            .offset()
+            .get(1)
+            .ok_or_else(|| VideoError::DecodeFailed("NV12: missing UV offset".into()))?;
         let y_size = y_stride
             .checked_mul(height)
             .ok_or_else(|| VideoError::DecodeFailed("NV12: Y layout is too large".into()))?;
