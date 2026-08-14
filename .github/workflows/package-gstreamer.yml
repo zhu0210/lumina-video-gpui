@@ -2,6 +2,18 @@ name: Package locked GStreamer runtime
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/package-gstreamer.yml
+      - vendor/gstreamer-1.0.lock.json
+      - scripts/discover-gstreamer-lock.sh
+      - scripts/build-gstreamer-runtime.sh
+      - scripts/smoke-gstreamer-runtime.sh
+      - crates/lumina-video-native-frame/src/vendored_runtime.rs
+      - crates/lumina-video-native-frame/src/linux_video.rs
+      - crates/lumina-video-native-frame/src/linux_video_gst.rs
+      - crates/lumina-video-native-frame/src/moq_decoder.rs
+      - fixtures/generate.sh
 
 concurrency:
   group: package-gstreamer-runtime
