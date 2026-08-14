@@ -16,9 +16,9 @@ use crossbeam_channel::{self, Receiver, Sender, TryRecvError, TrySendError};
 use lumina_video_core::audio::AudioHandle;
 pub use lumina_video_core::session::{AudioObservation, AudioTrack};
 use lumina_video_core::session::{
-    CapabilityDowngradeReason, CapabilityTier, DecodeMode, FrameRealization, MediaSession,
-    RendererOutcome, SessionCommand, SessionError, SessionEvent, SessionMetadata, SessionSnapshot,
-    SessionState,
+    CapabilityDowngradeReason, CapabilityTier, ConversionMode, DecodeMode, DecodeResidency,
+    FrameRealization, ImportMode, MediaSession, RendererOutcome, SessionCommand, SessionError,
+    SessionEvent, SessionMetadata, SessionSnapshot, SessionState, SynchronizationMode,
 };
 use lumina_video_native_frame::linux_video_gst::{
     AudioTrackSelectionResult, GStreamerDecoder, GstLifecycleControl, GstPipelineObservation,
@@ -194,6 +194,8 @@ impl PresentationDecision {
 #[derive(Debug)]
 struct SnapshotState {
     snapshot: RwLock<SessionSnapshot>,
+    capability: AtomicU8,
+    frame_realization: AtomicU64,
     decode_mode: AtomicU8,
     latest_renderer_outcome: AtomicU8,
     latest_downgrade_reason: AtomicU8,
@@ -219,6 +221,8 @@ impl SnapshotState {
     fn with_capability(capability: CapabilityTier) -> Self {
         Self {
             snapshot: RwLock::new(SessionSnapshot::new(capability)),
+            capability: AtomicU8::new(encode_capability(Some(capability))),
+            frame_realization: AtomicU64::new(0),
             decode_mode: AtomicU8::new(0),
             latest_renderer_outcome: AtomicU8::new(0),
             latest_downgrade_reason: AtomicU8::new(0),
@@ -245,7 +249,9 @@ fn publish_capability_if_changed(
     if *published == next {
         return false;
     }
-    state.snapshot.write().capability = next;
+    state
+        .capability
+        .store(encode_capability(Some(next)), Ordering::Relaxed);
     *published = next;
     true
 }
@@ -263,9 +269,101 @@ fn record_renderer_outcome(state: &SnapshotState, outcome: RendererOutcome) {
 }
 
 fn record_realization(state: &SnapshotState, realization: FrameRealization) {
-    let mut snapshot = state.snapshot.write();
-    snapshot.capability = realization.capability_tier();
-    snapshot.frame_realization = Some(realization);
+    state.frame_realization.store(
+        encode_frame_realization(Some(realization)),
+        Ordering::Relaxed,
+    );
+}
+
+const fn encode_capability(capability: Option<CapabilityTier>) -> u8 {
+    match capability {
+        None => 0,
+        Some(CapabilityTier::DirectAlias) => 1,
+        Some(CapabilityTier::GpuConversion) => 2,
+        Some(CapabilityTier::SystemMemoryUpload) => 3,
+    }
+}
+
+const fn decode_capability(value: u8) -> Option<CapabilityTier> {
+    match value {
+        1 => Some(CapabilityTier::DirectAlias),
+        2 => Some(CapabilityTier::GpuConversion),
+        3 => Some(CapabilityTier::SystemMemoryUpload),
+        _ => None,
+    }
+}
+
+const fn encode_frame_realization(realization: Option<FrameRealization>) -> u64 {
+    let Some(realization) = realization else {
+        return 0;
+    };
+    let decode = match realization.decode {
+        DecodeMode::Hardware => 1_u64,
+        DecodeMode::Software => 2_u64,
+    };
+    let residency = match realization.residency {
+        DecodeResidency::NativeGpu => 1_u64,
+        DecodeResidency::SystemMemory => 2_u64,
+    };
+    let import = match realization.import {
+        ImportMode::DirectAlias => 1_u64,
+        ImportMode::GpuCopy => 2_u64,
+        ImportMode::CpuUpload => 3_u64,
+    };
+    let conversion = match realization.conversion {
+        ConversionMode::None => 1_u64,
+        ConversionMode::YuvShader => 2_u64,
+        ConversionMode::GpuBlit => 3_u64,
+    };
+    let synchronization = match realization.synchronization {
+        SynchronizationMode::None => 1_u64,
+        SynchronizationMode::Explicit => 2_u64,
+        SynchronizationMode::VerifiedImplicit => 3_u64,
+        SynchronizationMode::CpuWait => 4_u64,
+    };
+    decode | (residency << 3) | (import << 6) | (conversion << 9) | (synchronization << 12)
+}
+
+const fn decode_frame_realization(value: u64) -> Option<FrameRealization> {
+    if value == 0 || value & !0x7fff != 0 {
+        return None;
+    }
+    let decode = match value & 0x7 {
+        1 => DecodeMode::Hardware,
+        2 => DecodeMode::Software,
+        _ => return None,
+    };
+    let residency = match (value >> 3) & 0x7 {
+        1 => DecodeResidency::NativeGpu,
+        2 => DecodeResidency::SystemMemory,
+        _ => return None,
+    };
+    let import = match (value >> 6) & 0x7 {
+        1 => ImportMode::DirectAlias,
+        2 => ImportMode::GpuCopy,
+        3 => ImportMode::CpuUpload,
+        _ => return None,
+    };
+    let conversion = match (value >> 9) & 0x7 {
+        1 => ConversionMode::None,
+        2 => ConversionMode::YuvShader,
+        3 => ConversionMode::GpuBlit,
+        _ => return None,
+    };
+    let synchronization = match (value >> 12) & 0x7 {
+        1 => SynchronizationMode::None,
+        2 => SynchronizationMode::Explicit,
+        3 => SynchronizationMode::VerifiedImplicit,
+        4 => SynchronizationMode::CpuWait,
+        _ => return None,
+    };
+    Some(FrameRealization {
+        decode,
+        residency,
+        import,
+        conversion,
+        synchronization,
+    })
 }
 
 const fn encode_decode_mode(mode: Option<DecodeMode>) -> u8 {
@@ -341,6 +439,14 @@ const fn decode_downgrade_reason(value: u8) -> Option<CapabilityDowngradeReason>
 impl SnapshotState {
     fn snapshot_with_atomics(&self) -> SessionSnapshot {
         let mut snapshot = self.snapshot.read().clone();
+        let realization = decode_frame_realization(self.frame_realization.load(Ordering::Relaxed));
+        if let Some(realization) = realization {
+            snapshot.capability = realization.capability_tier();
+        } else if let Some(capability) = decode_capability(self.capability.load(Ordering::Relaxed))
+        {
+            snapshot.capability = capability;
+        }
+        snapshot.frame_realization = realization;
         snapshot.latest_renderer_outcome =
             decode_renderer_outcome(self.latest_renderer_outcome.load(Ordering::Relaxed));
         snapshot.latest_downgrade_reason =
@@ -2172,12 +2278,18 @@ impl GstMediaSession {
 
     /// Returns the current presentation capability committed by the renderer.
     pub fn capability(&self) -> CapabilityTier {
-        self.state.snapshot.read().capability
+        if let Some(realization) = self.frame_realization() {
+            return realization.capability_tier();
+        }
+        match decode_capability(self.state.capability.load(Ordering::Relaxed)) {
+            Some(capability) => capability,
+            None => CapabilityTier::SystemMemoryUpload,
+        }
     }
 
     /// Returns the last successfully committed frame realization.
     pub fn frame_realization(&self) -> Option<FrameRealization> {
-        self.state.snapshot.read().frame_realization
+        decode_frame_realization(self.state.frame_realization.load(Ordering::Relaxed))
     }
 
     /// Returns the latest typed renderer outcome.
@@ -3728,7 +3840,7 @@ mod tests {
             CapabilityTier::DirectAlias
         ));
         assert_eq!(
-            state.snapshot.read().capability,
+            state.snapshot_with_atomics().capability,
             CapabilityTier::DirectAlias
         );
 
@@ -3739,7 +3851,7 @@ mod tests {
         ));
         assert_eq!(published, CapabilityTier::SystemMemoryUpload);
         assert_eq!(
-            state.snapshot.read().capability,
+            state.snapshot_with_atomics().capability,
             CapabilityTier::SystemMemoryUpload
         );
         assert!(!publish_capability_if_changed(
@@ -3764,7 +3876,7 @@ mod tests {
             Some(CapabilityDowngradeReason::RendererUnsupported)
         );
         assert_eq!(
-            state.snapshot.read().capability,
+            state.snapshot_with_atomics().capability,
             CapabilityTier::DirectAlias
         );
 
