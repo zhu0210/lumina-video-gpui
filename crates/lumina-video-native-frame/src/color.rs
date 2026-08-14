@@ -719,6 +719,12 @@ mod tests {
         let bt709 = yuv_to_rgb_matrix(ColorMatrix::Bt709, ColorRange::Limited);
         assert_ne!(bt601, bt709);
         let mut color = metadata(ColorMatrix::Bt601, ColorRange::Limited);
+        color.primaries = ColorPrimaries::Bt470Bg;
+        assert_eq!(yuv_to_rgb_matrix(color.matrix, color.range), bt601);
+        assert_eq!(
+            render_decision(color),
+            ColorRenderDecision::UnsupportedSdrColor
+        );
         color.primaries = ColorPrimaries::Bt709;
         assert!(matches!(
             render_decision(color),

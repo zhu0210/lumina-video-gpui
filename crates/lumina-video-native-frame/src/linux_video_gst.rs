@@ -2861,7 +2861,7 @@ mod tests {
         gst::init()?;
         let colorimetry = gst_video::VideoColorimetry::new(
             gst_video::VideoColorRange::Range16_235,
-            gst_video::VideoColorMatrix::Bt709,
+            gst_video::VideoColorMatrix::Bt601,
             gst_video::VideoTransferFunction::Bt709,
             gst_video::VideoColorPrimaries::Bt709,
         );
@@ -2872,7 +2872,7 @@ mod tests {
         assert_eq!(
             super::color_metadata_from_video_info(&info),
             crate::ColorMetadata {
-                matrix: ColorMatrix::Bt709,
+                matrix: ColorMatrix::Bt601,
                 primaries: ColorPrimaries::Bt709,
                 transfer: ColorTransfer::Bt709,
                 range: ColorRange::Limited,
