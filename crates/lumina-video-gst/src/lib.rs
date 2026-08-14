@@ -3202,7 +3202,10 @@ mod tests {
             panic!("small RGBA pool must configure");
         };
         let Some(mut memory) = pool.try_acquire() else {
-            panic!("payload must be available");
+            panic!("first payload must be available");
+        };
+        let Some(second) = pool.try_acquire() else {
+            panic!("second payload must be available");
         };
         let Some(plane) = memory.planes.first_mut() else {
             panic!("payload must have one plane");
@@ -3213,6 +3216,7 @@ mod tests {
             pool.try_acquire_checked(),
             Err("RGBA recycle payload shape changed")
         ));
+        drop(second);
     }
 
     #[test]
