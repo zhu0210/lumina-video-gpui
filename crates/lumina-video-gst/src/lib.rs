@@ -24,12 +24,9 @@ use lumina_video_native_frame::linux_video_gst::{
     DEFAULT_LIFECYCLE_TIMEOUT,
 };
 pub use lumina_video_native_frame::linux_video_gst::{GstAudioSinkMode, DEFAULT_OPEN_TIMEOUT};
-use lumina_video_native_frame::video::{
-    CpuFrame, DecodedFrame, VideoDecoderBackend, VideoError, VideoFrame,
-};
+use lumina_video_native_frame::video::{VideoDecoderBackend, VideoError};
 use lumina_video_native_frame::{
-    into_cpu_planes, AcquireSync, CpuMemory, FrameExtent, NativeFrameDescriptor, NativeFrameLease,
-    NativeMemory,
+    AcquireSync, NativeFrameDescriptor, NativeFrameLease, NativeMemory,
 };
 use parking_lot::RwLock;
 use url::Url;
@@ -340,41 +337,6 @@ fn session_error(error: VideoError) -> SessionError {
         VideoError::UnsupportedFormat(message) => SessionError::Unsupported(message),
         VideoError::Generic(message) => SessionError::Fatal(message),
     }
-}
-
-fn owned_cpu_lease(
-    frame: VideoFrame,
-    frame_id: u64,
-    stream_generation: u64,
-    duration: Option<Duration>,
-) -> Result<Frame, SessionError> {
-    let VideoFrame { pts, frame } = frame;
-    let DecodedFrame::Cpu(CpuFrame {
-        format,
-        width,
-        height,
-        planes,
-    }) = frame
-    else {
-        return Err(SessionError::Unsupported(
-            "GStreamer session only accepts owned system-memory frames".into(),
-        ));
-    };
-
-    let descriptor = NativeFrameDescriptor {
-        frame_id,
-        stream_generation,
-        pts,
-        duration,
-        extent: FrameExtent::new(width, height),
-        format,
-    };
-    NativeFrameLease::new(
-        descriptor,
-        NativeMemory::Cpu(CpuMemory::new(into_cpu_planes(planes))),
-        AcquireSync::None,
-    )
-    .map_err(|error| SessionError::Decode(error.to_string()))
 }
 
 fn send_control(sender: &ControlSender, event: SequencedEvent) -> bool {
@@ -844,6 +806,7 @@ struct WorkerIo {
     audio_handle: AudioHandle,
     audio_sink: GstAudioSinkMode,
     tls_ca_file: Option<String>,
+    requested_tier: CapabilityTier,
     lifecycle_control: GstLifecycleControl,
 }
 
@@ -902,6 +865,7 @@ fn run_worker(
         audio_handle,
         audio_sink,
         tls_ca_file,
+        requested_tier,
         lifecycle_control,
     } = io;
     let mut sequence = 0_u64;
@@ -923,8 +887,9 @@ fn run_worker(
         }
     };
     let mut decoder =
-        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeouts_and_control_and_tls_ca_file(
+        match GStreamerDecoder::new_with_requested_tier_and_audio_sink_and_timeouts_and_control_and_tls_ca_file(
             &source,
+            requested_tier,
             audio_sink,
             lifecycle_timeout,
             open_timeout,
@@ -1150,7 +1115,7 @@ fn run_worker(
             continue;
         }
 
-        match decoder.decode_next() {
+        match decoder.decode_next_native() {
             Ok(Some(frame)) => {
                 if lifecycle_cancelled(&lifecycle_control) {
                     if lifecycle_control.is_stop_requested() {
@@ -1171,23 +1136,40 @@ fn run_worker(
                     .position_us
                     .store(playback.position.as_micros() as u64, Ordering::Relaxed);
                 update_audio_observation(&state, &audio_handle, &decoder, playback.position);
-                let lease = match owned_cpu_lease(
-                    frame,
+                let descriptor = NativeFrameDescriptor {
                     frame_id,
-                    playback.stream_generation,
-                    Some(decoder.metadata().frame_duration()),
-                ) {
+                    stream_generation: playback.stream_generation,
+                    pts: frame.pts,
+                    duration: Some(decoder.metadata().frame_duration()),
+                    extent: frame.extent,
+                    format: frame.format,
+                };
+                let settled_tier = if requested_tier != CapabilityTier::SystemMemoryUpload
+                    && matches!(&frame.memory, NativeMemory::DmaBuf(_))
+                {
+                    requested_tier
+                } else {
+                    CapabilityTier::SystemMemoryUpload
+                };
+                let lease = match NativeFrameLease::new(descriptor, frame.memory, AcquireSync::None)
+                {
                     Ok(lease) => lease,
                     Err(error) => {
                         if lifecycle_control.is_stop_requested() {
                             publish_ended(&state, &control_sender, &mut sequence);
                         } else if !lifecycle_cancelled(&lifecycle_control) {
-                            let _ = publish_error(&state, &control_sender, &mut sequence, error);
+                            let _ = publish_error(
+                                &state,
+                                &control_sender,
+                                &mut sequence,
+                                SessionError::Decode(error.to_string()),
+                            );
                         }
                         shutdown_worker(&mut decoder, &lifecycle_control);
                         return;
                     }
                 };
+                state.snapshot.write().capability = settled_tier;
                 frame_id = frame_id.saturating_add(1);
                 if !send_frame(
                     &frame_sender,
@@ -1309,6 +1291,24 @@ impl GstMediaSession {
         )
     }
 
+    /// Starts a session with an explicit requested frame capability. Native
+    /// layout failures settle the session to system-memory upload once.
+    pub fn new_with_requested_tier(
+        source: impl Into<String>,
+        requested_tier: CapabilityTier,
+    ) -> Self {
+        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file_and_tier(
+            source,
+            false,
+            GstAudioSinkMode::Auto,
+            DEFAULT_LIFECYCLE_TIMEOUT,
+            DEFAULT_OPEN_TIMEOUT,
+            0,
+            None,
+            requested_tier,
+        )
+    }
+
     /// Starts opening `source` on a background worker and optionally autoplays
     /// after GStreamer reaches its preroll-ready state.
     pub fn new_with_autoplay(source: impl Into<String>, autoplay: bool) -> Self {
@@ -1404,6 +1404,34 @@ impl GstMediaSession {
         stream_generation: u64,
         tls_ca_file: Option<String>,
     ) -> Self {
+        Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file_and_tier(
+            source,
+            autoplay,
+            audio_sink,
+            lifecycle_timeout,
+            open_timeout,
+            stream_generation,
+            tls_ca_file,
+            CapabilityTier::SystemMemoryUpload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file_and_tier(
+        source: impl Into<String>,
+        autoplay: bool,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        open_timeout: Duration,
+        stream_generation: u64,
+        tls_ca_file: Option<String>,
+        requested_tier: CapabilityTier,
+    ) -> Self {
+        let requested_tier = if requested_tier == CapabilityTier::DirectAlias {
+            CapabilityTier::SystemMemoryUpload
+        } else {
+            requested_tier
+        };
         let source = source.into();
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
@@ -1442,6 +1470,7 @@ impl GstMediaSession {
                         audio_handle: worker_audio_handle,
                         audio_sink,
                         tls_ca_file,
+                        requested_tier,
                         lifecycle_control: worker_lifecycle_control,
                     },
                 )
@@ -1797,7 +1826,7 @@ impl Drop for GstMediaSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumina_video_native_frame::CpuPlane;
+    use lumina_video_native_frame::{CpuMemory, CpuPlane, FrameExtent, NativeMemory};
     use std::fs;
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener};
