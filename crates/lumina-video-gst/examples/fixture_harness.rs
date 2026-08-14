@@ -99,11 +99,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(generation) = seek_generation {
                     if frame.descriptor.stream_generation >= generation {
-                        let delta = if frame.descriptor.pts >= seek_target {
-                            frame.descriptor.pts - seek_target
-                        } else {
-                            seek_target - frame.descriptor.pts
-                        };
+                        let delta = frame.descriptor.pts.abs_diff(seek_target);
                         if delta <= Duration::from_millis(250) {
                             seek_seen = true;
                             seek_pts = Some(frame.descriptor.pts);

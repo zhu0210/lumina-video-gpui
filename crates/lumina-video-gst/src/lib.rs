@@ -19,10 +19,11 @@ use lumina_video_core::session::{
     CapabilityTier, MediaSession, SessionCommand, SessionError, SessionEvent, SessionMetadata,
     SessionSnapshot, SessionState,
 };
-pub use lumina_video_native_frame::linux_video_gst::GstAudioSinkMode;
 use lumina_video_native_frame::linux_video_gst::{
-    AudioTrackSelectionResult, GStreamerDecoder, GstLifecycleControl, DEFAULT_LIFECYCLE_TIMEOUT,
+    AudioTrackSelectionResult, GStreamerDecoder, GstLifecycleControl, GstPipelineObservation,
+    DEFAULT_LIFECYCLE_TIMEOUT,
 };
+pub use lumina_video_native_frame::linux_video_gst::{GstAudioSinkMode, DEFAULT_OPEN_TIMEOUT};
 use lumina_video_native_frame::video::{
     CpuFrame, DecodedFrame, VideoDecoderBackend, VideoError, VideoFrame,
 };
@@ -40,6 +41,19 @@ const COMMAND_QUEUE_CAPACITY: usize = 32;
 pub type Frame = NativeFrameLease;
 type Event = SessionEvent<Frame>;
 pub type SessionEventFrame = SessionEvent<Frame>;
+
+/// GStreamer-owned timing and live-edge facts observed by a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GstObservation {
+    pub is_live: bool,
+    pub is_live_known: bool,
+    pub seekable: bool,
+    pub seekability_known: bool,
+    pub pipeline_latency: Option<Duration>,
+    pub frame_mailbox_occupancy: usize,
+    pub dropped_frames: u64,
+    pub qos_events: u64,
+}
 
 #[derive(Debug)]
 struct SequencedEvent {
@@ -184,6 +198,14 @@ struct SnapshotState {
     position_us: AtomicU64,
     audio_connected: AtomicBool,
     audio_buffers_seen: AtomicU64,
+    is_live: AtomicBool,
+    is_live_known: AtomicBool,
+    seekable: AtomicBool,
+    seekability_known: AtomicBool,
+    pipeline_latency_ns: AtomicU64,
+    pipeline_latency_known: AtomicBool,
+    frame_mailbox_occupancy: AtomicU64,
+    qos_events: AtomicU64,
 }
 
 impl SnapshotState {
@@ -193,6 +215,14 @@ impl SnapshotState {
             position_us: AtomicU64::new(0),
             audio_connected: AtomicBool::new(false),
             audio_buffers_seen: AtomicU64::new(0),
+            is_live: AtomicBool::new(false),
+            is_live_known: AtomicBool::new(false),
+            seekable: AtomicBool::new(false),
+            seekability_known: AtomicBool::new(false),
+            pipeline_latency_ns: AtomicU64::new(0),
+            pipeline_latency_known: AtomicBool::new(false),
+            frame_mailbox_occupancy: AtomicU64::new(0),
+            qos_events: AtomicU64::new(0),
         }
     }
 }
@@ -221,6 +251,39 @@ fn update_audio_observation(
         .store(buffers_seen, Ordering::Relaxed);
     audio_handle.set_available(connected);
     audio_handle.set_native_position(position);
+}
+
+fn update_gst_observation(
+    state: &Arc<SnapshotState>,
+    decoder: &GStreamerDecoder,
+    frame_mailbox_occupancy: usize,
+) {
+    let observation: GstPipelineObservation = decoder.pipeline_observation();
+    if observation.is_live_known {
+        state.is_live.store(observation.is_live, Ordering::Relaxed);
+        state.is_live_known.store(true, Ordering::Release);
+    }
+    if observation.seekable_known {
+        state
+            .seekable
+            .store(observation.seekable, Ordering::Relaxed);
+        state.seekability_known.store(true, Ordering::Release);
+    }
+    if let Some(latency) = observation.latency {
+        state.pipeline_latency_ns.store(
+            latency.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+    state
+        .pipeline_latency_known
+        .store(observation.latency_known, Ordering::Release);
+    state
+        .frame_mailbox_occupancy
+        .store(frame_mailbox_occupancy as u64, Ordering::Relaxed);
+    state
+        .qos_events
+        .store(decoder.qos_events(), Ordering::Relaxed);
 }
 
 fn sync_audio_controls(
@@ -467,11 +530,84 @@ fn publish_error(
     publish_state(state, control_sender, sequence, SessionState::Error(error))
 }
 
+fn publish_nonterminal_error(
+    control_sender: &ControlSender,
+    sequence: &mut u64,
+    error: SessionError,
+) -> bool {
+    let event = SequencedEvent {
+        sequence: *sequence,
+        event: SessionEvent::Error(error),
+    };
+    *sequence = sequence.saturating_add(1);
+    send_control(control_sender, event)
+}
+
 struct PlaybackState {
     playing: bool,
     buffering: bool,
     position: Duration,
     stream_generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct LiveGapDeadline {
+    live_media_seen: bool,
+    deadline: Option<std::time::Instant>,
+}
+
+impl LiveGapDeadline {
+    fn disarm(&mut self) {
+        self.deadline = None;
+    }
+
+    fn observe_media_progress(&mut self, playing: bool, is_live: bool, progressed: bool) {
+        if !playing || !is_live {
+            self.disarm();
+            return;
+        }
+        if progressed {
+            self.live_media_seen = true;
+            self.disarm();
+        }
+    }
+
+    fn expired(
+        &mut self,
+        now: std::time::Instant,
+        playing: bool,
+        is_live: bool,
+        lifecycle_timeout: Duration,
+    ) -> bool {
+        if !playing || !is_live || !self.live_media_seen {
+            if !playing || !is_live {
+                self.disarm();
+            }
+            return false;
+        }
+        let deadline = self
+            .deadline
+            .get_or_insert_with(|| now.checked_add(lifecycle_timeout).unwrap_or(now));
+        now >= *deadline
+    }
+}
+
+fn observe_live_media_progress(
+    live_gap: &mut LiveGapDeadline,
+    decoder: &GStreamerDecoder,
+    playback: &PlaybackState,
+    last_audio_buffers_seen: &mut u64,
+    video_progressed: bool,
+) {
+    let audio_buffers_seen = decoder.audio_handle().audio_buffers_seen();
+    let audio_progressed = audio_buffers_seen > *last_audio_buffers_seen;
+    *last_audio_buffers_seen = audio_buffers_seen;
+    let observation = decoder.pipeline_observation();
+    live_gap.observe_media_progress(
+        playback.playing,
+        observation.is_live_known && observation.is_live,
+        video_progressed || audio_progressed,
+    );
 }
 
 fn mark_eos(playback: &mut PlaybackState) {
@@ -631,6 +767,13 @@ fn process_command(
                     )
                 }
                 Err(error) => {
+                    if matches!(error, VideoError::UnsupportedFormat(_)) {
+                        return publish_nonterminal_error(
+                            control_sender,
+                            sequence,
+                            session_error(error),
+                        );
+                    }
                     let _ = publish_error(state, control_sender, sequence, session_error(error));
                     false
                 }
@@ -744,6 +887,7 @@ fn run_worker(
     source: String,
     autoplay: bool,
     lifecycle_timeout: Duration,
+    open_timeout: Duration,
     initial_stream_generation: u64,
     io: WorkerIo,
 ) {
@@ -779,10 +923,11 @@ fn run_worker(
         }
     };
     let mut decoder =
-        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeout_and_control_and_tls_ca_file(
+        match GStreamerDecoder::new_system_memory_with_audio_sink_and_timeouts_and_control_and_tls_ca_file(
             &source,
             audio_sink,
             lifecycle_timeout,
+            open_timeout,
             lifecycle_control.clone(),
             tls_ca_file,
         ) {
@@ -816,6 +961,7 @@ fn run_worker(
         return;
     }
     update_audio_observation(&state, &audio_handle, &decoder, Duration::ZERO);
+    update_gst_observation(&state, &decoder, frame_sender.len());
 
     let metadata = session_metadata(decoder.metadata());
     state.snapshot.write().metadata = Some(metadata.clone());
@@ -865,6 +1011,8 @@ fn run_worker(
         stream_generation: initial_stream_generation,
     };
     let mut frame_id = 0_u64;
+    let mut live_gap = LiveGapDeadline::default();
+    let mut last_audio_buffers_seen = decoder.audio_handle().audio_buffers_seen();
 
     if autoplay {
         match decoder.resume() {
@@ -935,6 +1083,7 @@ fn run_worker(
                 return;
             }
         }
+        update_gst_observation(&state, &decoder, frame_sender.len());
         if !sync_buffering_state(
             &mut playback,
             &decoder,
@@ -966,6 +1115,16 @@ fn run_worker(
         }
         update_audio_observation(&state, &audio_handle, &decoder, playback.position);
 
+        if !playback.playing {
+            observe_live_media_progress(
+                &mut live_gap,
+                &decoder,
+                &playback,
+                &mut last_audio_buffers_seen,
+                false,
+            );
+            live_gap.disarm();
+        }
         if !playback.playing {
             match commands.recv_timeout(Duration::from_millis(25)) {
                 Ok(command) => {
@@ -1001,6 +1160,13 @@ fn run_worker(
                     return;
                 }
                 playback.position = frame.pts;
+                observe_live_media_progress(
+                    &mut live_gap,
+                    &decoder,
+                    &playback,
+                    &mut last_audio_buffers_seen,
+                    true,
+                );
                 state
                     .position_us
                     .store(playback.position.as_micros() as u64, Ordering::Relaxed);
@@ -1038,6 +1204,7 @@ fn run_worker(
                     shutdown_worker(&mut decoder, &lifecycle_control);
                     return;
                 }
+                update_gst_observation(&state, &decoder, frame_sender.len());
                 sequence = sequence.saturating_add(1);
             }
             Ok(None) if decoder.is_eof() => {
@@ -1058,7 +1225,35 @@ fn run_worker(
                 }
                 continue;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                observe_live_media_progress(
+                    &mut live_gap,
+                    &decoder,
+                    &playback,
+                    &mut last_audio_buffers_seen,
+                    false,
+                );
+                let observation = decoder.pipeline_observation();
+                if live_gap.expired(
+                    std::time::Instant::now(),
+                    playback.playing,
+                    observation.is_live_known && observation.is_live,
+                    lifecycle_timeout,
+                ) {
+                    let _ = publish_error(
+                        &state,
+                        &control_sender,
+                        &mut sequence,
+                        SessionError::Network(format!(
+                            "live media gap exceeded {:?}",
+                            lifecycle_timeout
+                        )),
+                    );
+                    shutdown_worker(&mut decoder, &lifecycle_control);
+                    return;
+                }
+                update_gst_observation(&state, &decoder, frame_sender.len());
+            }
             Err(error) => {
                 if lifecycle_control.is_stop_requested() {
                     publish_ended(&state, &control_sender, &mut sequence);
@@ -1091,7 +1286,7 @@ pub struct GstMediaSession {
     state: Arc<SnapshotState>,
     audio_handle: AudioHandle,
     dropped_frames: Arc<AtomicU64>,
-    pending_frame: Option<SequencedEvent>,
+    last_delivered_sequence: Option<u64>,
     has_presented_frame: bool,
     worker: Option<JoinHandle<()>>,
     worker_disconnected: bool,
@@ -1150,11 +1345,31 @@ impl GstMediaSession {
         lifecycle_timeout: Duration,
         stream_generation: u64,
     ) -> Self {
+        Self::new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
+            source,
+            autoplay,
+            audio_sink,
+            lifecycle_timeout,
+            DEFAULT_OPEN_TIMEOUT,
+            stream_generation,
+        )
+    }
+
+    /// Starts a session with separate opening and lifecycle bounds.
+    pub fn new_with_autoplay_and_audio_sink_and_timeouts_and_generation(
+        source: impl Into<String>,
+        autoplay: bool,
+        audio_sink: GstAudioSinkMode,
+        lifecycle_timeout: Duration,
+        open_timeout: Duration,
+        stream_generation: u64,
+    ) -> Self {
         Self::new_with_autoplay_and_audio_sink_and_timeout_and_generation_and_tls_ca_file(
             source,
             autoplay,
             audio_sink,
             lifecycle_timeout,
+            open_timeout,
             stream_generation,
             None,
         )
@@ -1174,6 +1389,7 @@ impl GstMediaSession {
             autoplay,
             audio_sink,
             lifecycle_timeout,
+            DEFAULT_OPEN_TIMEOUT,
             stream_generation,
             Some(tls_ca_file),
         )
@@ -1184,6 +1400,7 @@ impl GstMediaSession {
         autoplay: bool,
         audio_sink: GstAudioSinkMode,
         lifecycle_timeout: Duration,
+        open_timeout: Duration,
         stream_generation: u64,
         tls_ca_file: Option<String>,
     ) -> Self {
@@ -1212,6 +1429,7 @@ impl GstMediaSession {
                     source,
                     autoplay,
                     lifecycle_timeout,
+                    open_timeout,
                     stream_generation,
                     WorkerIo {
                         commands: command_receiver,
@@ -1251,7 +1469,7 @@ impl GstMediaSession {
             state,
             audio_handle,
             dropped_frames,
-            pending_frame: None,
+            last_delivered_sequence: None,
             has_presented_frame: false,
             worker,
             worker_disconnected,
@@ -1297,6 +1515,26 @@ impl GstMediaSession {
         }
     }
 
+    /// Returns the latest GStreamer live-edge, timing, mailbox, and QoS facts.
+    pub fn gst_observation(&self) -> GstObservation {
+        let is_live_known = self.state.is_live_known.load(Ordering::Acquire);
+        let seekability_known = self.state.seekability_known.load(Ordering::Acquire);
+        let pipeline_latency_known = self.state.pipeline_latency_known.load(Ordering::Acquire);
+        let pipeline_latency = pipeline_latency_known
+            .then(|| Duration::from_nanos(self.state.pipeline_latency_ns.load(Ordering::Relaxed)));
+        GstObservation {
+            is_live: is_live_known && self.state.is_live.load(Ordering::Relaxed),
+            is_live_known,
+            seekable: seekability_known && self.state.seekable.load(Ordering::Relaxed),
+            seekability_known,
+            pipeline_latency,
+            frame_mailbox_occupancy: self.state.frame_mailbox_occupancy.load(Ordering::Relaxed)
+                as usize,
+            dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
+            qos_events: self.state.qos_events.load(Ordering::Relaxed),
+        }
+    }
+
     /// Returns the latest discoverable audio tracks without consuming events.
     pub fn audio_tracks(&self) -> Vec<AudioTrack> {
         self.state.snapshot.read().audio_tracks.clone()
@@ -1328,6 +1566,12 @@ impl GstMediaSession {
         }
     }
 
+    fn update_frame_mailbox_occupancy(&self) {
+        self.state
+            .frame_mailbox_occupancy
+            .store(self.frame_receiver.len() as u64, Ordering::Relaxed);
+    }
+
     fn fill_pending(&mut self) {
         Self::fill_control_pending(&mut self.pending_metadata, &self.control_receiver.metadata);
         Self::fill_control_pending(
@@ -1345,34 +1589,6 @@ impl GstMediaSession {
             &mut self.pending_transient,
             &self.control_receiver.transient,
         );
-        match self.frame_receiver.try_recv() {
-            Ok(event) => {
-                let generation = match &event.event {
-                    SessionEvent::Frame { frame, .. } => frame.descriptor.stream_generation,
-                    _ => self.stream_generation,
-                };
-                if generation != self.latest_requested_generation {
-                    self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.stream_generation = generation;
-                    self.replay_pending = false;
-                    if self.pending_frame.replace(event).is_some() {
-                        self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            Err(TryRecvError::Disconnected) => self.worker_disconnected = true,
-            Err(TryRecvError::Empty) => {}
-        }
-        if self.pending_frame.as_ref().is_some_and(|event| {
-            matches!(
-                &event.event,
-                SessionEvent::Frame { frame, .. }
-                    if frame.descriptor.stream_generation != self.latest_requested_generation
-            )
-        }) {
-            self.pending_frame = None;
-        }
     }
 }
 
@@ -1433,6 +1649,14 @@ impl MediaSession for GstMediaSession {
             return Ok(());
         }
         let is_seek = matches!(&command, SessionCommand::Seek { .. });
+        if is_seek {
+            let observation = self.gst_observation();
+            if observation.seekability_known && !observation.seekable {
+                return Err(SessionError::Unsupported(
+                    "GStreamer reported a non-seekable stream".into(),
+                ));
+            }
+        }
         let is_play = matches!(&command, SessionCommand::Play);
         let was_ended = matches!(self.snapshot().state, SessionState::Ended);
         let is_replay = is_play && was_ended && !self.replay_pending;
@@ -1447,7 +1671,6 @@ impl MediaSession for GstMediaSession {
                 },
             )?;
             self.latest_requested_generation = target_generation;
-            self.pending_frame = None;
         } else {
             enqueue_latest(&self.commands, &self.command_drop_receiver, command)?;
         }
@@ -1495,11 +1718,6 @@ impl MediaSession for GstMediaSession {
                 source = Some((event.sequence, 6));
             }
         }
-        if let Some(event) = self.pending_frame.as_ref() {
-            if source.is_none_or(|(sequence, _)| event.sequence < sequence) {
-                source = Some((event.sequence, 7));
-            }
-        }
         let next = match source.map(|(_, kind)| kind) {
             Some(0) => self.pending_metadata.take(),
             Some(1) => self.pending_audio_tracks.take(),
@@ -1508,10 +1726,14 @@ impl MediaSession for GstMediaSession {
             Some(4) => self.pending_error.take(),
             Some(5) => self.pending_terminal.take(),
             Some(6) => self.pending_transient.take(),
-            Some(7) => self.pending_frame.take(),
             _ => None,
         };
         if let Some(event) = next {
+            self.update_frame_mailbox_occupancy();
+            self.last_delivered_sequence = Some(
+                self.last_delivered_sequence
+                    .map_or(event.sequence, |last| last.max(event.sequence)),
+            );
             if matches!(
                 &event.event,
                 SessionEvent::Error(_)
@@ -1524,10 +1746,41 @@ impl MediaSession for GstMediaSession {
             }
             return Ok(Some(event.event));
         }
-        if self.worker_disconnected {
+
+        let frame = match self.frame_receiver.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => {
+                self.update_frame_mailbox_occupancy();
+                return Ok(None);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.worker_disconnected = true;
+                self.update_frame_mailbox_occupancy();
+                return Ok(None);
+            }
+        };
+        let generation = match &frame.event {
+            SessionEvent::Frame { frame, .. } => frame.descriptor.stream_generation,
+            _ => self.stream_generation,
+        };
+        if generation != self.latest_requested_generation {
+            self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            self.update_frame_mailbox_occupancy();
             return Ok(None);
         }
-        Ok(None)
+        if self
+            .last_delivered_sequence
+            .is_some_and(|last| frame.sequence <= last)
+        {
+            self.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            self.update_frame_mailbox_occupancy();
+            return Ok(None);
+        }
+        self.stream_generation = generation;
+        self.replay_pending = false;
+        self.last_delivered_sequence = Some(frame.sequence);
+        self.update_frame_mailbox_occupancy();
+        Ok(Some(frame.event))
     }
 }
 
@@ -1549,6 +1802,7 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -1558,12 +1812,63 @@ mod tests {
         worker: Option<JoinHandle<()>>,
     }
 
+    #[derive(Clone)]
+    struct LiveFixtureControl {
+        outage: Arc<AtomicUsize>,
+        playlist_requests: Arc<AtomicUsize>,
+        highest_served_sequence: Arc<AtomicUsize>,
+    }
+
+    impl LiveFixtureControl {
+        fn set_outage(&self, outage: bool) {
+            self.outage
+                .store(if outage { 1 } else { 0 }, Ordering::Release);
+        }
+
+        fn outage_seen(&self) -> bool {
+            self.outage.load(Ordering::Acquire) >= 2
+        }
+
+        fn highest_served_sequence(&self) -> Option<usize> {
+            self.highest_served_sequence
+                .load(Ordering::Acquire)
+                .checked_sub(1)
+        }
+    }
+
     impl ControlledServer {
         fn spawn(root: PathBuf, tls_config: Option<Arc<rustls::ServerConfig>>) -> io::Result<Self> {
+            Self::spawn_with_live(root, tls_config, None).map(|(server, _)| server)
+        }
+
+        fn spawn_live(root: PathBuf) -> io::Result<(Self, LiveFixtureControl)> {
+            let control = LiveFixtureControl {
+                outage: Arc::new(AtomicUsize::new(0)),
+                playlist_requests: Arc::new(AtomicUsize::new(0)),
+                highest_served_sequence: Arc::new(AtomicUsize::new(0)),
+            };
+            let (server, _) = Self::spawn_with_live(
+                root,
+                None,
+                Some((
+                    Arc::clone(&control.outage),
+                    Arc::clone(&control.playlist_requests),
+                    Arc::clone(&control.highest_served_sequence),
+                )),
+            )?;
+            Ok((server, control))
+        }
+
+        fn spawn_with_live(
+            root: PathBuf,
+            tls_config: Option<Arc<rustls::ServerConfig>>,
+            live: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+        ) -> io::Result<(Self, Option<LiveFixtureControl>)> {
             let listener = TcpListener::bind(("127.0.0.1", 0))?;
             listener.set_nonblocking(true)?;
             let address = listener.local_addr()?;
             let (stop, stop_receiver) = mpsc::channel();
+            let live_for_worker = live.clone();
             let worker = thread::Builder::new()
                 .name("lumina-gst-fixture-server".into())
                 .spawn(move || loop {
@@ -1586,17 +1891,26 @@ mod tests {
                             continue;
                         };
                         let mut stream = rustls::StreamOwned::new(connection, stream);
-                        let _ = serve_fixture_request(&mut stream, &root);
+                        let _ = serve_fixture_request(&mut stream, &root, live_for_worker.as_ref());
                     } else {
                         let mut stream = stream;
-                        let _ = serve_fixture_request(&mut stream, &root);
+                        let _ = serve_fixture_request(&mut stream, &root, live_for_worker.as_ref());
                     }
                 })?;
-            Ok(Self {
-                address,
-                stop: Some(stop),
-                worker: Some(worker),
-            })
+            Ok((
+                Self {
+                    address,
+                    stop: Some(stop),
+                    worker: Some(worker),
+                },
+                live.map(|(outage, playlist_requests, highest_served_sequence)| {
+                    LiveFixtureControl {
+                        outage,
+                        playlist_requests,
+                        highest_served_sequence,
+                    }
+                }),
+            ))
         }
 
         fn url(&self, scheme: &str, path: &str) -> String {
@@ -1615,7 +1929,11 @@ mod tests {
         }
     }
 
-    fn serve_fixture_request<S: Read + Write>(stream: &mut S, root: &Path) -> io::Result<()> {
+    fn serve_fixture_request<S: Read + Write>(
+        stream: &mut S,
+        root: &Path,
+        live: Option<&(Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+    ) -> io::Result<()> {
         let Some(request) = read_fixture_request(stream)? else {
             return Ok(());
         };
@@ -1654,6 +1972,24 @@ mod tests {
                 head,
             );
         }
+        if path.starts_with("/hls-live/") {
+            if let Some((outage, playlist_requests, _)) = live {
+                if path == "/hls-live/index.m3u8" {
+                    let advance = !observe_live_outage(outage);
+                    return serve_live_playlist(stream, root, playlist_requests, advance, head);
+                }
+                if observe_live_outage(outage) {
+                    return write_fixture_response(
+                        stream,
+                        "503 Service Unavailable",
+                        "text/plain",
+                        b"controlled live outage",
+                        None,
+                        head,
+                    );
+                }
+            }
+        }
         if path == "/redirect.m3u8" {
             return write_fixture_response(
                 stream,
@@ -1666,7 +2002,40 @@ mod tests {
         }
 
         let relative_path = path.trim_start_matches('/');
-        let file_path = root.join(relative_path);
+        let file_path = if let Some(sequence) = live_segment_sequence(path) {
+            let segment_count = fs::read_dir(root.join("hls-live"))?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "ts")
+                })
+                .count();
+            if segment_count == 0 {
+                return write_fixture_response(
+                    stream,
+                    "404 Not Found",
+                    "text/plain",
+                    b"live fixture has no segments",
+                    None,
+                    head,
+                );
+            }
+            if sequence >= segment_count {
+                return write_fixture_response(
+                    stream,
+                    "404 Not Found",
+                    "text/plain",
+                    b"live fixture sequence is not available",
+                    None,
+                    head,
+                );
+            }
+            root.join(format!("hls-live/segment-{sequence:03}.ts"))
+        } else {
+            root.join(relative_path)
+        };
         let body = match fs::read(file_path) {
             Ok(body) => body,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1722,14 +2091,87 @@ mod tests {
                 format!("bytes {start}-{end}/{}", body.len()),
             )
         });
-        write_fixture_response_with_content_range(
+        let response = write_fixture_response_with_content_range(
             stream,
             status,
             content_type,
             content,
             content_range,
             head,
+        );
+        if response.is_ok() {
+            if let Some((_, _, highest_served_sequence)) = live {
+                if let Some(sequence) = live_segment_sequence(path) {
+                    highest_served_sequence.fetch_max(sequence.saturating_add(1), Ordering::AcqRel);
+                }
+            }
+        }
+        response
+    }
+
+    fn observe_live_outage(outage: &AtomicUsize) -> bool {
+        let active = outage.load(Ordering::Acquire) != 0;
+        if active {
+            outage.fetch_max(2, Ordering::AcqRel);
+        }
+        active
+    }
+
+    fn serve_live_playlist<S: Write>(
+        stream: &mut S,
+        root: &Path,
+        playlist_requests: &AtomicUsize,
+        advance: bool,
+        head: bool,
+    ) -> io::Result<()> {
+        let segment_count = fs::read_dir(root.join("hls-live"))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ts")
+            })
+            .count();
+        if segment_count == 0 {
+            return write_fixture_response(
+                stream,
+                "404 Not Found",
+                "text/plain",
+                b"live fixture has no segments",
+                None,
+                head,
+            );
+        }
+        let requested = if advance {
+            playlist_requests.fetch_add(1, Ordering::AcqRel)
+        } else {
+            playlist_requests.load(Ordering::Acquire).saturating_sub(1)
+        };
+        let window = segment_count.saturating_div(2).max(1);
+        let published = window.saturating_add(requested).min(segment_count);
+        let start = published.saturating_sub(window);
+        let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n");
+        playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{start}\n"));
+        for sequence in start..published {
+            playlist.push_str("#EXTINF:1.000000,\n");
+            playlist.push_str(&format!("segment-{sequence:03}.ts\n"));
+        }
+        write_fixture_response(
+            stream,
+            "200 OK",
+            "application/vnd.apple.mpegurl",
+            playlist.as_bytes(),
+            None,
+            head,
         )
+    }
+
+    fn live_segment_sequence(path: &str) -> Option<usize> {
+        path.strip_prefix("/hls-live/")
+            .and_then(|name| name.strip_suffix(".ts"))
+            .and_then(|name| name.strip_prefix("segment-"))
+            .and_then(|sequence| sequence.parse().ok())
     }
 
     fn read_fixture_request<S: Read>(stream: &mut S) -> io::Result<Option<String>> {
@@ -1941,6 +2383,19 @@ mod tests {
         ) || matches!(&snapshot.state, SessionState::Error(error) if matches_error(error))
     }
 
+    fn fail_on_live_error(
+        event: Option<&SessionEventFrame>,
+        _snapshot: &SessionSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(SessionEvent::Error(error)) = event {
+            return Err(Box::new(error.clone()));
+        }
+        if let SessionState::Error(error) = &_snapshot.state {
+            return Err(Box::new(error.clone()));
+        }
+        Ok(())
+    }
+
     fn run_vod_session(
         source: String,
         tls_ca_file: Option<String>,
@@ -2114,6 +2569,178 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn public_live_hls_observes_live_edge_and_recovers_at_a_higher_sequence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = fixture_root().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "generated HLS fixture missing; run fixtures/generate.sh",
+            )
+        })?;
+        if !root.join("hls-live/index.m3u8").is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "generated live HLS fixture missing; run fixtures/generate.sh",
+            )
+            .into());
+        }
+        let live_segment_count = fs::read_dir(root.join("hls-live"))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "ts")
+            })
+            .count();
+        if live_segment_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "generated live HLS fixture has no media segments",
+            )
+            .into());
+        }
+        // The fixture's EXTINF duration is one second; use the full generated
+        // media duration as an observation bound, never a desired target.
+        let latency_bound = Duration::from_secs(live_segment_count as u64);
+        let (server, live_control) = ControlledServer::spawn_live(root)?;
+        let mut session =
+            GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                server.url("http", "/hls-live/index.m3u8"),
+                true,
+                GstAudioSinkMode::Fake,
+                Duration::from_secs(2),
+                0,
+            );
+        let startup_deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_frame_pts = None;
+        while Instant::now() < startup_deadline {
+            let event = session.try_next_event()?;
+            let snapshot = session.snapshot();
+            fail_on_live_error(event.as_ref(), &snapshot)?;
+            if let Some(SessionEvent::Frame { pts, .. }) = event {
+                last_frame_pts = Some(pts);
+            }
+            let observation = session.gst_observation();
+            if last_frame_pts.is_some()
+                && observation.is_live_known
+                && observation.is_live
+                && observation.seekability_known
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pre_gap_frame = last_frame_pts.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "live HLS did not produce a frame")
+        })?;
+        let pre_gap_sequence = live_control.highest_served_sequence().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "live HLS did not serve a media segment",
+            )
+        })?;
+        let observation = session.gst_observation();
+        assert!(
+            observation.is_live_known,
+            "GStreamer live query did not complete"
+        );
+        assert!(
+            observation.is_live,
+            "GStreamer did not report a live pipeline"
+        );
+        assert!(observation.seekability_known);
+        assert!(observation.frame_mailbox_occupancy <= FRAME_QUEUE_CAPACITY);
+        assert_eq!(observation.dropped_frames, session.dropped_frame_count());
+        let initial_pipeline_latency = observation.pipeline_latency.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GStreamer did not report pipeline latency for live HLS",
+            )
+        })?;
+        assert!(initial_pipeline_latency <= latency_bound);
+        assert!(
+            observation.seekable,
+            "sliding live HLS did not report its DVR window as seekable"
+        );
+        let initial_qos_events = observation.qos_events;
+        let initial_dropped_frames = observation.dropped_frames;
+
+        let dropped_before_poll_pause = session.dropped_frame_count();
+        thread::sleep(Duration::from_millis(250));
+        let dropped_after_poll_pause = session.dropped_frame_count();
+        assert!(
+            dropped_after_poll_pause > dropped_before_poll_pause,
+            "live mailbox did not drop a frame while polling was paused"
+        );
+        let _ = session.try_next_event()?;
+
+        live_control.set_outage(true);
+        let outage_deadline = Instant::now() + Duration::from_millis(1250);
+        while Instant::now() < outage_deadline {
+            let event = session.try_next_event()?;
+            let snapshot = session.snapshot();
+            fail_on_live_error(event.as_ref(), &snapshot)?;
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            live_control.outage_seen(),
+            "controlled live outage did not handle a request"
+        );
+        live_control.set_outage(false);
+        let recovery_deadline = Instant::now() + Duration::from_secs(10);
+        let mut recovery_sequence = None;
+        let mut recovery_sequence_observed_at = None;
+        let mut recovered = false;
+        while Instant::now() < recovery_deadline {
+            let event_observed_at = Instant::now();
+            let event = session.try_next_event()?;
+            let snapshot = session.snapshot();
+            fail_on_live_error(event.as_ref(), &snapshot)?;
+            if recovery_sequence.is_none() {
+                if let Some(sequence) = live_control.highest_served_sequence() {
+                    if sequence > pre_gap_sequence {
+                        recovery_sequence = Some(sequence);
+                        recovery_sequence_observed_at = Some(Instant::now());
+                    }
+                }
+            }
+            if let Some(SessionEvent::Frame { pts, .. }) = event {
+                recovered = recovery_sequence_observed_at
+                    .is_some_and(|observed_at| event_observed_at >= observed_at)
+                    && pts > pre_gap_frame;
+            }
+            let observation = session.gst_observation();
+            assert!(observation.frame_mailbox_occupancy <= FRAME_QUEUE_CAPACITY);
+            if recovered {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            recovery_sequence.is_some_and(|sequence| sequence > pre_gap_sequence),
+            "live recovery did not serve a higher media sequence"
+        );
+        assert!(
+            recovered,
+            "live recovery did not deliver a later frame after the higher sequence response"
+        );
+        let recovered_observation = session.gst_observation();
+        assert!(recovered_observation.frame_mailbox_occupancy <= FRAME_QUEUE_CAPACITY);
+        assert!(recovered_observation.qos_events >= initial_qos_events);
+        assert!(recovered_observation.dropped_frames >= initial_dropped_frames);
+        let recovered_pipeline_latency =
+            recovered_observation.pipeline_latency.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "GStreamer stopped reporting live HLS pipeline latency",
+                )
+            })?;
+        assert!(recovered_pipeline_latency <= latency_bound);
+        Ok(())
+    }
+
     fn test_frame_with_generation(frame_id: u64, stream_generation: u64) -> Frame {
         match NativeFrameLease::new(
             NativeFrameDescriptor {
@@ -2183,6 +2810,71 @@ mod tests {
     }
 
     #[test]
+    fn nonterminal_error_does_not_change_snapshot_state() {
+        let state = Arc::new(SnapshotState::new());
+        let (control_sender, control_receiver) = control_channels();
+        let mut sequence = 7;
+
+        assert!(publish_nonterminal_error(
+            &control_sender,
+            &mut sequence,
+            SessionError::Unsupported("not seekable".into()),
+        ));
+        assert_eq!(sequence, 8);
+        assert!(matches!(
+            &state.snapshot.read().state,
+            SessionState::Loading
+        ));
+
+        match control_receiver.error.try_recv() {
+            Ok(event) => {
+                assert_eq!(event.sequence, 7);
+                assert!(matches!(
+                    event.event,
+                    SessionEvent::Error(SessionError::Unsupported(message))
+                        if message == "not seekable"
+                ));
+            }
+            Err(error) => panic!("nonterminal error event missing: {error}"),
+        }
+    }
+
+    #[test]
+    fn live_gap_deadline_arms_once_after_media_and_expires_without_buffering_reset() {
+        let base = Instant::now();
+        let timeout = Duration::from_secs(2);
+        let mut gap = LiveGapDeadline::default();
+
+        assert!(!gap.expired(base, true, true, timeout));
+        assert!(gap.deadline.is_none());
+        gap.observe_media_progress(false, true, true);
+        assert!(!gap.live_media_seen);
+        gap.observe_media_progress(true, true, true);
+        assert!(!gap.expired(base, true, true, timeout));
+        let deadline = gap.deadline;
+        assert_eq!(deadline, Some(base + timeout));
+
+        // A buffering poll leaves the same absolute deadline in place.
+        assert!(!gap.expired(base + Duration::from_secs(1), true, true, timeout));
+        assert_eq!(gap.deadline, deadline);
+
+        // A later audio/video progress update clears the old deadline, so
+        // continuous media cannot be mistaken for a gap.
+        gap.observe_media_progress(true, true, true);
+        assert!(gap.deadline.is_none());
+        assert!(!gap.expired(base + Duration::from_secs(1), true, true, timeout));
+        assert_eq!(gap.deadline, Some(base + Duration::from_secs(3)));
+
+        // Pausing disarms the old deadline; resuming starts a fresh absolute
+        // timeout instead of inheriting time spent paused.
+        assert!(!gap.expired(base + Duration::from_secs(2), false, true, timeout));
+        assert!(gap.deadline.is_none());
+        assert!(!gap.expired(base + Duration::from_secs(2), true, true, timeout));
+        assert_eq!(gap.deadline, Some(base + Duration::from_secs(4)));
+        assert!(gap.expired(base + Duration::from_secs(4), true, true, timeout));
+    }
+
+    #[test]
     fn presentation_decision_keeps_non_frames_on_hold() {
         let decision = PresentationDecision::from_event(Some(SessionEvent::Ended), true);
         assert!(matches!(decision, PresentationDecision::Hold));
@@ -2238,12 +2930,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_frame_refresh_keeps_latest_after_control_event() {
+    fn frame_mailbox_stays_single_slot_while_control_event_is_pending() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
         let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (control_sender, control_receiver) = control_channels();
         let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
+        let frame_drop_receiver = frame_receiver.clone();
         let state = Arc::new(SnapshotState::new());
         let dropped_frames = Arc::new(AtomicU64::new(0));
         let audio_handle = AudioHandle::new();
@@ -2257,6 +2950,7 @@ mod tests {
             state,
             audio_handle,
             dropped_frames: Arc::clone(&dropped_frames),
+            last_delivered_sequence: None,
             pending_metadata: None,
             pending_audio_tracks: None,
             pending_audio_selection: None,
@@ -2264,7 +2958,6 @@ mod tests {
             pending_error: None,
             pending_terminal: None,
             pending_transient: None,
-            pending_frame: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2275,16 +2968,32 @@ mod tests {
             replay_pending: false,
         };
 
-        assert!(frame_sender
-            .send(SequencedEvent {
+        assert!(send_frame(
+            &frame_sender,
+            &frame_drop_receiver,
+            SequencedEvent {
                 sequence: 1,
                 event: SessionEvent::Frame {
                     pts: Duration::from_millis(1),
                     frame: test_frame(1),
                 },
-            })
-            .is_ok());
-        session.fill_pending();
+            },
+            &dropped_frames,
+        ));
+        assert!(send_frame(
+            &frame_sender,
+            &frame_drop_receiver,
+            SequencedEvent {
+                sequence: 2,
+                event: SessionEvent::Frame {
+                    pts: Duration::from_millis(2),
+                    frame: test_frame(2),
+                },
+            },
+            &dropped_frames,
+        ));
+        assert_eq!(dropped_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(session.frame_receiver.len(), FRAME_QUEUE_CAPACITY);
 
         assert!(send_control(
             &control_sender,
@@ -2295,15 +3004,6 @@ mod tests {
                 },
             }
         ));
-        assert!(frame_sender
-            .send(SequencedEvent {
-                sequence: 2,
-                event: SessionEvent::Frame {
-                    pts: Duration::from_millis(2),
-                    frame: test_frame(2),
-                },
-            })
-            .is_ok());
 
         assert!(matches!(
             session.try_next_event(),
@@ -2311,12 +3011,109 @@ mod tests {
                 state: SessionState::Ready
             }))
         ));
+        assert_eq!(session.frame_receiver.len(), FRAME_QUEUE_CAPACITY);
+        assert_eq!(session.gst_observation().frame_mailbox_occupancy, 1);
         let next = session.try_next_event();
         assert!(matches!(
             next,
             Ok(Some(SessionEvent::Frame { frame, .. })) if frame.descriptor.frame_id == 2
         ));
+        assert_eq!(session.frame_receiver.len(), 0);
+        assert_eq!(session.gst_observation().frame_mailbox_occupancy, 0);
         assert_eq!(dropped_frames.load(Ordering::Relaxed), 1);
+
+        drop(frame_drop_receiver);
+        drop(frame_sender);
+        assert!(matches!(session.try_next_event(), Ok(None)));
+        assert!(session.worker_disconnected);
+    }
+
+    #[test]
+    fn control_sequence_drops_older_queued_frame_and_allows_later_frame() {
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
+        let (control_sender, control_receiver) = control_channels();
+        let (frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
+        let frame_drop_receiver = frame_receiver.clone();
+        let dropped_frames = Arc::new(AtomicU64::new(0));
+        let mut session = GstMediaSession {
+            commands,
+            command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver: generation_receiver.clone(),
+            control_receiver,
+            pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
+            pending_state: None,
+            pending_error: None,
+            pending_terminal: None,
+            pending_transient: None,
+            frame_receiver,
+            state: Arc::new(SnapshotState::new()),
+            audio_handle: AudioHandle::new(),
+            dropped_frames: Arc::clone(&dropped_frames),
+            last_delivered_sequence: None,
+            has_presented_frame: false,
+            worker: None,
+            worker_disconnected: false,
+            lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
+            lifecycle_control: GstLifecycleControl::new(),
+            stream_generation: 0,
+            latest_requested_generation: 0,
+            replay_pending: false,
+        };
+
+        assert!(send_frame(
+            &frame_sender,
+            &frame_drop_receiver,
+            SequencedEvent {
+                sequence: 1,
+                event: SessionEvent::Frame {
+                    pts: Duration::from_millis(1),
+                    frame: test_frame(1),
+                },
+            },
+            &dropped_frames,
+        ));
+        assert!(send_control(
+            &control_sender,
+            SequencedEvent {
+                sequence: 2,
+                event: SessionEvent::StateChanged {
+                    state: SessionState::Ready,
+                },
+            }
+        ));
+        assert!(matches!(
+            session.try_next_event(),
+            Ok(Some(SessionEvent::StateChanged {
+                state: SessionState::Ready
+            }))
+        ));
+        assert_eq!(session.frame_receiver.len(), 1);
+        assert!(matches!(session.try_next_event(), Ok(None)));
+        assert_eq!(dropped_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(session.frame_receiver.len(), 0);
+
+        assert!(send_frame(
+            &frame_sender,
+            &frame_drop_receiver,
+            SequencedEvent {
+                sequence: 3,
+                event: SessionEvent::Frame {
+                    pts: Duration::from_millis(3),
+                    frame: test_frame(3),
+                },
+            },
+            &dropped_frames,
+        ));
+        assert!(matches!(
+            session.try_next_event(),
+            Ok(Some(SessionEvent::Frame { frame, .. })) if frame.descriptor.frame_id == 3
+        ));
+        assert_eq!(session.last_delivered_sequence, Some(3));
     }
 
     #[test]
@@ -2349,6 +3146,7 @@ mod tests {
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
+            last_delivered_sequence: None,
             pending_metadata: None,
             pending_audio_tracks: None,
             pending_audio_selection: None,
@@ -2356,7 +3154,6 @@ mod tests {
             pending_error: None,
             pending_terminal: None,
             pending_transient: None,
-            pending_frame: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2412,6 +3209,7 @@ mod tests {
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
+            last_delivered_sequence: None,
             pending_metadata: None,
             pending_audio_tracks: None,
             pending_audio_selection: None,
@@ -2419,7 +3217,6 @@ mod tests {
             pending_error: None,
             pending_terminal: None,
             pending_transient: None,
-            pending_frame: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2447,6 +3244,64 @@ mod tests {
     }
 
     #[test]
+    fn query_confirmed_nonseekable_seek_is_immediate_and_nonterminal() {
+        let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
+        let command_drop_receiver = command_receiver.clone();
+        let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
+        let generation_drop_receiver = generation_receiver.clone();
+        let (_control_sender, control_receiver) = control_channels();
+        let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
+        let state = Arc::new(SnapshotState::new());
+        state.is_live.store(true, Ordering::Relaxed);
+        state.is_live_known.store(true, Ordering::Release);
+        state.seekable.store(false, Ordering::Relaxed);
+        state.seekability_known.store(true, Ordering::Release);
+        let mut session = GstMediaSession {
+            commands,
+            command_drop_receiver,
+            generation_commands,
+            generation_drop_receiver,
+            control_receiver,
+            frame_receiver,
+            state: Arc::clone(&state),
+            audio_handle: AudioHandle::new(),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            last_delivered_sequence: None,
+            pending_metadata: None,
+            pending_audio_tracks: None,
+            pending_audio_selection: None,
+            pending_state: None,
+            pending_error: None,
+            pending_terminal: None,
+            pending_transient: None,
+            has_presented_frame: false,
+            worker: None,
+            worker_disconnected: false,
+            lifecycle_timeout: DEFAULT_LIFECYCLE_TIMEOUT,
+            lifecycle_control: GstLifecycleControl::new(),
+            stream_generation: 0,
+            latest_requested_generation: 0,
+            replay_pending: false,
+        };
+
+        assert!(matches!(
+            session.command(SessionCommand::Seek {
+                position: Duration::from_secs(1),
+            }),
+            Err(SessionError::Unsupported(message))
+                if message == "GStreamer reported a non-seekable stream"
+        ));
+        assert!(matches!(
+            generation_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert!(!matches!(
+            state.snapshot.read().state,
+            SessionState::Error(_)
+        ));
+    }
+
+    #[test]
     fn duplicate_play_while_ended_keeps_one_replay_generation_pending() {
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let command_drop_receiver = command_receiver.clone();
@@ -2465,6 +3320,7 @@ mod tests {
             state,
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
+            last_delivered_sequence: None,
             pending_metadata: None,
             pending_audio_tracks: None,
             pending_audio_selection: None,
@@ -2472,7 +3328,6 @@ mod tests {
             pending_error: None,
             pending_terminal: None,
             pending_transient: None,
-            pending_frame: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2499,6 +3354,7 @@ mod tests {
         let command_drop_receiver = command_receiver.clone();
         let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
         let (_control_sender, control_receiver) = control_channels();
+        let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         for _ in 0..COMMAND_QUEUE_CAPACITY {
             assert!(commands.send(SessionCommand::Pause).is_ok());
         }
@@ -2515,11 +3371,11 @@ mod tests {
             pending_error: None,
             pending_terminal: None,
             pending_transient: None,
-            frame_receiver: crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY).1,
+            frame_receiver,
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_frame: None,
+            last_delivered_sequence: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2549,6 +3405,7 @@ mod tests {
             assert!(commands.send(SessionCommand::Pause).is_ok());
         }
         let lifecycle_control = GstLifecycleControl::new();
+        let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver,
@@ -2562,11 +3419,11 @@ mod tests {
             pending_error: None,
             pending_terminal: None,
             pending_transient: None,
-            frame_receiver: crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY).1,
+            frame_receiver,
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_frame: None,
+            last_delivered_sequence: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2706,6 +3563,7 @@ mod tests {
 
         let (commands, command_receiver) = crossbeam_channel::bounded(COMMAND_QUEUE_CAPACITY);
         let (generation_commands, generation_receiver) = crossbeam_channel::bounded(1);
+        let (_frame_sender, frame_receiver) = crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY);
         let mut session = GstMediaSession {
             commands,
             command_drop_receiver: command_receiver.clone(),
@@ -2719,11 +3577,11 @@ mod tests {
             pending_error: None,
             pending_terminal: None,
             pending_transient: None,
-            frame_receiver: crossbeam_channel::bounded(FRAME_QUEUE_CAPACITY).1,
+            frame_receiver,
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_frame: None,
+            last_delivered_sequence: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2774,7 +3632,7 @@ mod tests {
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_frame: None,
+            last_delivered_sequence: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,
@@ -2880,7 +3738,7 @@ mod tests {
             state: Arc::new(SnapshotState::new()),
             audio_handle: AudioHandle::new(),
             dropped_frames: Arc::new(AtomicU64::new(0)),
-            pending_frame: None,
+            last_delivered_sequence: None,
             has_presented_frame: false,
             worker: None,
             worker_disconnected: false,

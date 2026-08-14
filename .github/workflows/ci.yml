@@ -55,9 +55,12 @@ jobs:
             libspeechd-dev libxkbcommon-dev libssl-dev libunwind-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-libav ffmpeg \
             libasound2-dev libavutil-dev libavformat-dev libavcodec-dev \
             libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev \
             libclang-dev
+      - name: Generate deterministic fixtures
+        run: ./fixtures/generate.sh
       - name: Build
         run: cargo build --package lumina-video-core --package lumina-video-native-frame --package lumina-video-gst --package lumina-video-wgpu --package lumina-video-gpui --package lumina-video-demo --verbose
       - name: Run tests
