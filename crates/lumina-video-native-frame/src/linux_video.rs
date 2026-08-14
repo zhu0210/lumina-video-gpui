@@ -426,13 +426,10 @@ impl ZeroCopyGStreamerDecoder {
     /// uridecodebin → videoconvert → video/x-raw,format=NV12 → appsink
     /// ```
     pub fn new(url: &str) -> Result<Self, VideoError> {
-        // Initialize vendored runtime environment before GStreamer init
+        // Validate the launcher-established runtime contract before GStreamer init
         #[cfg(feature = "vendored-runtime")]
         {
-            let runtime = crate::vendored_runtime::VendoredRuntime::new();
-            if !runtime.init() {
-                tracing::warn!("vendored-runtime: vendor directory not found; falling back to system libraries");
-            }
+            crate::vendored_runtime::validate().map_err(VideoError::DecoderInit)?;
         }
 
         gst::init().map_err(|e| VideoError::DecoderInit(format!("GStreamer init failed: {e}")))?;

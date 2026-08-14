@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "gstreamer": {
+    "version": "1.28.6",
+    "source": {
+      "url": "https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz",
+      "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca"
+    }
+  },
+  "sources": {
+    "gst_libav": {
+      "package": "gst-libav-1.0",
+      "filename": "gst-libav-1.28.6.tar.xz",
+      "url": "https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.28.6.tar.xz",
+      "sha256": "71e6eafb4fff2a66d1bb0ba8d078224dfe7e3397307d8c0bba3dc23606e08f51"
+    },
+    "zlib": {
+      "version": "1.3.1",
+      "filename": "zlib-1.3.1.tar.gz",
+      "url": "https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz",
+      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+    }
+  },
+  "cerbero": {
+    "repository": "https://gitlab.freedesktop.org/gstreamer/cerbero.git",
+    "tag": "1.28.6",
+    "tag_object": "78666745b34b6245a85510ac47a03a5033af4711",
+    "commit": "59548269f4fd0f701818f0bafdb102959ec81e65",
+    "archive": {
+      "url": "https://gitlab.freedesktop.org/gstreamer/cerbero/-/archive/1.28.6/cerbero-1.28.6.tar.gz",
+      "sha256": "16cea2f8c34370f7f1e5774c4c4f66927659c354f6f90ce0e13d41cf80cc34da"
+    }
+  },
+  "target": {
+    "os": "linux",
+    "architecture": "x86_64",
+    "distribution": "ubuntu",
+    "distribution_version": "24.04",
+    "glibc": "2.39"
+  },
+  "builder": {
+    "image": "ubuntu@sha256:019e8eb29a85e74d64925745884f2ec79aa27e3feab36353d24656f4d6b89467",
+    "platform": "linux/amd64"
+  },
+  "packages": [
+    "gstreamer-1.0",
+    "gstreamer-1.0-libav"
+  ],
+  "artifact": {
+    "type": "tarball",
+    "compression": "xz",
+    "split": false,
+    "archive_layout": {
+      "source_libdir": "lib/x86_64-linux-gnu",
+      "runtime_libdir": "lib/x86_64-linux-gnu",
+      "package_roots": {
+        "gstreamer-1.0": [
+          "bin",
+          "etc",
+          "lib",
+          "libexec",
+          "share"
+        ],
+        "gstreamer-1.0-libav": [
+          "lib"
+        ]
+      }
+    }
+  },
+  "variants": [
+    "norust"
+  ],
+  "required_elements": [
+    {
+      "name": "playbin3",
+      "filename": "libgstplayback.so",
+      "purpose": "playback graph"
+    },
+    {
+      "name": "qtdemux",
+      "filename": "libgstisomp4.so",
+      "purpose": "MP4 demux"
+    },
+    {
+      "name": "h264parse",
+      "filename": "libgstvideoparsersbad.so",
+      "purpose": "H.264 parser"
+    },
+    {
+      "name": "avdec_h264",
+      "filename": "libgstlibav.so",
+      "purpose": "H.264 decoder"
+    },
+    {
+      "name": "aacparse",
+      "filename": "libgstaudioparsers.so",
+      "purpose": "AAC parser"
+    },
+    {
+      "name": "avdec_aac",
+      "filename": "libgstlibav.so",
+      "purpose": "AAC decoder"
+    },
+    {
+      "name": "fakesink",
+      "filename": "libgstcoreelements.so",
+      "purpose": "headless smoke sink"
+    }
+  ]
+}

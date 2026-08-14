@@ -1169,13 +1169,10 @@ impl GStreamerDecoder {
             return Err(VideoError::DecoderInit("lifecycle cancelled".into()));
         }
 
-        // Initialize vendored runtime environment before GStreamer init
+        // Validate the launcher-established runtime contract before GStreamer init
         #[cfg(feature = "vendored-runtime")]
         {
-            let runtime = crate::vendored_runtime::VendoredRuntime::new();
-            if !runtime.init() {
-                tracing::warn!("vendored-runtime: vendor directory not found; falling back to system libraries");
-            }
+            crate::vendored_runtime::validate().map_err(VideoError::DecoderInit)?;
         }
 
         // Initialize GStreamer (safe to call multiple times)

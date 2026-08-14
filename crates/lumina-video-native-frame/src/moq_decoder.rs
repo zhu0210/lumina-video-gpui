@@ -4023,7 +4023,12 @@ impl MoqGStreamerDecoder {
         use gstreamer::prelude::*;
         use gstreamer_app as gst_app;
 
-        // Initialize GStreamer (safe to call multiple times)
+        // Validate the launcher-established runtime contract before GStreamer init
+        #[cfg(all(target_os = "linux", feature = "vendored-runtime"))]
+        {
+            crate::vendored_runtime::validate().map_err(VideoError::DecoderInit)?;
+        }
+
         gst::init().map_err(|e| VideoError::DecoderInit(format!("GStreamer init failed: {e}")))?;
 
         // Parse the MoQ URL
