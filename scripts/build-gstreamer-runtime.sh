@@ -1270,6 +1270,117 @@ while IFS=$'\t' read -r component_name component_recipe component_sha component_
         >>"$runtime_source_matches"
 done <"$expected_source_rows"
 
+extract_license() {
+    local archive=$1
+    local member_pattern=$2
+    local destination=$3
+    local member_list temporary
+    local -a matching_members=()
+    member_list="$work_dir/license-members.$RANDOM"
+    if [[ "$archive" == *.zip ]]; then
+        if ! unzip -Z1 "$archive" "$member_pattern" >"$member_list" 2>/dev/null; then
+            rm -f -- "$member_list"
+            fail "license member pattern is absent from $archive: $member_pattern"
+        fi
+    elif ! tar -tf "$archive" --wildcards -- "$member_pattern" >"$member_list" 2>/dev/null; then
+        rm -f -- "$member_list"
+        fail "license member pattern is absent from $archive: $member_pattern"
+    fi
+    mapfile -t matching_members <"$member_list"
+    rm -f -- "$member_list"
+    ((${#matching_members[@]} == 1)) || {
+        fail "license member pattern is not unique in $archive: $member_pattern"
+    }
+    [[ -n "${matching_members[0]}" ]] || fail "license member name is empty in $archive: $member_pattern"
+    [[ "${matching_members[0]}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*(/[A-Za-z0-9][A-Za-z0-9._+-]*)*$ ]] || {
+        fail "archive license member path is unsafe: ${matching_members[0]}"
+    }
+    temporary="$work_dir/license.$RANDOM"
+    if [[ "$archive" == *.zip ]]; then
+        unzip -p "$archive" "${matching_members[0]}" >"$temporary" 2>/dev/null || {
+            rm -f -- "$temporary"
+            fail "license text is missing from $archive: $member_pattern"
+        }
+    else
+        tar -xOf "$archive" -- "${matching_members[0]}" >"$temporary" 2>/dev/null || {
+            rm -f -- "$temporary"
+            fail "license text is missing from $archive: $member_pattern"
+        }
+    fi
+    [[ -s "$temporary" ]] || {
+        rm -f -- "$temporary"
+        fail "license text is empty in $archive: $member_pattern"
+    }
+    mkdir -p "$(dirname -- "$destination")"
+    chmod 0644 -- "$temporary"
+    cp -a -- "$temporary" "$destination"
+    rm -f -- "$temporary"
+}
+
+license_preflight_list="$work_dir/license-preflight.tsv"
+if ! jq -er '
+    [
+      .components[] as $component
+      | (
+          if ($component | has("license_members")) then
+            if (($component.license_members | type) == "array") then $component.license_members
+            else error("license_members must be an array")
+            end
+          else
+            [{member: ($component.license_member // null), output: ($component.license_output // null)}]
+          end
+        ) as $members
+      | if ($members | length) == 0 then
+          error("license member list is empty")
+        elif any($members[];
+          (type != "object")
+          or ((.member | type) != "string")
+          or ((.member | length) == 0)
+          or ((.member | test("^\\*/[A-Za-z0-9][A-Za-z0-9._+-]*(/[A-Za-z0-9][A-Za-z0-9._+-]*)*$")) | not)
+          or ((.member | contains("//")))
+          or ((.member | test("[\\t\\r\\n]")))
+          or any((.member | split("/"))[]; . == "." or . == "..")
+          or ((.output | type) != "string")
+          or ((.output | length) == 0)) then
+          error("license member metadata is incomplete")
+        elif any($members[];
+          ((.output | test("^[A-Za-z0-9][A-Za-z0-9._+-]*$")) | not)
+          or ((.output | test("[\\t\\r\\n]")))) then
+          error("license output is not a safe basename")
+        elif (($members | map(.member) | unique | length) != ($members | length)) then
+          error("license member patterns are duplicated for a component")
+        else
+          $members[] | {component: $component.name, member: .member, output: .output}
+        end
+    ] as $rows
+    | if ($rows | length) == 0 then
+        error("license member manifest is empty")
+      elif (($rows | map(.output) | unique | length) != ($rows | length)) then
+        error("license outputs are duplicated")
+      else
+        $rows[] | [.component, .member, .output] | @tsv
+      end
+' "$lock_file" >"$license_preflight_list"; then
+    fail "lock license member metadata is invalid"
+fi
+license_stage_dir="$work_dir/verified-licenses"
+mkdir -p "$license_stage_dir"
+while IFS=$'\t' read -r component_name license_member license_output; do
+    [[ -n "$component_name" && -n "$license_member" && -n "$license_output" ]] || {
+        fail "component license metadata is incomplete"
+    }
+    case "$license_output" in
+        ""|/*|*/*|.|..|*..*)
+            fail "license output is not a safe basename: $license_output"
+            ;;
+    esac
+    archive_path=${component_archive[$component_name]:-}
+    [[ -f "$archive_path" && ! -L "$archive_path" ]] || {
+        fail "component archive is missing from source cache: $component_name"
+    }
+    extract_license "$archive_path" "$license_member" "$license_stage_dir/$license_output"
+done <"$license_preflight_list"
+
 verify_pulse_archive() {
     local archive=$1 members root meson_file license_file archive_sha
     members="$work_dir/pulseaudio-members"
@@ -1863,38 +1974,16 @@ if [[ -d "$runtime_root/share" ]]; then
         cp -a -- "$license_file" "$license_dir/share/$relative_license"
     done < <(find -P "$runtime_root/share" -type f \( -iname '*copying*' -o -iname '*license*' -o -iname '*notice*' \) -print0)
 fi
-extract_license() {
-    local archive=$1
-    local member_pattern=$2
-    local destination=$3
-    local temporary="$work_dir/license.$RANDOM"
-    if [[ "$archive" == *.zip ]]; then
-        unzip -p "$archive" "$member_pattern" >"$temporary" 2>/dev/null
-    else
-        tar -xOf "$archive" --wildcards "$member_pattern" >"$temporary" 2>/dev/null
-    fi || {
-        rm -f -- "$temporary"
-        fail "license text is missing from $archive: $member_pattern"
-    }
-    [[ -s "$temporary" ]] || {
-        rm -f -- "$temporary"
-        fail "license text is empty in $archive: $member_pattern"
-    }
-    chmod 0644 -- "$temporary"
-    cp -a -- "$temporary" "$destination"
-    rm -f -- "$temporary"
-}
-
 while IFS=$'\t' read -r component_name license_member license_output; do
     [[ -n "$component_name" && -n "$license_member" && -n "$license_output" ]] || {
         fail "component license metadata is incomplete"
     }
-    archive_path=${component_archive[$component_name]:-}
-    [[ -f "$archive_path" ]] || fail "component archive is missing from source cache: $component_name"
-    extract_license "$archive_path" "$license_member" "$license_dir/$license_output"
-done < <(jq -er '.components[] | . as $component |
-    (($component.license_members // [{member: $component.license_member, output: $component.license_output}])[] |
-     [$component.name, .member, .output] | @tsv)' "$lock_file")
+    stage_path="$license_stage_dir/$license_output"
+    [[ -f "$stage_path" && ! -L "$stage_path" ]] || {
+        fail "preflight license text is missing: $license_output"
+    }
+    cp -a -- "$stage_path" "$license_dir/$license_output"
+done <"$license_preflight_list"
 mkdir -p "$license_dir/overlay"
 cp -a -- "$overlay_dir/LICENSE.md" "$license_dir/overlay/LICENSE.md"
 jq -n --argjson components "$(jq -c '.components' "$lock_file")" \

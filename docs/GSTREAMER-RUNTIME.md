@@ -48,6 +48,9 @@ Before packaging, the local AST checks provide friendly diagnostics for the
 reviewed base/good/bad/GStreamer control sets; they are not the security
 boundary. The lock's exact overlay hashes, post-package 21-plugin inventory,
 source/license checks, and artifact audit are authoritative.
+After fetch/source SHA mapping and before offline bootstrap/package build, the formal
+build resolves every lock license member exactly once and stages those bytes;
+license assembly reuses that verified staging area.
 
 The lock section `audit.overlay_inputs` contains exactly 16 regular control files
 under the repo-owned config/package/recipe/patch directories. Build and
