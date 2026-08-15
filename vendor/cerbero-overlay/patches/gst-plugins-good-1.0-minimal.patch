@@ -1,8 +1,6 @@
 --- a/recipes/gst-plugins-good-1.0.recipe
 +++ b/recipes/gst-plugins-good-1.0.recipe
-@@ -4,42 +4,25 @@
-     name = 'gst-plugins-good-1.0'
-     btype = BuildType.MESON
+@@ -6,38 +6,21 @@
      tarball_checksum = 'b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df'
 -    meson_options = {# enabled plugins
 -                     'amrnb': 'enabled',
@@ -59,9 +57,9 @@
 -        Platform.LINUX: ['alsa', 'x11', 'libpulse'],
 +        Platform.LINUX: ['alsa', 'libpulse'],
      }
-
-     files_lang = ['gst-plugins-good-1.0']
-@@ -35,1 +35,10 @@
+@@ -51,2 +34,11 @@
+-
++
 +    files_plugins_lumina = [
 +             '%(libdir)s/gstreamer-1.0/libgstadaptivedemux2%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstaudioparsers%(mext)s',
@@ -72,9 +70,9 @@
 +             '%(libdir)s/gstreamer-1.0/libgstpulse%(mext)s',
 +    ]
      files_plugins_core_devel = [
-     def prepare(self):
-         self.append_env('CFLAGS', '-DLIBSOUP_DOES_NOT_STEAL_OUR_CONTEXT=1')
-
+@@ -240,42 +232,4 @@
+-
++
 -        if self.config.target_platform == Platform.WINDOWS:
 -            self.meson_options['directsound'] = 'enabled'
 -            self.enable_plugin('jack', 'sys')
@@ -90,5 +88,30 @@
 -        self.enable_plugin('video4linux2', 'capture', variant='v4l2', option='v4l2')
 -        self.enable_plugin('ximagesrc', 'capture', variant='x11')
          self.enable_plugin('pulseaudio', 'sys', variant='pulse', option='pulse')
-
-         if self.using_msvc() and self.config.target_arch == Architecture.ARM64:
+-
++
+-        if self.using_msvc() and self.config.target_arch == Architecture.ARM64:
+-            # Needs MinGW
+-            self.disable_plugin('mpg123', 'codecs', dep='mpg123')
+-
+-        # Enable qt5 plugin if possible and selected
+-        can_enable_qt5 = True
+-        if self.config.target_platform == Platform.IOS:
+-            # iOS Qt5 binaries support arm64 and x86
+-            if self.config.target_arch not in (Architecture.ARM64, Architecture.X86_64):
+-                can_enable_qt5 = False
+-        elif self.config.target_platform == Platform.ANDROID:
+-            # Android Qt5 binaries support armv7, arm64, x86
+-            if self.config.target_arch == Architecture.X86_64:
+-                can_enable_qt5 = False
+-        if can_enable_qt5:
+-            self.enable_plugin('qmlgl', 'qt5', 'qt5', option='qt5')
+-
+-        # Enable qt6 plugin if possible and selected
+-        can_enable_qt6 = False
+-        if self.config.target_platform in (Platform.LINUX, Platform.DARWIN, Platform.WINDOWS):
+-            can_enable_qt6 = True
+-        if can_enable_qt6:
+-            self.enable_plugin('qml6', 'qt6', 'qt6', option='qt6')
+-
+         if self.config.target_platform != Platform.LINUX:

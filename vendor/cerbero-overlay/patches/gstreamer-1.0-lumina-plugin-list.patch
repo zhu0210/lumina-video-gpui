@@ -1,7 +1,23 @@
 --- a/recipes/gstreamer-1.0.recipe
 +++ b/recipes/gstreamer-1.0.recipe
-@@ -23,1 +23,4 @@
+@@ -20,6 +20,9 @@
+         '%(libdir)s/gstreamer-1.0/libgstcoreelements%(mext)s',
+         '%(libdir)s/gstreamer-1.0/libgstcoretracers%(mext)s'
+     ]
 +    files_plugins_lumina = [
 +        '%(libdir)s/gstreamer-1.0/libgstcoreelements%(mext)s',
 +    ]
      files_plugins_core_devel = [
+         '%(libdir)s/gstreamer-1.0/libgstcoreelements.a', '%(libdir)s/gstreamer-1.0/libgstcoreelements.la',
+         '%(libdir)s/gstreamer-1.0/libgstcoretracers.a', '%(libdir)s/gstreamer-1.0/libgstcoretracers.la',
+@@ -73,9 +76,6 @@
+         else:
+             self.meson_options['libunwind'] = 'disabled'
+-
++
+-        if self.using_msvc():
+-            self.meson_options['dbghelp'] = 'enabled'
+-
+         # Ship the PTP helper process if the rust variant is enabled and this
+         # is not a mobile platform.
+         if self.config.variants.rust and \

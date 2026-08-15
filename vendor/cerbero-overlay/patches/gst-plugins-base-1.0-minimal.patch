@@ -1,6 +1,6 @@
 --- a/recipes/gst-plugins-base-1.0.recipe
 +++ b/recipes/gst-plugins-base-1.0.recipe
-@@ -5,23 +5,20 @@
+@@ -5,16 +5,16 @@
      name = 'gst-plugins-base-1.0'
      btype = BuildType.MESON
      tarball_checksum = '0ba699c7c6c66f4ba640be78cb38a24715add9683f3e3a199f5369dc5a4f04ac'
@@ -9,21 +9,24 @@
 -                     'gl-graphene': 'enabled',
 -                     'gl-png': 'enabled',
 -                     'gl-jpeg': 'enabled',
-+    meson_options = {# only Ogg/Opus playback codecs are selected
+-                     'ogg': 'enabled',
++    meson_options = {# only Opus playback is selected
 +                     'gl': 'disabled',
 +                     'gl-graphene': 'disabled',
 +                     'gl-png': 'disabled',
 +                     'gl-jpeg': 'disabled',
-                      'ogg': 'enabled',
++                     'ogg': 'disabled',
                       'opus': 'enabled',
 -                     'pango': 'enabled',
 -                     'theora': 'enabled',
 -                     'vorbis': 'enabled',
--                     # disabled plugins
 +                     'pango': 'disabled',
 +                     'theora': 'disabled',
 +                     'vorbis': 'disabled',
+                      # disabled plugins
                       'tremor': 'disabled'}
+     deps = ['glib', 'gstreamer-1.0', 'libogg', 'pango', 'libtheora',
+@@ -20,6 +20,4 @@
 -    deps = ['glib', 'gstreamer-1.0', 'libogg', 'pango', 'libtheora',
 -            'libvorbis', 'zlib', 'orc', 'opus', 'graphene',
 -            'libjpeg-turbo', 'libpng']
@@ -32,9 +35,12 @@
 -        Platform.LINUX: ['alsa', 'libdrm', 'x11'],
 +        Platform.LINUX: ['alsa'],
      }
-
+@@ -25,3 +25,3 @@
+     }
+-
++
      files_bins = ['gst-discoverer-1.0', 'gst-play-1.0', 'gst-device-monitor-1.0']
-@@ -53,1 +53,11 @@
+@@ -56,1 +54,12 @@
 +    files_plugins_lumina = [
 +             '%(libdir)s/gstreamer-1.0/libgstplayback%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstopus%(mext)s',
@@ -45,12 +51,11 @@
 +             '%(libdir)s/gstreamer-1.0/libgstaudioresample%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstvolume%(mext)s',
 +    ]
++
      files_plugins_core_devel = [
-     ]
-
+@@ -176,5 +184,2 @@
      def prepare(self):
 -        self.enable_plugin('cdparanoia', 'sys', 'cdparanoia', dep='cdparanoia')
 -        self.enable_plugin('ximagesink', 'sys', 'x11', option='x11')
 -        self.enable_plugin('xvimagesink', 'sys', 'x11', option='xvideo')
          if self.config.target_platform == Platform.LINUX:
-             self.enable_plugin('alsa', 'sys', 'alsa')

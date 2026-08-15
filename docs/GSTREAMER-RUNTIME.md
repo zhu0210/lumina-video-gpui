@@ -26,6 +26,8 @@ pinned recipe, checks the actual FFmpeg options, and verifies actual plugin
 licenses with isolated `gst-inspect-1.0`.
 The audit parses each plugin's space-delimited `License` and `Source module`
 fields, accepts only raw `LGPL` or `MIT/X11`, and records normalized SPDX values.
+Before packaging, independent AST gates fail closed on every plugin enable/disable
+control and require the reviewed base/good/bad/GStreamer control sets.
 
 The `nogi` and `nounwind` variants disable GObject introspection and unwind
 inputs, and the GStreamer recipe's Cerbero bash-completion integration is
