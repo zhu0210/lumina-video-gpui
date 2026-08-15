@@ -82,6 +82,10 @@ under the repo-owned config/package/recipe/patch directories. Build and
 discovery materialize that list and verify every path and SHA-256 before using
 any Cerbero input; extra, missing, or tampered controls fail.
 
+Runtime/source manifest schema 2 is the first published audited-runtime schema;
+its final `bundled_files` semantics include typed regular files and symlinks,
+with link targets covered by both the manifest and vendor-tree digest.
+
 The `nogi` and `nounwind` variants disable GObject introspection and unwind
 inputs, and the GStreamer recipe's Cerbero bash-completion integration is
 disabled. These are not

@@ -2402,18 +2402,20 @@ file_inventory=$(cd "$bundle" &&
         fi
     done | jq -Rn '[inputs | split("\t") | {kind: .[0], path: .[1], sha256: .[2], component: .[3]} + if .[0] == "symlink" then {link_target: .[4]} else {} end]')
 shared_library_allowlist=$(jq -c '.audit.shared_library_allowlist' "$lock_file")
-jq -e --arg prefix "vendor/linux-x86_64/$archive_runtime_libdir/" \
-    --argjson expected "$shared_library_allowlist" '
-    [ .[]
-      | select(.path | startswith($prefix))
-      | .path = (.path | ltrimstr($prefix))
-      | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
-      | .path |= sub("\\.so(\\..*)?$"; ".so")
-      | {component, path}
-    ] as $actual
-    | all($actual | group_by(.path)[]; (map(.component) | unique | length) == 1)
-      and (($actual | unique_by(.path) | sort_by(.path)) == ($expected | sort_by(.path)))
-' <<<"$file_inventory" >/dev/null || fail "bundled shared-library owner mapping differs from the lock allowlist"
+shared_library_prefix="vendor/linux-x86_64/$archive_runtime_libdir/"
+if ! manifest_shared_entries=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
+    'include "gstreamer-shared-library-manifest"; shared_library_entries($prefix)' <<<"$file_inventory"); then
+    fail "bundled shared-library manifest entries are malformed"
+fi
+expected_shared_entries=$(jq -c '[.entries[] | {path, kind, link_target: (.link_target // null)}] | sort_by(.path)' \
+    "$shared_library_inventory_json")
+[[ "$manifest_shared_entries" == "$expected_shared_entries" ]] || fail "bundled shared-library manifest entries differ from the package"
+if ! manifest_shared_owners=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
+    'include "gstreamer-shared-library-manifest"; shared_library_owners($prefix)' <<<"$file_inventory"); then
+    fail "bundled shared-library owner mapping is ambiguous"
+fi
+[[ "$manifest_shared_owners" == "$(jq -c 'sort_by(.path)' <<<"$shared_library_allowlist")" ]] || \
+    fail "bundled shared-library owner mapping differs from the lock allowlist"
 plugin_inventory=$(jq -c '.audit.plugin_allowlist' "$lock_file")
 component_inventory=$(jq -c '.components' "$lock_file")
 closure_json=$(jq -Rn '[inputs | split("\t") | {object: .[0], needed: .[1], scope: .[2]}]' <"$closure_tsv")
