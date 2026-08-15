@@ -25,7 +25,7 @@ class Package(package.Package):
         'libffi:libs',
         'pcre2:libs',
         'zlib:libs',
-        'orc:libs',
+        'orc:libs_lumina',
         'libogg:libs',
         'opus:libs',
         'libvpx:libs',

@@ -44,6 +44,8 @@ library and the Pulse private common library. GStreamer core/base use literal
 net, RTP, check, FFT, RTSP, SDP, GL, and app broad-category
 spill is not packaged. Build/discovery compare recipe-derived paths, while
 package and artifact checks reject any missing or extra canonical shared file.
+ORC uses a literal `libs_lumina` category containing only `liborc-0.4`;
+the upstream `liborc-test-0.4` helper remains outside the runtime package.
 
 References: the [Cerbero build guide](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html),
 [GStreamer Cerbero deployment guide](https://gstreamer.freedesktop.org/documentation/deploying/multiplatform-using-cerbero.html),
