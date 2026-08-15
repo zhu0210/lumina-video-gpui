@@ -180,6 +180,17 @@ import sys
 
 tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
 
+def is_recipe_class(node):
+    if not (isinstance(node, ast.ClassDef) and node.name == "Recipe" and len(node.bases) == 1):
+        return False
+    base = node.bases[0]
+    return (isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name)
+            and (base.value.id, base.attr) in (("custom", "GStreamer"), ("recipe", "Recipe")))
+
+recipe_classes = [node for node in tree.body if is_recipe_class(node)]
+recipe_class = recipe_classes[0] if len(recipe_classes) == 1 else None
+recipe_body = recipe_class.body if recipe_class is not None else []
+
 def strings(node):
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return [item.value for item in node.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)]
@@ -207,6 +218,31 @@ def control_error(name):
 def meson_error(name):
     if name not in facts["meson_control_errors"]:
         facts["meson_control_errors"].append(name)
+
+if recipe_class is None:
+    control_error("Recipe class")
+
+self_aliases = {"self"}
+alias_scan_changed = True
+while alias_scan_changed:
+    alias_scan_changed = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if not isinstance(value, ast.Name) or value.id not in self_aliases:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                control_error("self alias")
+                if target.id not in self_aliases:
+                    self_aliases.add(target.id)
+                    alias_scan_changed = True
 
 def string_value(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
@@ -241,7 +277,7 @@ def record_meson_assignment(target, value_node, owner=None):
         allowed_method_meson_attrs.add(id(owner))
     record_meson_state(key, value)
 
-for node in ast.walk(tree):
+for node in recipe_body:
     if isinstance(node, ast.Assign):
         for target in node.targets:
             if not isinstance(target, ast.Name):
@@ -303,14 +339,22 @@ for node in ast.walk(tree):
             control_error(node.id)
         if node.id == "meson_options" and id(node) not in allowed_meson_targets:
             meson_error("meson_options")
-    elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
-        if node.attr.startswith("files_plugins_"):
-            file_error(node.attr)
-        elif node.attr in ("enable_plugin", "disable_plugin"):
-            if id(node) not in allowed_enable_calls:
-                control_error(node.attr)
-        elif node.attr == "meson_options" and id(node) not in allowed_method_meson_attrs:
-            meson_error("meson_options")
+    elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.value.id in self_aliases and node.value.id != "self":
+            if node.attr.startswith("files_plugins_"):
+                file_error(node.attr)
+            elif node.attr in ("enable_plugin", "disable_plugin"):
+                control_error("self alias")
+            elif node.attr == "meson_options":
+                meson_error("self alias")
+        elif node.value.id == "self":
+            if node.attr.startswith("files_plugins_"):
+                file_error(node.attr)
+            elif node.attr in ("enable_plugin", "disable_plugin"):
+                if id(node) not in allowed_enable_calls:
+                    control_error(node.attr)
+            elif node.attr == "meson_options" and id(node) not in allowed_method_meson_attrs:
+                meson_error("meson_options")
 
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         owner = node.func.value
