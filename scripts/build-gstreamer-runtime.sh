@@ -616,9 +616,9 @@ snapshot_source_cache() {
 }
 
 # Bootstrap may populate its own source cache. Snapshot it first, then audit
-# package fetches by recipe, SHA, and archive basename. A component may reuse
-# a bootstrap-fetched archive, but every newly introduced/changed file must
-# still be one of the reviewed component archives.
+# package fetches by locked component SHA. A component may reuse a
+# bootstrap-fetched archive, but every newly introduced/changed file must
+# still be one of the reviewed component archives; basenames are labels only.
 "${cerbero[@]}" fetch-bootstrap --system=no --toolchains=no --build-tools=yes --jobs=2
 bootstrap_source_snapshot="$work_dir/bootstrap-source-cache.tsv"
 snapshot_source_cache "$bootstrap_source_snapshot"
@@ -637,22 +637,52 @@ awk -F '\t' 'NR == FNR { before[$1] = $2; next }
 
 expected_source_rows="$work_dir/expected-source-rows.tsv"
 # Cerbero BaseTarball caches under <local_sources>/<package_name>/<tarball_name>;
-# a recipe may rewrite tarball_name. URL basenames are output labels only.
+# a recipe may rewrite tarball_name. Ownership is SHA-based; URL basenames
+# are output labels only.
 jq -er '.components[] | [.name, .recipe, .sha256, (.source_url | split("/") | last)] | @tsv' \
     "$lock_file" >"$expected_source_rows"
 runtime_source_matches="$work_dir/runtime-source-matches.tsv"
 : >"$runtime_source_matches"
 declare -A component_archive=()
 declare -A component_source_rel=()
+diagnose_source_matches() {
+    local component_name=$1 component_recipe=$2 expected_sha=$3 expected_filename=$4
+    local match_count=$5 snapshot=$6 source_relative source_sha top_cache_dir basename
+    local candidate_count=0
+    printf 'source cache match failure: component=%s recipe=%s expected_sha=%s match_count=%s\n' \
+        "$component_name" "$component_recipe" "$expected_sha" "$match_count" >&2
+    while IFS=$'\t' read -r source_relative source_sha; do
+        [[ -n "$source_relative" ]] || continue
+        top_cache_dir=${source_relative%%/*}
+        basename=${source_relative##*/}
+        if [[ "$source_sha" == "$expected_sha" ||
+              "$top_cache_dir" == "$component_recipe" ||
+              "$top_cache_dir" == "$component_recipe-"* ||
+              "$basename" == "$expected_filename" ]]; then
+            if ((candidate_count < 20)); then
+                printf '  candidate %s\t%s\n' "$source_relative" "$source_sha" >&2
+            fi
+            ((candidate_count += 1))
+        fi
+    done <"$snapshot"
+    if ((candidate_count == 0)); then
+        echo '  candidate <none>' >&2
+    elif ((candidate_count > 20)); then
+        printf '  ... %s additional candidate(s) omitted\n' "$((candidate_count - 20))" >&2
+    fi
+}
 while IFS=$'\t' read -r component_name component_recipe component_sha component_filename; do
     [[ -n "$component_name" && -n "$component_recipe" && -n "$component_sha" && -n "$component_filename" ]] || {
         fail "component source metadata is incomplete"
     }
     mapfile -t source_matches < <(awk -F '\t' -v expected_sha="$component_sha" \
         '($2 == expected_sha) { print $1 }' "$after_runtime_source_snapshot")
-    [[ ${#source_matches[@]} -eq 1 ]] || {
+    match_count=${#source_matches[@]}
+    if ((match_count != 1)); then
+        diagnose_source_matches "$component_name" "$component_recipe" "$component_sha" \
+            "$component_filename" "$match_count" "$after_runtime_source_snapshot"
         fail "Cerbero cache does not contain exactly one audited source archive for $component_name"
-    }
+    fi
     source_relative=${source_matches[0]}
     component_archive["$component_name"]="$source_cache_root/$source_relative"
     component_source_rel["$component_name"]="archives/$component_recipe/$component_filename"
