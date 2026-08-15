@@ -10,9 +10,10 @@ lock_file="$repo_root/vendor/gstreamer-1.0.lock.json"
 cerbero_dir=
 cerbero_archive=
 pipewire_archive=
+pulseaudio_archive=
 
 usage() {
-    echo "Usage: $0 --cerbero-dir DIR --cerbero-archive ARCHIVE --pipewire-archive ARCHIVE [--lock PATH]" >&2
+    echo "Usage: $0 --cerbero-dir DIR --cerbero-archive ARCHIVE --pipewire-archive ARCHIVE --pulseaudio-archive ARCHIVE [--lock PATH]" >&2
     exit 2
 }
 
@@ -32,25 +33,27 @@ while (($#)); do
         --cerbero-dir) (($# >= 2)) || usage; cerbero_dir=$2; shift 2 ;;
         --cerbero-archive) (($# >= 2)) || usage; cerbero_archive=$2; shift 2 ;;
         --pipewire-archive) (($# >= 2)) || usage; pipewire_archive=$2; shift 2 ;;
+        --pulseaudio-archive) (($# >= 2)) || usage; pulseaudio_archive=$2; shift 2 ;;
         *) usage ;;
     esac
 done
-for command_name in curl git jq sha256sum mktemp mv cp rm grep awk sed realpath patch python3 cmp find sort; do
+for command_name in curl git jq sha256sum tar mktemp mv cp rm grep awk sed realpath patch python3 cmp find sort; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
     }
 done
-[[ -n "$cerbero_dir" && -n "$cerbero_archive" && -n "$pipewire_archive" ]] || usage
+[[ -n "$cerbero_dir" && -n "$cerbero_archive" && -n "$pipewire_archive" && -n "$pulseaudio_archive" ]] || usage
 overlay_dir="$repo_root/vendor/cerbero-overlay"
 
 lock_file=$(realpath "$lock_file")
 cerbero_dir=$(realpath "$cerbero_dir")
 cerbero_archive=$(realpath "$cerbero_archive")
 pipewire_archive=$(realpath "$pipewire_archive")
+pulseaudio_archive=$(realpath "$pulseaudio_archive")
 [[ -d "$cerbero_dir/recipes" ]] || { echo "Cerbero tree lacks recipes/: $cerbero_dir" >&2; exit 1; }
-[[ -f "$cerbero_archive" && -f "$pipewire_archive" ]] || {
-    echo "discovery requires local pinned Cerbero and PipeWire archives" >&2
+[[ -f "$cerbero_archive" && -f "$pipewire_archive" && -f "$pulseaudio_archive" ]] || {
+    echo "discovery requires local pinned Cerbero, PipeWire, and PulseAudio archives" >&2
     exit 1
 }
 
@@ -254,6 +257,55 @@ pipewire_tag_commit=$(git ls-remote --tags https://gitlab.freedesktop.org/pipewi
 [[ "$pipewire_tag_commit" == b741e0c74f5436f0c925f7741140db0efd32cf4e ]] || {
     fail "official PipeWire 1.6.8 tag changed"
 }
+pulse_repo=https://gitlab.freedesktop.org/pulseaudio/pulseaudio.git
+pulse_tag=v17.0
+pulse_tag_refs=$(git ls-remote --tags "$pulse_repo" "refs/tags/$pulse_tag" "refs/tags/$pulse_tag^{}")
+pulse_tag_object=$(awk -v ref="refs/tags/$pulse_tag" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
+pulse_tag_commit=$(awk -v ref="refs/tags/$pulse_tag^{}" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
+[[ "$pulse_tag_object" == 16be4f7accce287fd08519591c6356ffa61aaaf1 && \
+   "$pulse_tag_commit" == 1f020889c9aa44ea0f63d7222e8c2b62c3f45f68 ]] || {
+    fail "official PulseAudio v17.0 tag metadata disagrees"
+}
+pulse_signature_json=$(curl -fsSL --max-filesize 1048576 \
+    "https://gitlab.freedesktop.org/api/v4/projects/pulseaudio%2Fpulseaudio/repository/commits/$pulse_tag_commit/signature")
+pulse_signature=$(jq -er 'select(.signature_type == "PGP" and .verification_status == "verified") | .signature_type' \
+    <<<"$pulse_signature_json") || fail "official PulseAudio commit signature is not verified PGP"
+pulse_url="https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/archive/$pulse_tag_commit/pulseaudio-$pulse_tag_commit.tar.gz"
+pulse_sha=$(sha256sum "$pulseaudio_archive" | awk '{ print $1 }')
+pulse_archive_root="pulseaudio-$pulse_tag_commit"
+verify_pulse_archive() {
+    local members root meson_file license_file raw_meson raw_license
+    members="$tmp_dir/pulseaudio-members"
+    if ! tar -tzf "$pulseaudio_archive" >"$members"; then
+        fail "could not list the caller-supplied PulseAudio archive"
+    fi
+    root=$(awk -F/ 'NF { print $1; exit }' "$members")
+    [[ "$root" == "$pulse_archive_root" ]] || fail "PulseAudio archive root disagrees with signed commit"
+    if ! awk -F/ -v expected="$pulse_archive_root" '$1 != expected { invalid = 1 } END { exit invalid ? 1 : 0 }' "$members"; then
+        fail "PulseAudio archive contains an unexpected top-level path"
+    fi
+    if grep -Fx "$pulse_archive_root/.tarball-version" "$members" >/dev/null; then
+        fail "PulseAudio archive unexpectedly contains .tarball-version"
+    fi
+    [[ "$pulse_sha" == 0ccee8a0c9653badc668cf11f0eaad97a1febb85afa82c24c2d1935926446e3b ]] || {
+        fail "caller-supplied PulseAudio archive checksum is not the signed commit archive"
+    }
+    meson_file="$tmp_dir/pulseaudio-meson.build"
+    license_file="$tmp_dir/pulseaudio-LGPL"
+    raw_meson="$tmp_dir/pulseaudio-meson.raw"
+    raw_license="$tmp_dir/pulseaudio-LGPL.raw"
+    tar -xOf "$pulseaudio_archive" "$pulse_archive_root/meson.build" >"$meson_file" || fail "PulseAudio meson.build is missing"
+    tar -xOf "$pulseaudio_archive" "$pulse_archive_root/LGPL" >"$license_file" || fail "PulseAudio LGPL text is missing"
+    curl -fsSL --max-filesize 1048576 \
+        "https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/raw/$pulse_tag_commit/meson.build" >"$raw_meson" || fail "PulseAudio commit meson.build fetch failed"
+    curl -fsSL --max-filesize 1048576 \
+        "https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/raw/$pulse_tag_commit/LGPL" >"$raw_license" || fail "PulseAudio commit LGPL fetch failed"
+    cmp -s "$meson_file" "$raw_meson" || fail "PulseAudio archive meson.build differs from the signed commit"
+    cmp -s "$license_file" "$raw_license" || fail "PulseAudio archive LGPL differs from the signed commit"
+    [[ "$(sha256sum "$meson_file" | awk '{ print $1 }')" == 33318f0c2019939d46ea38acb8a6d1e43198d9d6772a1ef56d1d1618f05a174a ]] || fail "PulseAudio meson.build bytes are not pinned"
+    [[ "$(sha256sum "$license_file" | awk '{ print $1 }')" == a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861 ]] || fail "PulseAudio LGPL bytes are not pinned"
+}
+verify_pulse_archive
 cerbero_archive_url="https://gitlab.freedesktop.org/gstreamer/cerbero/-/archive/${gstreamer_version}/cerbero-${gstreamer_version}.tar.gz"
 cerbero_archive_sha=$(sha256sum "$cerbero_archive" | awk '{ print $1 }')
 pipewire_sha=$(sha256sum "$pipewire_archive" | awk '{ print $1 }')
@@ -281,6 +333,42 @@ while IFS= read -r overlay_recipe; do
     cp -a -- "$overlay_dir/recipes/$overlay_recipe.recipe" "$tmp_dir/recipes/$overlay_recipe.recipe"
     verify_overlay_copy "vendor/cerbero-overlay/recipes/$overlay_recipe.recipe" "$tmp_dir/recipes/$overlay_recipe.recipe"
 done < <(jq -er '.audit.recipe_metadata[] | select(.overlay == true) | .recipe' "$lock_file")
+if ! python3 - "$tmp_dir/recipes/libpulse.recipe" <<'PY'
+import ast
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+recipes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Recipe"]
+if len(recipes) != 1:
+    raise SystemExit("PulseAudio recipe class is not unique")
+base = recipes[0].bases
+if len(base) != 1 or not (
+    isinstance(base[0], ast.Attribute)
+    and isinstance(base[0].value, ast.Name)
+    and base[0].value.id == "recipe"
+    and base[0].attr == "Recipe"
+):
+    raise SystemExit("PulseAudio recipe uses a system or host fallback")
+set_env_calls = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Name) and node.id in {"SystemRecipe", "system_recipe", "allow_system_recipes"}:
+        raise SystemExit("PulseAudio recipe references a system fallback")
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr in {"use_system", "system_recipe", "get_system_recipe"}:
+            raise SystemExit("PulseAudio recipe calls a system fallback")
+        if node.func.attr == "set_env":
+            set_env_calls.append(node)
+if len(set_env_calls) != 1:
+    raise SystemExit("PulseAudio release environment assignment is not unique")
+call = set_env_calls[0]
+if len(call.args) != 2 or any(not isinstance(arg, ast.Constant) or not isinstance(arg.value, str) for arg in call.args):
+    raise SystemExit("PulseAudio release environment assignment is not literal")
+if [arg.value for arg in call.args] != ["GIT_DESCRIBE_FOR_BUILD", "v17.0"]:
+    raise SystemExit("PulseAudio release environment is not v17.0")
+PY
+then
+    fail "pinned PulseAudio recipe is not the exact signed-tag client recipe"
+fi
 while IFS= read -r patch_name; do
     [[ -n "$patch_name" ]] || continue
     patch --directory "$tmp_dir" --batch --forward --fuzz=0 --strip=1 \
@@ -558,6 +646,13 @@ jq \
     --arg pipewire_url "$pipewire_url" \
     --arg pipewire_sha "$pipewire_sha" \
     --arg pipewire_commit "$pipewire_tag_commit" \
+    --arg pulse_url "$pulse_url" \
+    --arg pulse_sha "$pulse_sha" \
+    --arg pulse_tag "$pulse_tag" \
+    --arg pulse_tag_object "$pulse_tag_object" \
+    --arg pulse_tag_commit "$pulse_tag_commit" \
+    --arg pulse_signature "$pulse_signature" \
+    --arg pulse_archive_root "$pulse_archive_root" \
     ' .gstreamer.version = $version
     | .gstreamer.source.url = $gstreamer_url
     | .gstreamer.source.sha256 = $gstreamer_sha
@@ -575,11 +670,13 @@ jq \
         if .recipe == "gstreamer-1.0" then .version = $version | .source_url = $gstreamer_url | .sha256 = $gstreamer_sha
         elif .recipe == "gst-libav-1.0" then .version = $version | .source_url = $libav_url | .sha256 = $libav_sha
         elif .recipe == "pipewire" then .tag_commit = $pipewire_commit | .source_url = $pipewire_url | .sha256 = $pipewire_sha
+        elif .recipe == "libpulse" then .version = "17.0" | .source_url = $pulse_url | .sha256 = $pulse_sha | .tag = $pulse_tag | .tag_object = $pulse_tag_object | .tag_commit = $pulse_tag_commit | .signature = $pulse_signature
         else . end)
     | .audit.recipe_metadata |= map(
         if .recipe == "gstreamer-1.0" then .version = $version | .source_url = $gstreamer_url | .sha256 = $gstreamer_sha
         elif .recipe == "gst-libav-1.0" then .version = $version | .source_url = $libav_url | .sha256 = $libav_sha
         elif .recipe == "pipewire" then .source_url = $pipewire_url | .sha256 = $pipewire_sha
+        elif .recipe == "libpulse" then .version = "17.0" | .source_url = $pulse_url | .sha256 = $pulse_sha | .archive_root = $pulse_archive_root | .tag = $pulse_tag | .tag_object = $pulse_tag_object | .tag_commit = $pulse_tag_commit | .signature = $pulse_signature
         else . end)' "$lock_file" >"$lock_tmp"
 mv -f "$lock_tmp" "$lock_file"
 trap - EXIT

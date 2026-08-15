@@ -1,17 +1,15 @@
-# The upstream Cerbero recipe is a SystemRecipe.  Keep only the Pulse client
-# library in the audited user-space closure; the server and optional backends
-# are intentionally not package inputs.  PulseAudio 17's meson_options.txt
-# declares daemon/tests/man/doxygen as booleans and the optional backends as
-# features, so Cerbero receives 'false' for the former and 'disabled' for the
-# latter.
+# Keep only the Pulse client library in the audited user-space closure; the
+# server and optional backends are intentionally not package inputs. The
+# signed v17.0 tag is acquired from its immutable commit archive, which has
+# no .tarball-version file, so the release-generated version is explicit.
 class Recipe(recipe.Recipe):
     name = 'libpulse'
     version = '17.0'
     stype = SourceType.TARBALL
-    tarball_dirname = 'pulseaudio-%(version)s'
+    tarball_dirname = 'pulseaudio-1f020889c9aa44ea0f63d7222e8c2b62c3f45f68'
     btype = BuildType.MESON
-    url = 'https://freedesktop.org/software/pulseaudio/releases/pulseaudio-17.0.tar.xz'
-    tarball_checksum = '053794d6671a3e397d849e478a80b82a63cb9d8ca296bd35b73317bb5ceb87b5'
+    url = 'https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/archive/1f020889c9aa44ea0f63d7222e8c2b62c3f45f68/pulseaudio-1f020889c9aa44ea0f63d7222e8c2b62c3f45f68.tar.gz'
+    tarball_checksum = '0ccee8a0c9653badc668cf11f0eaad97a1febb85afa82c24c2d1935926446e3b'
     licenses = [License.LGPLv2_1Plus]
     meson_options = {
         'daemon': 'false',
@@ -35,3 +33,6 @@ class Recipe(recipe.Recipe):
     }
     deps = ['libsndfile']
     files_libs = ['libpulse']
+
+    def prepare(self):
+        self.set_env('GIT_DESCRIBE_FOR_BUILD', 'v17.0')

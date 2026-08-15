@@ -15,6 +15,9 @@ inventory change.
 `audit.overlay_inputs` is the single SHA-256 inventory of the 16 regular
 repo-owned Cerbero control files under config, packages, recipes, and patches;
 the build and discovery scripts reject path-set or byte mismatches.
+PulseAudio uses the verified signed `v17.0` tag and peeled commit archive;
+the archive SHA, root, license/meson bytes, and explicit release-generated
+`GIT_DESCRIBE_FOR_BUILD` value are lock-checked before acquisition.
 
 The audited closure is intentionally narrow: only the lock's direct recipe
 categories are built into the single `lumina-audited` package, with exactly 21
@@ -32,7 +35,11 @@ features are disabled, so no recursive codec closure is added.
 Discovery is the only moving-metadata path:
 
 ```bash
-./scripts/discover-gstreamer-lock.sh
+./scripts/discover-gstreamer-lock.sh \
+  --cerbero-dir /path/to/cerbero \
+  --cerbero-archive /path/to/cerbero.tar.gz \
+  --pipewire-archive /path/to/pipewire.tar.gz \
+  --pulseaudio-archive /path/to/pulseaudio.tar.gz
 ```
 
 The formal build reads only the lock, seeds the Cerbero source cache from the
