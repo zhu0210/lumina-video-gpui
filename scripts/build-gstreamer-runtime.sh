@@ -379,7 +379,7 @@ jq -e --arg url "$pulse_url" --arg sha "$pulse_sha" --arg root "$pulse_archive_r
     echo "unsupported PulseAudio tag commit" >&2
     exit 1
 }
-[[ "$pulse_url" == https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/archive/1f020889c9aa44ea0f63d7222e8c2b62c3f45f68/pulseaudio-1f020889c9aa44ea0f63d7222e8c2b62c3f45f68.tar.gz ]] || {
+[[ "$pulse_url" == https://codeload.github.com/pulseaudio/pulseaudio/tar.gz/1f020889c9aa44ea0f63d7222e8c2b62c3f45f68 ]] || {
     echo "unsupported PulseAudio source URL" >&2
     exit 1
 }

@@ -241,18 +241,18 @@ libav_sha=$(curl -fsSL --retry 3 --max-filesize 1048576 "${libav_url}.sha256sum"
 }
 
 cerbero_repo=https://github.com/GStreamer/cerbero.git
-tag_json=$(curl -fsSL --retry 3 --max-filesize 1048576 \
+tag_json=$(curl -fsSL --max-filesize 1048576 \
     "https://api.github.com/repos/GStreamer/cerbero/git/ref/tags/${gstreamer_version}")
 cerbero_api_tag_object=$(jq -er --arg expected_ref "refs/tags/$gstreamer_version" '
     if .ref == $expected_ref and .object.type == "tag" then .object.sha
     else error("Cerbero tag ref is not an annotated tag") end
 ' <<<"$tag_json")
-tag_object_json=$(curl -fsSL --retry 3 --max-filesize 1048576 \
+tag_object_json=$(curl -fsSL --max-filesize 1048576 \
     "https://api.github.com/repos/GStreamer/cerbero/git/tags/$cerbero_api_tag_object")
 cerbero_commit=$(jq -er --arg tag_object "$cerbero_api_tag_object" '
     if .sha == $tag_object and .object.type == "commit" and
        .verification.verified == true and .verification.reason == "valid" and
-       (.verification.signature | type == "string" and length > 0) then .object.sha
+       (.verification.signature | type == "string" and startswith("-----BEGIN PGP SIGNATURE-----")) then .object.sha
     else error("Cerbero tag object is not a verified PGP tag") end
 ' <<<"$tag_object_json")
 tag_refs=$(git ls-remote --tags "$cerbero_repo" "refs/tags/${gstreamer_version}" "refs/tags/${gstreamer_version}^{}")
@@ -273,24 +273,39 @@ pipewire_tag_commit=$(git ls-remote --tags https://gitlab.freedesktop.org/pipewi
 [[ "$pipewire_tag_commit" == b741e0c74f5436f0c925f7741140db0efd32cf4e ]] || {
     fail "official PipeWire 1.6.8 tag changed"
 }
-pulse_repo=https://gitlab.freedesktop.org/pulseaudio/pulseaudio.git
+pulse_repo=https://github.com/pulseaudio/pulseaudio.git
 pulse_tag=v17.0
+pulse_ref_json=$(curl -fsSL --max-filesize 1048576 \
+    "https://api.github.com/repos/pulseaudio/pulseaudio/git/ref/tags/$pulse_tag")
+pulse_api_tag_object=$(jq -er --arg expected_ref "refs/tags/$pulse_tag" '
+    if .ref == $expected_ref and .object.type == "tag" then .object.sha
+    else error("PulseAudio tag ref is not an annotated tag") end
+' <<<"$pulse_ref_json")
+pulse_tag_object_json=$(curl -fsSL --max-filesize 1048576 \
+    "https://api.github.com/repos/pulseaudio/pulseaudio/git/tags/$pulse_api_tag_object")
+pulse_api_tag_commit=$(jq -er --arg tag_object "$pulse_api_tag_object" '
+    if .sha == $tag_object and .tag == "v17.0" and .object.type == "commit" and
+       .object.sha == "1f020889c9aa44ea0f63d7222e8c2b62c3f45f68" and
+       (.verification.signature | type == "string" and startswith("-----BEGIN PGP SIGNATURE-----"))
+    then .object.sha else error("PulseAudio tag lacks the expected PGP signature") end
+' <<<"$pulse_tag_object_json")
 pulse_tag_refs=$(git ls-remote --tags "$pulse_repo" "refs/tags/$pulse_tag" "refs/tags/$pulse_tag^{}")
+pulse_ref_tag_object=$(awk -v ref="refs/tags/$pulse_tag" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
 pulse_tag_object=$(awk -v ref="refs/tags/$pulse_tag" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
 pulse_tag_commit=$(awk -v ref="refs/tags/$pulse_tag^{}" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
-[[ "$pulse_tag_object" == 16be4f7accce287fd08519591c6356ffa61aaaf1 && \
+[[ "$pulse_api_tag_object" == "$pulse_ref_tag_object" && \
+   "$pulse_tag_object" == "$pulse_ref_tag_object" && \
+   "$pulse_tag_object" == 16be4f7accce287fd08519591c6356ffa61aaaf1 && \
+   "$pulse_api_tag_commit" == "$pulse_tag_commit" && \
    "$pulse_tag_commit" == 1f020889c9aa44ea0f63d7222e8c2b62c3f45f68 ]] || {
     fail "official PulseAudio v17.0 tag metadata disagrees"
 }
-pulse_signature_json=$(curl -fsSL --max-filesize 1048576 \
-    "https://gitlab.freedesktop.org/api/v4/projects/pulseaudio%2Fpulseaudio/repository/tags/$pulse_tag/signature")
-pulse_signature=$(jq -er 'if type == "object" and .signature_type == "PGP" then .signature_type else error("tag signature is not PGP") end' \
-    <<<"$pulse_signature_json") || fail "official PulseAudio annotated tag signature is not PGP"
-pulse_url="https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/archive/$pulse_tag_commit/pulseaudio-$pulse_tag_commit.tar.gz"
+pulse_signature=PGP
+pulse_url="https://codeload.github.com/pulseaudio/pulseaudio/tar.gz/$pulse_tag_commit"
 pulse_sha=$(sha256sum "$pulseaudio_archive" | awk '{ print $1 }')
 pulse_archive_root="pulseaudio-$pulse_tag_commit"
 verify_pulse_archive() {
-    local members root meson_file license_file raw_meson raw_license
+    local members root meson_file license_file
     members="$tmp_dir/pulseaudio-members"
     if ! tar -tzf "$pulseaudio_archive" >"$members"; then
         fail "could not list the caller-supplied PulseAudio archive"
@@ -308,18 +323,10 @@ verify_pulse_archive() {
     }
     meson_file="$tmp_dir/pulseaudio-meson.build"
     license_file="$tmp_dir/pulseaudio-LGPL"
-    raw_meson="$tmp_dir/pulseaudio-meson.raw"
-    raw_license="$tmp_dir/pulseaudio-LGPL.raw"
     tar -xOf "$pulseaudio_archive" "$pulse_archive_root/meson.build" >"$meson_file" || fail "PulseAudio meson.build is missing"
     tar -xOf "$pulseaudio_archive" "$pulse_archive_root/LGPL" >"$license_file" || fail "PulseAudio LGPL text is missing"
-    curl -fsSL --max-filesize 1048576 \
-        "https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/raw/$pulse_tag_commit/meson.build" >"$raw_meson" || fail "PulseAudio commit meson.build fetch failed"
-    curl -fsSL --max-filesize 1048576 \
-        "https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/raw/$pulse_tag_commit/LGPL" >"$raw_license" || fail "PulseAudio commit LGPL fetch failed"
-    cmp -s "$meson_file" "$raw_meson" || fail "PulseAudio archive meson.build differs from the pinned commit raw file"
-    cmp -s "$license_file" "$raw_license" || fail "PulseAudio archive LGPL differs from the pinned commit raw file"
-    [[ "$(sha256sum "$meson_file" | awk '{ print $1 }')" == 33318f0c2019939d46ea38acb8a6d1e43198d9d6772a1ef56d1d1618f05a174a ]] || fail "PulseAudio meson.build bytes are not pinned"
-    [[ "$(sha256sum "$license_file" | awk '{ print $1 }')" == a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861 ]] || fail "PulseAudio LGPL bytes are not pinned"
+    [[ "$(sha256sum "$meson_file" | awk '{ print $1 }')" == 33318f0c2019939d46ea38acb8a6d1e43198d9d6772a1ef56d1d1618f05a174a ]] || fail "PulseAudio meson.build bytes disagree with locked commit facts"
+    [[ "$(sha256sum "$license_file" | awk '{ print $1 }')" == a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861 ]] || fail "PulseAudio LGPL bytes disagree with locked commit facts"
 }
 verify_pulse_archive
 cerbero_archive_url="https://codeload.github.com/GStreamer/cerbero/tar.gz/59548269f4fd0f701818f0bafdb102959ec81e65"
