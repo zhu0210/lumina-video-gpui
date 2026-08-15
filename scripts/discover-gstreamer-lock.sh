@@ -689,8 +689,8 @@ assert_reviewed_recipe_files gst-plugins-base-1.0 libs_lumina '["libgstallocator
 assert_reviewed_recipe_files orc libs_lumina '["liborc-0.4"]'
 
 # Resolve only the plugin categories named by the package specs. recipe_facts
-# is the sole AST seam; this shell layer rejects dynamic/malformed declarations
-# and normalizes the one reviewed Cerbero extension pattern to a .so basename.
+# is a friendly precheck for reviewed literal patterns, not the security
+# boundary; exact overlay hashes and post-package/artifact sets are authoritative.
 plugin_set_from_pinned_recipes() {
     local recipes_dir=$1 package_specs=$2 recipe category facts patterns pattern basename
     local pattern_re='^%\(libdir\)s/gstreamer-1\.0/libgst[A-Za-z0-9_+-]+%\(mext\)s$'
