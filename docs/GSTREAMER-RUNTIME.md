@@ -74,10 +74,16 @@ the runtime inventory remains 29 components.
 `scripts/discover-gstreamer-lock.sh` is metadata-only: it accepts a local
 extracted pinned Cerbero tree and local Cerbero/PipeWire/PulseAudio archives, validates
 every locked recipe after the repo patches, and queries only small official
-checksum and tag/signature endpoints.
+checksum, direct-tag, and commit raw-file endpoints; the signed-tag endpoint is
+used only for the separately pinned PulseAudio release.
 It refuses to download those archives itself.
-The PipeWire archive is addressed to commit
-`b741e0c74f5436f0c925f7741140db0efd32cf4e` and byte-locked by its SHA-256.
+PipeWire 1.6.8 is a lightweight direct tag with no tag-signature claim: both
+the official GitLab and GitHub direct refs resolve to commit
+`b741e0c74f5436f0c925f7741140db0efd32cf4e`, with no peeled ref. Acquisition
+uses the GitHub commit-addressed codeload archive, byte-locked by SHA-256;
+discovery compares its root and `meson.build`, `COPYING`, and `LICENSE` bytes
+with the official GitLab commit raw files. The codeload and GitLab commit
+blobs are the same bytes.
 PulseAudio is acquired from the official API's annotated `v17.0` tag, which reports a PGP signature (tag object
 `16be4f7accce287fd08519591c6356ffa61aaaf1`, peeled commit
 `1f020889c9aa44ea0f63d7222e8c2b62c3f45f68`) using its commit-addressed
@@ -159,8 +165,12 @@ Primary references: [GStreamer source index](https://gstreamer.freedesktop.org/s
 [FFmpeg configure options](https://ffmpeg.org/ffmpeg-all.html#toc-Advanced-options),
 [GStreamer HLS demuxer](https://gstreamer.freedesktop.org/documentation/adaptivedemux2/hlsdemux2.html),
 [PipeWire 1.6.8 Meson options](https://raw.githubusercontent.com/PipeWire/pipewire/1.6.8/meson_options.txt),
-[PipeWire 1.6.8 tag](https://gitlab.freedesktop.org/pipewire/pipewire/-/tags/1.6.8),
-[PipeWire 1.6.8 commit-addressed archive](https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/b741e0c74f5436f0c925f7741140db0efd32cf4e/pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e.tar.gz),
+[PipeWire 1.6.8 GitHub lightweight tag](https://github.com/PipeWire/pipewire/tree/1.6.8),
+[PipeWire 1.6.8 GitLab commit](https://gitlab.freedesktop.org/pipewire/pipewire/-/commit/b741e0c74f5436f0c925f7741140db0efd32cf4e),
+[PipeWire 1.6.8 GitHub codeload archive](https://codeload.github.com/PipeWire/pipewire/tar.gz/b741e0c74f5436f0c925f7741140db0efd32cf4e),
+[PipeWire commit meson.build](https://raw.githubusercontent.com/PipeWire/pipewire/b741e0c74f5436f0c925f7741140db0efd32cf4e/meson.build),
+[PipeWire commit COPYING](https://raw.githubusercontent.com/PipeWire/pipewire/b741e0c74f5436f0c925f7741140db0efd32cf4e/COPYING),
+[PipeWire commit LICENSE](https://raw.githubusercontent.com/PipeWire/pipewire/b741e0c74f5436f0c925f7741140db0efd32cf4e/LICENSE),
 [PipeWire 1.6.8 documentation](https://docs.pipewire.org/),
 [Flatpak runtime documentation](https://docs.flatpak.org/en/latest/available-runtimes.html),
 and the [Flathub Freedesktop Platform manifest](https://github.com/flathub/org.freedesktop.Platform).

@@ -278,6 +278,7 @@ pipewire_tag_commit=$(jq -er '.sources.pipewire.tag_commit' "$lock_file")
 pipewire_url=$(jq -er '.sources.pipewire.url' "$lock_file")
 pipewire_sha=$(jq -er '.sources.pipewire.sha256' "$lock_file")
 pipewire_license=$(jq -er '.sources.pipewire.license' "$lock_file")
+pipewire_archive_root=$(jq -er '.audit.recipe_metadata[] | select(.recipe == "pipewire") | .archive_root' "$lock_file")
 pulse_version=$(jq -er '.components[] | select(.name == "PulseAudio") | .version' "$lock_file")
 pulse_tag=$(jq -er '.components[] | select(.name == "PulseAudio") | .tag' "$lock_file")
 pulse_tag_object=$(jq -er '.components[] | select(.name == "PulseAudio") | .tag_object' "$lock_file")
@@ -357,12 +358,34 @@ ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock
     echo "unsupported PipeWire tag commit" >&2
     exit 1
 }
-[[ "$pipewire_url" == https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/b741e0c74f5436f0c925f7741140db0efd32cf4e/pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e.tar.gz ]] || {
+[[ "$pipewire_url" == https://codeload.github.com/PipeWire/pipewire/tar.gz/b741e0c74f5436f0c925f7741140db0efd32cf4e ]] || {
     echo "unsupported PipeWire source URL" >&2
     exit 1
 }
 [[ "$pipewire_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid PipeWire checksum" >&2; exit 1; }
 [[ "$pipewire_license" == MIT ]] || { echo "unsupported PipeWire license metadata" >&2; exit 1; }
+jq -e --arg url "$pipewire_url" --arg sha "$pipewire_sha" --arg root "$pipewire_archive_root" \
+    --arg tag "$pipewire_tag" --arg commit "$pipewire_tag_commit" '
+    .sources.pipewire as $source
+    | ($source.version == "1.6.8" and $source.tag == $tag and
+       $source.tag_commit == $commit and $source.url == $url and
+       $source.sha256 == $sha and $source.license == "MIT" and
+       (($source | has("tag_object")) | not) and (($source | has("signature")) | not))
+    and any(.components[]; .name == "PipeWire" and .version == "1.6.8" and
+        .tag == $tag and .tag_commit == $commit and .source_url == $url and
+        .sha256 == $sha and .license == "MIT" and
+        ((has("tag_object")) | not) and ((has("signature")) | not))
+    and any(.audit.recipe_metadata[]; .recipe == "pipewire" and
+        .version == "1.6.8" and .source_url == $url and .sha256 == $sha and
+        .archive_root == $root)
+' "$lock_file" >/dev/null || {
+    echo "PipeWire component, recipe, and lightweight-commit metadata disagrees" >&2
+    exit 1
+}
+[[ "$pipewire_archive_root" == pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e ]] || {
+    echo "unsupported PipeWire archive root" >&2
+    exit 1
+}
 jq -e --arg url "$pulse_url" --arg sha "$pulse_sha" --arg root "$pulse_archive_root" \
     --arg tag "$pulse_tag" --arg object "$pulse_tag_object" --arg commit "$pulse_tag_commit" \
     --arg signature "$pulse_signature" '
@@ -793,6 +816,9 @@ if grep -F "'codecs_gpl_restricted'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.r
 fi
 grep -F "tarball_checksum = '$pipewire_sha'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
     fail "PipeWire recipe checksum disagrees with lock"
+}
+grep -F "tarball_name = 'pipewire-1.6.8.tar.gz'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe does not use the stable codeload tarball name"
 }
 grep -F "'gstreamer': 'enabled'" "$cerbero_dir/recipes/pipewire.recipe" >/dev/null || {
     fail "PipeWire recipe does not enable its actual GStreamer option"
@@ -1292,6 +1318,31 @@ while IFS=$'\t' read -r component_name component_recipe component_sha component_
         "$component_name" "$component_recipe" "$component_sha" "$component_filename" "$source_relative" \
         >>"$runtime_source_matches"
 done <"$expected_source_rows"
+
+verify_pipewire_archive() {
+    local archive=$1 members root meson_file copying_file license_file actual_sha
+    [[ -f "$archive" && ! -L "$archive" ]] || fail "PipeWire source archive is not a regular file"
+    actual_sha=$(sha256sum -- "$archive" | awk '{ print $1 }') || fail "could not hash PipeWire source archive"
+    [[ "$actual_sha" == "$pipewire_sha" ]] || fail "PipeWire source archive checksum disagrees with the lock"
+    members="$work_dir/pipewire-members"
+    tar -tzf "$archive" >"$members" || fail "could not list the PipeWire source archive"
+    root=$(awk -F/ 'NF { print $1; exit }' "$members")
+    [[ "$root" == "$pipewire_archive_root" ]] || fail "PipeWire archive root disagrees with the lock"
+    if ! awk -F/ -v expected="$pipewire_archive_root" '$1 != expected { invalid = 1 } END { exit invalid ? 1 : 0 }' "$members"; then
+        fail "PipeWire archive contains an unexpected top-level path"
+    fi
+    meson_file="$work_dir/pipewire-meson.build"
+    copying_file="$work_dir/pipewire-COPYING"
+    license_file="$work_dir/pipewire-LICENSE"
+    tar -xOf "$archive" -- "$pipewire_archive_root/meson.build" >"$meson_file" || fail "PipeWire meson.build is missing"
+    tar -xOf "$archive" -- "$pipewire_archive_root/COPYING" >"$copying_file" || fail "PipeWire COPYING is missing"
+    tar -xOf "$archive" -- "$pipewire_archive_root/LICENSE" >"$license_file" || fail "PipeWire LICENSE is missing"
+    [[ "$(sha256sum "$meson_file" | awk '{ print $1 }')" == 9b3d15076e8051e45d747c262ad33eaff54bd638733f02f14c762e00dd8f0de5 ]] || fail "PipeWire meson.build bytes disagree with the pinned commit"
+    [[ "$(sha256sum "$copying_file" | awk '{ print $1 }')" == 8909c319a7e27dbb33a15b9035f89ab3b7b2f6a12f8bcddc755206a8db1ada44 ]] || fail "PipeWire COPYING bytes disagree with the pinned commit"
+    [[ "$(sha256sum "$license_file" | awk '{ print $1 }')" == be4be5d77424833edf31f53fc1f1cecb6996b9e2d747d9e6fb8f878362ebc92b ]] || fail "PipeWire LICENSE bytes disagree with the pinned commit"
+    grep -F "version : '1.6.8'" "$meson_file" >/dev/null || fail "PipeWire meson.build version disagrees with the lock"
+}
+verify_pipewire_archive "${component_archive[PipeWire]}"
 
 extract_license() {
     local archive=$1
