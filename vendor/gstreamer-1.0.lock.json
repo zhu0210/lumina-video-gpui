@@ -37,13 +37,14 @@
     }
   },
   "cerbero": {
-    "repository": "https://gitlab.freedesktop.org/gstreamer/cerbero.git",
+    "repository": "https://github.com/GStreamer/cerbero.git",
     "tag": "1.28.6",
     "tag_object": "78666745b34b6245a85510ac47a03a5033af4711",
     "commit": "59548269f4fd0f701818f0bafdb102959ec81e65",
     "archive": {
-      "url": "https://gitlab.freedesktop.org/gstreamer/cerbero/-/archive/1.28.6/cerbero-1.28.6.tar.gz",
-      "sha256": "16cea2f8c34370f7f1e5774c4c4f66927659c354f6f90ce0e13d41cf80cc34da"
+      "url": "https://codeload.github.com/GStreamer/cerbero/tar.gz/59548269f4fd0f701818f0bafdb102959ec81e65",
+      "sha256": "1874c5ed8b67612ca0370e5a8c7b25420ed98f0176425aa427eb1461293a82d3",
+      "root": "cerbero-59548269f4fd0f701818f0bafdb102959ec81e65"
     }
   },
   "target": {

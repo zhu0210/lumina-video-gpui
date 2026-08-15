@@ -11,6 +11,14 @@ elements, playback/audio/video helpers, MP4/Matroska/HLS/VP9/Opus paths,
 ALSA/Pulse/VA/PipeWire, and LGPL FFmpeg. Broad upstream codec categories are
 not packaged. All Cerbero jobs use two workers.
 
+Cerbero is pinned to the official [GStreamer GitHub mirror](https://github.com/GStreamer/cerbero)
+at tag object `78666745b34b6245a85510ac47a03a5033af4711`, peeled commit
+`59548269f4fd0f701818f0bafdb102959ec81e65`, and its commit-addressed
+[codeload archive](https://codeload.github.com/GStreamer/cerbero/tar.gz/59548269f4fd0f701818f0bafdb102959ec81e65)
+with SHA-256 `1874c5ed8b67612ca0370e5a8c7b25420ed98f0176425aa427eb1461293a82d3`
+and root `cerbero-59548269f4fd0f701818f0bafdb102959ec81e65`. Discovery checks
+the GitHub tag API and the supplied archive before updating metadata.
+
 The lock fixes 29 runtime components, including GStreamer 1.28.6,
 FFmpeg 7.1, the libsoup 3.6.6 HTTPS closure (glib-networking, libproxy,
 libpsl, nghttp2, and sqlite3), PipeWire 1.6.8, and the explicitly bundled
