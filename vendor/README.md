@@ -16,6 +16,15 @@ The Cerbero lock uses the official GitHub mirror, tag object
 SHA-256 `1874c5ed8b67612ca0370e5a8c7b25420ed98f0176425aa427eb1461293a82d3`,
 and root `cerbero-59548269f4fd0f701818f0bafdb102959ec81e65`.
 
+PipeWire 1.6.8 is a lightweight direct tag, with no tag-signature claim.
+Official GitLab and GitHub direct refs both resolve to commit
+`b741e0c74f5436f0c925f7741140db0efd32cf4e` and expose no peeled ref. The lock
+acquires the GitHub codeload archive at that commit with root
+`pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e` and SHA-256
+`a78762e007a604846fc16c83979ef15bbb69dba1a2923c32bb6e2f18fafa343f`;
+discovery compares its `meson.build`, `COPYING`, and `LICENSE` bytes with the
+official GitLab commit raw files and requires them to match.
+
 `nogi`/`nounwind` and the empty GStreamer bash-completion list are deliberate:
 introspection, unwind, and shell-completion inputs are not needed for playback
 and would add build-only, non-runtime, or runtime-link inputs.

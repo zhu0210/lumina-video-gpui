@@ -274,12 +274,43 @@ cerbero_peeled_commit=$(awk -v ref="refs/tags/${gstreamer_version}^{}" '$2 == re
     fail "official Cerbero tag metadata disagrees"
 }
 
-pipewire_url="https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/b741e0c74f5436f0c925f7741140db0efd32cf4e/pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e.tar.gz"
-pipewire_tag_commit=$(git ls-remote --tags https://gitlab.freedesktop.org/pipewire/pipewire.git \
-    'refs/tags/1.6.8^{}' | awk 'NR == 1 { print $1 }')
-[[ "$pipewire_tag_commit" == b741e0c74f5436f0c925f7741140db0efd32cf4e ]] || {
-    fail "official PipeWire 1.6.8 tag changed"
+pipewire_version=$(jq -er '.sources.pipewire.version' "$lock_file")
+pipewire_tag=$(jq -er '.sources.pipewire.tag' "$lock_file")
+pipewire_tag_commit=$(jq -er '.sources.pipewire.tag_commit' "$lock_file")
+pipewire_url=$(jq -er '.sources.pipewire.url' "$lock_file")
+pipewire_lock_sha=$(jq -er '.sources.pipewire.sha256' "$lock_file")
+pipewire_archive_root=$(jq -er '.audit.recipe_metadata[] | select(.recipe == "pipewire") | .archive_root' "$lock_file")
+[[ "$pipewire_version" == 1.6.8 && "$pipewire_tag" == 1.6.8 && \
+   "$pipewire_tag_commit" == b741e0c74f5436f0c925f7741140db0efd32cf4e && \
+   "$pipewire_url" == https://codeload.github.com/PipeWire/pipewire/tar.gz/b741e0c74f5436f0c925f7741140db0efd32cf4e && \
+   "$pipewire_archive_root" == pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e ]] || {
+    fail "lock PipeWire metadata is not the pinned GitHub codeload commit"
 }
+jq -e '
+    (.sources.pipewire | (has("tag_object") | not) and (has("signature") | not)) and
+    any(.components[]; .name == "PipeWire" and (has("tag_object") | not) and (has("signature") | not)) and
+    all(.audit.recipe_metadata[] | select(.recipe == "pipewire"); (has("tag_object") | not) and (has("signature") | not))
+' "$lock_file" >/dev/null || fail "PipeWire lock must not claim a tag object or signature"
+pipewire_gitlab_repo=https://gitlab.freedesktop.org/pipewire/pipewire.git
+pipewire_github_repo=https://github.com/PipeWire/pipewire.git
+pipewire_gitlab_refs=$(git ls-remote --tags "$pipewire_gitlab_repo" "refs/tags/$pipewire_tag" "refs/tags/$pipewire_tag^{}")
+pipewire_github_refs=$(git ls-remote --tags "$pipewire_github_repo" "refs/tags/$pipewire_tag" "refs/tags/$pipewire_tag^{}")
+pipewire_gitlab_direct=$(awk -v ref="refs/tags/$pipewire_tag" '$2 == ref { print $1 }' <<<"$pipewire_gitlab_refs")
+pipewire_gitlab_peeled=$(awk -v ref="refs/tags/$pipewire_tag^{}" '$2 == ref { print $1 }' <<<"$pipewire_gitlab_refs")
+pipewire_github_direct=$(awk -v ref="refs/tags/$pipewire_tag" '$2 == ref { print $1 }' <<<"$pipewire_github_refs")
+pipewire_github_peeled=$(awk -v ref="refs/tags/$pipewire_tag^{}" '$2 == ref { print $1 }' <<<"$pipewire_github_refs")
+[[ "$pipewire_gitlab_direct" == "$pipewire_tag_commit" && \
+   "$pipewire_github_direct" == "$pipewire_tag_commit" && \
+   -z "$pipewire_gitlab_peeled" && -z "$pipewire_github_peeled" ]] || {
+    fail "PipeWire official direct tag refs disagree or unexpectedly have peeled refs"
+}
+pipewire_ref_json=$(curl -fsSL --max-filesize 1048576 \
+    "https://api.github.com/repos/PipeWire/pipewire/git/ref/tags/$pipewire_tag")
+pipewire_api_commit=$(jq -er --arg expected_ref "refs/tags/$pipewire_tag" --arg expected_commit "$pipewire_tag_commit" '
+    if .ref == $expected_ref and .object.type == "commit" and .object.sha == $expected_commit
+    then .object.sha else error("PipeWire tag is not the pinned lightweight commit ref") end
+' <<<"$pipewire_ref_json")
+[[ "$pipewire_api_commit" == "$pipewire_tag_commit" ]] || fail "PipeWire GitHub tag API disagrees"
 pulse_repo=https://github.com/pulseaudio/pulseaudio.git
 pulse_tag=v17.0
 pulse_ref_json=$(curl -fsSL --max-filesize 1048576 \
@@ -348,6 +379,38 @@ if ! awk -F/ -v expected="$cerbero_archive_root" '$1 != expected { invalid = 1 }
     fail "Cerbero archive contains an unexpected top-level path"
 fi
 pipewire_sha=$(sha256sum "$pipewire_archive" | awk '{ print $1 }')
+[[ "$pipewire_sha" == "$pipewire_lock_sha" ]] || fail "PipeWire archive checksum disagrees with the lock"
+pipewire_members="$tmp_dir/pipewire-members"
+tar -tzf "$pipewire_archive" >"$pipewire_members" || fail "could not list the caller-supplied PipeWire archive"
+pipewire_root=$(awk -F/ 'NF { print $1; exit }' "$pipewire_members")
+[[ "$pipewire_root" == "$pipewire_archive_root" ]] || fail "PipeWire archive root disagrees with the lock"
+if ! awk -F/ -v expected="$pipewire_archive_root" '$1 != expected { invalid = 1 } END { exit invalid ? 1 : 0 }' "$pipewire_members"; then
+    fail "PipeWire archive contains an unexpected top-level path"
+fi
+for pipewire_file in meson.build COPYING LICENSE; do
+    case "$pipewire_file" in
+        meson.build) pipewire_expected_sha=9b3d15076e8051e45d747c262ad33eaff54bd638733f02f14c762e00dd8f0de5 ;;
+        COPYING) pipewire_expected_sha=8909c319a7e27dbb33a15b9035f89ab3b7b2f6a12f8bcddc755206a8db1ada44 ;;
+        LICENSE) pipewire_expected_sha=be4be5d77424833edf31f53fc1f1cecb6996b9e2d747d9e6fb8f878362ebc92b ;;
+    esac
+    pipewire_archive_file="$tmp_dir/pipewire-archive-$pipewire_file"
+    pipewire_gitlab_file="$tmp_dir/pipewire-gitlab-$pipewire_file"
+    tar -xOf "$pipewire_archive" -- "$pipewire_archive_root/$pipewire_file" >"$pipewire_archive_file" || {
+        fail "PipeWire archive is missing $pipewire_file"
+    }
+    if ! curl -fsSL --max-filesize 1048576 \
+        "https://gitlab.freedesktop.org/pipewire/pipewire/-/raw/$pipewire_tag_commit/$pipewire_file" >"$pipewire_gitlab_file"; then
+        fail "could not read the official GitLab PipeWire commit file: $pipewire_file"
+    fi
+    [[ "$(sha256sum "$pipewire_archive_file" | awk '{ print $1 }')" == "$pipewire_expected_sha" && \
+       "$(sha256sum "$pipewire_gitlab_file" | awk '{ print $1 }')" == "$pipewire_expected_sha" ]] || {
+        fail "PipeWire $pipewire_file bytes disagree with the pinned commit"
+    }
+    cmp -s "$pipewire_archive_file" "$pipewire_gitlab_file" || fail "PipeWire codeload/GitLab $pipewire_file bytes differ"
+done
+grep -F "version : '1.6.8'" "$tmp_dir/pipewire-archive-meson.build" >/dev/null || {
+    fail "PipeWire meson.build version disagrees with the lock"
+}
 
 cp -a -- "$cerbero_dir/recipes" "$tmp_dir/recipes"
 overlay_package="$overlay_dir/packages/lumina-audited.package"
@@ -372,6 +435,9 @@ while IFS= read -r overlay_recipe; do
     cp -a -- "$overlay_dir/recipes/$overlay_recipe.recipe" "$tmp_dir/recipes/$overlay_recipe.recipe"
     verify_overlay_copy "vendor/cerbero-overlay/recipes/$overlay_recipe.recipe" "$tmp_dir/recipes/$overlay_recipe.recipe"
 done < <(jq -er '.audit.recipe_metadata[] | select(.overlay == true) | .recipe' "$lock_file")
+grep -F "tarball_name = 'pipewire-1.6.8.tar.gz'" "$tmp_dir/recipes/pipewire.recipe" >/dev/null || {
+    fail "PipeWire recipe does not use the stable codeload tarball name"
+}
 if ! python3 - "$tmp_dir/recipes/libpulse.recipe" <<'PY'
 import ast
 import sys
