@@ -48,7 +48,10 @@ in `audit.shared_library_allowlist`. Controller/check/FFT/RTSP/SDP/GL/app
 spill from upstream broad GStreamer categories is excluded. Build/discovery
 derive the selected literal recipe categories; package and artifact checks
 compare canonical `.so` paths with that lock set while preserving recursive
-DT_NEEDED closure.
+DT_NEEDED closure. Version/SONAME symlinks are inventory entries and must use
+relative same-directory targets that resolve to a regular file with the same
+canonical name; absolute, escaping, dangling, cross-name, duplicate-regular,
+and special-file entries fail before packaging and again during artifact audit.
 The pinned 1.28.6 Meson link graph supplies the evidence for each retained
 GStreamer library: the CLI/plugins use `libgstreamer` and `libgstbase`; VA uses
 allocators, video, codecs, and codec parsers; the selected audio, playback,

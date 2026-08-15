@@ -11,6 +11,8 @@ on:
       - scripts/discover-gstreamer-lock.sh
       - scripts/build-gstreamer-runtime.sh
       - scripts/audit-gstreamer-runtime.sh
+      - scripts/gstreamer-shared-library-inventory.py
+      - scripts/test-gstreamer-runtime-shared-libraries.sh
       - scripts/smoke-gstreamer-runtime.sh
       - scripts/run-gstreamer-smoke-case.sh
       - flatpak/io.github.lumina_video.Demo.yml
@@ -62,6 +64,9 @@ jobs:
           test "$(. /etc/os-release && echo "$VERSION_ID")" = 24.04
           ldd --version | sed -n '1p' | grep -F '2.39'
           test "$BUILDER_IMAGE" = "$(jq -r '.builder.image' "$LOCK_FILE")"
+
+      - name: Test fail-closed shared-library inventory
+        run: ./scripts/test-gstreamer-runtime-shared-libraries.sh
 
       - name: Build from lock (fetch, then offline package)
         run: |
