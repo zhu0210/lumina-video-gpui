@@ -1169,46 +1169,60 @@ done
 # hard failure even if its filename is absent from the matrix.
 plugin_license_tsv="$work_dir/plugin-effective-license.tsv"
 : >"$plugin_license_tsv"
+plugin_metadata_field() {
+    local field=$1 report=$2
+    sed -n "s/^[[:space:]]*${field}[[:space:]]\\{1,\\}//p" <<<"$report" | sed -n '1p'
+}
+normalize_plugin_license() {
+    case "$1" in
+        LGPL) printf '%s\n' 'LGPL-2.1-or-later' ;;
+        MIT/X11) printf '%s\n' 'MIT/X11' ;;
+        *) fail "unsupported plugin license: $2 ($1)" ;;
+    esac
+}
 inspect_plugin_license() {
     local plugin_file=$1
-    local plugin_name=$2
-    local report license normalized owner source_url
+    local plugin_path=$2
+    local report raw_license license source_module owner expected_source_module
+    local component_license source_url
     owner=$(jq -r --arg path "vendor/linux-x86_64/$archive_runtime_libdir/gstreamer-1.0/$plugin_file" '
         first(.file_ownership[] | select(any(.prefixes[]; . as $prefix | ($path | startswith($prefix)))) | .component) // empty
     ' "$lock_file")
     [[ -n "$owner" ]] || fail "bundled plugin has no package/component owner: $plugin_file"
+    component_license=$(jq -r --arg owner "$owner" 'first(.components[] | select(.name == $owner) | .license) // empty' "$lock_file")
     source_url=$(jq -r --arg owner "$owner" 'first(.components[] | select(.name == $owner) | .source_url) // empty' "$lock_file")
-    [[ -n "$source_url" ]] || fail "bundled plugin owner has no source URL: $plugin_file"
-    report=$("$launcher" "$runtime_root/bin/gst-inspect-1.0" "$plugin_name" 2>/dev/null) || {
+    [[ -n "$component_license" && -n "$source_url" ]] || fail "bundled plugin owner metadata is incomplete: $plugin_file"
+    report=$("$launcher" "$runtime_root/bin/gst-inspect-1.0" "$plugin_path" 2>/dev/null) || {
         fail "gst-inspect could not load bundled plugin $plugin_file"
     }
-    license=$(sed -n 's/^[[:space:]]*License:[[:space:]]*//p' <<<"$report" | sed -n '1p')
-    normalized=$(tr '[:upper:]' '[:lower:]' <<<"$license")
-    [[ -n "$license" && "$normalized" != unknown* ]] || {
-        fail "bundled plugin has unknown effective license: $plugin_file"
+    raw_license=$(plugin_metadata_field 'License' "$report")
+    source_module=$(plugin_metadata_field 'Source module' "$report")
+    [[ -n "$raw_license" && -n "$source_module" ]] || fail "bundled plugin metadata is incomplete: $plugin_file"
+    license=$(normalize_plugin_license "$raw_license" "$plugin_file")
+    expected_source_module=${owner,,}
+    [[ "$source_module" == "$expected_source_module" ]] || {
+        fail "bundled plugin source module disagrees with owner: $plugin_file ($source_module != $expected_source_module)"
     }
-    if [[ "${normalized//lgpl/}" == *gpl* ]]; then
-        fail "bundled plugin has GPL effective license: $plugin_file ($license)"
+    if [[ "$license" == LGPL-2.1-or-later* ]]; then
+        [[ "$component_license" == LGPL-2.1-or-later* ]] || fail "LGPL plugin owner has incompatible component license: $plugin_file"
+    else
+        [[ "$component_license" == MIT ]] || fail "MIT/X11 plugin owner has incompatible component license: $plugin_file"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$plugin_file" "$license" "$owner" "$source_url" >>"$plugin_license_tsv"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$plugin_file" "$license" "$owner" "$source_module" "$source_url" >>"$plugin_license_tsv"
 }
 while IFS= read -r -d '' plugin_path; do
     plugin_file=${plugin_path#"$plugin_dir"/}
-    plugin_name=${plugin_file#libgst}
-    plugin_name=${plugin_name%%.so*}
-    inspect_plugin_license "$plugin_file" "$plugin_name"
+    inspect_plugin_license "$plugin_file" "$plugin_path"
 done < <(find -P "$plugin_dir" -type f -name 'libgst*.so*' -print0 | sort -z)
 jq -r '.audit.plugin_allowlist[] | [.element, .filename, .owner_component, .license] | @tsv' "$lock_file" |
     while IFS=$'\t' read -r element filename owner declared_license; do
         actual_license=$(awk -F '\t' -v file="$filename" '$1 == file {print $2; exit}' "$plugin_license_tsv")
+        actual_owner=$(awk -F '\t' -v file="$filename" '$1 == file {print $3; exit}' "$plugin_license_tsv")
+        actual_source_module=$(awk -F '\t' -v file="$filename" '$1 == file {print $4; exit}' "$plugin_license_tsv")
         [[ -n "$actual_license" ]] || fail "allowlisted plugin was not inspected: $filename"
-        normalized_actual=$(tr '[:upper:]' '[:lower:]' <<<"$actual_license")
-        [[ "${normalized_actual//lgpl/}" != *gpl* ]] || {
-            fail "allowlisted plugin is GPL despite lock metadata: $element"
-        }
-        [[ "$owner" != "PipeWire" || "$actual_license" == *MIT* || "$actual_license" == *X11* ]] || {
-            fail "PipeWire GStreamer plugin is not MIT/X11: $actual_license"
-        }
+        [[ "$actual_license" == "$declared_license" ]] || fail "allowlisted plugin license disagrees with lock: $element"
+        [[ "$actual_owner" == "$owner" ]] || fail "allowlisted plugin owner disagrees with lock: $element"
+        [[ "$actual_source_module" == "${owner,,}" ]] || fail "allowlisted plugin source module disagrees with owner: $element"
     done
 for forbidden in "${forbidden_components[@]}"; do
     if find -P "$runtime_root" -iname "*$forbidden*" -print -quit | grep -q .; then
@@ -1355,7 +1369,7 @@ file_inventory=$(cd "$bundle" &&
 plugin_inventory=$(jq -c '.audit.plugin_allowlist' "$lock_file")
 component_inventory=$(jq -c '.components' "$lock_file")
 closure_json=$(jq -Rn '[inputs | split("\t") | {object: .[0], needed: .[1], scope: .[2]}]' <"$closure_tsv")
-actual_plugin_inventory=$(jq -Rn '[inputs | select(length > 0) | split("\t") | {filename: .[0], license: .[1], component: .[2], source_url: .[3]}]' <"$plugin_license_tsv")
+actual_plugin_inventory=$(jq -Rn '[inputs | select(length > 0) | split("\t") | {filename: .[0], license: .[1], component: .[2], source_module: .[3], source_url: .[4]}]' <"$plugin_license_tsv")
 jq -n \
     --arg version "$gstreamer_version" \
     --arg commit "$cerbero_commit" \

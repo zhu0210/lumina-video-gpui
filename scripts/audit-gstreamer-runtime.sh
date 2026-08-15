@@ -66,7 +66,7 @@ jq -e --argjson expected "$(jq -c '.audit.package_files' "$lock_file")" \
 jq -e --argjson expected "$(jq -c '.components' "$lock_file")" \
     '.components == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest component inventory differs from lock"
 jq -e --argjson owners "$(jq -c '[.components[].name]' "$lock_file")" \
-    'all(.actual_plugin_license[]; (.component as $owner | (.filename and .license and .source_url and ($owners | index($owner) != null))))' \
+    'all(.actual_plugin_license[]; (.filename and .license and .component and .source_module and .source_url and (.component as $owner | ($owners | index($owner) != null))))' \
     <<<"$manifest" >/dev/null || {
     fail "runtime manifest effective plugin inventory is incomplete"
 }
@@ -210,19 +210,53 @@ export GST_REGISTRY_1_0="$cache_dir/gstreamer-1.0.registry"
 export GST_REGISTRY=
 export GST_REGISTRY_REUSE_PLUGIN_SCANNER=no
 
-inspect_license() {
-    local plugin_path=$1 plugin_name=$2 report license normalized
-    report=$("$runtime_bin/gst-inspect-1.0" "$plugin_name" 2>/dev/null) || fail "gst-inspect failed for $plugin_path"
-    license=$(sed -n 's/^[[:space:]]*License:[[:space:]]*//p' <<<"$report" | sed -n '1p')
-    normalized=$(tr '[:upper:]' '[:lower:]' <<<"$license")
-    [[ -n "$license" && "$normalized" != unknown* ]] || fail "unknown plugin license: $plugin_path"
-    [[ "${normalized//lgpl/}" != *gpl* ]] || fail "GPL plugin license: $plugin_path ($license)"
+plugin_license_tsv="$cache_dir/plugin-effective-license.tsv"
+: >"$plugin_license_tsv"
+plugin_metadata_field() {
+    local field=$1 report=$2
+    sed -n "s/^[[:space:]]*${field}[[:space:]]\\{1,\\}//p" <<<"$report" | sed -n '1p'
+}
+normalize_plugin_license() {
+    case "$1" in
+        LGPL) printf '%s\n' 'LGPL-2.1-or-later' ;;
+        MIT/X11) printf '%s\n' 'MIT/X11' ;;
+        *) fail "unsupported plugin license: $2 ($1)" ;;
+    esac
+}
+inspect_plugin_license() {
+    local plugin_path=$1 plugin_file=$2 report raw_license license source_module
+    local owner expected_source_module component_license source_url manifest_path
+    manifest_path="vendor/linux-x86_64/$runtime_libdir/gstreamer-1.0/$plugin_file"
+    owner=$(jq -r --arg path "$manifest_path" '
+        first(.file_ownership[] | select(any(.prefixes[]; . as $prefix | ($path | startswith($prefix)))) | .component) // empty
+    ' "$lock_file")
+    [[ -n "$owner" ]] || fail "bundled plugin has no package/component owner: $plugin_file"
+    component_license=$(jq -r --arg owner "$owner" 'first(.components[] | select(.name == $owner) | .license) // empty' "$lock_file")
+    source_url=$(jq -r --arg owner "$owner" 'first(.components[] | select(.name == $owner) | .source_url) // empty' "$lock_file")
+    [[ -n "$component_license" && -n "$source_url" ]] || fail "bundled plugin owner metadata is incomplete: $plugin_file"
+    report=$("$runtime_bin/gst-inspect-1.0" "$plugin_path" 2>/dev/null) || fail "gst-inspect failed for $plugin_file"
+    raw_license=$(plugin_metadata_field 'License' "$report")
+    source_module=$(plugin_metadata_field 'Source module' "$report")
+    [[ -n "$raw_license" && -n "$source_module" ]] || fail "bundled plugin metadata is incomplete: $plugin_file"
+    license=$(normalize_plugin_license "$raw_license" "$plugin_file")
+    expected_source_module=${owner,,}
+    [[ "$source_module" == "$expected_source_module" ]] || {
+        fail "bundled plugin source module disagrees with owner: $plugin_file ($source_module != $expected_source_module)"
+    }
+    if [[ "$license" == LGPL-2.1-or-later* ]]; then
+        [[ "$component_license" == LGPL-2.1-or-later* ]] || fail "LGPL plugin owner has incompatible component license: $plugin_file"
+    else
+        [[ "$component_license" == MIT ]] || fail "MIT/X11 plugin owner has incompatible component license: $plugin_file"
+    fi
+    jq -e --arg filename "$plugin_file" --arg license "$license" --arg component "$owner" \
+        --arg source_module "$source_module" --arg source_url "$source_url" \
+        'any(.actual_plugin_license[]; .filename == $filename and .license == $license and .component == $component and .source_module == $source_module and .source_url == $source_url)' \
+        <<<"$manifest" >/dev/null || fail "manifest plugin metadata disagrees with inspection: $plugin_file"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$plugin_file" "$license" "$owner" "$source_module" "$source_url" >>"$plugin_license_tsv"
 }
 while IFS= read -r -d '' plugin_path; do
     plugin_file=${plugin_path#"$runtime_plugin_dir"/}
-    plugin_name=${plugin_file#libgst}
-    plugin_name=${plugin_name%%.so*}
-    inspect_license "$plugin_file" "$plugin_name"
+    inspect_plugin_license "$plugin_path" "$plugin_file"
     jq -e --arg path "vendor/linux-x86_64/$runtime_libdir/gstreamer-1.0/$plugin_file" \
         'any(.bundled_files[]; .path == $path and ((.component // "") != ""))' <<<"$manifest" >/dev/null || {
         fail "bundled plugin is not owned by a packaged component: $plugin_file"
@@ -232,11 +266,12 @@ done < <(find -P "$runtime_plugin_dir" -type f -name 'libgst*.so*' -print0 | sor
 while IFS=$'\t' read -r element filename owner declared; do
     [[ -f "$runtime_plugin_dir/$filename" ]] || fail "audited plugin file is missing: $filename"
     report=$("$runtime_bin/gst-inspect-1.0" "$element" 2>/dev/null) || fail "audited element is not resolvable: $element"
-    actual=$(sed -n 's/^[[:space:]]*License:[[:space:]]*//p' <<<"$report" | sed -n '1p')
-    [[ -n "$actual" ]] || fail "audited element has no effective license: $element"
-    if [[ "$owner" == PipeWire ]]; then
-        [[ "$actual" == *MIT* || "$actual" == *X11* ]] || fail "PipeWire plugin is not MIT/X11: $actual"
-    fi
+    actual_license=$(awk -F '\t' -v file="$filename" '$1 == file {print $2; exit}' "$plugin_license_tsv")
+    actual_owner=$(awk -F '\t' -v file="$filename" '$1 == file {print $3; exit}' "$plugin_license_tsv")
+    actual_source_module=$(awk -F '\t' -v file="$filename" '$1 == file {print $4; exit}' "$plugin_license_tsv")
+    [[ "$actual_license" == "$declared" ]] || fail "audited element license disagrees with lock: $element"
+    [[ "$actual_owner" == "$owner" ]] || fail "audited element owner disagrees with lock: $element"
+    [[ "$actual_source_module" == "${owner,,}" ]] || fail "audited element source module disagrees with owner: $element"
 done < <(jq -er '.audit.plugin_allowlist[] | [.element, .filename, .owner_component, .license] | @tsv' "$lock_file")
 
 # The allowlist is a ceiling, not a claim that every GPU/display ABI is used by
