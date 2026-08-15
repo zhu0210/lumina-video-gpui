@@ -2,8 +2,12 @@
 
 `gstreamer-1.0.lock.json` is schema 2 and pins every moving input used by the
 runtime build: GStreamer 1.28.6, gst-libav/FFmpeg 7.1, zlib, PipeWire 1.6.8,
-Cerbero, Ubuntu 24.04/glibc 2.39, the exact `norust,alsa,pulse,va` variants,
+Cerbero, Ubuntu 24.04/glibc 2.39, the exact `norust,nogi,nounwind,alsa,pulse,va` variants,
 and Freedesktop 25.08 Flatpak refs.
+
+`nogi`/`nounwind` and the empty GStreamer bash-completion list are deliberate:
+introspection, unwind, and shell-completion inputs are not needed for playback
+and would add build-only, non-runtime, or runtime-link inputs.
 
 The audited closure is intentionally narrow: only the lock's direct recipe
 categories are built into the single `lumina-audited` package. The matrix

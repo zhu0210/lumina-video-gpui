@@ -10,17 +10,23 @@ categories select the core/base/good/bad/libav plugins, the PipeWire-owned
 GStreamer plugin, and the explicitly bundled codec/audio/VA libraries. All
 Cerbero jobs use two workers.
 
-The lock fixes 28 runtime/build components, including GStreamer 1.28.6,
+The lock fixes 28 runtime components, including GStreamer 1.28.6,
 FFmpeg 7.1, the libsoup 3.6.6 HTTPS closure (glib-networking, libproxy,
 libpsl, nghttp2, and sqlite3), PipeWire 1.6.8, and the explicitly bundled
 audio/VA/DRM user-space libraries. It also fixes the Ubuntu builder image, the
-exact variant set `norust,alsa,pulse,va`, recipe/plugin audit allowlists, and
+exact variant set `norust,nogi,nounwind,alsa,pulse,va`, recipe/plugin audit allowlists, and
 the system ELF ABI allowlist. `vendor/cerbero-overlay` contains the direct
 package, source-backed audio/VA/DRM recipes, PipeWire recipe, and applied
-base/good/bad/OpenSSL recipe patches; all are included in the
+base/good/bad/GStreamer bash-completion/OpenSSL recipe patches; all are included in the
 corresponding-source archive. The build verifies every patch against the
 pinned recipe, checks the actual FFmpeg options, and verifies actual plugin
 licenses with isolated `gst-inspect-1.0`.
+
+The `nogi` and `nounwind` variants disable GObject introspection and unwind
+inputs, and the GStreamer recipe's Cerbero bash-completion integration is
+disabled. These are not
+needed for playback and would add build-only, non-runtime, or runtime-link
+inputs to the audited closure.
 
 `scripts/discover-gstreamer-lock.sh` is metadata-only: it accepts a local
 extracted pinned Cerbero tree and local Cerbero/PipeWire archives, validates

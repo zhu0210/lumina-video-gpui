@@ -59,7 +59,7 @@ fi
 
 manifest=$(tar -xJOf "$artifact" ./runtime-manifest.json)
 jq -e \
-    '.schema_version == 2 and (.packages == ["lumina-audited"]) and (.package_files | length >= 7) and .policy.gpl == false and .policy.nonfree == false and .policy.unknown == false and .policy.ugly == false and (.variants == ["norust", "alsa", "pulse", "va"]) and (.recursive_dt_needed | type == "array") and (.bundled_files | type == "array") and (.components | type == "array") and (.actual_plugin_license | type == "array")' \
+    '.schema_version == 2 and (.packages == ["lumina-audited"]) and (.package_files | length >= 7) and .policy.gpl == false and .policy.nonfree == false and .policy.unknown == false and .policy.ugly == false and (.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]) and (.recursive_dt_needed | type == "array") and (.bundled_files | type == "array") and (.components | type == "array") and (.actual_plugin_license | type == "array")' \
     <<<"$manifest" >/dev/null || fail "runtime manifest policy or inventory is incomplete"
 jq -e --argjson expected "$(jq -c '.audit.package_files' "$lock_file")" \
     '.package_files == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest package file categories differ from lock"
@@ -137,14 +137,46 @@ find -P "$source_dir/archives" -type f -print | sed "s#^$source_dir/##" | sort >
 cmp -s "$expected_source_paths" "$actual_source_paths" || {
     fail "corresponding source contains an extra or missing runtime archive"
 }
-[[ -d "$source_dir/overlay/patches" &&
-   -f "$source_dir/overlay/patches/gst-plugins-bad-1.0-disable-gpl.patch" &&
-   -f "$source_dir/overlay/patches/gst-plugins-bad-1.0-no-gpl-deps.patch" &&
-   -f "$source_dir/overlay/patches/gst-plugins-bad-1.0-minimal.patch" &&
-   -f "$source_dir/overlay/patches/gst-plugins-base-1.0-minimal.patch" &&
-   -f "$source_dir/overlay/patches/gst-plugins-good-1.0-minimal.patch" ]] || {
-    fail "source bundle lacks the applied recipe patches"
-}
+overlay_patch_dir="$source_dir/overlay/patches"
+[[ -d "$overlay_patch_dir" ]] || fail "source bundle lacks the overlay patch directory"
+patch_list="$cache_dir/overlay-patches.list"
+if ! jq -er '
+    [.audit.recipe_metadata[] | select(has("overlay_patches")) | .overlay_patches] as $declared
+    | if ($declared | length) == 0 then
+          error("no recipe declares overlay_patches")
+      elif any($declared[]; type != "array") then
+          error("overlay_patches must be arrays")
+      else
+          [$declared[] | .[]] as $patches
+          | if ($patches | length) == 0 then
+                error("overlay_patches must not be empty")
+            elif any($patches[]; if type == "string" then length == 0 else true end) then
+                error("overlay_patches entries must be nonempty strings")
+            elif ($patches | unique | length) != ($patches | length) then
+                error("overlay_patches entries must be unique")
+            else
+                $patches[]
+            end
+      end
+' "$lock_file" >"$patch_list"; then
+    fail "lock overlay patch metadata is invalid"
+fi
+while IFS= read -r patch_name; do
+    [[ -n "$patch_name" ]] || {
+        printf 'audit-gstreamer-runtime: invalid lock overlay patch name %q\n' "$patch_name" >&2
+        exit 1
+    }
+    case "$patch_name" in
+        /*|.|..|*/*)
+            printf 'audit-gstreamer-runtime: invalid lock overlay patch name %q\n' "$patch_name" >&2
+            exit 1
+            ;;
+    esac
+    printf -v patch_display '%q' "$patch_name"
+    [[ -f "$overlay_patch_dir/$patch_name" ]] || {
+        fail "source bundle lacks lock-listed overlay patch: $patch_display"
+    }
+done <"$patch_list"
 [[ -f "$source_dir/overlay/packages/lumina-audited.package" ]] || {
     fail "source bundle lacks the custom audited package recipe"
 }
@@ -153,9 +185,6 @@ while IFS= read -r overlay_recipe; do
         fail "source bundle lacks overlay recipe: $overlay_recipe"
     }
 done < <(jq -er '.audit.recipe_metadata[] | select(.overlay == true) | .recipe' "$lock_file")
-[[ -f "$source_dir/overlay/patches/openssl-no-ca-certificates.patch" ]] || {
-    fail "source bundle lacks the applied OpenSSL dependency patch"
-}
 jq -e '
     .sources.pipewire.plugin_license == "MIT/X11" and
     .sources.pipewire.plugin_license_source == "src/gst" and

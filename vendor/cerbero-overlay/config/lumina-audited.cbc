@@ -1,10 +1,9 @@
-# Cerbero 1.28.6 local configuration. The variant CSV is supplied on the
-# command line so that the lock remains the one source of truth.
+# Cerbero 1.28.6 local configuration. The CLI supplies the lock's variants;
+# the lock is the sole variant authority and this file does not override it.
 #
 # This file intentionally contains no policy-only Meson/configure keys. The
 # gst-plugins-bad GPL setting is an applied, fuzz-free patch in patches/ and
 # the FFmpeg settings are asserted against the pinned upstream recipe.
-variants = ['norust', 'alsa', 'pulse', 'va']
 # Audited/default tarball recipes win same-name conflicts while system-only
 # recipes remain available.
 system_recipes_priority = -1

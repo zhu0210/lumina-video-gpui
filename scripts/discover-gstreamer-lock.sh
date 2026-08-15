@@ -49,6 +49,12 @@ fail() {
 
 gstreamer_version=$(jq -er '.gstreamer.version' "$lock_file")
 [[ "$gstreamer_version" == 1.28.6 ]] || fail "reviewed lock template only supports GStreamer 1.28.6"
+jq -e '.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]' "$lock_file" >/dev/null || {
+    fail "lock variants are not the exact audited set"
+}
+jq -e '(.components | length == 28) and all(.components[]; (.recipe != "bash-completion" and .recipe != "libunwind" and .recipe != "gobject-introspection"))' "$lock_file" >/dev/null || {
+    fail "lock must contain exactly the 28 audited runtime components"
+}
 gstreamer_url="https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-${gstreamer_version}.tar.xz"
 libav_url="https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-${gstreamer_version}.tar.xz"
 gstreamer_sha=$(curl -fsSL --retry 3 --max-filesize 1048576 "${gstreamer_url}.sha256sum" | awk 'NR == 1 { print $1 }')
@@ -92,6 +98,13 @@ while IFS= read -r patch_name; do
     patch --directory "$tmp_dir" --batch --forward --fuzz=0 --strip=1 \
         <"$overlay_dir/patches/$patch_name" >/dev/null || fail "overlay patch did not apply: $patch_name"
 done < <(jq -er '.audit.recipe_metadata[].overlay_patches[]?' "$lock_file")
+grep -F "bash_completions = []" "$tmp_dir/recipes/gstreamer-1.0.recipe" >/dev/null || {
+    fail "GStreamer bash completions patch did not apply"
+}
+if grep -Eq "^[[:space:]]*bash_completions[[:space:]]*=.*(gst-inspect-1\\.0|gst-launch-1\\.0)" \
+    "$tmp_dir/recipes/gstreamer-1.0.recipe"; then
+    fail "GStreamer recipe still lists gst shell completions"
+fi
 
 recipe_facts() {
     python3 - "$1" <<'PY'
