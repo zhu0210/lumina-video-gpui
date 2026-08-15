@@ -16,7 +16,6 @@ class Recipe(recipe.Recipe):
         '--disable-alisp',
         '--disable-ucm',
         '--disable-topology',
-        '--disable-seq',
         '--disable-rawmidi',
         '--disable-hwdep',
     ]
