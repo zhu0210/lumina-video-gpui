@@ -63,7 +63,7 @@
   "audit": {
     "overlay_inputs": [
       {"path": "vendor/cerbero-overlay/config/lumina-audited.cbc", "sha256": "6f93a2242387c1d027badbc605aedeb2647276b6fd88f8a84d6469a4e6bd21c6"},
-      {"path": "vendor/cerbero-overlay/packages/lumina-audited.package", "sha256": "2b03dbaae4ad8f11d3678bf40ad804b4821905a95f9426c2371e8a09a0cfa8fb"},
+      {"path": "vendor/cerbero-overlay/packages/lumina-audited.package", "sha256": "8450495e1d4d05cb8a3461b7c4fbe0ac8230fe75c2ca148ee7e85d2c3a4f313c"},
       {"path": "vendor/cerbero-overlay/recipes/alsa.recipe", "sha256": "88bda7945683298660b4698376040197b6fb2680383f33bb0a73d27bc2e90ba0"},
       {"path": "vendor/cerbero-overlay/recipes/libdrm.recipe", "sha256": "5aed555e18894553e5db9b6407882fe13adbdd949f4660d2629686a3b9c8a9c0"},
       {"path": "vendor/cerbero-overlay/recipes/libpulse.recipe", "sha256": "dfd481f60ef4b0c0b12d30f434d7cb2de8bb47a90c1a78bdfb43f005a2a7ab84"},
