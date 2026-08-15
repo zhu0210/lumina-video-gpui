@@ -268,7 +268,7 @@ while IFS= read -r -d '' plugin_path; do
     }
 done < <(find -P "$runtime_plugin_dir" -type f -name 'libgst*.so*' -print0 | sort -z)
 
-if ! inspected_plugin_inventory=$(jq -Rn '
+if ! inspected_plugin_inventory=$(jq -Rnc '
     [inputs | select(length > 0) | split("\t")] as $rows
     | if any($rows[]; (length != 5 or any(.[]; . == ""))) then
           error("plugin inspection TSV is not five nonempty fields")
