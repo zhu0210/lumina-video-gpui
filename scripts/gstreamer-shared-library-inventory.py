@@ -9,7 +9,7 @@ import stat
 import sys
 
 
-SHARED_LIBRARY = re.compile(r"^(lib[A-Za-z0-9_.+-]+\.so)(?:\..*)?$")
+SHARED_LIBRARY = re.compile(r"^(lib[A-Za-z0-9_.+-]+\.so)(?:\.[0-9]+){0,3}$")
 
 
 def fail(message: str) -> None:
