@@ -18,6 +18,7 @@ public_dir="$fixture_root/runtime/lib/x86_64-linux-gnu"
 private_dir="$public_dir/pulseaudio"
 mkdir -p "$private_dir"
 printf 'public\n' >"$public_dir/libfixture.so.1"
+printf 'debug\n' >"$public_dir/libfixture.so.1.debuginfo"
 ln -s libfixture.so.1 "$public_dir/libfixture.so"
 printf 'private\n' >"$private_dir/libprivate.so.1"
 ln -s libprivate.so.1 "$private_dir/libprivate.so"
@@ -26,6 +27,7 @@ inventory="$fixture_root/inventory.json"
 python3 "$script_dir/gstreamer-shared-library-inventory.py" \
     "$fixture_root/runtime" lib/x86_64-linux-gnu lib/x86_64-linux-gnu/pulseaudio \
     >"$inventory"
+jq -e 'all(.entries[]; .path != "libfixture.so.1.debuginfo")' "$inventory" >/dev/null
 printf '%s\n' libfixture.so pulseaudio/libprivate.so | sort >"$fixture_root/expected"
 jq -r '.canonical_paths[]' "$inventory" >"$fixture_root/actual"
 cmp -s "$fixture_root/expected" "$fixture_root/actual"
