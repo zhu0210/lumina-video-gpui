@@ -1,8 +1,9 @@
 # The upstream Cerbero recipe is a SystemRecipe.  Keep only the Pulse client
 # library in the audited user-space closure; the server and optional backends
 # are intentionally not package inputs.  PulseAudio 17's meson_options.txt
-# declares these switches as booleans, so Cerbero receives the boolean form
-# 'false', not the feature-only value 'disabled'.
+# declares daemon/tests/man/doxygen as booleans and the optional backends as
+# features, so Cerbero receives 'false' for the former and 'disabled' for the
+# latter.
 class Recipe(recipe.Recipe):
     name = 'libpulse'
     version = '17.0'
@@ -17,10 +18,10 @@ class Recipe(recipe.Recipe):
         'tests': 'false',
         'man': 'false',
         'doxygen': 'false',
-        'bluez5': 'false',
-        'alsa': 'false',
-        'jack': 'false',
-        'avahi': 'false',
-        'dbus': 'false',
+        'bluez5': 'disabled',
+        'alsa': 'disabled',
+        'jack': 'disabled',
+        'avahi': 'disabled',
+        'dbus': 'disabled',
     }
     files_libs = ['libpulse']
