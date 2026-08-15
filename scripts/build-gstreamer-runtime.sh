@@ -286,11 +286,13 @@ pulse_signature=$(jq -er '.components[] | select(.name == "PulseAudio") | .signa
 pulse_url=$(jq -er '.components[] | select(.name == "PulseAudio") | .source_url' "$lock_file")
 pulse_sha=$(jq -er '.components[] | select(.name == "PulseAudio") | .sha256' "$lock_file")
 pulse_archive_root=$(jq -er '.audit.recipe_metadata[] | select(.recipe == "libpulse") | .archive_root' "$lock_file")
+cerbero_repository=$(jq -er '.cerbero.repository' "$lock_file")
 cerbero_tag=$(jq -er '.cerbero.tag' "$lock_file")
 cerbero_tag_object=$(jq -er '.cerbero.tag_object' "$lock_file")
 cerbero_commit=$(jq -er '.cerbero.commit' "$lock_file")
 cerbero_archive_url=$(jq -er '.cerbero.archive.url' "$lock_file")
 cerbero_archive_sha=$(jq -er '.cerbero.archive.sha256' "$lock_file")
+cerbero_archive_root=$(jq -er '.cerbero.archive.root' "$lock_file")
 builder_image=$(jq -er '.builder.image' "$lock_file")
 builder_platform=$(jq -er '.builder.platform' "$lock_file")
 schema_version=$(jq -er '.schema_version' "$lock_file")
@@ -407,10 +409,34 @@ jq -e '
     echo "PipeWire component/tag metadata disagrees" >&2
     exit 1
 }
-[[ "$cerbero_archive_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid Cerbero archive checksum" >&2; exit 1; }
-[[ "$cerbero_tag_object" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid Cerbero tag object" >&2; exit 1; }
-[[ "$cerbero_commit" =~ ^[[:xdigit:]]{40}$ ]] || { echo "invalid Cerbero commit" >&2; exit 1; }
-[[ "$cerbero_tag" == "$gstreamer_version" ]] || { echo "Cerbero/GStreamer tags differ" >&2; exit 1; }
+[[ "$cerbero_repository" == https://github.com/GStreamer/cerbero.git ]] || {
+    echo "unsupported Cerbero repository" >&2
+    exit 1
+}
+[[ "$cerbero_tag" == 1.28.6 && "$cerbero_tag" == "$gstreamer_version" ]] || {
+    echo "unsupported Cerbero/GStreamer tags" >&2
+    exit 1
+}
+[[ "$cerbero_tag_object" == 78666745b34b6245a85510ac47a03a5033af4711 ]] || {
+    echo "unsupported Cerbero tag object" >&2
+    exit 1
+}
+[[ "$cerbero_commit" == 59548269f4fd0f701818f0bafdb102959ec81e65 ]] || {
+    echo "unsupported Cerbero commit" >&2
+    exit 1
+}
+[[ "$cerbero_archive_url" == https://codeload.github.com/GStreamer/cerbero/tar.gz/59548269f4fd0f701818f0bafdb102959ec81e65 ]] || {
+    echo "unsupported Cerbero archive URL" >&2
+    exit 1
+}
+[[ "$cerbero_archive_sha" == 1874c5ed8b67612ca0370e5a8c7b25420ed98f0176425aa427eb1461293a82d3 ]] || {
+    echo "unsupported Cerbero archive checksum" >&2
+    exit 1
+}
+[[ "$cerbero_archive_root" == cerbero-59548269f4fd0f701818f0bafdb102959ec81e65 ]] || {
+    echo "unsupported Cerbero archive root" >&2
+    exit 1
+}
 [[ "$builder_image" =~ ^ubuntu@sha256:[[:xdigit:]]{64}$ ]] || { echo "builder image is not digest pinned" >&2; exit 1; }
 [[ "$builder_platform" == linux/amd64 ]] || { echo "unsupported builder platform" >&2; exit 1; }
 [[ "$target_os" == linux && "$target_architecture" == x86_64 ]] || {
@@ -579,7 +605,11 @@ download_and_verify "$cerbero_archive_url" "$cerbero_archive_sha" "$cerbero_arch
 cerbero_list="$work_dir/cerbero.list"
 tar -tzf "$cerbero_archive" >"$cerbero_list"
 cerbero_root=$(sed -n '1s|/.*||p' "$cerbero_list")
-[[ -n "$cerbero_root" ]] || { echo "Cerbero archive has no root directory" >&2; exit 1; }
+[[ "$cerbero_root" == "$cerbero_archive_root" ]] || { echo "Cerbero archive root disagrees with lock" >&2; exit 1; }
+if ! awk -F/ -v expected="$cerbero_archive_root" '$1 != expected { invalid = 1 } END { exit invalid ? 1 : 0 }' "$cerbero_list"; then
+    echo "Cerbero archive contains an unexpected top-level path" >&2
+    exit 1
+fi
 tar -xzf "$cerbero_archive" -C "$work_dir"
 cerbero_dir="$work_dir/$cerbero_root"
 [[ -x "$cerbero_dir/cerbero-uninstalled" ]] || { echo "Cerbero entrypoint missing" >&2; exit 1; }

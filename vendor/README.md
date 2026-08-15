@@ -5,6 +5,12 @@ runtime build: GStreamer 1.28.6, gst-libav/FFmpeg 7.1, zlib, PipeWire 1.6.8,
 Cerbero, Ubuntu 24.04/glibc 2.39, the exact `norust,nogi,nounwind,alsa,pulse,va` variants,
 and Freedesktop 25.08 Flatpak refs.
 
+The Cerbero lock uses the official GitHub mirror, tag object
+`78666745b34b6245a85510ac47a03a5033af4711`, peeled commit
+`59548269f4fd0f701818f0bafdb102959ec81e65`, commit-addressed codeload URL,
+SHA-256 `1874c5ed8b67612ca0370e5a8c7b25420ed98f0176425aa427eb1461293a82d3`,
+and root `cerbero-59548269f4fd0f701818f0bafdb102959ec81e65`.
+
 `nogi`/`nounwind` and the empty GStreamer bash-completion list are deliberate:
 introspection, unwind, and shell-completion inputs are not needed for playback
 and would add build-only, non-runtime, or runtime-link inputs.

@@ -240,14 +240,30 @@ libav_sha=$(curl -fsSL --retry 3 --max-filesize 1048576 "${libav_url}.sha256sum"
     fail "official GStreamer checksums are not SHA-256 digests"
 }
 
-cerbero_repo=https://gitlab.freedesktop.org/gstreamer/cerbero.git
+cerbero_repo=https://github.com/GStreamer/cerbero.git
 tag_json=$(curl -fsSL --retry 3 --max-filesize 1048576 \
-    "https://gitlab.freedesktop.org/api/v4/projects/gstreamer%2Fcerbero/repository/tags/${gstreamer_version}")
-cerbero_commit=$(jq -er '.commit.id' <<<"$tag_json")
-tag_refs=$(git ls-remote --tags "$cerbero_repo" "refs/tags/${gstreamer_version}*")
+    "https://api.github.com/repos/GStreamer/cerbero/git/ref/tags/${gstreamer_version}")
+cerbero_api_tag_object=$(jq -er --arg expected_ref "refs/tags/$gstreamer_version" '
+    if .ref == $expected_ref and .object.type == "tag" then .object.sha
+    else error("Cerbero tag ref is not an annotated tag") end
+' <<<"$tag_json")
+tag_object_json=$(curl -fsSL --retry 3 --max-filesize 1048576 \
+    "https://api.github.com/repos/GStreamer/cerbero/git/tags/$cerbero_api_tag_object")
+cerbero_commit=$(jq -er --arg tag_object "$cerbero_api_tag_object" '
+    if .sha == $tag_object and .object.type == "commit" and
+       .verification.verified == true and .verification.reason == "valid" and
+       (.verification.signature | type == "string" and length > 0) then .object.sha
+    else error("Cerbero tag object is not a verified PGP tag") end
+' <<<"$tag_object_json")
+tag_refs=$(git ls-remote --tags "$cerbero_repo" "refs/tags/${gstreamer_version}" "refs/tags/${gstreamer_version}^{}")
+cerbero_ref_tag_object=$(awk -v ref="refs/tags/$gstreamer_version" '$2 == ref { print $1 }' <<<"$tag_refs")
 cerbero_tag_object=$(awk -v ref="refs/tags/${gstreamer_version}" '$2 == ref { print $1 }' <<<"$tag_refs")
 cerbero_peeled_commit=$(awk -v ref="refs/tags/${gstreamer_version}^{}" '$2 == ref { print $1 }' <<<"$tag_refs")
-[[ "$cerbero_tag_object" =~ ^[[:xdigit:]]{40}$ && "$cerbero_peeled_commit" == "$cerbero_commit" ]] || {
+[[ "$cerbero_api_tag_object" == "$cerbero_ref_tag_object" && \
+   "$cerbero_tag_object" == "$cerbero_ref_tag_object" && \
+   "$cerbero_tag_object" == 78666745b34b6245a85510ac47a03a5033af4711 && \
+   "$cerbero_peeled_commit" == "$cerbero_commit" && \
+   "$cerbero_commit" == 59548269f4fd0f701818f0bafdb102959ec81e65 ]] || {
     fail "official Cerbero tag metadata disagrees"
 }
 
@@ -306,8 +322,19 @@ verify_pulse_archive() {
     [[ "$(sha256sum "$license_file" | awk '{ print $1 }')" == a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861 ]] || fail "PulseAudio LGPL bytes are not pinned"
 }
 verify_pulse_archive
-cerbero_archive_url="https://gitlab.freedesktop.org/gstreamer/cerbero/-/archive/${gstreamer_version}/cerbero-${gstreamer_version}.tar.gz"
+cerbero_archive_url="https://codeload.github.com/GStreamer/cerbero/tar.gz/59548269f4fd0f701818f0bafdb102959ec81e65"
 cerbero_archive_sha=$(sha256sum "$cerbero_archive" | awk '{ print $1 }')
+cerbero_archive_root="cerbero-59548269f4fd0f701818f0bafdb102959ec81e65"
+[[ "$cerbero_archive_sha" == 1874c5ed8b67612ca0370e5a8c7b25420ed98f0176425aa427eb1461293a82d3 ]] || {
+    fail "caller-supplied Cerbero archive checksum is not the pinned GitHub archive"
+}
+cerbero_members="$tmp_dir/cerbero-members"
+tar -tzf "$cerbero_archive" >"$cerbero_members" || fail "could not list the caller-supplied Cerbero archive"
+cerbero_root=$(sed -n '1s|/.*||p' "$cerbero_members")
+[[ "$cerbero_root" == "$cerbero_archive_root" ]] || fail "Cerbero archive root disagrees with the pinned commit"
+if ! awk -F/ -v expected="$cerbero_archive_root" '$1 != expected { invalid = 1 } END { exit invalid ? 1 : 0 }' "$cerbero_members"; then
+    fail "Cerbero archive contains an unexpected top-level path"
+fi
 pipewire_sha=$(sha256sum "$pipewire_archive" | awk '{ print $1 }')
 
 cp -a -- "$cerbero_dir/recipes" "$tmp_dir/recipes"
@@ -643,6 +670,7 @@ jq \
     --arg cerbero_commit "$cerbero_commit" \
     --arg cerbero_archive_url "$cerbero_archive_url" \
     --arg cerbero_archive_sha "$cerbero_archive_sha" \
+    --arg cerbero_archive_root "$cerbero_archive_root" \
     --arg pipewire_url "$pipewire_url" \
     --arg pipewire_sha "$pipewire_sha" \
     --arg pipewire_commit "$pipewire_tag_commit" \
@@ -666,6 +694,7 @@ jq \
     | .cerbero.commit = $cerbero_commit
     | .cerbero.archive.url = $cerbero_archive_url
     | .cerbero.archive.sha256 = $cerbero_archive_sha
+    | .cerbero.archive.root = $cerbero_archive_root
     | .components |= map(
         if .recipe == "gstreamer-1.0" then .version = $version | .source_url = $gstreamer_url | .sha256 = $gstreamer_sha
         elif .recipe == "gst-libav-1.0" then .version = $version | .source_url = $libav_url | .sha256 = $libav_sha
