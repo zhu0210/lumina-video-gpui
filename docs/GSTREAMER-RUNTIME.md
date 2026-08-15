@@ -61,6 +61,10 @@ and libav use video; and HLS/MPEG-TS use the MPEG-TS library. No selected
 binary links the controller, net, or RTP libraries, so those broad-category
 outputs are excluded. The recursive ELF gate remains the final transitive
 closure check.
+The selected `libgstaudio-1.0` and `libgstvideo-1.0` Meson targets both link
+`orc_dep`, so the ORC package uses an exact `libs_lumina` category containing
+only `liborc-0.4`. Cerbero's `liborc-test-0.4` prepare-time addition has no
+selected runtime consumer and is deliberately excluded.
 PulseAudio's client categories are exact: `libs_lumina` selects top-level
 `libpulse`, while `lumina_private` selects the literal
 `pulseaudio/libpulsecommon-17.0` file. The latter is installed in the lock-authorized private
@@ -77,7 +81,7 @@ After fetch/source SHA mapping and before offline bootstrap/package build, the f
 build resolves every lock license member exactly once and stages those bytes;
 license assembly reuses that verified staging area.
 
-The lock section `audit.overlay_inputs` contains exactly 18 regular control files
+The lock section `audit.overlay_inputs` contains exactly 19 regular control files
 under the repo-owned config/package/recipe/patch directories. Build and
 discovery materialize that list and verify every path and SHA-256 before using
 any Cerbero input; extra, missing, or tampered controls fail.

@@ -113,8 +113,21 @@ awk '
 ' "$script_dir/build-gstreamer-runtime.sh" >"$fixture_root/recipe-facts.py"
 printf '%s\n' "files_libs = ['libfixture']" >"$fixture_root/literal.recipe"
 printf '%s\n' "files_libs = ['libfixture']" "files_libs.append('libextra')" >"$fixture_root/dynamic.recipe"
+printf '%s\n' \
+    "files_libs = ['liborc-0.4']" \
+    "files_libs_lumina = ['liborc-0.4']" \
+    "class Recipe:" \
+    "    def prepare(self):" \
+    "        self.files_libs.append('liborc-test-0.4')" \
+    >"$fixture_root/orc.recipe"
 python3 "$fixture_root/recipe-facts.py" "$fixture_root/literal.recipe" >"$fixture_root/literal.json"
 python3 "$fixture_root/recipe-facts.py" "$fixture_root/dynamic.recipe" >"$fixture_root/dynamic.json"
+python3 "$fixture_root/recipe-facts.py" "$fixture_root/orc.recipe" >"$fixture_root/orc.json"
 jq -e '.file_patterns.files_libs == ["libfixture"] and .file_errors == []' \
     "$fixture_root/literal.json" >/dev/null
 jq -e '.file_errors | index("files_libs") != null' "$fixture_root/dynamic.json" >/dev/null
+jq -e '
+    .file_errors == []
+    and .file_patterns.files_libs == ["liborc-0.4", "liborc-test-0.4"]
+    and .file_patterns.files_libs_lumina == ["liborc-0.4"]
+' "$fixture_root/orc.json" >/dev/null

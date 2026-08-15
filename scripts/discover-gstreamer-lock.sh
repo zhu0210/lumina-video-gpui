@@ -72,8 +72,8 @@ validate_overlay_inputs() {
 
     if ! jq -er '
         .audit.overlay_inputs as $items
-        | if ($items | type) != "array" or ($items | length) != 18 then
-            error("overlay input manifest must contain exactly 18 files")
+        | if ($items | type) != "array" or ($items | length) != 19 then
+            error("overlay input manifest must contain exactly 19 files")
           elif any($items[]; (.path | type) != "string" or (.sha256 | type) != "string") then
             error("overlay input manifest has invalid fields")
           elif any($items[]; (.path | test("^vendor/cerbero-overlay/(config|packages|recipes|patches)/[^/]+$") | not)) then
@@ -117,7 +117,7 @@ validate_overlay_inputs() {
     cmp -s "$normalized_file_list" "$listed_file_list" || {
         fail "audited overlay file set differs from the lock"
     }
-    if ! awk 'END { exit !(NR == 18) }' "$destination"; then
+    if ! awk 'END { exit !(NR == 19) }' "$destination"; then
         fail "audited overlay input manifest has an unexpected size"
     fi
     while IFS=$'\t' read -r path expected_sha; do
@@ -660,6 +660,7 @@ assert_reviewed_recipe_files libpulse libs_lumina '["libpulse"]'
 assert_reviewed_recipe_files libpulse lumina_private '["%(libdir)s/pulseaudio/libpulsecommon-17.0%(srext)s"]'
 assert_reviewed_recipe_files gstreamer-1.0 libs_lumina '["libgstreamer-1.0", "libgstbase-1.0"]'
 assert_reviewed_recipe_files gst-plugins-base-1.0 libs_lumina '["libgstallocators-1.0", "libgstaudio-1.0", "libgstpbutils-1.0", "libgstriff-1.0", "libgsttag-1.0", "libgstvideo-1.0"]'
+assert_reviewed_recipe_files orc libs_lumina '["liborc-0.4"]'
 
 # Resolve only the plugin categories named by the package specs. recipe_facts
 # is the sole AST seam; this shell layer rejects dynamic/malformed declarations
