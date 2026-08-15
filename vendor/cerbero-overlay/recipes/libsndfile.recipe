@@ -1,0 +1,22 @@
+# PulseAudio's client-common library unconditionally links libsndfile. Keep
+# optional codec integrations disabled so this adds no recursive codec closure.
+class Recipe(recipe.Recipe):
+    name = 'libsndfile'
+    version = '1.2.2'
+    stype = SourceType.TARBALL
+    library_type = LibraryType.SHARED
+    btype = BuildType.CMAKE
+    url = 'https://github.com/libsndfile/libsndfile/releases/download/1.2.2/libsndfile-1.2.2.tar.xz'
+    tarball_checksum = '3799ca9924d3125038880367bf1468e53a1b7e3686a934f098b7e1d286cdb80e'
+    licenses = [{License.LGPLv2_1Plus: ['COPYING']}]
+    deps = []
+    configure_options = [
+        '-DENABLE_EXTERNAL_LIBS=OFF',
+        '-DENABLE_MPEG=OFF',
+        '-DBUILD_TESTING=OFF',
+        '-DBUILD_PROGRAMS=OFF',
+        '-DBUILD_EXAMPLES=OFF',
+        '-DENABLE_CPACK=OFF',
+        '-DENABLE_BOW_DOCS=OFF',
+    ]
+    files_libs = ['libsndfile']

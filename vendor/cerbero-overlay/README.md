@@ -10,6 +10,9 @@ This follows Cerbero's documented private-package API: a private package uses
 direct `files` categories and omits package-level `deps`.
 There is no same-name `lumina-audited` recipe; the package file is the sole
 custom output and the lock recipe allowlist contains only fetched recipes.
+The 29-component closure includes libsndfile 1.2.2 because PulseAudio's
+client-common ABI links it unconditionally; its external/MPEG/optional codec
+features are disabled, so no recursive codec closure is added.
 
 The lock is the authority for the exact variants and plugin set. The overlay
 keeps Rust off and carries applied patches against the pinned 1.28.6 recipe

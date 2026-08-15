@@ -10,11 +10,13 @@ categories select the core/base/good/bad/libav plugins, the PipeWire-owned
 GStreamer plugin, and the explicitly bundled codec/audio/VA libraries. All
 Cerbero jobs use two workers.
 
-The lock fixes 28 runtime components, including GStreamer 1.28.6,
+The lock fixes 29 runtime components, including GStreamer 1.28.6,
 FFmpeg 7.1, the libsoup 3.6.6 HTTPS closure (glib-networking, libproxy,
 libpsl, nghttp2, and sqlite3), PipeWire 1.6.8, and the explicitly bundled
-audio/VA/DRM user-space libraries. It also fixes the Ubuntu builder image, the
-exact variant set `norust,nogi,nounwind,alsa,pulse,va`, recipe/plugin audit allowlists, and
+audio/VA/DRM user-space libraries. libsndfile is bundled because PulseAudio's
+client-common ABI links it unconditionally; its external/MPEG/optional codec
+features are disabled, so it adds no recursive codec closure. It also fixes
+the Ubuntu builder image, the exact variant set `norust,nogi,nounwind,alsa,pulse,va`, recipe/plugin audit allowlists, and
 the system ELF ABI allowlist. `vendor/cerbero-overlay` contains the direct
 package, source-backed audio/VA/DRM recipes, PipeWire recipe, and applied
 base/good/bad/GStreamer bash-completion/OpenSSL recipe patches; all are included in the
@@ -28,10 +30,10 @@ disabled. These are not
 needed for playback and would add build-only, non-runtime, or runtime-link
 inputs to the audited closure.
 
-The lock records the verified archive roots for the six recipes whose source
+The lock records the verified archive roots for the seven recipes whose source
 trees do not all use Cerbero's default directory names. Explicit
 `tarball_dirname` normalization is limited to ALSA, PulseAudio, and PipeWire;
-the runtime inventory remains 28 components.
+the runtime inventory remains 29 components.
 
 `scripts/discover-gstreamer-lock.sh` is metadata-only: it accepts a local
 extracted pinned Cerbero tree and local Cerbero/PipeWire archives, validates

@@ -21,6 +21,9 @@ FFmpeg options, gst-plugins-ugly, x264, and unknown licenses are rejected.
 H.264/AAC software fallback is `avdec_h264`/`avdec_aac`. ALSA, PulseAudio,
 PipeWire, and libva user-space libraries are bundled; only glibc/loader and
 explicit GPU/display driver ABI names remain external.
+The 29-component closure also bundles libsndfile because PulseAudio's
+client-common ABI links it unconditionally; its external/MPEG/optional codec
+features are disabled, so no recursive codec closure is added.
 
 Discovery is the only moving-metadata path:
 

@@ -52,16 +52,16 @@ gstreamer_version=$(jq -er '.gstreamer.version' "$lock_file")
 jq -e '.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]' "$lock_file" >/dev/null || {
     fail "lock variants are not the exact audited set"
 }
-jq -e '(.components | length == 28) and all(.components[]; (.recipe != "bash-completion" and .recipe != "libunwind" and .recipe != "gobject-introspection"))' "$lock_file" >/dev/null || {
-    fail "lock must contain exactly the 28 audited runtime components"
+jq -e '(.components | length == 29) and all(.components[]; (.recipe != "bash-completion" and .recipe != "libunwind" and .recipe != "gobject-introspection"))' "$lock_file" >/dev/null || {
+    fail "lock must contain exactly the 29 audited runtime components"
 }
 jq -e '
     ([.audit.recipe_metadata[] | select(has("archive_root"))] as $roots
-     | ($roots | length == 6)
-     and (($roots | map(.recipe) | sort) == ["alsa", "libdrm", "libpulse", "libva", "openssl", "pipewire"])
+     | ($roots | length == 7)
+     and (($roots | map(.recipe) | sort) == ["alsa", "libdrm", "libpulse", "libsndfile", "libva", "openssl", "pipewire"])
      and all($roots[]; (.archive_root | (type == "string" and length > 0)))
      and (($roots | map(.archive_root) | unique | length) == ($roots | length))
-     and (([.audit.recipe_metadata[] | select(.overlay == true) | .recipe] | sort) == ["alsa", "libdrm", "libpulse", "libva", "pipewire"])
+     and (([.audit.recipe_metadata[] | select(.overlay == true) | .recipe] | sort) == ["alsa", "libdrm", "libpulse", "libsndfile", "libva", "pipewire"])
     )
 ' "$lock_file" >/dev/null || fail "lock archive-root metadata is incomplete"
 gstreamer_url="https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-${gstreamer_version}.tar.xz"

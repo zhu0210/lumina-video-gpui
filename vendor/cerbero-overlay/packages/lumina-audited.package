@@ -36,6 +36,7 @@ class Package(package.Package):
         'libvpx:libs',
         'alsa:libs',
         'libpulse:libs',
+        'libsndfile:libs',
         'libva:libs',
         'libdrm:libs',
         'libsoup:libs',
