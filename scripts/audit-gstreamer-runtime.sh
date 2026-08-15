@@ -94,18 +94,13 @@ jq -e --argjson owners "$(jq -c '[.components[].name]' "$lock_file")" \
 jq -e --argjson owners "$(jq -c '[.components[].name]' "$lock_file")" \
     'all(.bundled_files[] | select(.path | test("\\.so($|\\.)")); .component as $owner | ($owners | index($owner)))' \
     <<<"$manifest" >/dev/null || fail "runtime shared-library ownership is incomplete"
-jq -e --arg prefix 'vendor/linux-x86_64/lib/x86_64-linux-gnu/' \
-    --argjson expected "$(jq -c '.audit.shared_library_allowlist' "$lock_file")" '
-    [ .bundled_files[]
-      | select(.path | startswith($prefix))
-      | .path = (.path | ltrimstr($prefix))
-      | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
-      | .path |= sub("\\.so(\\..*)?$"; ".so")
-      | {component, path}
-    ] as $actual
-    | all($actual | group_by(.path)[]; (map(.component) | unique | length) == 1)
-      and (($actual | unique_by(.path) | sort_by(.path)) == ($expected | sort_by(.path)))
-' <<<"$manifest" >/dev/null || fail "runtime shared-library owner mapping differs from the lock allowlist"
+shared_library_prefix='vendor/linux-x86_64/lib/x86_64-linux-gnu/'
+if ! manifest_shared_owners=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
+    'include "gstreamer-shared-library-manifest"; .bundled_files | shared_library_owners($prefix)' <<<"$manifest"); then
+    fail "runtime shared-library owner mapping is ambiguous"
+fi
+[[ "$manifest_shared_owners" == "$(jq -c '.audit.shared_library_allowlist | sort_by(.path)' "$lock_file")" ]] || \
+    fail "runtime shared-library owner mapping differs from the lock allowlist"
 
 runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-runtime-audit.XXXXXX")
 source_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-source-audit.XXXXXX")
@@ -279,6 +274,13 @@ fi
 if ! jq -er '.canonical_paths[]' "$shared_library_inventory_json" >"$actual_shared_library_files"; then
     fail "runtime shared-library inventory is malformed"
 fi
+if ! manifest_shared_entries=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
+    'include "gstreamer-shared-library-manifest"; .bundled_files | shared_library_entries($prefix)' <<<"$manifest"); then
+    fail "runtime shared-library manifest entries are malformed"
+fi
+actual_shared_entries=$(jq -c '[.entries[] | {path, kind, link_target: (.link_target // null)}] | sort_by(.path)' \
+    "$shared_library_inventory_json")
+[[ "$manifest_shared_entries" == "$actual_shared_entries" ]] || fail "runtime shared-library manifest entries differ from the artifact"
 if ! cmp -s "$actual_shared_library_files" "$expected_shared_library_files"; then
     shared_library_set_diff="$cache_dir/runtime-shared-library-set.diff"
     comm -3 "$expected_shared_library_files" "$actual_shared_library_files" >"$shared_library_set_diff"

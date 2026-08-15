@@ -14,6 +14,7 @@ on:
       - scripts/build-gstreamer-runtime.sh
       - scripts/audit-gstreamer-runtime.sh
       - scripts/gstreamer-shared-library-inventory.py
+      - scripts/gstreamer-shared-library-manifest.jq
       - scripts/test-gstreamer-runtime-shared-libraries.sh
       - scripts/smoke-gstreamer-runtime.sh
       - scripts/run-gstreamer-smoke-case.sh
