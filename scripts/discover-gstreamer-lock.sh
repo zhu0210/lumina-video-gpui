@@ -520,6 +520,21 @@ def meson_error(name):
         facts["meson_control_errors"].append(name)
 def string_value(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+def literal_strings(node):
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values = []
+        for item in node.elts:
+            value = string_value(item)
+            if value is None:
+                return None
+            values.append(value)
+        return values
+    return None
+def add_plain_library_values(values):
+    if values is None or "files_libs" not in facts["file_patterns"]:
+        file_error("files_libs")
+    else:
+        facts["file_patterns"]["files_libs"].extend(values)
 def meson_subscript(node):
     if not isinstance(node, ast.Subscript):
         return None
@@ -595,10 +610,18 @@ for node in ast.walk(tree):
     if isinstance(node, ast.Name) and (node.id == "files_libs" or node.id.startswith(("files_plugins_", "files_libs_")) or node.id == "files_lumina_private") and id(node) not in allowed_file_targets:
         file_error(node.id)
     elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-          and node.value.id == "self" and (node.attr == "files_libs" or node.attr.startswith(("files_plugins_", "files_libs_")) or node.attr == "files_lumina_private")):
+          and node.value.id == "self" and (node.attr.startswith(("files_plugins_", "files_libs_")) or node.attr == "files_lumina_private")):
         file_error(node.attr)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         owner = node.func.value
+        if (isinstance(owner, ast.Attribute) and owner.attr == "files_libs"
+                and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            if node.func.attr == "append" and len(node.args) == 1:
+                add_plain_library_values([string_value(node.args[0])] if string_value(node.args[0]) is not None else None)
+            elif node.func.attr == "extend" and len(node.args) == 1:
+                add_plain_library_values(literal_strings(node.args[0]))
+            else:
+                file_error("files_libs")
         if isinstance(owner, ast.Name) and owner.id == "self":
             if node.func.attr == "enable_plugin":
                 target = string_value(node.args[0]) if node.args else None
@@ -620,6 +643,9 @@ for node in ast.walk(tree):
         if meson_subscript(node.target) is not None:
             meson_error("meson_options")
     elif isinstance(node, ast.AugAssign):
+        if (isinstance(node.target, ast.Attribute) and node.target.attr == "files_libs"
+                and isinstance(node.target.value, ast.Name) and node.target.value.id == "self"):
+            add_plain_library_values(literal_strings(node.value))
         if meson_subscript(node.target) is not None:
             meson_error("meson_options")
     elif isinstance(node, ast.Delete):
