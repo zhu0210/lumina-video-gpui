@@ -50,7 +50,8 @@ the runtime inventory remains 29 components.
 `scripts/discover-gstreamer-lock.sh` is metadata-only: it accepts a local
 extracted pinned Cerbero tree and local Cerbero/PipeWire/PulseAudio archives, validates
 every locked recipe after the repo patches, and queries only small official
-tag/checksum endpoints. It refuses to download those archives itself.
+checksum, tag/signature, and commit raw-file (`meson.build`/`LGPL`) endpoints.
+It refuses to download those archives itself.
 The PipeWire archive is addressed to commit
 `b741e0c74f5436f0c925f7741140db0efd32cf4e` and byte-locked by its SHA-256.
 PulseAudio is acquired from the official API's PGP-signed annotated `v17.0` tag (tag object
