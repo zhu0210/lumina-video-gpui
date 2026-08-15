@@ -217,6 +217,15 @@ PY
 
 gstreamer_version=$(jq -er '.gstreamer.version' "$lock_file")
 [[ "$gstreamer_version" == 1.28.6 ]] || fail "reviewed lock template only supports GStreamer 1.28.6"
+zlib_version=$(jq -er '.sources.zlib.version' "$lock_file")
+zlib_filename=$(jq -er '.sources.zlib.filename' "$lock_file")
+zlib_url=$(jq -er '.sources.zlib.url' "$lock_file")
+zlib_sha=$(jq -er '.sources.zlib.sha256' "$lock_file")
+[[ "$zlib_version" == 1.3.1 && "$zlib_filename" == zlib-1.3.1.tar.gz &&
+   "$zlib_url" == https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz &&
+   "$zlib_sha" == 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23 ]] || {
+    fail "lock zlib acquisition metadata is not the audited mirror/version/SHA"
+}
 jq -e '.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]' "$lock_file" >/dev/null || {
     fail "lock variants are not the exact audited set"
 }
