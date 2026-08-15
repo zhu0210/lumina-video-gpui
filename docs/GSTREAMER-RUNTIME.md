@@ -28,6 +28,11 @@ disabled. These are not
 needed for playback and would add build-only, non-runtime, or runtime-link
 inputs to the audited closure.
 
+The lock records the verified archive roots for the six recipes whose source
+trees do not all use Cerbero's default directory names. Explicit
+`tarball_dirname` normalization is limited to ALSA, PulseAudio, and PipeWire;
+the runtime inventory remains 28 components.
+
 `scripts/discover-gstreamer-lock.sh` is metadata-only: it accepts a local
 extracted pinned Cerbero tree and local Cerbero/PipeWire archives, validates
 every locked recipe after the repo patches, and queries only small official

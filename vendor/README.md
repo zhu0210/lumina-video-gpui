@@ -9,6 +9,10 @@ and Freedesktop 25.08 Flatpak refs.
 introspection, unwind, and shell-completion inputs are not needed for playback
 and would add build-only, non-runtime, or runtime-link inputs.
 
+The lock also records verified archive roots; explicit Cerbero root
+normalization is limited to ALSA, PulseAudio, and PipeWire, with no runtime
+inventory change.
+
 The audited closure is intentionally narrow: only the lock's direct recipe
 categories are built into the single `lumina-audited` package. The matrix
 plugin allowlist records effective license/source, while the build and audit
