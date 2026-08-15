@@ -1345,19 +1345,26 @@ verify_pipewire_archive() {
 verify_pipewire_archive "${component_archive[PipeWire]}"
 
 extract_license() {
-    local archive=$1
-    local member_pattern=$2
-    local destination=$3
+    local component_name=$1
+    local archive=$2
+    local member_pattern=$3
+    local destination=$4
+    local archive_label=${archive##*/}
+    local context="component=$component_name archive=$archive_label member=$member_pattern"
+    local destination_dir=${destination%/*}
     local member_list temporary archive_member member_kind root suffix selected_member rest root_metadata_name
     local -A seen_archive_members=()
     local -A seen_roots=()
     local -a path_parts=()
+    cleanup_license_temp() {
+        rm -f -- "$1" 2>/dev/null || fail "$context: could not clean temporary license data"
+    }
     member_list="$work_dir/license-members.$RANDOM"
     [[ "$member_pattern" =~ ^\*/[A-Za-z0-9][A-Za-z0-9._+-]*(/[A-Za-z0-9][A-Za-z0-9._+-]*)*$ ]] || {
-        fail "license member pattern is unsafe: $member_pattern"
+        fail "$context: license member pattern is unsafe"
     }
     suffix=${member_pattern#*/}
-    if ! python3 - "$archive" "$member_list" <<'PY'
+    if ! python3 - "$archive" "$member_list" 2>/dev/null <<'PY'
 import sys
 import stat
 import tarfile
@@ -1405,13 +1412,12 @@ try:
                     else:
                         kind = "special"
                     write_member(destination, member.name, kind)
-except Exception as error:
-    print(f"archive enumeration failed: {error}", file=sys.stderr)
+except Exception:
     raise SystemExit(1)
 PY
     then
-        rm -f -- "$member_list"
-        fail "could not enumerate archive members: $archive"
+        cleanup_license_temp "$member_list"
+        fail "$context: could not enumerate archive members"
     fi
     selected_member=
     root_metadata_name=
@@ -1420,52 +1426,52 @@ PY
         if IFS= read -r -d '' archive_member; then
             :
         elif [[ -n "$archive_member" ]]; then
-            rm -f -- "$member_list"
-            fail "archive member stream has an incomplete name: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive member stream has an incomplete name"
         else
             break
         fi
         member_kind=
         if ! IFS= read -r -d '' member_kind; then
-            rm -f -- "$member_list"
-            fail "archive member stream has an incomplete type: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive member stream has an incomplete type"
         fi
         [[ -n "$archive_member" ]] || {
-            rm -f -- "$member_list"
-            fail "archive contains an empty member name: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive contains an empty member name"
         }
         [[ ! "$archive_member" =~ [[:cntrl:]] ]] || {
-            rm -f -- "$member_list"
-            fail "archive member contains control characters: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive member contains control characters"
         }
         [[ "$archive_member" != /* && "$archive_member" != *"//"* ]] || {
-            rm -f -- "$member_list"
-            fail "archive member path is absolute or has an empty component: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive member path is absolute or has an empty component"
         }
         IFS=/ read -r -a path_parts <<<"$archive_member"
         for path_part in "${path_parts[@]}"; do
             [[ "$path_part" != "." && "$path_part" != ".." ]] || {
-                rm -f -- "$member_list"
-                fail "archive member path contains dot traversal: $archive"
+                cleanup_license_temp "$member_list"
+                fail "$context: archive member path contains dot traversal"
             }
         done
         [[ "$member_kind" == directory || "$member_kind" == regular ||
            "$member_kind" == symlink || "$member_kind" == hardlink ||
            "$member_kind" == special ]] || {
-            rm -f -- "$member_list"
-            fail "archive member has an invalid type: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive member has an invalid type"
         }
         if [[ "$archive_member" == */* ]]; then
             root=${archive_member%%/*}
             rest=${archive_member#*/}
             [[ -n "$root" ]] || {
-                rm -f -- "$member_list"
-                fail "archive member has an empty top-level root: $archive"
+                cleanup_license_temp "$member_list"
+                fail "$context: archive member has an empty top-level root"
             }
         else
             [[ "$member_kind" == directory ]] || {
-                rm -f -- "$member_list"
-                fail "archive member has no top-level root: $archive"
+                cleanup_license_temp "$member_list"
+                fail "$context: archive member has no top-level root"
             }
             root=$archive_member
             rest=
@@ -1473,67 +1479,76 @@ PY
         if [[ -n "${seen_roots["$root"]+x}" ]]; then
             :
         elif ((${#seen_roots[@]} > 0)); then
-            rm -f -- "$member_list"
-            fail "archive has multiple top-level roots: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive has multiple top-level roots"
         fi
         seen_roots["$root"]=1
         if [[ -n "${seen_archive_members["$archive_member"]+x}" ]]; then
-            rm -f -- "$member_list"
-            fail "archive contains duplicate members: $archive"
+            cleanup_license_temp "$member_list"
+            fail "$context: archive contains duplicate members"
         fi
         seen_archive_members["$archive_member"]=1
         if [[ -z "$rest" ]]; then
             [[ "$member_kind" == directory ]] || {
-                rm -f -- "$member_list"
-                fail "top-level root entry is not a directory: $archive"
+                cleanup_license_temp "$member_list"
+                fail "$context: top-level root entry is not a directory"
             }
             [[ -z "$root_metadata_name" ]] || {
-                rm -f -- "$member_list"
-                fail "archive has conflicting top-level root metadata: $archive"
+                cleanup_license_temp "$member_list"
+                fail "$context: archive has conflicting top-level root metadata"
             }
             root_metadata_name=$archive_member
             continue
         fi
         if [[ "$rest" == "$suffix" ]]; then
             [[ "$member_kind" == regular ]] || {
-                rm -f -- "$member_list"
-                fail "license member is not a regular file: $member_pattern"
+                cleanup_license_temp "$member_list"
+                fail "$context: license member is not a regular file"
             }
             [[ -z "$selected_member" ]] || {
-                rm -f -- "$member_list"
-                fail "license member pattern matches multiple archive members: $member_pattern"
+                cleanup_license_temp "$member_list"
+                fail "$context: license member pattern matches multiple archive members"
             }
             selected_member=$archive_member
         fi
     done <"$member_list"
-    rm -f -- "$member_list"
-    [[ ${#seen_roots[@]} -eq 1 ]] || fail "archive must have exactly one top-level root: $archive"
-    [[ -n "$selected_member" ]] || fail "license member pattern is absent from $archive: $member_pattern"
+    cleanup_license_temp "$member_list"
+    [[ ${#seen_roots[@]} -eq 1 ]] || fail "$context: archive must have exactly one top-level root"
+    [[ -n "$selected_member" ]] || fail "$context: license member pattern is absent"
     [[ "$selected_member" != -* && "$selected_member" != *'*'* && "$selected_member" != *'?'* &&
        "$selected_member" != *'['* && "$selected_member" != *']'* ]] || {
-        fail "selected archive license member is not a safe exact path: $selected_member"
+        fail "$context: selected archive license member is not a safe exact path"
     }
-    [[ ! "$selected_member" =~ [\\] ]] || fail "selected archive license member contains a backslash: $selected_member"
+    [[ ! "$selected_member" =~ [\\] ]] || fail "$context: selected archive license member contains a backslash"
     temporary="$work_dir/license.$RANDOM"
     if [[ "$archive" == *.zip ]]; then
         unzip -p "$archive" "$selected_member" >"$temporary" 2>/dev/null || {
-            rm -f -- "$temporary"
-            fail "license text is missing from $archive: $member_pattern"
+            cleanup_license_temp "$temporary"
+            fail "$context: license text is missing"
         }
     else
         tar -xOf "$archive" -- "$selected_member" >"$temporary" 2>/dev/null || {
-            rm -f -- "$temporary"
-            fail "license text is missing from $archive: $member_pattern"
+            cleanup_license_temp "$temporary"
+            fail "$context: license text is missing"
         }
     fi
     [[ -s "$temporary" ]] || {
-        rm -f -- "$temporary"
-        fail "license text is empty in $archive: $member_pattern"
+        cleanup_license_temp "$temporary"
+        fail "$context: license text is empty"
     }
-    mkdir -p "$(dirname -- "$destination")"
-    chmod 0644 -- "$temporary"
-    cp -a -- "$temporary" "$destination"
-    rm -f -- "$temporary"
+    if ! mkdir -p -- "$destination_dir" 2>/dev/null; then
+        cleanup_license_temp "$temporary"
+        fail "$context: could not create license staging directory"
+    fi
+    if ! chmod 0644 -- "$temporary" 2>/dev/null; then
+        cleanup_license_temp "$temporary"
+        fail "$context: could not set license staging mode"
+    fi
+    if ! cp -a -- "$temporary" "$destination" 2>/dev/null; then
+        cleanup_license_temp "$temporary"
+        fail "$context: could not stage license text"
+    fi
+    cleanup_license_temp "$temporary"
 }
 
 license_preflight_list="$work_dir/license-preflight.tsv"
@@ -1597,7 +1612,7 @@ while IFS=$'\t' read -r component_name license_member license_output; do
     [[ -f "$archive_path" && ! -L "$archive_path" ]] || {
         fail "component archive is missing from source cache: $component_name"
     }
-    extract_license "$archive_path" "$license_member" "$license_stage_dir/$license_output"
+    extract_license "$component_name" "$archive_path" "$license_member" "$license_stage_dir/$license_output"
 done <"$license_preflight_list"
 
 verify_pulse_archive() {
