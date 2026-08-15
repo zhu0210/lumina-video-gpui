@@ -613,37 +613,84 @@ def is_recipe_class(node):
     return (isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name)
             and (base.value.id, base.attr) in (("custom", "GStreamer"), ("recipe", "Recipe")))
 
-def binds_recipe_target(node):
-    if isinstance(node, ast.Name):
-        return node.id == "Recipe"
-    if isinstance(node, (ast.Starred, ast.Tuple, ast.List)):
-        return any(binds_recipe_target(element) for element in node.elts)
-    return False
+class ModuleRecipeBindingCollector(ast.NodeVisitor):
+    def __init__(self, direct_statements):
+        self.events = []
+        self.direct_statements = {id(statement) for statement in direct_statements}
 
-def binds_recipe_name(statement):
-    if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-        return statement.name == "Recipe"
-    if isinstance(statement, ast.Assign):
-        return any(binds_recipe_target(target) for target in statement.targets)
-    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
-        return binds_recipe_target(statement.target)
-    if isinstance(statement, (ast.For, ast.AsyncFor)):
-        return binds_recipe_target(statement.target)
-    if isinstance(statement, (ast.With, ast.AsyncWith)):
-        return any(item.optional_vars is not None and binds_recipe_target(item.optional_vars)
-                   for item in statement.items)
-    if isinstance(statement, ast.Import):
-        return any((alias.asname or alias.name.split(".")[0]) == "Recipe" for alias in statement.names)
-    if isinstance(statement, ast.ImportFrom):
-        return any((alias.asname or alias.name) == "Recipe" for alias in statement.names)
-    if isinstance(statement, ast.Expr):
-        return any(isinstance(node, ast.NamedExpr) and binds_recipe_target(node.target)
-                   for node in ast.walk(statement.value))
-    return False
+    def event(self, kind, node):
+        self.events.append((kind, node, id(node) in self.direct_statements))
 
-recipe_bindings = [statement for statement in tree.body if binds_recipe_name(statement)]
-recipe_class = (recipe_bindings[0]
-                if len(recipe_bindings) == 1 and is_recipe_class(recipe_bindings[0])
+    def visit_Name(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)) and node.id == "Recipe":
+            self.event("name", node)
+
+    def visit_ClassDef(self, node):
+        if node.name == "Recipe":
+            self.event("class", node)
+
+    def visit_FunctionDef(self, node):
+        if node.name == "Recipe":
+            self.event("function", node)
+
+    def visit_AsyncFunctionDef(self, node):
+        if node.name == "Recipe":
+            self.event("function", node)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            if (alias.asname or alias.name.split(".")[0]) == "Recipe":
+                self.event("import", alias)
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            if alias.name != "*" and (alias.asname or alias.name) == "Recipe":
+                self.event("import", alias)
+
+    def visit_ExceptHandler(self, node):
+        if node.name == "Recipe":
+            self.event("except", node)
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node):
+        if node.name == "Recipe":
+            self.event("match", node)
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node):
+        if node.name == "Recipe":
+            self.event("match", node)
+        self.generic_visit(node)
+
+    def visit_MatchMapping(self, node):
+        if node.rest == "Recipe":
+            self.event("match", node)
+        self.generic_visit(node)
+
+    def visit_Lambda(self, node):
+        return
+
+    def visit_ListComp(self, node):
+        return
+
+    def visit_SetComp(self, node):
+        return
+
+    def visit_DictComp(self, node):
+        return
+
+    def visit_GeneratorExp(self, node):
+        return
+
+collector = ModuleRecipeBindingCollector(tree.body)
+for statement in tree.body:
+    collector.visit(statement)
+recipe_bindings = collector.events
+recipe_class = (recipe_bindings[0][1]
+                if len(recipe_bindings) == 1
+                and recipe_bindings[0][0] == "class"
+                and recipe_bindings[0][2]
+                and is_recipe_class(recipe_bindings[0][1])
                 else None)
 recipe_body = recipe_class.body if recipe_class is not None else []
 
