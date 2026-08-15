@@ -15,6 +15,17 @@ usage() {
     exit 2
 }
 
+verify_overlay_copy() {
+    local relative_path=$1 materialized_path=$2 expected_sha actual_sha
+    expected_sha=$(awk -F '\t' -v path="$relative_path" '$1 == path { print $2 }' "$overlay_input_list")
+    [[ -n "$expected_sha" ]] || fail "materialized overlay path is not lock-owned: $relative_path"
+    [[ -f "$materialized_path" && ! -L "$materialized_path" ]] || fail "materialized overlay control is not a regular file: $relative_path"
+    if ! actual_sha=$(sha256sum -- "$materialized_path" | awk '{ print $1 }'); then
+        fail "could not hash materialized overlay control: $relative_path"
+    fi
+    [[ "$actual_sha" == "$expected_sha" ]] || fail "materialized overlay control hash mismatch: $relative_path"
+}
+
 while (($#)); do
     case "$1" in
         --lock)
@@ -455,7 +466,8 @@ cleanup() {
     rm -rf "$work_dir"
 }
 trap cleanup EXIT
-validate_overlay_inputs "$overlay_dir" "$lock_file" "$work_dir/overlay-inputs.tsv" "$repo_root"
+overlay_input_list="$work_dir/overlay-inputs.tsv"
+validate_overlay_inputs "$overlay_dir" "$lock_file" "$overlay_input_list" "$repo_root"
 
 export HOME="$work_dir/home"
 export XDG_CACHE_HOME="$work_dir/cache"
@@ -500,11 +512,13 @@ gstreamer_lumina_plugin_list_patch="$overlay_dir/patches/gstreamer-1.0-lumina-pl
 overlay_package="$overlay_dir/packages/lumina-audited.package"
 [[ -f "$overlay_package" ]] || fail "audited Cerbero package is missing"
 cp -a -- "$overlay_package" "$cerbero_dir/packages/lumina-audited.package"
+verify_overlay_copy "vendor/cerbero-overlay/packages/lumina-audited.package" "$cerbero_dir/packages/lumina-audited.package"
 while IFS= read -r overlay_recipe; do
     [[ -n "$overlay_recipe" ]] || continue
     overlay_recipe_file="$overlay_dir/recipes/$overlay_recipe.recipe"
     [[ -f "$overlay_recipe_file" ]] || fail "missing repo-owned overlay recipe: $overlay_recipe"
     cp -a -- "$overlay_recipe_file" "$cerbero_dir/recipes/$overlay_recipe.recipe"
+    verify_overlay_copy "vendor/cerbero-overlay/recipes/$overlay_recipe.recipe" "$cerbero_dir/recipes/$overlay_recipe.recipe"
 done < <(jq -er '.audit.recipe_metadata[] | select(.overlay == true) | .recipe' "$lock_file")
 if grep -Eq '^[[:space:]]*deps[[:space:]]*=' "$overlay_package"; then
     fail "audited private package must not depend on an upstream package"

@@ -15,6 +15,17 @@ usage() {
     echo "Usage: $0 --cerbero-dir DIR --cerbero-archive ARCHIVE --pipewire-archive ARCHIVE [--lock PATH]" >&2
     exit 2
 }
+
+verify_overlay_copy() {
+    local relative_path=$1 materialized_path=$2 expected_sha actual_sha
+    expected_sha=$(awk -F '\t' -v path="$relative_path" '$1 == path { print $2 }' "$overlay_input_list")
+    [[ -n "$expected_sha" ]] || fail "materialized overlay path is not lock-owned: $relative_path"
+    [[ -f "$materialized_path" && ! -L "$materialized_path" ]] || fail "materialized overlay control is not a regular file: $relative_path"
+    if ! actual_sha=$(sha256sum -- "$materialized_path" | awk '{ print $1 }'); then
+        fail "could not hash materialized overlay control: $relative_path"
+    fi
+    [[ "$actual_sha" == "$expected_sha" ]] || fail "materialized overlay control hash mismatch: $relative_path"
+}
 while (($#)); do
     case "$1" in
         --lock) (($# >= 2)) || usage; lock_file=$2; shift 2 ;;
@@ -113,7 +124,8 @@ validate_overlay_inputs() {
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-lock-discovery.XXXXXX")
 cleanup() { rm -rf "$tmp_dir"; }
 trap cleanup EXIT
-validate_overlay_inputs "$overlay_dir" "$lock_file" "$tmp_dir/overlay-inputs.tsv" "$repo_root"
+overlay_input_list="$tmp_dir/overlay-inputs.tsv"
+validate_overlay_inputs "$overlay_dir" "$lock_file" "$overlay_input_list" "$repo_root"
 
 # Keep this verifier local so discovery remains independently auditable.
 package_files_from_overlay() {
@@ -221,6 +233,7 @@ fi
 while IFS= read -r overlay_recipe; do
     [[ -n "$overlay_recipe" ]] || continue
     cp -a -- "$overlay_dir/recipes/$overlay_recipe.recipe" "$tmp_dir/recipes/$overlay_recipe.recipe"
+    verify_overlay_copy "vendor/cerbero-overlay/recipes/$overlay_recipe.recipe" "$tmp_dir/recipes/$overlay_recipe.recipe"
 done < <(jq -er '.audit.recipe_metadata[] | select(.overlay == true) | .recipe' "$lock_file")
 while IFS= read -r patch_name; do
     [[ -n "$patch_name" ]] || continue
