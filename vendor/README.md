@@ -12,6 +12,9 @@ and would add build-only, non-runtime, or runtime-link inputs.
 The lock also records verified archive roots; explicit Cerbero root
 normalization is limited to ALSA, PulseAudio, and PipeWire, with no runtime
 inventory change.
+`audit.overlay_inputs` is the single SHA-256 inventory of the 16 regular
+repo-owned Cerbero control files under config, packages, recipes, and patches;
+the build and discovery scripts reject path-set or byte mismatches.
 
 The audited closure is intentionally narrow: only the lock's direct recipe
 categories are built into the single `lumina-audited` package, with exactly 21

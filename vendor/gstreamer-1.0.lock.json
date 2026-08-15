@@ -60,6 +60,24 @@
   "packages": ["lumina-audited"],
   "variants": ["norust", "nogi", "nounwind", "alsa", "pulse", "va"],
   "audit": {
+    "overlay_inputs": [
+      {"path": "vendor/cerbero-overlay/config/lumina-audited.cbc", "sha256": "6f93a2242387c1d027badbc605aedeb2647276b6fd88f8a84d6469a4e6bd21c6"},
+      {"path": "vendor/cerbero-overlay/packages/lumina-audited.package", "sha256": "2b03dbaae4ad8f11d3678bf40ad804b4821905a95f9426c2371e8a09a0cfa8fb"},
+      {"path": "vendor/cerbero-overlay/recipes/alsa.recipe", "sha256": "88bda7945683298660b4698376040197b6fb2680383f33bb0a73d27bc2e90ba0"},
+      {"path": "vendor/cerbero-overlay/recipes/libdrm.recipe", "sha256": "5aed555e18894553e5db9b6407882fe13adbdd949f4660d2629686a3b9c8a9c0"},
+      {"path": "vendor/cerbero-overlay/recipes/libpulse.recipe", "sha256": "55aee13cd5fa0c99a949d9fac53023d9980b4b26d29016c4f9cf92c70ef11b33"},
+      {"path": "vendor/cerbero-overlay/recipes/libsndfile.recipe", "sha256": "0aef9f5b55e4bdffc89bbb8e9d8e706c7ebc2398d44ff0a206a413ad5bf3cca1"},
+      {"path": "vendor/cerbero-overlay/recipes/libva.recipe", "sha256": "a3e3308c19e9bd401abfe670128cfd326a67aa7139f3b46b3eb4f32b306b2654"},
+      {"path": "vendor/cerbero-overlay/recipes/pipewire.recipe", "sha256": "8a4c661fe73038096580f5a8d3a256ec2a45992cbb4dc389d19027c358cda74c"},
+      {"path": "vendor/cerbero-overlay/patches/gst-plugins-bad-1.0-disable-gpl.patch", "sha256": "0a19ff0f5125702201143b812b5b7d60153bcacbff900ffc67bbdc9271c1da0f"},
+      {"path": "vendor/cerbero-overlay/patches/gst-plugins-bad-1.0-minimal.patch", "sha256": "701ebdec17ea1f6ec5286146a1c2f0cadf5e535a2032785f27cb6cd72e1201ff"},
+      {"path": "vendor/cerbero-overlay/patches/gst-plugins-bad-1.0-no-gpl-deps.patch", "sha256": "46413403aabd41b7365dd9001c77b64cd4915208cabe3fafa8215cc737f9d185"},
+      {"path": "vendor/cerbero-overlay/patches/gst-plugins-base-1.0-minimal.patch", "sha256": "593888a6ef5c546c73f9b3be5490e1b3c202bcd0acc06dbc1ce1b70777cdde04"},
+      {"path": "vendor/cerbero-overlay/patches/gst-plugins-good-1.0-minimal.patch", "sha256": "7f300173262b980b3f97a19130415c47d5aa7c00757d60630afce490d5d2b482"},
+      {"path": "vendor/cerbero-overlay/patches/gstreamer-1.0-lumina-plugin-list.patch", "sha256": "e23c42ce219c3be01c062673b7017c201f88ffd5c7aefcb3dba99107d7e097a7"},
+      {"path": "vendor/cerbero-overlay/patches/gstreamer-1.0-no-bash-completions.patch", "sha256": "64d6158f9dd2c5c311fa8fe9b8c99d2d94d161deeb17d67ed626597aea6f09ad"},
+      {"path": "vendor/cerbero-overlay/patches/openssl-no-ca-certificates.patch", "sha256": "e533171285ee1e49af93b7c8ac879bd3870d64719ba3a1d3ce904aa8d89c640b"}
+    ],
     "recipe_allowlist": [
       "gstreamer-1.0",
       "gst-plugins-base-1.0",
