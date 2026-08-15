@@ -7,6 +7,13 @@ fixture_root=$(mktemp -d "${TMPDIR:-/tmp}/lumina-shared-library-test.XXXXXX")
 cleanup() { rm -rf -- "$fixture_root"; }
 trap cleanup EXIT
 
+jq -L "$script_dir" -e 'include "gstreamer-shared-library-manifest"; valid_shared_library_allowlist' \
+    "$repo_root/vendor/gstreamer-1.0.lock.json" >/dev/null
+jq '.audit.shared_library_allowlist[0].component = "missing-owner"' \
+    "$repo_root/vendor/gstreamer-1.0.lock.json" >"$fixture_root/unknown-owner-lock.json"
+! jq -L "$script_dir" -e 'include "gstreamer-shared-library-manifest"; valid_shared_library_allowlist' \
+    "$fixture_root/unknown-owner-lock.json" >/dev/null
+
 public_dir="$fixture_root/runtime/lib/x86_64-linux-gnu"
 private_dir="$public_dir/pulseaudio"
 mkdir -p "$private_dir"

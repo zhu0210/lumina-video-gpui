@@ -1,3 +1,13 @@
+def valid_shared_library_allowlist:
+  .components as $components
+  | .audit.shared_library_allowlist as $items
+  | ($items | type == "array" and length > 0)
+    and all($items[];
+      (.component | type == "string" and length > 0)
+      and (.path | type == "string" and test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)$")))
+    and (($items | map(.path) | length) == ($items | map(.path) | unique | length))
+    and all($items[]; .component as $owner | any($components[]; .name == $owner));
+
 def shared_library_entries($prefix):
   [ .[]
     | select(.path | startswith($prefix))
