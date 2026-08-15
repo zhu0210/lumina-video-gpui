@@ -59,11 +59,13 @@ fail() {
     exit 1
 }
 validate_overlay_inputs() {
-    local overlay_root=$1 lock_path=$2 destination=$3 source_root=$4
+    local overlay_root=$1 lock_path=$2 destination=$3 source_root=$4 snapshot_root=$5
     local actual_file_list="${destination}.filesystem"
     local normalized_file_list="${destination}.normalized"
     local listed_file_list="${destination}.listed"
-    local path expected_sha actual_sha absolute
+    local snapshot_file_list="${destination}.snapshot"
+    local snapshot_normalized_file_list="${destination}.snapshot.normalized"
+    local path expected_sha actual_sha snapshot_sha absolute source_path snapshot_path metadata_name
 
     if ! jq -er '
         .audit.overlay_inputs as $items
@@ -79,14 +81,16 @@ validate_overlay_inputs() {
             error("overlay input hash is not lowercase SHA-256")
           elif (($items | map(.path) | length) != ($items | map(.path) | unique | length)) then
             error("overlay input paths are not unique")
-          elif (($items | map(.sha256) | length) != ($items | map(.sha256) | unique | length)) then
-            error("overlay input hashes are not unique")
           else $items[] | [.path, .sha256] | @tsv
           end
     ' "$lock_path" >"$destination"; then
         fail "invalid audited overlay input hash manifest"
     fi
 
+    [[ ! -e "$snapshot_root" ]] || fail "overlay snapshot path already exists"
+    if ! mkdir -p "$snapshot_root"; then
+        fail "could not create private overlay snapshot"
+    fi
     : >"$actual_file_list"
     for directory in config packages recipes patches; do
         if ! find "$overlay_root/$directory" -type f -print >>"$actual_file_list"; then
@@ -114,18 +118,60 @@ validate_overlay_inputs() {
         fail "audited overlay input manifest has an unexpected size"
     fi
     while IFS=$'\t' read -r path expected_sha; do
-        [[ -f "$source_root/$path" ]] || fail "missing audited overlay control: $path"
-        if ! actual_sha=$(sha256sum -- "$source_root/$path" | awk '{ print $1 }'); then
+        source_path="$source_root/$path"
+        snapshot_path="$snapshot_root/$path"
+        [[ -f "$source_path" && ! -L "$source_path" ]] || fail "missing audited overlay control: $path"
+        if ! actual_sha=$(sha256sum -- "$source_path" | awk '{ print $1 }'); then
             fail "could not hash audited overlay control: $path"
         fi
         [[ "$actual_sha" == "$expected_sha" ]] || fail "audited overlay control hash mismatch: $path"
+        mkdir -p "${snapshot_path%/*}"
+        if ! cp -- "$source_path" "$snapshot_path"; then
+            fail "could not snapshot audited overlay control: $path"
+        fi
+        [[ -f "$snapshot_path" && ! -L "$snapshot_path" ]] || fail "snapshot control is not a regular file: $path"
+        if ! snapshot_sha=$(sha256sum -- "$snapshot_path" | awk '{ print $1 }'); then
+            fail "could not hash snapshot overlay control: $path"
+        fi
+        [[ "$snapshot_sha" == "$expected_sha" ]] || fail "snapshot overlay control hash mismatch: $path"
     done <"$destination"
+    for metadata_name in README.md LICENSE.md; do
+        source_path="$overlay_root/$metadata_name"
+        snapshot_path="$snapshot_root/vendor/cerbero-overlay/$metadata_name"
+        [[ -f "$source_path" && ! -L "$source_path" ]] || fail "overlay metadata is missing: $metadata_name"
+        if ! cp -- "$source_path" "$snapshot_path"; then
+            fail "could not snapshot overlay metadata: $metadata_name"
+        fi
+        [[ -f "$snapshot_path" && ! -L "$snapshot_path" ]] || fail "snapshot metadata is not a regular file: $metadata_name"
+    done
+    : >"$snapshot_file_list"
+    for directory in config packages recipes patches; do
+        if ! find "$snapshot_root/vendor/cerbero-overlay/$directory" -type f -print >>"$snapshot_file_list"; then
+            fail "could not enumerate overlay snapshot controls"
+        fi
+    done
+    while IFS= read -r absolute; do
+        case "$absolute" in
+            "$snapshot_root"/*)
+                printf '%s\n' "${absolute#"$snapshot_root"/}"
+                ;;
+            *)
+                fail "overlay snapshot escapes its private root"
+                ;;
+        esac
+    done <"$snapshot_file_list" >"$snapshot_normalized_file_list"
+    sort -o "$snapshot_normalized_file_list" "$snapshot_normalized_file_list"
+    cmp -s "$snapshot_normalized_file_list" "$listed_file_list" || {
+        fail "overlay snapshot file set differs from the lock"
+    }
 }
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-lock-discovery.XXXXXX")
 cleanup() { rm -rf "$tmp_dir"; }
 trap cleanup EXIT
 overlay_input_list="$tmp_dir/overlay-inputs.tsv"
-validate_overlay_inputs "$overlay_dir" "$lock_file" "$overlay_input_list" "$repo_root"
+overlay_snapshot="$tmp_dir/overlay-snapshot"
+validate_overlay_inputs "$overlay_dir" "$lock_file" "$overlay_input_list" "$repo_root" "$overlay_snapshot"
+overlay_dir="$overlay_snapshot/vendor/cerbero-overlay"
 
 # Keep this verifier local so discovery remains independently auditable.
 package_files_from_overlay() {
