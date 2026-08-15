@@ -67,7 +67,7 @@
 +             '%(libdir)s/gstreamer-1.0/libgstmatroska%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstvpx%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstsoup%(mext)s',
-+             '%(libdir)s/gstreamer-1.0/libgstpulse%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstpulseaudio%(mext)s',
 +    ]
      files_plugins_core_devel = [
 @@ -240,42 +232,4 @@
