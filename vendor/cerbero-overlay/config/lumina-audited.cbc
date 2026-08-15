@@ -5,3 +5,6 @@
 # gst-plugins-bad GPL setting is an applied, fuzz-free patch in patches/ and
 # the FFmpeg settings are asserted against the pinned upstream recipe.
 variants = ['norust', 'alsa', 'pulse', 'va']
+# Audited/default tarball recipes win same-name conflicts while system-only
+# recipes remain available.
+system_recipes_priority = -1

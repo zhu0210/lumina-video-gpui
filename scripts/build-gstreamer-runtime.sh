@@ -603,7 +603,57 @@ grep -F "deps = ['zlib']" "$cerbero_dir/recipes/openssl.recipe" >/dev/null || {
 variant_csv=$(IFS=,; printf '%s' "${variants[*]}")
 cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive \
     -c "$cerbero_dir/config/linux.config" -c "$overlay_config" -v "$variant_csv")
-source_cache_root="$XDG_CACHE_HOME/cerbero-sources"
+cerbero_show_config=
+if ! cerbero_show_config=$("${cerbero[@]}" show-config); then
+    fail "Cerbero show-config failed"
+fi
+parse_show_config_value() {
+    local key=$1 result_var=$2 parsed
+    if ! parsed=$(awk -v key="$key" '
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*:" {
+            count++
+            value = $0
+            sub("^[[:space:]]*" key "[[:space:]]*:[[:space:]]*", "", value)
+            sub("[[:space:]]*$", "", value)
+            if (value == "") {
+                invalid = 1
+            } else {
+                print value
+            }
+        }
+        END { exit (count == 1 && !invalid) ? 0 : 1 }
+    ' <<<"$cerbero_show_config"); then
+        fail "Cerbero show-config did not provide exactly one nonempty $key value"
+    fi
+    printf -v "$result_var" '%s' "$parsed"
+}
+
+show_config_local_sources=
+parse_show_config_value local_sources show_config_local_sources
+[[ "$show_config_local_sources" == /* ]] || {
+    fail "Cerbero show-config local_sources is not absolute"
+}
+normalized_work_dir=$(realpath -m -- "$work_dir") || fail "could not normalize build work directory"
+if ! source_cache_root=$(realpath -m -- "$show_config_local_sources"); then
+    fail "could not normalize Cerbero local_sources"
+fi
+case "$source_cache_root/" in
+    "$normalized_work_dir/"*)
+        ;;
+    *)
+        fail "Cerbero local_sources escapes the build work directory"
+        ;;
+esac
+show_config_system_priority=
+parse_show_config_value system_recipes_priority show_config_system_priority
+[[ "$show_config_system_priority" == -1 ]] || {
+    fail "Cerbero system recipe priority is not -1"
+}
+show_config_allow_system=
+parse_show_config_value allow_system_recipes show_config_allow_system
+[[ "$show_config_allow_system" == True ]] || {
+    fail "Cerbero system recipes are not available"
+}
 mkdir -p "$source_cache_root"
 snapshot_source_cache() {
     local destination=$1 file relative digest
