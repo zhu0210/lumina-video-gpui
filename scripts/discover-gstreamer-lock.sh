@@ -47,6 +47,7 @@ fail() {
     exit 1
 }
 
+# Keep this verifier local so discovery remains independently auditable.
 package_files_from_overlay() {
     python3 - "$1" <<'PY'
 import ast
@@ -58,12 +59,15 @@ package_classes = [node for node in tree.body if isinstance(node, ast.ClassDef) 
 if len(package_classes) != 1:
     raise SystemExit("audited package class must be unique")
 assignments = [
-    node for node in ast.walk(package_classes[0])
+    node for node in package_classes[0].body
     if isinstance(node, ast.Assign)
-    and any(isinstance(target, ast.Name) and target.id == "files" for target in node.targets)
+    and len(node.targets) == 1
+    and isinstance(node.targets[0], ast.Name)
+    and node.targets[0].id == "files"
 ]
 if len(assignments) != 1:
     raise SystemExit("package files assignment must be unique")
+allowed_target = assignments[0].targets[0]
 value = assignments[0].value
 if not isinstance(value, (ast.List, ast.Tuple)):
     raise SystemExit("package files assignment must be a constant list")
@@ -74,6 +78,9 @@ for item in value.elts:
     files.append(item.value)
 if len(files) != len(set(files)):
     raise SystemExit("package files list contains duplicates")
+for node in ast.walk(package_classes[0]):
+    if isinstance(node, ast.Name) and node.id == "files" and node is not allowed_target:
+        raise SystemExit("package files name is mutated or read outside its declaration")
 json.dump(files, sys.stdout, separators=(",", ":"))
 print()
 PY
@@ -164,6 +171,7 @@ if grep -Eq "^[[:space:]]*bash_completions[[:space:]]*=.*(gst-inspect-1\\.0|gst-
     fail "GStreamer recipe still lists gst shell completions"
 fi
 
+# Keep this AST seam local so discovery can fail independently.
 recipe_facts() {
     python3 - "$1" <<'PY'
 import ast
@@ -180,40 +188,50 @@ def strings(node):
 facts = {"name": None, "version": None, "url": None, "sha256": None,
          "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": [],
          "file_patterns": {}, "file_errors": []}
+allowed_plugin_targets = set()
+def file_error(name):
+    if name not in facts["file_errors"]:
+        facts["file_errors"].append(name)
 for node in ast.walk(tree):
-    if not isinstance(node, ast.Assign):
-        continue
-    for target in node.targets:
-        if not isinstance(target, ast.Name):
-            continue
-        if target.id == "name" and isinstance(node.value, ast.Constant):
-            facts["name"] = node.value.value
-        elif target.id == "version" and isinstance(node.value, ast.Constant):
-            facts["version"] = node.value.value
-        elif target.id == "url" and isinstance(node.value, ast.Constant):
-            facts["url"] = node.value.value
-        elif target.id == "tarball_checksum" and isinstance(node.value, ast.Constant):
-            facts["sha256"] = node.value.value
-        elif target.id in ("package_name", "tarball_dirname") and isinstance(node.value, ast.Constant):
-            facts[target.id] = node.value.value
-        elif target.id == "deps":
-            facts["deps"] = strings(node.value)
-        elif target.id == "platform_deps" and isinstance(node.value, ast.Dict):
-            for key, value in zip(node.value.keys, node.value.values):
-                if isinstance(key, ast.Attribute) and key.attr == "LINUX":
-                    facts["platform_deps"] = strings(value)
-        elif target.id.startswith("files_plugins_"):
-            if not isinstance(node.value, (ast.List, ast.Tuple)):
-                facts["file_errors"].append(target.id)
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
                 continue
-            values = []
-            for item in node.value.elts:
-                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
-                    facts["file_errors"].append(target.id)
-                    break
-                values.append(item.value)
-            else:
-                facts["file_patterns"][target.id] = values
+            if target.id == "name" and isinstance(node.value, ast.Constant):
+                facts["name"] = node.value.value
+            elif target.id == "version" and isinstance(node.value, ast.Constant):
+                facts["version"] = node.value.value
+            elif target.id == "url" and isinstance(node.value, ast.Constant):
+                facts["url"] = node.value.value
+            elif target.id == "tarball_checksum" and isinstance(node.value, ast.Constant):
+                facts["sha256"] = node.value.value
+            elif target.id in ("package_name", "tarball_dirname") and isinstance(node.value, ast.Constant):
+                facts[target.id] = node.value.value
+            elif target.id == "deps":
+                facts["deps"] = strings(node.value)
+            elif target.id == "platform_deps" and isinstance(node.value, ast.Dict):
+                for key, value in zip(node.value.keys, node.value.values):
+                    if isinstance(key, ast.Attribute) and key.attr == "LINUX":
+                        facts["platform_deps"] = strings(value)
+            elif target.id.startswith("files_plugins_"):
+                if len(node.targets) != 1 or not isinstance(node.value, (ast.List, ast.Tuple)):
+                    file_error(target.id)
+                    continue
+                values = []
+                for item in node.value.elts:
+                    if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                        file_error(target.id)
+                        break
+                    values.append(item.value)
+                else:
+                    if target.id in facts["file_patterns"]:
+                        file_error(target.id)
+                    else:
+                        facts["file_patterns"][target.id] = values
+                        allowed_plugin_targets.add(id(target))
+for node in ast.walk(tree):
+    if isinstance(node, ast.Name) and node.id.startswith("files_plugins_") and id(node) not in allowed_plugin_targets:
+        file_error(node.id)
 print(json.dumps(facts, sort_keys=True))
 PY
 }
