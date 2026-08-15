@@ -103,14 +103,8 @@ mkfifo "$public_dir/libspecial.so"
     >"$fixture_root/special.json" 2>/dev/null
 unlink "$public_dir/libspecial.so"
 
-# Execute the formal builder's exact embedded recipe_facts parser against a
-# literal category and a dynamic mutation; do not maintain a second parser.
-awk '
-    /^recipe_facts\(\) \{/ { in_function = 1 }
-    in_function && /<<'\''PY'\''$/ { capture = 1; next }
-    capture && /^PY$/ { exit }
-    capture { print }
-' "$script_dir/build-gstreamer-runtime.sh" >"$fixture_root/recipe-facts.py"
+# Execute both standalone recipe_facts parsers against the same fixtures; do
+# not maintain a third parser in this test.
 printf '%s\n' "files_libs = ['libfixture']" >"$fixture_root/literal.recipe"
 printf '%s\n' "files_libs = ['libfixture']" "files_libs.append('libextra')" >"$fixture_root/dynamic.recipe"
 printf '%s\n' \
@@ -120,14 +114,22 @@ printf '%s\n' \
     "    def prepare(self):" \
     "        self.files_libs.append('liborc-test-0.4')" \
     >"$fixture_root/orc.recipe"
-python3 "$fixture_root/recipe-facts.py" "$fixture_root/literal.recipe" >"$fixture_root/literal.json"
-python3 "$fixture_root/recipe-facts.py" "$fixture_root/dynamic.recipe" >"$fixture_root/dynamic.json"
-python3 "$fixture_root/recipe-facts.py" "$fixture_root/orc.recipe" >"$fixture_root/orc.json"
-jq -e '.file_patterns.files_libs == ["libfixture"] and .file_errors == []' \
-    "$fixture_root/literal.json" >/dev/null
-jq -e '.file_errors | index("files_libs") != null' "$fixture_root/dynamic.json" >/dev/null
-jq -e '
-    .file_errors == []
-    and .file_patterns.files_libs == ["liborc-0.4", "liborc-test-0.4"]
-    and .file_patterns.files_libs_lumina == ["liborc-0.4"]
-' "$fixture_root/orc.json" >/dev/null
+for parser_script in build-gstreamer-runtime.sh discover-gstreamer-lock.sh; do
+    awk '
+        /^recipe_facts\(\) \{/ { in_function = 1 }
+        in_function && /<<'\''PY'\''$/ { capture = 1; next }
+        capture && /^PY$/ { exit }
+        capture { print }
+    ' "$script_dir/$parser_script" >"$fixture_root/recipe-facts.py"
+    python3 "$fixture_root/recipe-facts.py" "$fixture_root/literal.recipe" >"$fixture_root/literal.json"
+    python3 "$fixture_root/recipe-facts.py" "$fixture_root/dynamic.recipe" >"$fixture_root/dynamic.json"
+    python3 "$fixture_root/recipe-facts.py" "$fixture_root/orc.recipe" >"$fixture_root/orc.json"
+    jq -e '.file_patterns.files_libs == ["libfixture"] and .file_errors == []' \
+        "$fixture_root/literal.json" >/dev/null
+    jq -e '.file_errors | index("files_libs") != null' "$fixture_root/dynamic.json" >/dev/null
+    jq -e '
+        .file_errors == []
+        and .file_patterns.files_libs == ["liborc-0.4", "liborc-test-0.4"]
+        and .file_patterns.files_libs_lumina == ["liborc-0.4"]
+    ' "$fixture_root/orc.json" >/dev/null
+done
