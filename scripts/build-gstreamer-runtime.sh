@@ -672,6 +672,9 @@ for node in ast.walk(tree):
 for node in ast.walk(tree):
     if isinstance(node, ast.Name) and node.id.startswith("files_plugins_") and id(node) not in allowed_plugin_targets:
         file_error(node.id)
+    elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+          and node.value.id == "self" and node.attr.startswith("files_plugins_")):
+        file_error(node.attr)
 print(json.dumps(facts, sort_keys=True))
 PY
 }
