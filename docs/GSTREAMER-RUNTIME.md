@@ -26,8 +26,15 @@ pinned recipe, checks the actual FFmpeg options, and verifies actual plugin
 licenses with isolated `gst-inspect-1.0`.
 The audit parses each plugin's space-delimited `License` and `Source module`
 fields, accepts only raw `LGPL` or `MIT/X11`, and records normalized SPDX values.
-Before packaging, independent AST gates fail closed on every plugin enable/disable
-control and require the reviewed base/good/bad/GStreamer control sets.
+Before packaging, the local AST checks provide friendly diagnostics for the
+reviewed base/good/bad/GStreamer control sets; they are not the security
+boundary. The lock's exact overlay hashes, post-package 21-plugin inventory,
+source/license checks, and artifact audit are authoritative.
+
+The lock section `audit.overlay_inputs` contains exactly 16 regular control files
+under the repo-owned config/package/recipe/patch directories. Build and
+discovery materialize that list and verify every path and SHA-256 before using
+any Cerbero input; extra, missing, or tampered controls fail.
 
 The `nogi` and `nounwind` variants disable GObject introspection and unwind
 inputs, and the GStreamer recipe's Cerbero bash-completion integration is

@@ -24,13 +24,14 @@ while (($#)); do
         *) usage ;;
     esac
 done
-for command_name in curl git jq sha256sum mktemp mv cp rm grep awk sed realpath patch python3 cmp; do
+for command_name in curl git jq sha256sum mktemp mv cp rm grep awk sed realpath patch python3 cmp find sort; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
     }
 done
 [[ -n "$cerbero_dir" && -n "$cerbero_archive" && -n "$pipewire_archive" ]] || usage
+overlay_dir="$repo_root/vendor/cerbero-overlay"
 
 lock_file=$(realpath "$lock_file")
 cerbero_dir=$(realpath "$cerbero_dir")
@@ -46,6 +47,73 @@ fail() {
     echo "discover-gstreamer-lock: $*" >&2
     exit 1
 }
+validate_overlay_inputs() {
+    local overlay_root=$1 lock_path=$2 destination=$3 source_root=$4
+    local actual_file_list="${destination}.filesystem"
+    local normalized_file_list="${destination}.normalized"
+    local listed_file_list="${destination}.listed"
+    local path expected_sha actual_sha absolute
+
+    if ! jq -er '
+        .audit.overlay_inputs as $items
+        | if ($items | type) != "array" or ($items | length) != 16 then
+            error("overlay input manifest must contain exactly 16 files")
+          elif any($items[]; (.path | type) != "string" or (.sha256 | type) != "string") then
+            error("overlay input manifest has invalid fields")
+          elif any($items[]; (.path | test("^vendor/cerbero-overlay/(config|packages|recipes|patches)/[^/]+$") | not)) then
+            error("overlay input path is outside the control directories")
+          elif any($items[]; (.path | test("(^|/)\\.\\.?(/|$)"))) then
+            error("overlay input path contains traversal")
+          elif any($items[]; (.sha256 | test("^[0-9a-f]{64}$") | not)) then
+            error("overlay input hash is not lowercase SHA-256")
+          elif (($items | map(.path) | length) != ($items | map(.path) | unique | length)) then
+            error("overlay input paths are not unique")
+          elif (($items | map(.sha256) | length) != ($items | map(.sha256) | unique | length)) then
+            error("overlay input hashes are not unique")
+          else $items[] | [.path, .sha256] | @tsv
+          end
+    ' "$lock_path" >"$destination"; then
+        fail "invalid audited overlay input hash manifest"
+    fi
+
+    : >"$actual_file_list"
+    for directory in config packages recipes patches; do
+        if ! find "$overlay_root/$directory" -type f -print >>"$actual_file_list"; then
+            fail "could not enumerate audited overlay controls"
+        fi
+    done
+    while IFS= read -r absolute; do
+        case "$absolute" in
+            "$source_root"/*)
+                printf '%s\n' "${absolute#"$source_root"/}"
+                ;;
+            *)
+                fail "overlay control is outside the repository"
+                ;;
+        esac
+    done <"$actual_file_list" >"$normalized_file_list"
+    sort -o "$normalized_file_list" "$normalized_file_list"
+    if ! awk -F '\t' '{ print $1 }' "$destination" | sort >"$listed_file_list"; then
+        fail "could not normalize audited overlay input paths"
+    fi
+    cmp -s "$normalized_file_list" "$listed_file_list" || {
+        fail "audited overlay file set differs from the lock"
+    }
+    if ! awk 'END { exit !(NR == 16) }' "$destination"; then
+        fail "audited overlay input manifest has an unexpected size"
+    fi
+    while IFS=$'\t' read -r path expected_sha; do
+        [[ -f "$source_root/$path" ]] || fail "missing audited overlay control: $path"
+        if ! actual_sha=$(sha256sum -- "$source_root/$path" | awk '{ print $1 }'); then
+            fail "could not hash audited overlay control: $path"
+        fi
+        [[ "$actual_sha" == "$expected_sha" ]] || fail "audited overlay control hash mismatch: $path"
+    done <"$destination"
+}
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-lock-discovery.XXXXXX")
+cleanup() { rm -rf "$tmp_dir"; }
+trap cleanup EXIT
+validate_overlay_inputs "$overlay_dir" "$lock_file" "$tmp_dir/overlay-inputs.tsv" "$repo_root"
 
 # Keep this verifier local so discovery remains independently auditable.
 package_files_from_overlay() {
@@ -132,11 +200,7 @@ cerbero_archive_url="https://gitlab.freedesktop.org/gstreamer/cerbero/-/archive/
 cerbero_archive_sha=$(sha256sum "$cerbero_archive" | awk '{ print $1 }')
 pipewire_sha=$(sha256sum "$pipewire_archive" | awk '{ print $1 }')
 
-tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-lock-discovery.XXXXXX")
-cleanup() { rm -rf "$tmp_dir"; }
-trap cleanup EXIT
 cp -a -- "$cerbero_dir/recipes" "$tmp_dir/recipes"
-overlay_dir="$repo_root/vendor/cerbero-overlay"
 overlay_package="$overlay_dir/packages/lumina-audited.package"
 [[ -f "$overlay_package" ]] || fail "audited Cerbero package is missing"
 if grep -Eq '^[[:space:]]*deps[[:space:]]*=' "$overlay_package"; then
@@ -171,7 +235,7 @@ if grep -Eq "^[[:space:]]*bash_completions[[:space:]]*=.*(gst-inspect-1\\.0|gst-
     fail "GStreamer recipe still lists gst shell completions"
 fi
 
-# Keep this AST seam local so discovery can fail independently.
+# Keep this friendly AST seam local so discovery can fail independently.
 recipe_facts() {
     python3 - "$1" <<'PY'
 import ast
@@ -179,94 +243,6 @@ import json
 import sys
 
 tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
-
-def is_recipe_class(node):
-    if not (isinstance(node, ast.ClassDef) and node.name == "Recipe" and len(node.bases) == 1):
-        return False
-    base = node.bases[0]
-    return (isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name)
-            and (base.value.id, base.attr) in (("custom", "GStreamer"), ("recipe", "Recipe")))
-
-class ModuleRecipeBindingCollector(ast.NodeVisitor):
-    def __init__(self, direct_statements):
-        self.events = []
-        self.direct_statements = {id(statement) for statement in direct_statements}
-
-    def event(self, kind, node):
-        self.events.append((kind, node, id(node) in self.direct_statements))
-
-    def visit_Name(self, node):
-        if isinstance(node.ctx, (ast.Store, ast.Del)) and node.id == "Recipe":
-            self.event("name", node)
-
-    def visit_ClassDef(self, node):
-        if node.name == "Recipe":
-            self.event("class", node)
-
-    def visit_FunctionDef(self, node):
-        if node.name == "Recipe":
-            self.event("function", node)
-
-    def visit_AsyncFunctionDef(self, node):
-        if node.name == "Recipe":
-            self.event("function", node)
-
-    def visit_Import(self, node):
-        for alias in node.names:
-            if (alias.asname or alias.name.split(".")[0]) == "Recipe":
-                self.event("import", alias)
-
-    def visit_ImportFrom(self, node):
-        for alias in node.names:
-            if alias.name != "*" and (alias.asname or alias.name) == "Recipe":
-                self.event("import", alias)
-
-    def visit_ExceptHandler(self, node):
-        if node.name == "Recipe":
-            self.event("except", node)
-        self.generic_visit(node)
-
-    def visit_MatchAs(self, node):
-        if node.name == "Recipe":
-            self.event("match", node)
-        self.generic_visit(node)
-
-    def visit_MatchStar(self, node):
-        if node.name == "Recipe":
-            self.event("match", node)
-        self.generic_visit(node)
-
-    def visit_MatchMapping(self, node):
-        if node.rest == "Recipe":
-            self.event("match", node)
-        self.generic_visit(node)
-
-    def visit_Lambda(self, node):
-        return
-
-    def visit_ListComp(self, node):
-        return
-
-    def visit_SetComp(self, node):
-        return
-
-    def visit_DictComp(self, node):
-        return
-
-    def visit_GeneratorExp(self, node):
-        return
-
-collector = ModuleRecipeBindingCollector(tree.body)
-for statement in tree.body:
-    collector.visit(statement)
-recipe_bindings = collector.events
-recipe_class = (recipe_bindings[0][1]
-                if len(recipe_bindings) == 1
-                and recipe_bindings[0][0] == "class"
-                and recipe_bindings[0][2]
-                and is_recipe_class(recipe_bindings[0][1])
-                else None)
-recipe_body = recipe_class.body if recipe_class is not None else []
 
 def strings(node):
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
@@ -276,54 +252,20 @@ def strings(node):
 facts = {"name": None, "version": None, "url": None, "sha256": None,
          "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": [],
          "file_patterns": {}, "file_errors": [], "enable_plugin_targets": [],
-         "control_errors": [], "meson_enabled": [], "meson_nonbinary": [],
-         "meson_control_errors": []}
+         "control_errors": [], "meson_enabled": [], "meson_control_errors": []}
 allowed_plugin_targets = set()
-allowed_enable_calls = set()
-allowed_meson_targets = set()
-allowed_method_meson_attrs = set()
 meson_assignment_seen = False
-
 def file_error(name):
     if name not in facts["file_errors"]:
         facts["file_errors"].append(name)
-
 def control_error(name):
     if name not in facts["control_errors"]:
         facts["control_errors"].append(name)
-
 def meson_error(name):
     if name not in facts["meson_control_errors"]:
         facts["meson_control_errors"].append(name)
-
-if recipe_class is None:
-    control_error("Recipe class")
-
-self_aliases = {"self"}
-alias_scan_changed = True
-while alias_scan_changed:
-    alias_scan_changed = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-            value = node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        if not isinstance(value, ast.Name) or value.id not in self_aliases:
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name):
-                control_error("self alias")
-                if target.id not in self_aliases:
-                    self_aliases.add(target.id)
-                    alias_scan_changed = True
-
 def string_value(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
-
 def meson_subscript(node):
     if not isinstance(node, ast.Subscript):
         return None
@@ -332,29 +274,18 @@ def meson_subscript(node):
             and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
         return None
     return node.slice
-
-def record_meson_state(key, value):
-    if key is None or value is None:
-        meson_error("meson_options")
-    elif value == "enabled":
-        if key not in facts["meson_enabled"]:
-            facts["meson_enabled"].append(key)
-    elif value in ("disabled", "false"):
-        return
-    else:
-        facts["meson_nonbinary"].append([key, value])
-
-def record_meson_assignment(target, value_node, owner=None):
+def record_meson_assignment(target, value_node):
     key = string_value(target)
-    value = string_value(value_node)
-    if key is None or value is None:
+    if key is None:
         meson_error("meson_options")
         return
-    if owner is not None:
-        allowed_method_meson_attrs.add(id(owner))
-    record_meson_state(key, value)
-
-for node in recipe_body:
+    value = string_value(value_node)
+    if value is None:
+        meson_error("meson_options")
+        return
+    if value == "enabled" and key not in facts["meson_enabled"]:
+        facts["meson_enabled"].append(key)
+for node in ast.walk(tree):
     if isinstance(node, ast.Assign):
         for target in node.targets:
             if not isinstance(target, ast.Name):
@@ -376,21 +307,20 @@ for node in recipe_body:
                     if isinstance(key, ast.Attribute) and key.attr == "LINUX":
                         facts["platform_deps"] = strings(value)
             elif target.id == "meson_options":
-                if (len(node.targets) != 1 or meson_assignment_seen
-                        or not isinstance(node.value, ast.Dict)):
+                if meson_assignment_seen or not isinstance(node.value, ast.Dict):
                     meson_error("meson_options")
                     continue
                 meson_assignment_seen = True
-                allowed_meson_targets.add(id(target))
                 seen_meson_keys = set()
                 for key, value in zip(node.value.keys, node.value.values):
                     key_value = string_value(key)
                     value_value = string_value(value)
-                    if key_value is None or key_value in seen_meson_keys:
+                    if key_value is None or value_value is None or key_value in seen_meson_keys:
                         meson_error("meson_options")
                         continue
                     seen_meson_keys.add(key_value)
-                    record_meson_state(key_value, value_value)
+                    if value_value == "enabled":
+                        facts["meson_enabled"].append(key_value)
             elif target.id.startswith("files_plugins_"):
                 if len(node.targets) != 1 or not isinstance(node.value, (ast.List, ast.Tuple)):
                     file_error(target.id)
@@ -407,32 +337,12 @@ for node in recipe_body:
                     else:
                         facts["file_patterns"][target.id] = values
                         allowed_plugin_targets.add(id(target))
-
 for node in ast.walk(tree):
-    if isinstance(node, ast.Name):
-        if node.id.startswith("files_plugins_") and id(node) not in allowed_plugin_targets:
-            file_error(node.id)
-        if node.id in ("enable_plugin", "disable_plugin"):
-            control_error(node.id)
-        if node.id == "meson_options" and id(node) not in allowed_meson_targets:
-            meson_error("meson_options")
-    elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-        if node.value.id in self_aliases and node.value.id != "self":
-            if node.attr.startswith("files_plugins_"):
-                file_error(node.attr)
-            elif node.attr in ("enable_plugin", "disable_plugin"):
-                control_error("self alias")
-            elif node.attr == "meson_options":
-                meson_error("self alias")
-        elif node.value.id == "self":
-            if node.attr.startswith("files_plugins_"):
-                file_error(node.attr)
-            elif node.attr in ("enable_plugin", "disable_plugin"):
-                if id(node) not in allowed_enable_calls:
-                    control_error(node.attr)
-            elif node.attr == "meson_options" and id(node) not in allowed_method_meson_attrs:
-                meson_error("meson_options")
-
+    if isinstance(node, ast.Name) and node.id.startswith("files_plugins_") and id(node) not in allowed_plugin_targets:
+        file_error(node.id)
+    elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+          and node.value.id == "self" and node.attr.startswith("files_plugins_")):
+        file_error(node.attr)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         owner = node.func.value
         if isinstance(owner, ast.Name) and owner.id == "self":
@@ -440,26 +350,18 @@ for node in ast.walk(tree):
                 target = string_value(node.args[0]) if node.args else None
                 if target is None:
                     control_error("enable_plugin")
-                else:
-                    allowed_enable_calls.add(id(node.func))
-                    if target not in facts["enable_plugin_targets"]:
-                        facts["enable_plugin_targets"].append(target)
+                elif target not in facts["enable_plugin_targets"]:
+                    facts["enable_plugin_targets"].append(target)
             elif node.func.attr == "disable_plugin":
                 control_error("disable_plugin")
         elif (isinstance(owner, ast.Attribute) and owner.attr == "meson_options"
               and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
             meson_error("meson_options")
-
     if isinstance(node, ast.Assign):
         for target in node.targets:
             key = meson_subscript(target)
-            owner = target.value if isinstance(target, ast.Subscript) else None
             if key is not None:
-                if (len(node.targets) == 1 and isinstance(node.value, ast.Constant)
-                        and isinstance(node.value.value, str)):
-                    record_meson_assignment(key, node.value, owner)
-                else:
-                    meson_error("meson_options")
+                record_meson_assignment(key, node.value)
     elif isinstance(node, ast.AnnAssign):
         if meson_subscript(node.target) is not None:
             meson_error("meson_options")
@@ -467,33 +369,26 @@ for node in ast.walk(tree):
         targets = node.targets if isinstance(node, ast.Delete) else [node.target]
         if any(meson_subscript(target) is not None for target in targets):
             meson_error("meson_options")
-
 print(json.dumps(facts, sort_keys=True))
 PY
 }
 
 assert_reviewed_recipe_controls() {
-    local recipe=$1 expected_enable_plugins=$2 expected_meson_plugins=$3 expected_meson_helpers=$4 expected_nonbinary=$5 facts
+    local recipe=$1 expected_plugins=$2 expected_meson=$3 facts
     facts=$(recipe_facts "$tmp_dir/recipes/$recipe.recipe") || {
         fail "could not parse audited recipe controls: $recipe"
     }
-    jq -e --argjson expected_enable_plugins "$expected_enable_plugins" \
-        --argjson expected_meson_plugins "$expected_meson_plugins" \
-        --argjson expected_meson_helpers "$expected_meson_helpers" \
-        --argjson expected_nonbinary "$expected_nonbinary" '
-        ($expected_meson_plugins + $expected_meson_helpers) as $expected_enabled
-        | (($expected_enabled | unique | length) == ($expected_enabled | length))
-        and (.control_errors == []) and (.meson_control_errors == [])
-        and ((.enable_plugin_targets | sort) == ($expected_enable_plugins | sort))
-        and ((.meson_enabled | sort) == ($expected_enabled | sort))
-        and ((.meson_nonbinary | sort) == ($expected_nonbinary | sort))
+    jq -e --argjson expected_plugins "$expected_plugins" --argjson expected_meson "$expected_meson" '
+        (.control_errors == []) and (.meson_control_errors == [])
+        and ((.enable_plugin_targets | sort) == ($expected_plugins | sort))
+        and ((.meson_enabled | sort) == ($expected_meson | sort))
     ' <<<"$facts" >/dev/null || fail "unreviewed plugin control in recipe: $recipe"
 }
 
-assert_reviewed_recipe_controls gstreamer-1.0 '[]' '[]' '["libunwind", "ptp-helper"]' '[]'
-assert_reviewed_recipe_controls gst-plugins-base-1.0 '["alsa"]' '["opus"]' '[]' '[]'
-assert_reviewed_recipe_controls gst-plugins-good-1.0 '["pulseaudio"]' '["adaptivedemux2", "soup", "vpx"]' '[]' '[["qt-method", "qmake"]]'
-assert_reviewed_recipe_controls gst-plugins-bad-1.0 '["va"]' '[]' '[]' '[["hls-crypto", "openssl"]]'
+assert_reviewed_recipe_controls gstreamer-1.0 '[]' '["libunwind", "ptp-helper"]'
+assert_reviewed_recipe_controls gst-plugins-base-1.0 '["alsa"]' '["opus"]'
+assert_reviewed_recipe_controls gst-plugins-good-1.0 '["pulseaudio"]' '["adaptivedemux2", "soup", "vpx"]'
+assert_reviewed_recipe_controls gst-plugins-bad-1.0 '["va"]' '[]'
 
 # Resolve only the plugin categories named by the package specs. recipe_facts
 # is the sole AST seam; this shell layer rejects dynamic/malformed declarations
