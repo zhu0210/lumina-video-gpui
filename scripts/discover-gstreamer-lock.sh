@@ -498,7 +498,7 @@ for node in ast.walk(tree):
                     seen_meson_keys.add(key_value)
                     if value_value == "enabled":
                         facts["meson_enabled"].append(key_value)
-            elif target.id.startswith("files_plugins_"):
+            elif target.id.startswith(("files_plugins_", "files_libs_")):
                 if len(node.targets) != 1 or not isinstance(node.value, (ast.List, ast.Tuple)):
                     file_error(target.id)
                     continue
@@ -515,10 +515,10 @@ for node in ast.walk(tree):
                         facts["file_patterns"][target.id] = values
                         allowed_plugin_targets.add(id(target))
 for node in ast.walk(tree):
-    if isinstance(node, ast.Name) and node.id.startswith("files_plugins_") and id(node) not in allowed_plugin_targets:
+    if isinstance(node, ast.Name) and node.id.startswith(("files_plugins_", "files_libs_")) and id(node) not in allowed_plugin_targets:
         file_error(node.id)
     elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-          and node.value.id == "self" and node.attr.startswith("files_plugins_")):
+          and node.value.id == "self" and node.attr.startswith(("files_plugins_", "files_libs_"))):
         file_error(node.attr)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         owner = node.func.value
@@ -566,6 +566,17 @@ assert_reviewed_recipe_controls gstreamer-1.0 '[]' '["libunwind", "ptp-helper"]'
 assert_reviewed_recipe_controls gst-plugins-base-1.0 '["alsa"]' '["opus"]'
 assert_reviewed_recipe_controls gst-plugins-good-1.0 '["pulseaudio"]' '["adaptivedemux2", "soup", "vpx"]'
 assert_reviewed_recipe_controls gst-plugins-bad-1.0 '["va"]' '[]'
+assert_reviewed_recipe_files() {
+    local recipe=$1 expected=$2 facts
+    facts=$(recipe_facts "$tmp_dir/recipes/$recipe.recipe") || {
+        fail "could not parse audited recipe file categories: $recipe"
+    }
+    jq -e --argjson expected "$expected" '
+        (.file_errors == []) and (.file_patterns["files_libs_lumina"] == $expected)
+    ' <<<"$facts" >/dev/null || fail "unreviewed private library file list in recipe: $recipe"
+}
+
+assert_reviewed_recipe_files gst-plugins-bad-1.0 '["libgstcodecparsers-1.0", "libgstcodecs-1.0", "libgstmpegts-1.0", "libgstva-1.0"]'
 
 # Resolve only the plugin categories named by the package specs. recipe_facts
 # is the sole AST seam; this shell layer rejects dynamic/malformed declarations

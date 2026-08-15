@@ -32,6 +32,10 @@ base/good/bad/GStreamer plugin-list, bash-completion, and OpenSSL recipe patches
 corresponding-source archive. The build verifies every patch against the
 pinned recipe, checks the actual FFmpeg options, and verifies actual plugin
 licenses with isolated `gst-inspect-1.0`.
+The gst-plugins-bad runtime also packages exactly four private libraries
+(`libgstcodecparsers-1.0`, `libgstcodecs-1.0`, `libgstmpegts-1.0`, and
+`libgstva-1.0`) required by the selected VA, H.264-parser, and HLS paths;
+the ELF closure audit requires them to resolve from the bundle.
 The audit parses each plugin's space-delimited `License` and `Source module`
 fields, accepts only raw `LGPL` or `MIT/X11`, and records normalized SPDX values.
 Before packaging, the local AST checks provide friendly diagnostics for the

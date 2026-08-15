@@ -93,7 +93,7 @@
      platform_deps = {
          Platform.LINUX: ['libdrm']
      }
-@@ -281,6 +277,12 @@
+@@ -281,6 +277,19 @@
               '%(libdir)s/gstreamer-1.0/libgstzbar%(mext)s',
      ]
 -
@@ -102,6 +102,13 @@
 +             '%(libdir)s/gstreamer-1.0/libgstvideoparsersbad%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstva%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstmpegtsdemux%(mext)s',
++    ]
++
++    files_libs_lumina = [
++             'libgstcodecparsers-1.0',
++             'libgstcodecs-1.0',
++             'libgstmpegts-1.0',
++             'libgstva-1.0',
 +    ]
 +
      files_plugins_codecs_devel = [

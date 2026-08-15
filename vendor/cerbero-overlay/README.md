@@ -18,7 +18,9 @@ The lock is the authority for the exact variants and plugin set. The overlay
 keeps Rust off and carries applied patches against the pinned 1.28.6 recipe
 files: repo-owned `files_plugins_lumina` lists select exactly 21 playback,
 network, audio, video, HLS, hardware, and fallback plugin shared objects;
-base/good/bad are reduced to those lists, and the strict
+base/good/bad are reduced to those lists; bad also exposes exactly four
+private runtime libraries (`libgstcodecparsers-1.0`, `libgstcodecs-1.0`,
+`libgstmpegts-1.0`, and `libgstva-1.0`) for the selected closure. The strict
 GPL patch changes the actual `gst-plugins-bad-1.0.recipe`
 `meson_options['gpl']` value to `disabled`. PipeWire 1.6.8 is a real Meson
 recipe: it enables `gstreamer` and SPA/client libraries while disabling the
