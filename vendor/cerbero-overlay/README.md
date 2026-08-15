@@ -27,8 +27,10 @@ extras. The builder checks the patched recipe text and the pinned Cerbero
 FFmpeg recipe's LGPL license and disabled `nonfree`/`version3` options, plus
 absence of GPL/x264 settings, before it fetches the closure. GPL, ugly, and
 x264 features are rejected by the build audit.
-The pre-package AST seam also rejects unreviewed plugin controls and dynamic
-Meson option mutations before any package is built.
+The pre-package AST seam provides friendly diagnostics for reviewed plugin
+controls and Meson options; it is not the security authority. Lock exact
+overlay input hashes, the post-package exact 21-plugin inventory, and the
+artifact audit are authoritative.
 
 References: the [Cerbero build guide](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html),
 [GStreamer Cerbero deployment guide](https://gstreamer.freedesktop.org/documentation/deploying/multiplatform-using-cerbero.html),
