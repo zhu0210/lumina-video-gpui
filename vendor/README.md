@@ -5,6 +5,11 @@ runtime build: GStreamer 1.28.6, gst-libav/FFmpeg 7.1, zlib, PipeWire 1.6.8,
 Cerbero, Ubuntu 24.04/glibc 2.39, the exact `norust,nogi,nounwind,alsa,pulse,va` variants,
 and Freedesktop 25.08 Flatpak refs.
 
+The zlib recipe/component source remains zlib.net provenance; the formal
+acquisition URL is the lock-pinned official GStreamer mirror with the same
+filename and SHA, pre-seeded into Cerbero's resolved local source cache before
+fetch.
+
 The Cerbero lock uses the official GitHub mirror, tag object
 `78666745b34b6245a85510ac47a03a5033af4711`, peeled commit
 `59548269f4fd0f701818f0bafdb102959ec81e65`, commit-addressed codeload URL,

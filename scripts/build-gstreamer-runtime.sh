@@ -341,7 +341,7 @@ ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock
 [[ "$libav_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid gst-libav checksum" >&2; exit 1; }
 [[ "$zlib_version" == 1.3.1 ]] || { echo "unsupported zlib version" >&2; exit 1; }
 [[ "$zlib_filename" == zlib-1.3.1.tar.gz ]] || { echo "unsupported zlib filename" >&2; exit 1; }
-[[ "$zlib_url" == https://zlib.net/fossils/zlib-1.3.1.tar.gz ]] || {
+[[ "$zlib_url" == https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz ]] || {
     echo "unsupported zlib source URL" >&2
     exit 1
 }
@@ -1183,6 +1183,29 @@ parse_show_config_value allow_system_recipes show_config_allow_system
 [[ "$show_config_allow_system" == True ]] || {
     fail "Cerbero system recipes are not available"
 }
+zlib_cache_file=$(realpath -m -- "$source_cache_root/zlib-1.3.1/$zlib_filename") || {
+    fail "could not normalize the zlib Cerbero cache path"
+}
+case "$zlib_cache_file/" in
+    "$source_cache_root/"*)
+        ;;
+    *)
+        fail "zlib Cerbero cache path escapes local_sources"
+        ;;
+esac
+zlib_cache_dir=${zlib_cache_file%/*}
+if [[ -L "$zlib_cache_dir" || -e "$zlib_cache_dir" && ! -d "$zlib_cache_dir" ]]; then
+    fail "zlib Cerbero cache directory is not a real directory"
+fi
+mkdir -p "$zlib_cache_dir"
+[[ -d "$zlib_cache_dir" && ! -L "$zlib_cache_dir" ]] || fail "zlib Cerbero cache directory is unsafe"
+[[ ! -L "$zlib_cache_file" ]] || fail "zlib Cerbero cache target is a symlink"
+if [[ -e "$zlib_cache_file" && ! -f "$zlib_cache_file" ]]; then
+    fail "zlib Cerbero cache target is not a regular file"
+fi
+download_and_verify "$zlib_url" "$zlib_sha" "$zlib_cache_file"
+[[ -f "$zlib_cache_file" && ! -L "$zlib_cache_file" ]] || fail "zlib preseed did not create a regular file"
+printf '%s  %s\n' "$zlib_sha" "$zlib_cache_file" | sha256sum -c -
 mkdir -p "$source_cache_root"
 snapshot_source_cache() {
     local destination=$1 file relative digest
