@@ -63,10 +63,10 @@
   "audit": {
     "overlay_inputs": [
       {"path": "vendor/cerbero-overlay/config/lumina-audited.cbc", "sha256": "6f93a2242387c1d027badbc605aedeb2647276b6fd88f8a84d6469a4e6bd21c6"},
-      {"path": "vendor/cerbero-overlay/packages/lumina-audited.package", "sha256": "8450495e1d4d05cb8a3461b7c4fbe0ac8230fe75c2ca148ee7e85d2c3a4f313c"},
+      {"path": "vendor/cerbero-overlay/packages/lumina-audited.package", "sha256": "bd9650d2f56924db581ebb333241be899ad006cfe30849af497d202b049450f9"},
       {"path": "vendor/cerbero-overlay/recipes/alsa.recipe", "sha256": "88bda7945683298660b4698376040197b6fb2680383f33bb0a73d27bc2e90ba0"},
       {"path": "vendor/cerbero-overlay/recipes/libdrm.recipe", "sha256": "5aed555e18894553e5db9b6407882fe13adbdd949f4660d2629686a3b9c8a9c0"},
-      {"path": "vendor/cerbero-overlay/recipes/libpulse.recipe", "sha256": "dfd481f60ef4b0c0b12d30f434d7cb2de8bb47a90c1a78bdfb43f005a2a7ab84"},
+      {"path": "vendor/cerbero-overlay/recipes/libpulse.recipe", "sha256": "61b2560738c0e804d43470b42306bd3463049febbeaa8db324a61465202b24b3"},
       {"path": "vendor/cerbero-overlay/recipes/libsndfile.recipe", "sha256": "0aef9f5b55e4bdffc89bbb8e9d8e706c7ebc2398d44ff0a206a413ad5bf3cca1"},
       {"path": "vendor/cerbero-overlay/recipes/libva.recipe", "sha256": "a3e3308c19e9bd401abfe670128cfd326a67aa7139f3b46b3eb4f32b306b2654"},
       {"path": "vendor/cerbero-overlay/recipes/pipewire.recipe", "sha256": "8a4c661fe73038096580f5a8d3a256ec2a45992cbb4dc389d19027c358cda74c"},
@@ -158,7 +158,8 @@
       "opus:libs",
       "libvpx:libs",
       "alsa:libs",
-      "libpulse:libs",
+      "libpulse:libs_lumina",
+      "libpulse:lumina_private",
       "libsndfile:libs",
       "libva:libs",
       "libdrm:libs",
@@ -255,6 +256,7 @@
     "archive_layout": {
       "source_libdir": "lib/x86_64-linux-gnu",
       "runtime_libdir": "lib/x86_64-linux-gnu",
+      "private_runtime_libdirs": ["lib/x86_64-linux-gnu/pulseaudio"],
       "package_roots": {"lumina-audited": ["bin", "etc", "lib", "libexec", "share"]}
     }
   },
@@ -263,7 +265,7 @@
     {"component": "FFmpeg", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libav", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libsw"]},
     {"component": "gst-libav", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/gstreamer-1.0/libgstlibav"]},
     {"component": "ALSA", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libasound"]},
-    {"component": "PulseAudio", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libpulse"]},
+    {"component": "PulseAudio", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libpulse.so", "vendor/linux-x86_64/lib/x86_64-linux-gnu/pulseaudio/libpulsecommon-17.0.so"]},
     {"component": "libsndfile", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libsndfile"]},
     {"component": "libva", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libva"]},
     {"component": "glib", "prefixes": ["vendor/linux-x86_64/lib/x86_64-linux-gnu/libglib-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgobject-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgio-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgmodule-", "vendor/linux-x86_64/lib/x86_64-linux-gnu/libgthread-"]},

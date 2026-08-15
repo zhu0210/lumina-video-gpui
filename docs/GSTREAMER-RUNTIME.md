@@ -36,6 +36,12 @@ The gst-plugins-bad runtime also packages exactly four private libraries
 (`libgstcodecparsers-1.0`, `libgstcodecs-1.0`, `libgstmpegts-1.0`, and
 `libgstva-1.0`) required by the selected VA, H.264-parser, and HLS paths;
 the ELF closure audit requires them to resolve from the bundle.
+PulseAudio's client categories are exact: `libs_lumina` selects top-level
+`libpulse`, while `lumina_private` selects the literal
+`pulseaudio/libpulsecommon-17.0` file. The latter is installed in the lock-authorized private
+`lib/x86_64-linux-gnu/pulseaudio` directory and is included in launcher and
+audit loader paths. No PulseAudio server, module, or alternate client library
+is added.
 The audit parses each plugin's space-delimited `License` and `Source module`
 fields, accepts only raw `LGPL` or `MIT/X11`, and records normalized SPDX values.
 Before packaging, the local AST checks provide friendly diagnostics for the

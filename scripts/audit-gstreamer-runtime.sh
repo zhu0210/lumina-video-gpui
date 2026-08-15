@@ -198,6 +198,32 @@ jq -e '
 
 runtime_root="$runtime_dir/vendor/linux-x86_64"
 runtime_libdir=$(jq -er '.artifact.archive_layout.runtime_libdir' "$lock_file")
+if ! private_runtime_libdirs_text=$(jq -er '
+    .artifact.archive_layout.private_runtime_libdirs as $dirs
+    | if $dirs != ["lib/x86_64-linux-gnu/pulseaudio"] then
+          error("private runtime library directory is not the exact audited path")
+      else $dirs[]
+      end
+' "$lock_file"); then
+    fail "lock private runtime library directories are invalid"
+fi
+mapfile -t private_runtime_libdirs <<<"$private_runtime_libdirs_text"
+[[ ${#private_runtime_libdirs[@]} -eq 1 ]] || fail "exactly one private runtime library directory is required"
+private_runtime_paths=()
+for private_runtime_libdir in "${private_runtime_libdirs[@]}"; do
+    case "$private_runtime_libdir" in
+        ""|/*|.|..|./*|*/./*|*/.|../*|*/../*|*/..|*//* )
+            fail "invalid private runtime library directory: $private_runtime_libdir"
+            ;;
+    esac
+    private_runtime_path="$runtime_root/$private_runtime_libdir"
+    case "$private_runtime_path/" in
+        "$runtime_root/"*) ;;
+        *) fail "private runtime library directory escaped runtime root: $private_runtime_libdir" ;;
+    esac
+    [[ -d "$private_runtime_path" && ! -L "$private_runtime_path" ]] || fail "private runtime library directory is missing: $private_runtime_libdir"
+    private_runtime_paths+=("$private_runtime_path")
+done
 runtime_plugin_dir="$runtime_root/$runtime_libdir/gstreamer-1.0"
 runtime_bin="$runtime_root/bin"
 scanner="$runtime_root/libexec/gstreamer-1.0/gst-plugin-scanner"
@@ -224,7 +250,8 @@ if ! cmp -s "$actual_plugin_files" "$expected_plugin_files"; then
 fi
 export HOME="$cache_dir/home" XDG_CACHE_HOME="$cache_dir"
 mkdir -p "$HOME"
-export LD_LIBRARY_PATH="$runtime_root/$runtime_libdir"
+runtime_library_paths=("$runtime_root/$runtime_libdir" "${private_runtime_paths[@]}")
+export LD_LIBRARY_PATH="$(IFS=:; printf '%s' "${runtime_library_paths[*]}")"
 export GST_PLUGIN_PATH_1_0="$runtime_plugin_dir"
 export GST_PLUGIN_SYSTEM_PATH_1_0=
 export GST_PLUGIN_PATH=

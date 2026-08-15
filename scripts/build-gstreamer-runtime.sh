@@ -306,6 +306,16 @@ artifact_compression=$(jq -er '.artifact.compression' "$lock_file")
 artifact_split=$(jq -r '.artifact.split' "$lock_file")
 archive_source_libdir=$(jq -er '.artifact.archive_layout.source_libdir' "$lock_file")
 archive_runtime_libdir=$(jq -er '.artifact.archive_layout.runtime_libdir' "$lock_file")
+if ! private_runtime_libdirs_text=$(jq -er '
+    .artifact.archive_layout.private_runtime_libdirs as $dirs
+    | if $dirs != ["lib/x86_64-linux-gnu/pulseaudio"] then
+          error("private runtime library directory is not the exact audited path")
+      else $dirs[]
+      end
+' "$lock_file"); then
+    fail "lock private runtime library directories are invalid"
+fi
+mapfile -t private_runtime_libdirs <<<"$private_runtime_libdirs_text"
 mapfile -t packages < <(jq -er '.packages[]' "$lock_file")
 mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
 mapfile -t recipe_allowlist < <(jq -er '.audit.recipe_allowlist[]' "$lock_file")
@@ -464,6 +474,18 @@ jq -e '
     echo "source and runtime library directories differ" >&2
     exit 1
 }
+[[ ${#private_runtime_libdirs[@]} -eq 1 ]] || {
+    echo "exactly one private runtime library directory is required" >&2
+    exit 1
+}
+for private_runtime_libdir in "${private_runtime_libdirs[@]}"; do
+    case "$private_runtime_libdir" in
+        ""|/*|.|..|./*|*/./*|*/.|../*|*/../*|*/..|*//* )
+            echo "invalid private runtime library directory: $private_runtime_libdir" >&2
+            exit 1
+            ;;
+    esac
+done
 [[ "${packages[*]}" == "lumina-audited" ]] || {
     echo "package set must contain only lumina-audited" >&2
     exit 1
@@ -919,7 +941,7 @@ for node in ast.walk(tree):
                     seen_meson_keys.add(key_value)
                     if value_value == "enabled":
                         facts["meson_enabled"].append(key_value)
-            elif target.id.startswith(("files_plugins_", "files_libs_")):
+            elif target.id.startswith(("files_plugins_", "files_libs_")) or target.id == "files_lumina_private":
                 if len(node.targets) != 1 or not isinstance(node.value, (ast.List, ast.Tuple)):
                     file_error(target.id)
                     continue
@@ -936,10 +958,10 @@ for node in ast.walk(tree):
                         facts["file_patterns"][target.id] = values
                         allowed_file_targets.add(id(target))
 for node in ast.walk(tree):
-    if isinstance(node, ast.Name) and node.id.startswith(("files_plugins_", "files_libs_")) and id(node) not in allowed_file_targets:
+    if isinstance(node, ast.Name) and (node.id.startswith(("files_plugins_", "files_libs_")) or node.id == "files_lumina_private") and id(node) not in allowed_file_targets:
         file_error(node.id)
     elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-          and node.value.id == "self" and node.attr.startswith(("files_plugins_", "files_libs_"))):
+          and node.value.id == "self" and (node.attr.startswith(("files_plugins_", "files_libs_")) or node.attr == "files_lumina_private")):
         file_error(node.attr)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         owner = node.func.value
@@ -988,16 +1010,18 @@ assert_reviewed_recipe_controls gst-plugins-base-1.0 '["alsa"]' '["opus"]'
 assert_reviewed_recipe_controls gst-plugins-good-1.0 '["pulseaudio"]' '["adaptivedemux2", "soup", "vpx"]'
 assert_reviewed_recipe_controls gst-plugins-bad-1.0 '["va"]' '[]'
 assert_reviewed_recipe_files() {
-    local recipe=$1 expected=$2 facts
+    local recipe=$1 category=$2 expected=$3 facts
     facts=$(recipe_facts "$cerbero_dir/recipes/$recipe.recipe") || {
         fail "could not parse audited recipe file categories: $recipe"
     }
-    jq -e --argjson expected "$expected" '
-        (.file_errors == []) and (.file_patterns["files_libs_lumina"] == $expected)
+    jq -e --arg key "files_$category" --argjson expected "$expected" '
+        (.file_errors == []) and (.file_patterns[$key] == $expected)
     ' <<<"$facts" >/dev/null || fail "unreviewed private library file list in recipe: $recipe"
 }
 
-assert_reviewed_recipe_files gst-plugins-bad-1.0 '["libgstcodecparsers-1.0", "libgstcodecs-1.0", "libgstmpegts-1.0", "libgstva-1.0"]'
+assert_reviewed_recipe_files gst-plugins-bad-1.0 libs_lumina '["libgstcodecparsers-1.0", "libgstcodecs-1.0", "libgstmpegts-1.0", "libgstva-1.0"]'
+assert_reviewed_recipe_files libpulse libs_lumina '["libpulse"]'
+assert_reviewed_recipe_files libpulse lumina_private '["%(libdir)s/pulseaudio/libpulsecommon-17.0%(srext)s"]'
 
 # Resolve only the plugin categories named by the package specs. recipe_facts
 # is the sole AST seam; this shell layer rejects dynamic/malformed declarations
@@ -1567,11 +1591,27 @@ if ! chmod 0755 "$runtime_root"; then
 fi
 assert_symlink_tree "$runtime_root"
 
+private_runtime_paths=()
+for private_runtime_libdir in "${private_runtime_libdirs[@]}"; do
+    private_runtime_path="$runtime_root/$private_runtime_libdir"
+    case "$private_runtime_path/" in
+        "$runtime_root/"*) ;;
+        *) fail "private runtime library directory escaped runtime root: $private_runtime_libdir" ;;
+    esac
+    [[ -d "$private_runtime_path" && ! -L "$private_runtime_path" ]] || {
+        fail "private runtime library directory is missing: $private_runtime_libdir"
+    }
+    private_runtime_paths+=("$private_runtime_path")
+done
+
 launcher="$runtime_root/bin/lumina-gstreamer-runtime"
 mkdir -p "$(dirname -- "$launcher")"
 {
     printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
     printf 'runtime_libdir=%q\n' "$archive_runtime_libdir"
+    printf 'private_runtime_libdirs=('
+    printf ' %q' "${private_runtime_libdirs[@]}"
+    printf ' )\n'
     cat <<'EOF'
 
 fail() {
@@ -1588,6 +1628,22 @@ scanner="$runtime_root/libexec/gstreamer-1.0/gst-plugin-scanner"
 [[ -d "$lib_dir" ]] || fail "private library directory is missing: $lib_dir"
 [[ -d "$plugin_dir" ]] || fail "private plugin directory is missing: $plugin_dir"
 [[ -x "$scanner" ]] || fail "private plugin scanner is missing: $scanner"
+private_library_paths=("$lib_dir")
+for private_runtime_libdir in "${private_runtime_libdirs[@]}"; do
+    case "$private_runtime_libdir" in
+        ""|/*|.|..|./*|*/./*|*/.|../*|*/../*|*/..|*//* )
+            fail "invalid private runtime library directory: $private_runtime_libdir"
+            ;;
+    esac
+    private_dir="$runtime_root/$private_runtime_libdir"
+    case "$private_dir/" in
+        "$runtime_root/"*) ;;
+        *) fail "private runtime library directory escaped runtime root: $private_runtime_libdir" ;;
+    esac
+    [[ -d "$private_dir" && ! -L "$private_dir" ]] || fail "private runtime library directory is missing: $private_runtime_libdir"
+    private_library_paths+=("$private_dir")
+done
+runtime_library_path=$(IFS=:; printf '%s' "${private_library_paths[*]}")
 
 cache_root=${XDG_CACHE_HOME:-}
 if [[ -z "$cache_root" ]]; then
@@ -1621,7 +1677,7 @@ if [[ -e "$registry_path" && ! -f "$registry_path" ]]; then
 fi
 
 export XDG_CACHE_HOME="$cache_root"
-export LD_LIBRARY_PATH="$lib_dir"
+export LD_LIBRARY_PATH="$runtime_library_path"
 export GST_PLUGIN_PATH_1_0="$plugin_dir"
 export GST_PLUGIN_SYSTEM_PATH_1_0=
 export GST_PLUGIN_PATH=
