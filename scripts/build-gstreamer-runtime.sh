@@ -283,6 +283,10 @@ jq -e 'all(.components[]; (.name and .version and .source_url and (.sha256 | tes
     echo "component inventory is incomplete" >&2
     exit 1
 }
+jq -e '([.components[].sha256] | length) == ([.components[].sha256] | unique | length)' "$lock_file" >/dev/null || {
+    echo "component source SHA-256 values must be unique for ownership matching" >&2
+    exit 1
+}
 jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT")) or (.license | startswith("BSD")) or (.license == "BZIP2-1.0.6") or (.license == "Apache-2.0") or (.license == "Public Domain")))' "$lock_file" >/dev/null || {
     echo "component license policy rejects an unapproved component" >&2
     exit 1
@@ -632,6 +636,8 @@ awk -F '\t' 'NR == FNR { before[$1] = $2; next }
     "$before_runtime_source_snapshot" "$after_runtime_source_snapshot" >"$new_runtime_source_snapshot"
 
 expected_source_rows="$work_dir/expected-source-rows.tsv"
+# Cerbero BaseTarball caches under <local_sources>/<package_name>/<tarball_name>;
+# a recipe may rewrite tarball_name. URL basenames are output labels only.
 jq -er '.components[] | [.name, .recipe, .sha256, (.source_url | split("/") | last)] | @tsv' \
     "$lock_file" >"$expected_source_rows"
 runtime_source_matches="$work_dir/runtime-source-matches.tsv"
@@ -643,9 +649,7 @@ while IFS=$'\t' read -r component_name component_recipe component_sha component_
         fail "component source metadata is incomplete"
     }
     mapfile -t source_matches < <(awk -F '\t' -v expected_sha="$component_sha" \
-        -v expected_filename="$component_filename" \
-        '($2 == expected_sha) { n = split($1, parts, "/"); if (parts[n] == expected_filename) print $1 }' \
-        "$after_runtime_source_snapshot")
+        '($2 == expected_sha) { print $1 }' "$after_runtime_source_snapshot")
     [[ ${#source_matches[@]} -eq 1 ]] || {
         fail "Cerbero cache does not contain exactly one audited source archive for $component_name"
     }
