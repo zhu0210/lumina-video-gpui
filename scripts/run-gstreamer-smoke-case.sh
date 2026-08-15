@@ -17,11 +17,12 @@ export HOME="$runtime_home" XDG_CACHE_HOME="$runtime_cache"
 unset LD_LIBRARY_PATH GST_PLUGIN_PATH_1_0 GST_PLUGIN_SYSTEM_PATH_1_0 GST_PLUGIN_PATH GST_PLUGIN_SYSTEM_PATH
 unset GST_PLUGIN_SCANNER_1_0 GST_PLUGIN_SCANNER GST_REGISTRY_1_0 GST_REGISTRY GST_REGISTRY_REUSE_PLUGIN_SCANNER
 lib_dir="$runtime/$runtime_libdir"
+private_lib_dir="$lib_dir/pulseaudio"
 plugin_dir="$lib_dir/gstreamer-1.0"
 scanner="$runtime/libexec/gstreamer-1.0/gst-plugin-scanner"
 launcher="$runtime/bin/lumina-gstreamer-runtime"
 [[ -x "$launcher" && -x "$runtime/bin/gst-inspect-1.0" && -x "$runtime/bin/gst-launch-1.0" ]] || exit 1
-[[ -d "$plugin_dir" && -x "$scanner" ]] || exit 1
+[[ -d "$plugin_dir" && -x "$scanner" && -d "$private_lib_dir" && ! -L "$private_lib_dir" ]] || exit 1
 
 contract=$("$launcher" env)
 grep -Fx "GST_PLUGIN_PATH_1_0=$plugin_dir" <<<"$contract" >/dev/null
@@ -32,7 +33,7 @@ grep -Fx "GST_PLUGIN_SCANNER_1_0=$scanner" <<<"$contract" >/dev/null
 grep -Fx 'GST_PLUGIN_SCANNER=' <<<"$contract" >/dev/null
 grep -Fx 'GST_REGISTRY=' <<<"$contract" >/dev/null
 grep -Fx 'GST_REGISTRY_REUSE_PLUGIN_SCANNER=no' <<<"$contract" >/dev/null
-grep -Fx "LD_LIBRARY_PATH=$lib_dir" <<<"$contract" >/dev/null
+grep -Fx "LD_LIBRARY_PATH=$lib_dir:$private_lib_dir" <<<"$contract" >/dev/null
 
 "$launcher" "$runtime/bin/gst-inspect-1.0" --version | grep -F "$EXPECTED_GSTREAMER_VERSION" >/dev/null
 for element in $REQUIRED_ELEMENTS; do

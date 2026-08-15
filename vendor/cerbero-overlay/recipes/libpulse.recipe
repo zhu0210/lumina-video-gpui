@@ -34,7 +34,8 @@ class Recipe(recipe.Recipe):
         'valgrind': 'disabled',
     }
     deps = ['libsndfile']
-    files_libs = ['libpulse']
+    files_libs_lumina = ['libpulse']
+    files_lumina_private = ['%(libdir)s/pulseaudio/libpulsecommon-17.0%(srext)s']
 
     def prepare(self):
         self.set_env('GIT_DESCRIBE_FOR_BUILD', 'v17.0')

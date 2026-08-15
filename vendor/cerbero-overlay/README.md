@@ -13,6 +13,11 @@ custom output and the lock recipe allowlist contains only fetched recipes.
 The 29-component closure includes libsndfile 1.2.2 because PulseAudio's
 client-common ABI links it unconditionally; its external/MPEG/optional codec
 features are disabled, so no recursive codec closure is added.
+The Pulse client categories are exact: `libs_lumina` selects top-level
+`libpulse`, and `lumina_private` selects the literal
+`pulseaudio/libpulsecommon-17.0` file. The common library's lock-authorized private
+`lib/x86_64-linux-gnu/pulseaudio` directory is added to runtime loader paths,
+without packaging server, modules, or alternate client libraries.
 
 The lock is the authority for the exact variants and plugin set. The overlay
 keeps Rust off and carries applied patches against the pinned 1.28.6 recipe
