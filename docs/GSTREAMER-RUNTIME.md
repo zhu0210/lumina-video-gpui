@@ -39,6 +39,25 @@ The gst-plugins-bad runtime also packages exactly four private libraries
 (`libgstcodecparsers-1.0`, `libgstcodecs-1.0`, `libgstmpegts-1.0`, and
 `libgstva-1.0`) required by the selected VA, H.264-parser, and HLS paths;
 the ELF closure audit requires them to resolve from the bundle.
+The non-plugin shared-library set is also lock-exact: it includes the selected
+GStreamer core (`libgstreamer-1.0`, `libgstbase-1.0`), base
+(`libgstallocators-1.0`, `libgstaudio-1.0`, `libgstpbutils-1.0`,
+`libgstriff-1.0`, `libgsttag-1.0`, `libgstvideo-1.0`),
+bad/private, Pulse, PipeWire, FFmpeg, and other direct public libraries listed
+in `audit.shared_library_allowlist`. Controller/check/FFT/RTSP/SDP/GL/app
+spill from upstream broad GStreamer categories is excluded. Build/discovery
+derive the selected literal recipe categories; package and artifact checks
+compare canonical `.so` paths with that lock set while preserving recursive
+DT_NEEDED closure.
+The pinned 1.28.6 Meson link graph supplies the evidence for each retained
+GStreamer library: the CLI/plugins use `libgstreamer` and `libgstbase`; VA uses
+allocators, video, codecs, and codec parsers; the selected audio, playback,
+Opus, ALSA, and Pulse paths use audio and playback utilities; typefinding and
+the selected container parsers use RIFF and tag; video conversion, VP9, VA,
+and libav use video; and HLS/MPEG-TS use the MPEG-TS library. No selected
+binary links the controller, net, or RTP libraries, so those broad-category
+outputs are excluded. The recursive ELF gate remains the final transitive
+closure check.
 PulseAudio's client categories are exact: `libs_lumina` selects top-level
 `libpulse`, while `lumina_private` selects the literal
 `pulseaudio/libpulsecommon-17.0` file. The latter is installed in the lock-authorized private
@@ -55,7 +74,7 @@ After fetch/source SHA mapping and before offline bootstrap/package build, the f
 build resolves every lock license member exactly once and stages those bytes;
 license assembly reuses that verified staging area.
 
-The lock section `audit.overlay_inputs` contains exactly 16 regular control files
+The lock section `audit.overlay_inputs` contains exactly 18 regular control files
 under the repo-owned config/package/recipe/patch directories. Build and
 discovery materialize that list and verify every path and SHA-256 before using
 any Cerbero input; extra, missing, or tampered controls fail.

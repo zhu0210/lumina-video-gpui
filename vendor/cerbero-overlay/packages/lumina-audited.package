@@ -14,9 +14,9 @@ class Package(package.Package):
     # recipe categories and their recipe deps; it never emits an upstream
     # GStreamer meta package.
     files = [
-        'gstreamer-1.0:bins:libs:misc:plugins_lumina',
-        'gst-plugins-base-1.0:libs:plugins_lumina',
-        'gst-plugins-good-1.0:libs:plugins_lumina',
+        'gstreamer-1.0:bins:libs_lumina:misc:plugins_lumina',
+        'gst-plugins-base-1.0:libs_lumina:plugins_lumina',
+        'gst-plugins-good-1.0:plugins_lumina',
         'gst-plugins-bad-1.0:libs_lumina:plugins_lumina',
         'gst-libav-1.0:plugins_codecs_restricted',
         'pipewire:libs:plugins_gstreamer:spa',

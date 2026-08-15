@@ -38,6 +38,12 @@ The pre-package AST seam provides friendly diagnostics for reviewed plugin
 controls and Meson options; it is not the security authority. Lock exact
 overlay input hashes, the post-package exact 21-plugin inventory, and the
 artifact audit are authoritative.
+The lock also names the exact canonical `.so` paths for every selected public
+library and the Pulse private common library. GStreamer core/base use literal
+`libs_lumina` lists (`libgstreamer-1.0`, `libgstbase-1.0`, `libgstnet-1.0` and
+the seven base libraries); controller/check/FFT/RTSP/SDP/GL/app broad-category
+spill is not packaged. Build/discovery compare recipe-derived paths, while
+package and artifact checks reject any missing or extra canonical shared file.
 
 References: the [Cerbero build guide](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html),
 [GStreamer Cerbero deployment guide](https://gstreamer.freedesktop.org/documentation/deploying/multiplatform-using-cerbero.html),

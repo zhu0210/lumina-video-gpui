@@ -72,8 +72,8 @@ validate_overlay_inputs() {
 
     if ! jq -er '
         .audit.overlay_inputs as $items
-        | if ($items | type) != "array" or ($items | length) != 16 then
-            error("overlay input manifest must contain exactly 16 files")
+        | if ($items | type) != "array" or ($items | length) != 18 then
+            error("overlay input manifest must contain exactly 18 files")
           elif any($items[]; (.path | type) != "string" or (.sha256 | type) != "string") then
             error("overlay input manifest has invalid fields")
           elif any($items[]; (.path | test("^vendor/cerbero-overlay/(config|packages|recipes|patches)/[^/]+$") | not)) then
@@ -117,7 +117,7 @@ validate_overlay_inputs() {
     cmp -s "$normalized_file_list" "$listed_file_list" || {
         fail "audited overlay file set differs from the lock"
     }
-    if ! awk 'END { exit !(NR == 16) }' "$destination"; then
+    if ! awk 'END { exit !(NR == 18) }' "$destination"; then
         fail "audited overlay input manifest has an unexpected size"
     fi
     while IFS=$'\t' read -r path expected_sha; do
@@ -232,6 +232,15 @@ jq -e '.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]' "$loc
 jq -e '(.components | length == 29) and all(.components[]; (.recipe != "bash-completion" and .recipe != "libunwind" and .recipe != "gobject-introspection"))' "$lock_file" >/dev/null || {
     fail "lock must contain exactly the 29 audited runtime components"
 }
+jq -e '
+    .audit.shared_library_allowlist as $items
+    | ($items | type == "array" and length > 0)
+    and all($items[];
+        (.component | type == "string" and length > 0)
+        and (.path | type == "string" and test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)$")))
+    and (($items | map(.path) | length) == ($items | map(.path) | unique | length))
+    and all($items[] as $item; any(.components[]; .name == $item.component))
+' "$lock_file" >/dev/null || fail "lock shared-library allowlist is malformed"
 jq -e '
     ([.audit.recipe_metadata[] | select(has("archive_root"))] as $roots
      | ($roots | length == 7)
@@ -573,7 +582,7 @@ for node in ast.walk(tree):
                     seen_meson_keys.add(key_value)
                     if value_value == "enabled":
                         facts["meson_enabled"].append(key_value)
-            elif target.id.startswith(("files_plugins_", "files_libs_")) or target.id == "files_lumina_private":
+            elif target.id == "files_libs" or target.id.startswith(("files_plugins_", "files_libs_")) or target.id == "files_lumina_private":
                 if len(node.targets) != 1 or not isinstance(node.value, (ast.List, ast.Tuple)):
                     file_error(target.id)
                     continue
@@ -590,10 +599,10 @@ for node in ast.walk(tree):
                         facts["file_patterns"][target.id] = values
                         allowed_file_targets.add(id(target))
 for node in ast.walk(tree):
-    if isinstance(node, ast.Name) and (node.id.startswith(("files_plugins_", "files_libs_")) or node.id == "files_lumina_private") and id(node) not in allowed_file_targets:
+    if isinstance(node, ast.Name) and (node.id == "files_libs" or node.id.startswith(("files_plugins_", "files_libs_")) or node.id == "files_lumina_private") and id(node) not in allowed_file_targets:
         file_error(node.id)
     elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-          and node.value.id == "self" and (node.attr.startswith(("files_plugins_", "files_libs_")) or node.attr == "files_lumina_private")):
+          and node.value.id == "self" and (node.attr == "files_libs" or node.attr.startswith(("files_plugins_", "files_libs_")) or node.attr == "files_lumina_private")):
         file_error(node.attr)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         owner = node.func.value
@@ -617,9 +626,11 @@ for node in ast.walk(tree):
     elif isinstance(node, ast.AnnAssign):
         if meson_subscript(node.target) is not None:
             meson_error("meson_options")
-    elif isinstance(node, (ast.AugAssign, ast.Delete)):
-        targets = node.targets if isinstance(node, ast.Delete) else [node.target]
-        if any(meson_subscript(target) is not None for target in targets):
+    elif isinstance(node, ast.AugAssign):
+        if meson_subscript(node.target) is not None:
+            meson_error("meson_options")
+    elif isinstance(node, ast.Delete):
+        if any(meson_subscript(target) is not None for target in node.targets):
             meson_error("meson_options")
 print(json.dumps(facts, sort_keys=True))
 PY
@@ -654,6 +665,8 @@ assert_reviewed_recipe_files() {
 assert_reviewed_recipe_files gst-plugins-bad-1.0 libs_lumina '["libgstcodecparsers-1.0", "libgstcodecs-1.0", "libgstmpegts-1.0", "libgstva-1.0"]'
 assert_reviewed_recipe_files libpulse libs_lumina '["libpulse"]'
 assert_reviewed_recipe_files libpulse lumina_private '["%(libdir)s/pulseaudio/libpulsecommon-17.0%(srext)s"]'
+assert_reviewed_recipe_files gstreamer-1.0 libs_lumina '["libgstreamer-1.0", "libgstbase-1.0"]'
+assert_reviewed_recipe_files gst-plugins-base-1.0 libs_lumina '["libgstallocators-1.0", "libgstaudio-1.0", "libgstpbutils-1.0", "libgstriff-1.0", "libgsttag-1.0", "libgstvideo-1.0"]'
 
 # Resolve only the plugin categories named by the package specs. recipe_facts
 # is the sole AST seam; this shell layer rejects dynamic/malformed declarations
@@ -683,6 +696,36 @@ plugin_set_from_pinned_recipes() {
             fi
             seen["$basename"]=1
             printf '%s\n' "$basename"
+        done <<<"$patterns"
+    done <"$package_specs"
+}
+
+# Keep the discovery-side library verifier local: it must fail independently
+# from the formal build before a lock refresh can accept a broad category.
+shared_library_set_from_pinned_recipes() {
+    local recipes_dir=$1 package_specs=$2 recipe category facts patterns pattern path
+    declare -A seen=()
+    while IFS=$'\t' read -r recipe category; do
+        facts=$(recipe_facts "$recipes_dir/$recipe.recipe") || return 1
+        if ! patterns=$(jq -er --arg key "files_$category" '
+            if ((.file_errors | index($key)) != null) then error("dynamic shared-library file list")
+            elif (.file_patterns[$key] | type) != "array" then error("missing shared-library file list")
+            else .file_patterns[$key][]
+            end
+        ' <<<"$facts"); then
+            return 1
+        fi
+        while IFS= read -r pattern; do
+            if [[ "$category" == lumina_private ]]; then
+                [[ "$pattern" == '%(libdir)s/pulseaudio/libpulsecommon-17.0%(srext)s' ]] || return 1
+                path='pulseaudio/libpulsecommon-17.0.so'
+            else
+                [[ "$pattern" =~ ^lib[A-Za-z0-9_.+-]+$ ]] || return 1
+                path="$pattern.so"
+            fi
+            [[ -z "${seen[$path]+x}" ]] || return 1
+            seen["$path"]=1
+            printf '%s\n' "$path"
         done <<<"$patterns"
     done <"$package_specs"
 }
@@ -745,6 +788,27 @@ if ! jq -er '[.audit.plugin_allowlist[].filename] | unique | sort[]' "$lock_file
 fi
 if ! cmp -s "$declared_plugin_files" "$expected_plugin_files"; then
     fail "pinned recipe plugin categories differ from the lock allowlist"
+fi
+
+shared_library_package_specs="$tmp_dir/shared-library-package-specs"
+if ! jq -er '
+    .[] | split(":") as $parts
+    | $parts[1:][] | select(. == "libs" or . == "libs_lumina" or . == "lumina_private")
+    | [$parts[0], .] | @tsv
+' "$overlay_package_files" >"$shared_library_package_specs" || [[ ! -s "$shared_library_package_specs" ]]; then
+    fail "audited package shared-library categories are missing or malformed"
+fi
+declared_shared_library_files="$tmp_dir/declared-shared-library-files"
+if ! shared_library_set_from_pinned_recipes "$tmp_dir/recipes" "$shared_library_package_specs" >"$declared_shared_library_files"; then
+    fail "pinned recipe shared-library categories are not literal audited lists"
+fi
+sort -o "$declared_shared_library_files" "$declared_shared_library_files"
+expected_shared_library_files="$tmp_dir/expected-shared-library-files"
+if ! jq -er '[.audit.shared_library_allowlist[].path] | unique | sort[]' "$lock_file" >"$expected_shared_library_files"; then
+    fail "lock shared-library allowlist cannot produce a unique path set"
+fi
+if ! cmp -s "$declared_shared_library_files" "$expected_shared_library_files"; then
+    fail "pinned recipe shared-library categories differ from the lock"
 fi
 
 lock_tmp=$(mktemp "${lock_file}.XXXXXX")
