@@ -1677,7 +1677,10 @@ inspect_plugin_license() {
     local plugin_file=$1
     local plugin_path=$2
     local report raw_license license source_module owner expected_source_module
-    local component_license source_url
+    local component_license source_url plugin_inspect_stdout plugin_inspect_stderr
+    inspect_index=$((inspect_index + 1))
+    plugin_inspect_stdout="$work_dir/plugin-inspect-$inspect_index.stdout"
+    plugin_inspect_stderr="$work_dir/plugin-inspect-$inspect_index.stderr"
     owner=$(jq -r --arg path "vendor/linux-x86_64/$archive_runtime_libdir/gstreamer-1.0/$plugin_file" '
         first(.file_ownership[] | select(any(.prefixes[]; . as $prefix | ($path | startswith($prefix)))) | .component) // empty
     ' "$lock_file")
@@ -1685,9 +1688,17 @@ inspect_plugin_license() {
     component_license=$(jq -r --arg owner "$owner" 'first(.components[] | select(.name == $owner) | .license) // empty' "$lock_file")
     source_url=$(jq -r --arg owner "$owner" 'first(.components[] | select(.name == $owner) | .source_url) // empty' "$lock_file")
     [[ -n "$component_license" && -n "$source_url" ]] || fail "bundled plugin owner metadata is incomplete: $plugin_file"
-    report=$("$launcher" "$runtime_root/bin/gst-inspect-1.0" "$plugin_path" 2>/dev/null) || {
+    if ! "$launcher" "$runtime_root/bin/gst-inspect-1.0" "$plugin_path" \
+        >"$plugin_inspect_stdout" 2>"$plugin_inspect_stderr"; then
+        echo "gst-inspect failed for bundled plugin $plugin_file" >&2
+        if [[ -s "$plugin_inspect_stderr" ]]; then
+            head -20 -- "$plugin_inspect_stderr" >&2
+        else
+            echo "gst-inspect stderr: <empty>" >&2
+        fi
         fail "gst-inspect could not load bundled plugin $plugin_file"
-    }
+    fi
+    report=$(<"$plugin_inspect_stdout")
     raw_license=$(plugin_metadata_field 'License' "$report")
     source_module=$(plugin_metadata_field 'Source module' "$report")
     [[ -n "$raw_license" && -n "$source_module" ]] || fail "bundled plugin metadata is incomplete: $plugin_file"
@@ -1703,6 +1714,7 @@ inspect_plugin_license() {
     fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$plugin_file" "$license" "$owner" "$source_module" "$source_url" >>"$plugin_license_tsv"
 }
+inspect_index=0
 while IFS= read -r -d '' plugin_path; do
     plugin_file=${plugin_path#"$plugin_dir"/}
     inspect_plugin_license "$plugin_file" "$plugin_path"
