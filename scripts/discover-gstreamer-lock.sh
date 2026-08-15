@@ -232,15 +232,8 @@ jq -e '.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]' "$loc
 jq -e '(.components | length == 29) and all(.components[]; (.recipe != "bash-completion" and .recipe != "libunwind" and .recipe != "gobject-introspection"))' "$lock_file" >/dev/null || {
     fail "lock must contain exactly the 29 audited runtime components"
 }
-jq -e '
-    .audit.shared_library_allowlist as $items
-    | ($items | type == "array" and length > 0)
-    and all($items[];
-        (.component | type == "string" and length > 0)
-        and (.path | type == "string" and test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)$")))
-    and (($items | map(.path) | length) == ($items | map(.path) | unique | length))
-    and all($items[] as $item; any(.components[]; .name == $item.component))
-' "$lock_file" >/dev/null || fail "lock shared-library allowlist is malformed"
+jq -L "$script_dir" -e 'include "gstreamer-shared-library-manifest"; valid_shared_library_allowlist' \
+    "$lock_file" >/dev/null || fail "lock shared-library allowlist is malformed"
 jq -e '
     ([.audit.recipe_metadata[] | select(has("archive_root"))] as $roots
      | ($roots | length == 7)

@@ -566,15 +566,8 @@ jq -e '(.components | length == 29) and all(.components[]; (.recipe != "bash-com
     echo "lock must contain exactly the 29 audited runtime components" >&2
     exit 1
 }
-jq -e '
-    .audit.shared_library_allowlist as $items
-    | ($items | type == "array" and length > 0)
-    and all($items[];
-        (.component | type == "string" and length > 0)
-        and (.path | type == "string" and test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)$")))
-    and (($items | map(.path) | length) == ($items | map(.path) | unique | length))
-    and all($items[] as $item; any(.components[]; .name == $item.component))
-' "$lock_file" >/dev/null || {
+jq -L "$script_dir" -e 'include "gstreamer-shared-library-manifest"; valid_shared_library_allowlist' \
+    "$lock_file" >/dev/null || {
     echo "shared-library allowlist is malformed or has unknown owners" >&2
     exit 1
 }
