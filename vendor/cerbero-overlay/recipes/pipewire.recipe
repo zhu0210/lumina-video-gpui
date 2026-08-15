@@ -4,8 +4,8 @@ class Recipe(recipe.Recipe):
     version = '1.6.8'
     stype = SourceType.TARBALL
     btype = BuildType.MESON
-    url = 'https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz'
-    tarball_checksum = 'a28f12524d69a8b47feffe31309a6702e45ca4ee54494ff1343d766abf2ec58b'
+    url = 'https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/b741e0c74f5436f0c925f7741140db0efd32cf4e/pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e.tar.gz'
+    tarball_checksum = 'a78762e007a604846fc16c83979ef15bbb69dba1a2923c32bb6e2f18fafa343f'
     licenses = [{License.MIT: ['LICENSE']}]
     deps = [
         'glib', 'libffi', 'openssl', 'gstreamer-1.0', 'gst-plugins-base-1.0',

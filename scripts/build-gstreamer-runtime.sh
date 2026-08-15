@@ -179,7 +179,7 @@ ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock
     echo "unsupported PipeWire tag commit" >&2
     exit 1
 }
-[[ "$pipewire_url" == https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz ]] || {
+[[ "$pipewire_url" == https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/b741e0c74f5436f0c925f7741140db0efd32cf4e/pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e.tar.gz ]] || {
     echo "unsupported PipeWire source URL" >&2
     exit 1
 }
