@@ -278,6 +278,14 @@ pipewire_tag_commit=$(jq -er '.sources.pipewire.tag_commit' "$lock_file")
 pipewire_url=$(jq -er '.sources.pipewire.url' "$lock_file")
 pipewire_sha=$(jq -er '.sources.pipewire.sha256' "$lock_file")
 pipewire_license=$(jq -er '.sources.pipewire.license' "$lock_file")
+pulse_version=$(jq -er '.components[] | select(.name == "PulseAudio") | .version' "$lock_file")
+pulse_tag=$(jq -er '.components[] | select(.name == "PulseAudio") | .tag' "$lock_file")
+pulse_tag_object=$(jq -er '.components[] | select(.name == "PulseAudio") | .tag_object' "$lock_file")
+pulse_tag_commit=$(jq -er '.components[] | select(.name == "PulseAudio") | .tag_commit' "$lock_file")
+pulse_signature=$(jq -er '.components[] | select(.name == "PulseAudio") | .signature' "$lock_file")
+pulse_url=$(jq -er '.components[] | select(.name == "PulseAudio") | .source_url' "$lock_file")
+pulse_sha=$(jq -er '.components[] | select(.name == "PulseAudio") | .sha256' "$lock_file")
+pulse_archive_root=$(jq -er '.audit.recipe_metadata[] | select(.recipe == "libpulse") | .archive_root' "$lock_file")
 cerbero_tag=$(jq -er '.cerbero.tag' "$lock_file")
 cerbero_tag_object=$(jq -er '.cerbero.tag_object' "$lock_file")
 cerbero_commit=$(jq -er '.cerbero.commit' "$lock_file")
@@ -343,6 +351,44 @@ ffmpeg_sha=$(jq -er '.components[] | select(.name == "FFmpeg") | .sha256' "$lock
 }
 [[ "$pipewire_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid PipeWire checksum" >&2; exit 1; }
 [[ "$pipewire_license" == MIT ]] || { echo "unsupported PipeWire license metadata" >&2; exit 1; }
+jq -e --arg url "$pulse_url" --arg sha "$pulse_sha" --arg root "$pulse_archive_root" \
+    --arg tag "$pulse_tag" --arg object "$pulse_tag_object" --arg commit "$pulse_tag_commit" \
+    --arg signature "$pulse_signature" '
+    any(.components[]; .name == "PulseAudio" and .version == "17.0" and
+        .source_url == $url and .sha256 == $sha and .tag == $tag and
+        .tag_object == $object and .tag_commit == $commit and .signature == $signature) and
+    any(.audit.recipe_metadata[]; .recipe == "libpulse" and .version == "17.0" and
+        .source_url == $url and .sha256 == $sha and .archive_root == $root and
+        .tag == $tag and .tag_object == $object and .tag_commit == $commit and
+        .signature == $signature)
+' "$lock_file" >/dev/null || {
+    echo "PulseAudio component and recipe provenance disagrees" >&2
+    exit 1
+}
+[[ "$pulse_version" == 17.0 && "$pulse_tag" == v17.0 ]] || {
+    echo "unsupported PulseAudio release tag" >&2
+    exit 1
+}
+[[ "$pulse_tag_object" == 16be4f7accce287fd08519591c6356ffa61aaaf1 ]] || {
+    echo "unsupported PulseAudio annotated tag object" >&2
+    exit 1
+}
+[[ "$pulse_tag_commit" == 1f020889c9aa44ea0f63d7222e8c2b62c3f45f68 ]] || {
+    echo "unsupported PulseAudio tag commit" >&2
+    exit 1
+}
+[[ "$pulse_url" == https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/archive/1f020889c9aa44ea0f63d7222e8c2b62c3f45f68/pulseaudio-1f020889c9aa44ea0f63d7222e8c2b62c3f45f68.tar.gz ]] || {
+    echo "unsupported PulseAudio source URL" >&2
+    exit 1
+}
+[[ "$pulse_sha" == 0ccee8a0c9653badc668cf11f0eaad97a1febb85afa82c24c2d1935926446e3b ]] || {
+    echo "unsupported PulseAudio checksum" >&2
+    exit 1
+}
+[[ "$pulse_archive_root" == pulseaudio-1f020889c9aa44ea0f63d7222e8c2b62c3f45f68 && "$pulse_signature" == PGP ]] || {
+    echo "unsupported PulseAudio archive/signature metadata" >&2
+    exit 1
+}
 jq -e '
     .sources.pipewire.plugin_license == "MIT/X11" and
     .sources.pipewire.plugin_license_source == "src/gst" and
@@ -602,6 +648,42 @@ grep -F "tarball_checksum = 'b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1
     "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/dev/null || {
     fail "pinned gst-plugins-good recipe checksum is not 1.28.6"
 }
+if ! python3 - "$cerbero_dir/recipes/libpulse.recipe" <<'PY'
+import ast
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+recipes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Recipe"]
+if len(recipes) != 1:
+    raise SystemExit("PulseAudio recipe class is not unique")
+base = recipes[0].bases
+if len(base) != 1 or not (
+    isinstance(base[0], ast.Attribute)
+    and isinstance(base[0].value, ast.Name)
+    and base[0].value.id == "recipe"
+    and base[0].attr == "Recipe"
+):
+    raise SystemExit("PulseAudio recipe uses a system or host fallback")
+set_env_calls = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Name) and node.id in {"SystemRecipe", "system_recipe", "allow_system_recipes"}:
+        raise SystemExit("PulseAudio recipe references a system fallback")
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr in {"use_system", "system_recipe", "get_system_recipe"}:
+            raise SystemExit("PulseAudio recipe calls a system fallback")
+        if node.func.attr == "set_env":
+            set_env_calls.append(node)
+if len(set_env_calls) != 1:
+    raise SystemExit("PulseAudio release environment assignment is not unique")
+call = set_env_calls[0]
+if len(call.args) != 2 or any(not isinstance(arg, ast.Constant) or not isinstance(arg.value, str) for arg in call.args):
+    raise SystemExit("PulseAudio release environment assignment is not literal")
+if [arg.value for arg in call.args] != ["GIT_DESCRIBE_FOR_BUILD", "v17.0"]:
+    raise SystemExit("PulseAudio release environment is not v17.0")
+PY
+then
+    fail "pinned PulseAudio recipe is not the exact signed-tag client recipe"
+fi
 patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$gstreamer_no_bash_completions_patch" >/dev/null || {
     fail "could not apply the pinned GStreamer bash-completions patch"
 }
@@ -1122,6 +1204,37 @@ while IFS=$'\t' read -r component_name component_recipe component_sha component_
         "$component_name" "$component_recipe" "$component_sha" "$component_filename" "$source_relative" \
         >>"$runtime_source_matches"
 done <"$expected_source_rows"
+
+verify_pulse_archive() {
+    local archive=$1 members root meson_file license_file archive_sha
+    members="$work_dir/pulseaudio-members"
+    if ! archive_sha=$(sha256sum -- "$archive" | awk '{ print $1 }'); then
+        fail "could not hash the PulseAudio source archive"
+    fi
+    [[ "$archive_sha" == "$pulse_sha" ]] || fail "PulseAudio source archive checksum disagrees with lock"
+    if ! tar -tzf "$archive" >"$members"; then
+        fail "could not list the PulseAudio source archive"
+    fi
+    root=$(awk -F/ 'NF { print $1; exit }' "$members")
+    [[ "$root" == "$pulse_archive_root" ]] || fail "PulseAudio source archive root disagrees with lock"
+    if ! awk -F/ -v expected="$pulse_archive_root" '$1 != expected { invalid = 1 } END { exit invalid ? 1 : 0 }' "$members"; then
+        fail "PulseAudio source archive contains an unexpected top-level path"
+    fi
+    if grep -Fx "$pulse_archive_root/.tarball-version" "$members" >/dev/null; then
+        fail "PulseAudio source archive unexpectedly contains .tarball-version"
+    fi
+    meson_file="$work_dir/pulseaudio-meson.build"
+    license_file="$work_dir/pulseaudio-LGPL"
+    tar -xOf "$archive" "$pulse_archive_root/meson.build" >"$meson_file" || fail "PulseAudio meson.build is missing"
+    tar -xOf "$archive" "$pulse_archive_root/LGPL" >"$license_file" || fail "PulseAudio LGPL text is missing"
+    [[ "$(sha256sum "$meson_file" | awk '{ print $1 }')" == 33318f0c2019939d46ea38acb8a6d1e43198d9d6772a1ef56d1d1618f05a174a ]] || {
+        fail "PulseAudio meson.build bytes disagree with the pinned commit"
+    }
+    [[ "$(sha256sum "$license_file" | awk '{ print $1 }')" == a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861 ]] || {
+        fail "PulseAudio LGPL bytes disagree with the pinned archive"
+    }
+}
+verify_pulse_archive "${component_archive[PulseAudio]}"
 
 # Any newly fetched file not matched above is an unreviewed source input.
 while IFS=$'\t' read -r source_relative source_sha; do
