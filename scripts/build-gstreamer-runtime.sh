@@ -613,8 +613,38 @@ def is_recipe_class(node):
     return (isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name)
             and (base.value.id, base.attr) in (("custom", "GStreamer"), ("recipe", "Recipe")))
 
-recipe_classes = [node for node in tree.body if is_recipe_class(node)]
-recipe_class = recipe_classes[0] if len(recipe_classes) == 1 else None
+def binds_recipe_target(node):
+    if isinstance(node, ast.Name):
+        return node.id == "Recipe"
+    if isinstance(node, (ast.Starred, ast.Tuple, ast.List)):
+        return any(binds_recipe_target(element) for element in node.elts)
+    return False
+
+def binds_recipe_name(statement):
+    if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return statement.name == "Recipe"
+    if isinstance(statement, ast.Assign):
+        return any(binds_recipe_target(target) for target in statement.targets)
+    if isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        return binds_recipe_target(statement.target)
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return binds_recipe_target(statement.target)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return any(item.optional_vars is not None and binds_recipe_target(item.optional_vars)
+                   for item in statement.items)
+    if isinstance(statement, ast.Import):
+        return any((alias.asname or alias.name.split(".")[0]) == "Recipe" for alias in statement.names)
+    if isinstance(statement, ast.ImportFrom):
+        return any((alias.asname or alias.name) == "Recipe" for alias in statement.names)
+    if isinstance(statement, ast.Expr):
+        return any(isinstance(node, ast.NamedExpr) and binds_recipe_target(node.target)
+                   for node in ast.walk(statement.value))
+    return False
+
+recipe_bindings = [statement for statement in tree.body if binds_recipe_name(statement)]
+recipe_class = (recipe_bindings[0]
+                if len(recipe_bindings) == 1 and is_recipe_class(recipe_bindings[0])
+                else None)
 recipe_body = recipe_class.body if recipe_class is not None else []
 
 def strings(node):
