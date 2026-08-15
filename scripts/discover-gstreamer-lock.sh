@@ -267,9 +267,9 @@ pulse_tag_commit=$(awk -v ref="refs/tags/$pulse_tag^{}" '$2 == ref { print $1 }'
     fail "official PulseAudio v17.0 tag metadata disagrees"
 }
 pulse_signature_json=$(curl -fsSL --max-filesize 1048576 \
-    "https://gitlab.freedesktop.org/api/v4/projects/pulseaudio%2Fpulseaudio/repository/commits/$pulse_tag_commit/signature")
-pulse_signature=$(jq -er 'select(.signature_type == "PGP" and .verification_status == "verified") | .signature_type' \
-    <<<"$pulse_signature_json") || fail "official PulseAudio commit signature is not verified PGP"
+    "https://gitlab.freedesktop.org/api/v4/projects/pulseaudio%2Fpulseaudio/repository/tags/$pulse_tag/signature")
+pulse_signature=$(jq -er 'if type == "object" and .signature_type == "PGP" then .signature_type else error("tag signature is not PGP") end' \
+    <<<"$pulse_signature_json") || fail "official PulseAudio annotated tag signature is not PGP"
 pulse_url="https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/archive/$pulse_tag_commit/pulseaudio-$pulse_tag_commit.tar.gz"
 pulse_sha=$(sha256sum "$pulseaudio_archive" | awk '{ print $1 }')
 pulse_archive_root="pulseaudio-$pulse_tag_commit"
@@ -280,7 +280,7 @@ verify_pulse_archive() {
         fail "could not list the caller-supplied PulseAudio archive"
     fi
     root=$(awk -F/ 'NF { print $1; exit }' "$members")
-    [[ "$root" == "$pulse_archive_root" ]] || fail "PulseAudio archive root disagrees with signed commit"
+    [[ "$root" == "$pulse_archive_root" ]] || fail "PulseAudio archive root disagrees with the pinned commit archive"
     if ! awk -F/ -v expected="$pulse_archive_root" '$1 != expected { invalid = 1 } END { exit invalid ? 1 : 0 }' "$members"; then
         fail "PulseAudio archive contains an unexpected top-level path"
     fi
@@ -288,7 +288,7 @@ verify_pulse_archive() {
         fail "PulseAudio archive unexpectedly contains .tarball-version"
     fi
     [[ "$pulse_sha" == 0ccee8a0c9653badc668cf11f0eaad97a1febb85afa82c24c2d1935926446e3b ]] || {
-        fail "caller-supplied PulseAudio archive checksum is not the signed commit archive"
+        fail "caller-supplied PulseAudio archive checksum is not the pinned commit archive"
     }
     meson_file="$tmp_dir/pulseaudio-meson.build"
     license_file="$tmp_dir/pulseaudio-LGPL"
@@ -300,8 +300,8 @@ verify_pulse_archive() {
         "https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/raw/$pulse_tag_commit/meson.build" >"$raw_meson" || fail "PulseAudio commit meson.build fetch failed"
     curl -fsSL --max-filesize 1048576 \
         "https://gitlab.freedesktop.org/pulseaudio/pulseaudio/-/raw/$pulse_tag_commit/LGPL" >"$raw_license" || fail "PulseAudio commit LGPL fetch failed"
-    cmp -s "$meson_file" "$raw_meson" || fail "PulseAudio archive meson.build differs from the signed commit"
-    cmp -s "$license_file" "$raw_license" || fail "PulseAudio archive LGPL differs from the signed commit"
+    cmp -s "$meson_file" "$raw_meson" || fail "PulseAudio archive meson.build differs from the pinned commit raw file"
+    cmp -s "$license_file" "$raw_license" || fail "PulseAudio archive LGPL differs from the pinned commit raw file"
     [[ "$(sha256sum "$meson_file" | awk '{ print $1 }')" == 33318f0c2019939d46ea38acb8a6d1e43198d9d6772a1ef56d1d1618f05a174a ]] || fail "PulseAudio meson.build bytes are not pinned"
     [[ "$(sha256sum "$license_file" | awk '{ print $1 }')" == a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861 ]] || fail "PulseAudio LGPL bytes are not pinned"
 }

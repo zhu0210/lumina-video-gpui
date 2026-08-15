@@ -53,7 +53,7 @@ every locked recipe after the repo patches, and queries only small official
 tag/checksum endpoints. It refuses to download those archives itself.
 The PipeWire archive is addressed to commit
 `b741e0c74f5436f0c925f7741140db0efd32cf4e` and byte-locked by its SHA-256.
-PulseAudio is acquired from the signed annotated `v17.0` tag (tag object
+PulseAudio is acquired from the official API's PGP-signed annotated `v17.0` tag (tag object
 `16be4f7accce287fd08519591c6356ffa61aaaf1`, peeled commit
 `1f020889c9aa44ea0f63d7222e8c2b62c3f45f68`) using its commit-addressed
 archive and SHA-256. The archive has no `.tarball-version`; the pinned recipe
