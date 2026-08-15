@@ -15,6 +15,7 @@ class Recipe(recipe.Recipe):
     licenses = [License.LGPLv2_1Plus]
     meson_options = {
         'daemon': 'false',
+        'client': 'true',
         'tests': 'false',
         'man': 'false',
         'doxygen': 'false',
@@ -23,5 +24,14 @@ class Recipe(recipe.Recipe):
         'jack': 'disabled',
         'avahi': 'disabled',
         'dbus': 'disabled',
+        'glib': 'disabled',
+        'systemd': 'disabled',
+        'x11': 'disabled',
+        'oss-output': 'disabled',
+        'fftw': 'disabled',
+        'asyncns': 'disabled',
+        'gtk': 'disabled',
+        'valgrind': 'disabled',
     }
+    deps = ['libsndfile']
     files_libs = ['libpulse']
