@@ -171,7 +171,7 @@ if grep -Eq "^[[:space:]]*bash_completions[[:space:]]*=.*(gst-inspect-1\\.0|gst-
     fail "GStreamer recipe still lists gst shell completions"
 fi
 
-# Keep this AST seam local so discovery can fail independently.
+# Keep this AST seam local so the formal build can fail independently.
 recipe_facts() {
     python3 - "$1" <<'PY'
 import ast
@@ -187,11 +187,40 @@ def strings(node):
 
 facts = {"name": None, "version": None, "url": None, "sha256": None,
          "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": [],
-         "file_patterns": {}, "file_errors": []}
+         "file_patterns": {}, "file_errors": [], "enable_plugin_targets": [],
+         "control_errors": [], "meson_enabled": [], "meson_control_errors": []}
 allowed_plugin_targets = set()
+meson_assignment_seen = False
 def file_error(name):
     if name not in facts["file_errors"]:
         facts["file_errors"].append(name)
+def control_error(name):
+    if name not in facts["control_errors"]:
+        facts["control_errors"].append(name)
+def meson_error(name):
+    if name not in facts["meson_control_errors"]:
+        facts["meson_control_errors"].append(name)
+def string_value(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+def meson_subscript(node):
+    if not isinstance(node, ast.Subscript):
+        return None
+    owner = node.value
+    if not (isinstance(owner, ast.Attribute) and owner.attr == "meson_options"
+            and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+        return None
+    return node.slice
+def record_meson_assignment(target, value_node):
+    key = string_value(target)
+    if key is None:
+        meson_error("meson_options")
+        return
+    value = string_value(value_node)
+    if value is None:
+        meson_error("meson_options")
+        return
+    if value == "enabled" and key not in facts["meson_enabled"]:
+        facts["meson_enabled"].append(key)
 for node in ast.walk(tree):
     if isinstance(node, ast.Assign):
         for target in node.targets:
@@ -213,6 +242,21 @@ for node in ast.walk(tree):
                 for key, value in zip(node.value.keys, node.value.values):
                     if isinstance(key, ast.Attribute) and key.attr == "LINUX":
                         facts["platform_deps"] = strings(value)
+            elif target.id == "meson_options":
+                if meson_assignment_seen or not isinstance(node.value, ast.Dict):
+                    meson_error("meson_options")
+                    continue
+                meson_assignment_seen = True
+                seen_meson_keys = set()
+                for key, value in zip(node.value.keys, node.value.values):
+                    key_value = string_value(key)
+                    value_value = string_value(value)
+                    if key_value is None or value_value is None or key_value in seen_meson_keys:
+                        meson_error("meson_options")
+                        continue
+                    seen_meson_keys.add(key_value)
+                    if value_value == "enabled":
+                        facts["meson_enabled"].append(key_value)
             elif target.id.startswith("files_plugins_"):
                 if len(node.targets) != 1 or not isinstance(node.value, (ast.List, ast.Tuple)):
                     file_error(target.id)
@@ -235,10 +279,56 @@ for node in ast.walk(tree):
     elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
           and node.value.id == "self" and node.attr.startswith("files_plugins_")):
         file_error(node.attr)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        owner = node.func.value
+        if isinstance(owner, ast.Name) and owner.id == "self":
+            if node.func.attr == "enable_plugin":
+                target = string_value(node.args[0]) if node.args else None
+                if target is None:
+                    control_error("enable_plugin")
+                elif target not in facts["enable_plugin_targets"]:
+                    facts["enable_plugin_targets"].append(target)
+            elif node.func.attr == "disable_plugin":
+                control_error("disable_plugin")
+        elif (isinstance(owner, ast.Attribute) and owner.attr == "meson_options"
+              and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            meson_error("meson_options")
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            key = meson_subscript(target)
+            if key is not None:
+                record_meson_assignment(key, node.value)
+    elif isinstance(node, ast.AnnAssign):
+        if meson_subscript(node.target) is not None:
+            meson_error("meson_options")
+    elif isinstance(node, (ast.AugAssign, ast.Delete)):
+        targets = node.targets if isinstance(node, ast.Delete) else [node.target]
+        if any(meson_subscript(target) is not None for target in targets):
+            meson_error("meson_options")
 print(json.dumps(facts, sort_keys=True))
 PY
 }
 
+assert_reviewed_recipe_controls() {
+    local recipe=$1 expected_plugins=$2 expected_meson=$3 facts
+    facts=$(recipe_facts "$tmp_dir/recipes/$recipe.recipe") || {
+        fail "could not parse audited recipe controls: $recipe"
+    }
+    jq -e --argjson expected_plugins "$expected_plugins" --argjson expected_meson "$expected_meson" '
+        (.control_errors == []) and (.meson_control_errors == [])
+        and ((.enable_plugin_targets | sort) == ($expected_plugins | sort))
+        and ((.meson_enabled | sort) == ($expected_meson | sort))
+    ' <<<"$facts" >/dev/null || fail "unreviewed plugin control in recipe: $recipe"
+}
+
+assert_reviewed_recipe_controls gstreamer-1.0 '[]' '["libunwind", "ptp-helper"]'
+assert_reviewed_recipe_controls gst-plugins-base-1.0 '["alsa"]' '["opus"]'
+assert_reviewed_recipe_controls gst-plugins-good-1.0 '["pulseaudio"]' '["adaptivedemux2", "soup", "vpx"]'
+assert_reviewed_recipe_controls gst-plugins-bad-1.0 '["va"]' '[]'
+
+# Resolve only the plugin categories named by the package specs. recipe_facts
+# is the sole AST seam; this shell layer rejects dynamic/malformed declarations
+# and normalizes the one reviewed Cerbero extension pattern to a .so basename.
 plugin_set_from_pinned_recipes() {
     local recipes_dir=$1 package_specs=$2 recipe category facts patterns pattern basename
     local pattern_re='^%\(libdir\)s/gstreamer-1\.0/libgst[A-Za-z0-9_+-]+%\(mext\)s$'

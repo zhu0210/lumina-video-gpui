@@ -15,18 +15,19 @@
 -                     'decklink': 'enabled',
 -                     'dtls': 'enabled',
 -                     'dts': 'enabled',
-+                      'aes': 'disabled',
-+                      'analyticsoverlay': 'disabled',
-+                      'assrender': 'disabled',
-+                      'bz2': 'disabled',
-+                      'closedcaption': 'disabled',
-+                      'codecalpha': 'disabled',
-+                      'codectimestamper': 'disabled',
-+                      'dash': 'disabled',
-+                      'decklink': 'disabled',
-+                      'dtls': 'disabled',
-+                      'dts': 'disabled',
-                      'hls': 'enabled',
+-                     'hls': 'enabled',
++                     'aes': 'disabled',
++                     'analyticsoverlay': 'disabled',
++                     'assrender': 'disabled',
++                     'bz2': 'disabled',
++                     'closedcaption': 'disabled',
++                     'codecalpha': 'disabled',
++                     'codectimestamper': 'disabled',
++                     'dash': 'disabled',
++                     'decklink': 'disabled',
++                     'dtls': 'disabled',
++                     'dts': 'disabled',
++                     'hls': 'disabled',
                       'hls-crypto': 'openssl',
 -                     'ivfparse': 'enabled',
 -                     'ladspa': 'auto', # lrdf is optional
@@ -51,29 +52,29 @@
 -                     'webrtc': 'enabled',
 -                     'webrtcdsp': 'enabled',
 -                     'zbar': 'enabled',
-+                      'ivfparse': 'disabled',
-+                      'ladspa': 'disabled',
-+                      'lcevcdecoder': 'disabled',
-+                      'openh264': 'disabled',
-+                      'openjpeg': 'disabled',
-+                      'qroverlay': 'disabled',
-+                      'opus': 'disabled',
-+                      'rtmp': 'disabled',
-+                      'rtmp2': 'disabled',
-+                      'sbc': 'disabled',
-+                      'sctp': 'disabled',
-+                      'sctp-internal-usrsctp': 'disabled',
-+                      'soundtouch': 'disabled',
-+                      'srt': 'disabled',
-+                      'spandsp': 'disabled',
-+                      'srtp': 'disabled',
-+                      'resindvd': 'disabled',
-+                      'rist' : 'disabled',
-+                      'voaacenc': 'disabled',
-+                      'vulkan': 'disabled',
-+                      'webrtc': 'disabled',
-+                      'webrtcdsp': 'disabled',
-+                      'zbar': 'disabled',
++                     'ivfparse': 'disabled',
++                     'ladspa': 'disabled',
++                     'lcevcdecoder': 'disabled',
++                     'openh264': 'disabled',
++                     'openjpeg': 'disabled',
++                     'qroverlay': 'disabled',
++                     'opus': 'disabled',
++                     'rtmp': 'disabled',
++                     'rtmp2': 'disabled',
++                     'sbc': 'disabled',
++                     'sctp': 'disabled',
++                     'sctp-internal-usrsctp': 'disabled',
++                     'soundtouch': 'disabled',
++                     'srt': 'disabled',
++                     'spandsp': 'disabled',
++                     'srtp': 'disabled',
++                     'resindvd': 'disabled',
++                     'rist' : 'disabled',
++                     'voaacenc': 'disabled',
++                     'vulkan': 'disabled',
++                     'webrtc': 'disabled',
++                     'webrtcdsp': 'disabled',
++                     'zbar': 'disabled',
                       # disabled plugins
                       'amfcodec': 'disabled',
                       'asio': 'disabled',
@@ -92,29 +93,102 @@
      platform_deps = {
          Platform.LINUX: ['libdrm']
      }
-@@ -280,1 +280,6 @@
+@@ -281,6 +277,12 @@
+              '%(libdir)s/gstreamer-1.0/libgstzbar%(mext)s',
+     ]
+-
++
 +    files_plugins_lumina = [
 +             '%(libdir)s/gstreamer-1.0/libgstvideoparsersbad%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstva%(mext)s',
 +             '%(libdir)s/gstreamer-1.0/libgstmpegtsdemux%(mext)s',
 +    ]
++
      files_plugins_codecs_devel = [
+              '%(libdir)s/gstreamer-1.0/libgstadpcmdec.a', '%(libdir)s/gstreamer-1.0/libgstadpcmdec.la',
+              '%(libdir)s/gstreamer-1.0/libgstadpcmenc.a', '%(libdir)s/gstreamer-1.0/libgstadpcmenc.la',
+@@ -532,139 +534,11 @@
      }
-
+-
++
      def prepare(self):
 -        # Enable hardware codecs if variants are enabled since they have
 -        # external dependencies such as SDKs.
 -        self.enable_plugin('msdk', 'codecs', 'intelmsdk')
          self.enable_plugin('va', 'codecs', 'va', dep='libva')
-
+-
++
 -        self.enable_plugin('rsvg', 'codecs', variant='rust', dep='librsvg')
-
-         if self.config.target_subsystem == Subsystem.TVOS_SIMULATOR and self.config.target_arch == Architecture.X86_64:
-             # svtav1 plugin fails to link with the static svt-av1 lib on tvOS
-@@ -608,20 +605,6 @@
-             self.enable_plugin('mediafoundation', 'sys')
-             self.enable_plugin('wasapi2', 'sys')
-
+-
+-        if self.config.target_subsystem == Subsystem.TVOS_SIMULATOR and self.config.target_arch == Architecture.X86_64:
+-            # svtav1 plugin fails to link with the static svt-av1 lib on tvOS
+-            # Simulator x86_64
+-            self.meson_options['svtav1'] = 'disabled'
+-            # universal archs cannot have different deps
+-            self.deps.append('svt-av1')
+-        # Keep the audited closure free of optional codec dependencies.
+-
+-        if self.config.target_platform == Platform.WINDOWS:
+-            self.meson_options['wasapi'] = 'enabled'
+-            self.meson_options['d3dvideosink'] = 'enabled'
+-            self.meson_options['d3d11'] = 'enabled'
+-            self.meson_options['d3d11-math'] = 'enabled'
+-            self.meson_options['d3d12'] = 'enabled'
+-            self.meson_options['directsound'] = 'enabled'
+-            self.meson_options['winks'] = 'enabled'
+-            self.meson_options['winscreencap'] = 'enabled'
+-            if self.using_msvc():
+-                # This dll is used by mediafoundation UWP build
+-                self.files_libs += ['libgstwinrt-1.0']
+-                # WIC plugin supports only MSVC built for now
+-                self.enable_plugin('wic', 'codecs')
+-                # WGC support requires Windows 11 SDK from Visual Studio
+-                self.meson_options['d3d11-wgc'] = 'enabled'
+-                self.meson_options['d3d12-wgc'] = 'enabled'
+-                # HLSL cross-compile is not supported
+-                self.meson_options['d3d-hlsl-precompile'] = 'enabled'
+-                # Download webview2 nuget package
+-                self.deps.append('webview2')
+-                self.enable_plugin('webview2', 'sys')
+-                # DirectShow can only be built with MSVC
+-                self.enable_plugin('directshow', 'sys')
+-            else:
+-                # mingw does not ship DirectXMath headers
+-                self.deps += ['directxmath']
+-
+-            self.files_libs += ['libgstd3d11-1.0']
+-            self.files_typelibs += ['GstD3D11-1.0']
+-            self.files_plugins_devel += [
+-                'include/gstreamer-1.0/gst/d3d11',
+-                '%(libdir)s/gstreamer-1.0/include/gst/d3d11',
+-                '%(libdir)s/pkgconfig/gstreamer-d3d11-1.0.pc',
+-            ]
+-
+-            # Decoder baseclass library for d3d11 and d3d12 plugins
+-            self.files_libs += ['libgstdxva-1.0']
+-            self.files_typelibs += ['GstDxva-1.0']
+-
+-            # d3d11/d3d12 HLSL shader library
+-            self.files_libs += ['libgstd3dshader-1.0']
+-
+-            # D3D12 needs newer SDK than system installed one with helper library
+-            self.deps.append('directx-headers')
+-            self.files_libs += ['libgstd3d12-1.0']
+-            self.files_plugins_devel += [
+-                'include/gstreamer-1.0/gst/d3d12',
+-                '%(libdir)s/pkgconfig/gstreamer-d3d12-1.0.pc',
+-            ]
+-            self.files_typelibs += ['GstD3D12-1.0']
+-
+-            self.enable_plugin('amfcodec', 'codecs')
+-            self.enable_plugin('qsv', 'codecs')
+-            self.enable_plugin('win32ipc', 'sys')
+-            self.enable_plugin('dwrite', 'sys')
+-            self.enable_plugin('qt6d3d11', 'qt6', 'qt6')
+-            self.enable_plugin('asio', 'sys')
+-            self.enable_plugin('mediafoundation', 'sys')
+-            self.enable_plugin('wasapi2', 'sys')
+-
 -        if self.config.target_platform in (Platform.LINUX, Platform.WINDOWS):
 -            self.enable_plugin('nvcodec', 'codecs')
 -            self.files_plugins_devel += [
@@ -129,24 +203,47 @@
 -        if not Platform.is_app_platform(self.config.target_platform):
 -            self.enable_plugin('curl', 'net', dep='curl')
 -
-         if self.config.target_platform not in (Platform.ANDROID, Platform.WINDOWS):
-             self.meson_options['shm'] = 'enabled'
-
-@@ -650,10 +633,6 @@
+-        if self.config.target_platform not in (Platform.ANDROID, Platform.WINDOWS):
+-            self.meson_options['shm'] = 'enabled'
+-
+-        if Platform.is_apple(self.config.target_platform):
+-            self.meson_options['applemedia'] = 'enabled'
+-            self.deps += ['moltenvk']
+-        if self.config.target_platform in (Platform.ANDROID):
+-            self.deps += ['vulkan-android']
+-            self.enable_plugin('tinyalsa', 'sys', dep='tinyalsa')
+-
+-        # TODO: Vulkan support on Linux and Windows
+-        if self.config.target_platform in (Platform.LINUX, Platform.WINDOWS):
+-            self.disable_plugin('vulkan', 'sys', library_name='vulkan')
+-
+-        if Platform.is_app_platform(self.config.target_platform):
+-            self.disable_plugin('resindvd', 'dvd_gpl', dep='libdvdnav')
+-
+-        if self.using_msvc() and self.config.cross_compiling():
+-            # External deps that haven't been ported to MSVC
+-            self.disable_plugin('srt', 'net', dep='srt')
+-
+-        if self.meson_options['nvcodec'] == 'enabled':
+-            self.files_libs += ['libgstcuda-1.0']
+-            self.files_typelibs += ['CudaGst-1.0', 'GstCuda-1.0']
+-
          if self.config.variants.nodebug:
              self.append_env('CFLAGS', '-DGST_LEVEL_MAX=GST_LEVEL_FIXME')
-
+-
++
 -        if self.config.target_platform in (Platform.WINDOWS, Platform.LINUX):
 -            if self.config.target_arch == Architecture.X86_64:
 -                self.enable_plugin('svtjpegxs', 'codecs', dep='svt-jpeg-xs')
 -
-         if self.config.target_platform == Platform.WINDOWS:
-             if self.config.target_arch != Architecture.X86_64:
-                 self.disable_plugin('lcevcdecoder', 'codecs', dep='lcevcdec')
-@@ -662,9 +641,6 @@
-             # Needs libiconv, which uses Autotools
-             self.disable_plugin('zbar', 'codecs', dep='zbar')
-
+-        if self.config.target_platform == Platform.WINDOWS:
+-            if self.config.target_arch != Architecture.X86_64:
+-                self.disable_plugin('lcevcdecoder', 'codecs', dep='lcevcdec')
+-
+-        if self.using_msvc() and self.config.target_arch == Architecture.ARM64:
+-            # Needs libiconv, which uses Autotools
+-            self.disable_plugin('zbar', 'codecs', dep='zbar')
+-
 -        if self.config.target_platform != Platform.WINDOWS:
 -            self.enable_plugin('unixfd', 'effects')
 -
