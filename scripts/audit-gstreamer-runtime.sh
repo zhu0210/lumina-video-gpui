@@ -39,6 +39,15 @@ jq -e '
 ' "$lock_file" >/dev/null || {
     fail "recipe allowlist/metadata must equal the unique component recipe closure"
 }
+jq -e '
+    .audit.shared_library_allowlist as $items
+    | ($items | type == "array" and length > 0)
+    and all($items[];
+        (.component | type == "string" and length > 0)
+        and (.path | type == "string" and test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)$")))
+    and (($items | map(.path) | length) == ($items | map(.path) | unique | length))
+    and all($items[] as $item; any(.components[]; .name == $item.component))
+' "$lock_file" >/dev/null || fail "lock shared-library allowlist is malformed"
 
 # Stream tar listing directly. Keeping the complete member list in a shell
 # variable made archive safety proportional to archive size.
@@ -59,12 +68,14 @@ fi
 
 manifest=$(tar -xJOf "$artifact" ./runtime-manifest.json)
 jq -e \
-    '.schema_version == 2 and (.packages == ["lumina-audited"]) and (.package_files | length >= 7) and .policy.gpl == false and .policy.nonfree == false and .policy.unknown == false and .policy.ugly == false and (.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]) and (.recursive_dt_needed | type == "array") and (.bundled_files | type == "array") and (.components | type == "array") and (.actual_plugin_license | type == "array")' \
+    '.schema_version == 2 and (.packages == ["lumina-audited"]) and (.package_files | length >= 7) and .policy.gpl == false and .policy.nonfree == false and .policy.unknown == false and .policy.ugly == false and (.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]) and (.recursive_dt_needed | type == "array") and (.bundled_files | type == "array") and (.components | type == "array") and (.actual_plugin_license | type == "array") and (.shared_library_allowlist | type == "array") and (.bundled_shared_libraries | type == "array")' \
     <<<"$manifest" >/dev/null || fail "runtime manifest policy or inventory is incomplete"
 jq -e --argjson expected "$(jq -c '.audit.package_files' "$lock_file")" \
     '.package_files == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest package file categories differ from lock"
 jq -e --argjson expected "$(jq -c '.components' "$lock_file")" \
     '.components == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest component inventory differs from lock"
+jq -e --argjson expected "$(jq -c '.audit.shared_library_allowlist' "$lock_file")" \
+    '.shared_library_allowlist == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest shared-library allowlist differs from lock"
 if ! plugin_allowlist_json=$(jq -e -c '.audit.plugin_allowlist | select(type == "array")' "$lock_file"); then
     fail "lock plugin allowlist is not an array"
 fi
@@ -78,6 +89,16 @@ jq -e --argjson owners "$(jq -c '[.components[].name]' "$lock_file")" \
 jq -e --argjson owners "$(jq -c '[.components[].name]' "$lock_file")" \
     'all(.bundled_files[] | select(.path | test("\\.so($|\\.)")); .component as $owner | ($owners | index($owner)))' \
     <<<"$manifest" >/dev/null || fail "runtime shared-library ownership is incomplete"
+jq -e --arg prefix 'vendor/linux-x86_64/lib/x86_64-linux-gnu/' \
+    --argjson expected "$(jq -c '.audit.shared_library_allowlist' "$lock_file")" '
+    [ .bundled_files[]
+      | select(.path | startswith($prefix))
+      | .path = (.path | ltrimstr($prefix))
+      | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
+      | .path |= sub("\\.so(\\..*)?$"; ".so")
+      | {component, path}
+    ] | sort_by(.path) == ($expected | sort_by(.path))
+' <<<"$manifest" >/dev/null || fail "runtime shared-library owner mapping differs from the lock allowlist"
 
 runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-runtime-audit.XXXXXX")
 source_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-source-audit.XXXXXX")
@@ -228,6 +249,25 @@ runtime_plugin_dir="$runtime_root/$runtime_libdir/gstreamer-1.0"
 runtime_bin="$runtime_root/bin"
 scanner="$runtime_root/libexec/gstreamer-1.0/gst-plugin-scanner"
 [[ -d "$runtime_plugin_dir" && -x "$runtime_bin/gst-inspect-1.0" && -x "$scanner" ]] || fail "runtime inspection tools are missing"
+expected_shared_library_files="$cache_dir/expected-shared-library-files"
+if ! jq -er '[.audit.shared_library_allowlist[].path] | unique | sort[]' "$lock_file" >"$expected_shared_library_files"; then
+    fail "lock shared-library allowlist cannot produce a unique path set"
+fi
+actual_shared_library_files="$cache_dir/runtime-shared-library-files"
+{
+    find -P "$runtime_root/$runtime_libdir" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf '%f\n'
+    find -P "$runtime_root/${private_runtime_libdirs[0]}" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf 'pulseaudio/%f\n'
+} | sed -E 's/\.so(\..*)?$/.so/' | awk 'seen[$0]++ { bad = 1 } { print } END { exit bad }' | sort >"$actual_shared_library_files" || {
+    fail "runtime shared-library canonical names are ambiguous"
+}
+if ! cmp -s "$actual_shared_library_files" "$expected_shared_library_files"; then
+    shared_library_set_diff="$cache_dir/runtime-shared-library-set.diff"
+    comm -3 "$expected_shared_library_files" "$actual_shared_library_files" >"$shared_library_set_diff"
+    head -20 "$shared_library_set_diff" >&2
+    fail "runtime shared-library paths differ from the lock allowlist"
+fi
+jq -e --argjson expected "$(jq -Rn '[inputs | select(length > 0)] | sort' <"$actual_shared_library_files")" \
+    '.bundled_shared_libraries == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest shared-library files differ from the artifact"
 expected_plugin_files="$cache_dir/expected-plugin-files"
 if ! jq -er '[.audit.plugin_allowlist[].filename] | unique | sort[]' "$lock_file" >"$expected_plugin_files"; then
     fail "lock plugin allowlist cannot produce a unique filename set"

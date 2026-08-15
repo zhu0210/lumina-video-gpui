@@ -64,8 +64,8 @@ validate_overlay_inputs() {
 
     if ! jq -er '
         .audit.overlay_inputs as $items
-        | if ($items | type) != "array" or ($items | length) != 16 then
-            error("overlay input manifest must contain exactly 16 files")
+        | if ($items | type) != "array" or ($items | length) != 18 then
+            error("overlay input manifest must contain exactly 18 files")
           elif any($items[]; (.path | type) != "string" or (.sha256 | type) != "string") then
             error("overlay input manifest has invalid fields")
           elif any($items[]; (.path | test("^vendor/cerbero-overlay/(config|packages|recipes|patches)/[^/]+$") | not)) then
@@ -109,7 +109,7 @@ validate_overlay_inputs() {
     cmp -s "$normalized_file_list" "$listed_file_list" || {
         fail "audited overlay file set differs from the lock"
     }
-    if ! awk 'END { exit !(NR == 16) }' "$destination"; then
+    if ! awk 'END { exit !(NR == 18) }' "$destination"; then
         fail "audited overlay input manifest has an unexpected size"
     fi
     while IFS=$'\t' read -r path expected_sha; do
@@ -567,6 +567,18 @@ jq -e '(.components | length == 29) and all(.components[]; (.recipe != "bash-com
     exit 1
 }
 jq -e '
+    .audit.shared_library_allowlist as $items
+    | ($items | type == "array" and length > 0)
+    and all($items[];
+        (.component | type == "string" and length > 0)
+        and (.path | type == "string" and test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)$")))
+    and (($items | map(.path) | length) == ($items | map(.path) | unique | length))
+    and all($items[] as $item; any(.components[]; .name == $item.component))
+' "$lock_file" >/dev/null || {
+    echo "shared-library allowlist is malformed or has unknown owners" >&2
+    exit 1
+}
+jq -e '
     ([.audit.recipe_metadata[] | select(has("archive_root"))] as $roots
      | ($roots | length == 7)
      and (($roots | map(.recipe) | sort) == ["alsa", "libdrm", "libpulse", "libsndfile", "libva", "openssl", "pipewire"])
@@ -670,10 +682,13 @@ bad_minimal_patch="$overlay_dir/patches/gst-plugins-bad-1.0-minimal.patch"
 openssl_no_ca_patch="$overlay_dir/patches/openssl-no-ca-certificates.patch"
 gstreamer_no_bash_completions_patch="$overlay_dir/patches/gstreamer-1.0-no-bash-completions.patch"
 gstreamer_lumina_plugin_list_patch="$overlay_dir/patches/gstreamer-1.0-lumina-plugin-list.patch"
+gstreamer_lumina_libs_patch="$overlay_dir/patches/gstreamer-1.0-lumina-libs.patch"
+base_lumina_libs_patch="$overlay_dir/patches/gst-plugins-base-1.0-lumina-libs.patch"
 [[ -f "$base_minimal_patch" && -f "$good_minimal_patch" &&
    -f "$bad_no_gpl_deps_patch" && -f "$bad_minimal_patch" &&
    -f "$openssl_no_ca_patch" && -f "$gstreamer_no_bash_completions_patch" &&
-   -f "$gstreamer_lumina_plugin_list_patch" ]] || {
+   -f "$gstreamer_lumina_plugin_list_patch" && -f "$gstreamer_lumina_libs_patch" &&
+   -f "$base_lumina_libs_patch" ]] || {
     fail "minimal recipe patches are missing"
 }
 overlay_package="$overlay_dir/packages/lumina-audited.package"
@@ -765,8 +780,14 @@ patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$gstream
 patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$gstreamer_lumina_plugin_list_patch" >/dev/null || {
     fail "could not apply the pinned GStreamer plugin-list patch"
 }
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$gstreamer_lumina_libs_patch" >/dev/null || {
+    fail "could not apply the pinned GStreamer library-list patch"
+}
 patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$base_minimal_patch" >/dev/null || {
     fail "could not apply the pinned gst-plugins-base minimal patch"
+}
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$base_lumina_libs_patch" >/dev/null || {
+    fail "could not apply the pinned gst-plugins-base library-list patch"
 }
 patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$good_minimal_patch" >/dev/null || {
     fail "could not apply the pinned gst-plugins-good minimal patch"
@@ -912,6 +933,21 @@ def meson_error(name):
         facts["meson_control_errors"].append(name)
 def string_value(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+def literal_strings(node):
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values = []
+        for item in node.elts:
+            value = string_value(item)
+            if value is None:
+                return None
+            values.append(value)
+        return values
+    return None
+def add_plain_library_values(values):
+    if values is None or "files_libs" not in facts["file_patterns"]:
+        file_error("files_libs")
+    else:
+        facts["file_patterns"]["files_libs"].extend(values)
 def meson_subscript(node):
     if not isinstance(node, ast.Subscript):
         return None
@@ -967,7 +1003,7 @@ for node in ast.walk(tree):
                     seen_meson_keys.add(key_value)
                     if value_value == "enabled":
                         facts["meson_enabled"].append(key_value)
-            elif target.id.startswith(("files_plugins_", "files_libs_")) or target.id == "files_lumina_private":
+            elif target.id == "files_libs" or target.id.startswith(("files_plugins_", "files_libs_")) or target.id == "files_lumina_private":
                 if len(node.targets) != 1 or not isinstance(node.value, (ast.List, ast.Tuple)):
                     file_error(target.id)
                     continue
@@ -991,6 +1027,14 @@ for node in ast.walk(tree):
         file_error(node.attr)
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         owner = node.func.value
+        if (isinstance(owner, ast.Attribute) and owner.attr == "files_libs"
+                and isinstance(owner.value, ast.Name) and owner.value.id == "self"):
+            if node.func.attr == "append" and len(node.args) == 1:
+                add_plain_library_values([string_value(node.args[0])] if string_value(node.args[0]) is not None else None)
+            elif node.func.attr == "extend" and len(node.args) == 1:
+                add_plain_library_values(literal_strings(node.args[0]))
+            else:
+                file_error("files_libs")
         if isinstance(owner, ast.Name) and owner.id == "self":
             if node.func.attr == "enable_plugin":
                 target = string_value(node.args[0]) if node.args else None
@@ -1011,8 +1055,14 @@ for node in ast.walk(tree):
     elif isinstance(node, ast.AnnAssign):
         if meson_subscript(node.target) is not None:
             meson_error("meson_options")
-    elif isinstance(node, (ast.AugAssign, ast.Delete)):
-        targets = node.targets if isinstance(node, ast.Delete) else [node.target]
+    elif isinstance(node, ast.AugAssign):
+        if (isinstance(node.target, ast.Attribute) and node.target.attr == "files_libs"
+                and isinstance(node.target.value, ast.Name) and node.target.value.id == "self"):
+            add_plain_library_values(literal_strings(node.value))
+        if meson_subscript(node.target) is not None:
+            meson_error("meson_options")
+    elif isinstance(node, ast.Delete):
+        targets = node.targets
         if any(meson_subscript(target) is not None for target in targets):
             meson_error("meson_options")
 print(json.dumps(facts, sort_keys=True))
@@ -1048,6 +1098,8 @@ assert_reviewed_recipe_files() {
 assert_reviewed_recipe_files gst-plugins-bad-1.0 libs_lumina '["libgstcodecparsers-1.0", "libgstcodecs-1.0", "libgstmpegts-1.0", "libgstva-1.0"]'
 assert_reviewed_recipe_files libpulse libs_lumina '["libpulse"]'
 assert_reviewed_recipe_files libpulse lumina_private '["%(libdir)s/pulseaudio/libpulsecommon-17.0%(srext)s"]'
+assert_reviewed_recipe_files gstreamer-1.0 libs_lumina '["libgstreamer-1.0", "libgstbase-1.0"]'
+assert_reviewed_recipe_files gst-plugins-base-1.0 libs_lumina '["libgstallocators-1.0", "libgstaudio-1.0", "libgstpbutils-1.0", "libgstriff-1.0", "libgsttag-1.0", "libgstvideo-1.0"]'
 
 # Resolve only the plugin categories named by the package specs. recipe_facts
 # is the sole AST seam; this shell layer rejects dynamic/malformed declarations
@@ -1077,6 +1129,37 @@ plugin_set_from_pinned_recipes() {
             fi
             seen["$basename"]=1
             printf '%s\n' "$basename"
+        done <<<"$patterns"
+    done <"$package_specs"
+}
+
+# Resolve every selected public/private shared-library category, not just the
+# GStreamer plugins. The lock path set is compared with both these literals and
+# the packaged ELF files, so an upstream broad category cannot spill in.
+shared_library_set_from_pinned_recipes() {
+    local recipes_dir=$1 package_specs=$2 recipe category facts patterns pattern path
+    declare -A seen=()
+    while IFS=$'\t' read -r recipe category; do
+        facts=$(recipe_facts "$recipes_dir/$recipe.recipe") || return 1
+        if ! patterns=$(jq -er --arg key "files_$category" '
+            if ((.file_errors | index($key)) != null) then error("dynamic shared-library file list")
+            elif (.file_patterns[$key] | type) != "array" then error("missing shared-library file list")
+            else .file_patterns[$key][]
+            end
+        ' <<<"$facts"); then
+            return 1
+        fi
+        while IFS= read -r pattern; do
+            if [[ "$category" == lumina_private ]]; then
+                [[ "$pattern" == '%(libdir)s/pulseaudio/libpulsecommon-17.0%(srext)s' ]] || return 1
+                path='pulseaudio/libpulsecommon-17.0.so'
+            else
+                [[ "$pattern" =~ ^lib[A-Za-z0-9_.+-]+$ ]] || return 1
+                path="$pattern.so"
+            fi
+            [[ -z "${seen[$path]+x}" ]] || return 1
+            seen["$path"]=1
+            printf '%s\n' "$path"
         done <<<"$patterns"
     done <"$package_specs"
 }
@@ -1138,6 +1221,30 @@ if ! jq -er '[.audit.plugin_allowlist[].filename] | unique | sort[]' "$lock_file
 fi
 if ! cmp -s "$declared_plugin_files" "$expected_plugin_files"; then
     fail "pinned recipe plugin categories differ from the lock allowlist"
+fi
+
+shared_library_package_specs="$work_dir/shared-library-package-specs"
+if ! jq -er '
+    .[] | split(":") as $parts
+    | $parts[1:][] | select(. == "libs" or . == "libs_lumina" or . == "lumina_private")
+    | [$parts[0], .] | @tsv
+' "$overlay_package_files" >"$shared_library_package_specs" || [[ ! -s "$shared_library_package_specs" ]]; then
+    fail "audited package shared-library categories are missing or malformed"
+fi
+declared_shared_library_files="$work_dir/declared-shared-library-files"
+if ! shared_library_set_from_pinned_recipes "$cerbero_dir/recipes" "$shared_library_package_specs" >"$declared_shared_library_files"; then
+    fail "pinned recipe shared-library categories are not literal audited lists"
+fi
+sort -o "$declared_shared_library_files" "$declared_shared_library_files"
+expected_shared_library_files="$work_dir/expected-shared-library-files"
+if ! jq -er '[.audit.shared_library_allowlist[].path] | unique | sort[]' "$lock_file" >"$expected_shared_library_files"; then
+    fail "lock shared-library allowlist cannot produce a unique path set"
+fi
+if ! cmp -s "$declared_shared_library_files" "$expected_shared_library_files"; then
+    shared_library_set_diff="$work_dir/declared-shared-library-set.diff"
+    comm -3 "$expected_shared_library_files" "$declared_shared_library_files" >"$shared_library_set_diff"
+    head -20 "$shared_library_set_diff" >&2
+    fail "pinned recipe shared-library categories differ from the lock"
 fi
 
 zlib_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
@@ -2062,6 +2169,20 @@ if ! cmp -s "$actual_plugin_files" "$expected_plugin_files"; then
     fail "packaged GStreamer plugin files differ from the lock allowlist"
 fi
 
+actual_shared_library_files="$work_dir/package-shared-library-files"
+{
+    find -P "$runtime_root/$archive_runtime_libdir" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf '%f\n'
+    find -P "$runtime_root/${private_runtime_libdirs[0]}" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf 'pulseaudio/%f\n'
+} | sed -E 's/\.so(\..*)?$/.so/' | awk 'seen[$0]++ { bad = 1 } { print } END { exit bad }' | sort >"$actual_shared_library_files" || {
+    fail "packaged shared-library canonical names are ambiguous"
+}
+shared_library_set_diff="$work_dir/package-shared-library-set.diff"
+if ! cmp -s "$actual_shared_library_files" "$expected_shared_library_files"; then
+    comm -3 "$expected_shared_library_files" "$actual_shared_library_files" >"$shared_library_set_diff"
+    head -20 "$shared_library_set_diff" >&2
+    fail "packaged shared-library paths differ from the lock allowlist"
+fi
+
 jq -r '.required_elements[] | .filename' "$lock_file" | while IFS= read -r filename; do
     [[ -f "$plugin_dir/$filename" ]] || {
         echo "required plugin file missing: $filename" >&2
@@ -2261,10 +2382,22 @@ file_inventory=$(cd "$bundle" &&
         fi
         printf '%s\t%s\t%s\n' "$path" "$(sha256sum "$file" | awk '{ print $1 }')" "${owner:-metadata}"
     done | jq -Rn '[inputs | split("\t") | {path: .[0], sha256: .[1], component: .[2]}]')
+shared_library_allowlist=$(jq -c '.audit.shared_library_allowlist' "$lock_file")
+jq -e --arg prefix "vendor/linux-x86_64/$archive_runtime_libdir/" \
+    --argjson expected "$shared_library_allowlist" '
+    [ .[]
+      | select(.path | startswith($prefix))
+      | .path = (.path | ltrimstr($prefix))
+      | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
+      | .path |= sub("\\.so(\\..*)?$"; ".so")
+      | {component, path}
+    ] | sort_by(.path) == ($expected | sort_by(.path))
+' <<<"$file_inventory" >/dev/null || fail "bundled shared-library owner mapping differs from the lock allowlist"
 plugin_inventory=$(jq -c '.audit.plugin_allowlist' "$lock_file")
 component_inventory=$(jq -c '.components' "$lock_file")
 closure_json=$(jq -Rn '[inputs | split("\t") | {object: .[0], needed: .[1], scope: .[2]}]' <"$closure_tsv")
 actual_plugin_inventory=$(jq -Rn '[inputs | select(length > 0) | split("\t") | {filename: .[0], license: .[1], component: .[2], source_module: .[3], source_url: .[4]}]' <"$plugin_license_tsv")
+shared_library_inventory=$(jq -Rn '[inputs | select(length > 0)]' <"$actual_shared_library_files")
 jq -n \
     --arg version "$gstreamer_version" \
     --arg commit "$cerbero_commit" \
@@ -2277,8 +2410,10 @@ jq -n \
     --argjson files "$file_inventory" \
     --argjson closure "$closure_json" \
     --argjson actual_plugins "$actual_plugin_inventory" \
+    --argjson shared_libraries "$shared_library_inventory" \
+    --argjson shared_allowlist "$shared_library_allowlist" \
     --argjson system_abi "$(printf '%s\n' "${system_elf_allowlist[@]}" | jq -R . | jq -s .)" \
-    '{schema_version: 2, gstreamer_version: $version, pipewire_version: $pipewire, cerbero_commit: $commit, tree_sha256: $tree_sha, packages: ["lumina-audited"], package_files: $package_files, variants: $variants, components: $components, plugin_effective_license: $plugins, actual_plugin_license: $actual_plugins, bundled_files: $files, recursive_dt_needed: $closure, system_abi_allowlist: $system_abi, policy: {gpl: false, nonfree: false, unknown: false, ugly: false, h264_aac: "avdec_h264/avdec_aac"}}' \
+    '{schema_version: 2, gstreamer_version: $version, pipewire_version: $pipewire, cerbero_commit: $commit, tree_sha256: $tree_sha, packages: ["lumina-audited"], package_files: $package_files, variants: $variants, components: $components, plugin_effective_license: $plugins, actual_plugin_license: $actual_plugins, shared_library_allowlist: $shared_allowlist, bundled_shared_libraries: $shared_libraries, bundled_files: $files, recursive_dt_needed: $closure, system_abi_allowlist: $system_abi, policy: {gpl: false, nonfree: false, unknown: false, ugly: false, h264_aac: "avdec_h264/avdec_aac"}}' \
     >"$bundle/runtime-manifest.json"
 
 source_bundle_root="$work_dir/source-bundle"

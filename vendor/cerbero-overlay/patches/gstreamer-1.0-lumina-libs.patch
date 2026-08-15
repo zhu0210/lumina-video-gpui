@@ -1,0 +1,12 @@
+--- a/recipes/gstreamer-1.0.recipe
++++ b/recipes/gstreamer-1.0.recipe
+@@ -29,6 +29,9 @@
+     ]
+ 
+     files_misc = ['libexec/gstreamer-1.0/gst-plugin-scanner%(bext)s']
++    files_libs_lumina = [
++        'libgstreamer-1.0', 'libgstbase-1.0',
++    ]
+ 
+     files_devel = [
+             'include/gstreamer-1.0/gst/*.h',

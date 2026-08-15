@@ -1,0 +1,14 @@
+--- a/recipes/gst-plugins-base-1.0.recipe
++++ b/recipes/gst-plugins-base-1.0.recipe
+@@ -29,6 +29,11 @@
+                  'libgstfft-1.0', 'libgstpbutils-1.0', 'libgstriff-1.0', 'libgstrtp-1.0',
+                  'libgstrtsp-1.0', 'libgstsdp-1.0', 'libgsttag-1.0',
+                  'libgstvideo-1.0', 'libgstgl-1.0']
++    files_libs_lumina = [
++             'libgstallocators-1.0', 'libgstaudio-1.0',
++             'libgstpbutils-1.0', 'libgstriff-1.0',
++             'libgsttag-1.0', 'libgstvideo-1.0',
++    ]
+ 
+     files_plugins_core = [
+              '%(libdir)s/gstreamer-1.0/libgstadder%(mext)s',
