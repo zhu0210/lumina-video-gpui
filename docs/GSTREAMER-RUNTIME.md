@@ -6,9 +6,10 @@ builds with the pinned
 [Cerbero release](https://gstreamer.freedesktop.org/documentation/installing/building-from-source-using-cerbero.html),
 then switches to offline mode for bootstrap, packaging, audit, and artifact
 assembly. `lumina-audited` is the only Cerbero package output; its direct file
-categories select the core/base/good/bad/libav plugins, the PipeWire-owned
-GStreamer plugin, and the explicitly bundled codec/audio/VA libraries. All
-Cerbero jobs use two workers.
+categories select exactly 21 audited GStreamer plugin shared objects: core
+elements, playback/audio/video helpers, MP4/Matroska/HLS/VP9/Opus paths,
+ALSA/Pulse/VA/PipeWire, and LGPL FFmpeg. Broad upstream codec categories are
+not packaged. All Cerbero jobs use two workers.
 
 The lock fixes 29 runtime components, including GStreamer 1.28.6,
 FFmpeg 7.1, the libsoup 3.6.6 HTTPS closure (glib-networking, libproxy,
@@ -19,7 +20,7 @@ features are disabled, so it adds no recursive codec closure. It also fixes
 the Ubuntu builder image, the exact variant set `norust,nogi,nounwind,alsa,pulse,va`, recipe/plugin audit allowlists, and
 the system ELF ABI allowlist. `vendor/cerbero-overlay` contains the direct
 package, source-backed audio/VA/DRM recipes, PipeWire recipe, and applied
-base/good/bad/GStreamer bash-completion/OpenSSL recipe patches; all are included in the
+base/good/bad/GStreamer plugin-list, bash-completion, and OpenSSL recipe patches; all are included in the
 corresponding-source archive. The build verifies every patch against the
 pinned recipe, checks the actual FFmpeg options, and verifies actual plugin
 licenses with isolated `gst-inspect-1.0`.

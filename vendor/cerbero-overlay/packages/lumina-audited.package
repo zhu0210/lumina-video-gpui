@@ -14,15 +14,10 @@ class Package(package.Package):
     # recipe categories and their recipe deps; it never emits an upstream
     # GStreamer meta package.
     files = [
-        'gstreamer-1.0:bins:libs:misc:plugins_core',
-        'gst-plugins-base-1.0:libs:plugins_core:plugins_playback:plugins_codecs',
-        # In Cerbero 1.28.6, isomp4/matroska/adaptivedemux2/vpx/audio
-        # parsers are in good's plugins_codecs; soup is plugins_net and
-        # ALSA/Pulse are added to plugins_sys by the selected variants.
-        'gst-plugins-good-1.0:libs:plugins_codecs:plugins_net:plugins_sys',
-        # bad's plugins_codecs carries HLS/H.264 parsing; VA is selected in
-        # its plugins_sys category by the pinned recipe patch.
-        'gst-plugins-bad-1.0:libs:plugins_codecs:plugins_sys',
+        'gstreamer-1.0:bins:libs:misc:plugins_lumina',
+        'gst-plugins-base-1.0:libs:plugins_lumina',
+        'gst-plugins-good-1.0:libs:plugins_lumina',
+        'gst-plugins-bad-1.0:libs:plugins_lumina',
         'gst-libav-1.0:plugins_codecs_restricted',
         'pipewire:libs:plugins_gstreamer:spa',
         'ffmpeg:libs',

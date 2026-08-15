@@ -13,7 +13,7 @@ lock_file=${3:-$repo_root/vendor/gstreamer-1.0.lock.json}
     echo "Usage: $0 RUNTIME.tar.xz SOURCES.tar.xz [LOCK]" >&2
     exit 2
 }
-for command_name in jq tar sha256sum mktemp realpath grep awk sed find readelf tr sort cmp; do
+for command_name in jq tar sha256sum mktemp realpath grep awk sed find readelf tr sort cmp comm head; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -202,6 +202,26 @@ runtime_plugin_dir="$runtime_root/$runtime_libdir/gstreamer-1.0"
 runtime_bin="$runtime_root/bin"
 scanner="$runtime_root/libexec/gstreamer-1.0/gst-plugin-scanner"
 [[ -d "$runtime_plugin_dir" && -x "$runtime_bin/gst-inspect-1.0" && -x "$scanner" ]] || fail "runtime inspection tools are missing"
+expected_plugin_files="$cache_dir/expected-plugin-files"
+if ! jq -er '[.audit.plugin_allowlist[].filename] | unique | sort[]' "$lock_file" >"$expected_plugin_files"; then
+    fail "lock plugin allowlist cannot produce a unique filename set"
+fi
+actual_plugin_details="$cache_dir/runtime-plugin-files.tsv"
+if ! find -P "$runtime_plugin_dir" -type f -name 'libgst*.so*' -printf '%f\t%p\n' >"$actual_plugin_details"; then
+    fail "cannot enumerate runtime GStreamer plugins"
+fi
+actual_plugin_files="$cache_dir/runtime-plugin-files"
+if ! awk -F '\t' '{ if (seen[$1]++) { print "duplicate runtime plugin filename: " $1 > "/dev/stderr"; bad=1 } print $1 } END { exit bad }' \
+    "$actual_plugin_details" >"$actual_plugin_files"; then
+    fail "runtime GStreamer plugin filenames are ambiguous"
+fi
+sort -o "$actual_plugin_files" "$actual_plugin_files"
+if ! cmp -s "$actual_plugin_files" "$expected_plugin_files"; then
+    plugin_set_diff="$cache_dir/runtime-plugin-set.diff"
+    comm -3 "$expected_plugin_files" "$actual_plugin_files" >"$plugin_set_diff"
+    head -20 "$plugin_set_diff" >&2
+    fail "runtime GStreamer plugin files differ from the lock allowlist"
+fi
 export HOME="$cache_dir/home" XDG_CACHE_HOME="$cache_dir"
 mkdir -p "$HOME"
 export LD_LIBRARY_PATH="$runtime_root/$runtime_libdir"

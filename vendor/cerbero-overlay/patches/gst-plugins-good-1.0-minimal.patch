@@ -61,7 +61,17 @@
      }
 
      files_lang = ['gst-plugins-good-1.0']
-@@ -238,20 +221,6 @@
+@@ -35,1 +35,10 @@
++    files_plugins_lumina = [
++             '%(libdir)s/gstreamer-1.0/libgstadaptivedemux2%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstaudioparsers%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstisomp4%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstmatroska%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstvpx%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstsoup%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstpulse%(mext)s',
++    ]
+     files_plugins_core_devel = [
      def prepare(self):
          self.append_env('CFLAGS', '-DLIBSOUP_DOES_NOT_STEAL_OUR_CONTEXT=1')
 
