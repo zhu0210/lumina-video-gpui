@@ -65,8 +65,13 @@ jq -e --argjson expected "$(jq -c '.audit.package_files' "$lock_file")" \
     '.package_files == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest package file categories differ from lock"
 jq -e --argjson expected "$(jq -c '.components' "$lock_file")" \
     '.components == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest component inventory differs from lock"
+if ! plugin_allowlist_json=$(jq -e -c '.audit.plugin_allowlist | select(type == "array")' "$lock_file"); then
+    fail "lock plugin allowlist is not an array"
+fi
+jq -e --argjson expected "$plugin_allowlist_json" \
+    '.plugin_effective_license == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest plugin allowlist differs from lock"
 jq -e --argjson owners "$(jq -c '[.components[].name]' "$lock_file")" \
-    'all(.actual_plugin_license[]; (.filename and .license and .component and .source_module and .source_url and (.component as $owner | ($owners | index($owner) != null))))' \
+    'all(.actual_plugin_license[]; (type == "object" and (keys | sort) == ["component", "filename", "license", "source_module", "source_url"] and .filename and .license and .component and .source_module and .source_url and (.component as $owner | ($owners | index($owner) != null))))' \
     <<<"$manifest" >/dev/null || {
     fail "runtime manifest effective plugin inventory is incomplete"
 }
@@ -262,6 +267,33 @@ while IFS= read -r -d '' plugin_path; do
         fail "bundled plugin is not owned by a packaged component: $plugin_file"
     }
 done < <(find -P "$runtime_plugin_dir" -type f -name 'libgst*.so*' -print0 | sort -z)
+
+if ! inspected_plugin_inventory=$(jq -Rn '
+    [inputs | select(length > 0) | split("\t")] as $rows
+    | if any($rows[]; (length != 5 or any(.[]; . == ""))) then
+          error("plugin inspection TSV is not five nonempty fields")
+      else
+          [$rows[] | {filename: .[0], license: .[1], component: .[2], source_module: .[3], source_url: .[4]}]
+          | sort_by([.filename, .component, .source_module, .license, .source_url])
+      end
+' <"$plugin_license_tsv"); then
+    fail "plugin inspection inventory is malformed"
+fi
+if ! manifest_plugin_inventory=$(jq -c '
+    if (all(.actual_plugin_license[]; type == "object") | not) then
+        error("manifest plugin inventory contains a non-object")
+    elif any(.actual_plugin_license[]; (keys | sort) != ["component", "filename", "license", "source_module", "source_url"]) then
+        error("manifest plugin inventory has unexpected fields")
+    elif any(.actual_plugin_license[]; (all([.filename, .license, .component, .source_module, .source_url][]; type == "string" and length > 0) | not)) then
+        error("manifest plugin inventory has an empty field")
+    else
+        [.actual_plugin_license[] | {filename: .filename, license: .license, component: .component, source_module: .source_module, source_url: .source_url}]
+        | sort_by([.filename, .component, .source_module, .license, .source_url])
+    end
+' <<<"$manifest"); then
+    fail "runtime manifest plugin inventory is malformed"
+fi
+[[ "$inspected_plugin_inventory" == "$manifest_plugin_inventory" ]] || fail "runtime manifest plugin inventory differs from inspected plugins"
 
 while IFS=$'\t' read -r element filename owner declared; do
     [[ -f "$runtime_plugin_dir/$filename" ]] || fail "audited plugin file is missing: $filename"
