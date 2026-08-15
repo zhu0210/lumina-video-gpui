@@ -1297,7 +1297,7 @@ extract_license() {
     local archive=$1
     local member_pattern=$2
     local destination=$3
-    local member_list temporary archive_member root suffix selected_member rest
+    local member_list temporary archive_member member_kind root suffix selected_member rest root_metadata_name
     local -A seen_archive_members=()
     local -A seen_roots=()
     local -a path_parts=()
@@ -1308,23 +1308,52 @@ extract_license() {
     suffix=${member_pattern#*/}
     if ! python3 - "$archive" "$member_list" <<'PY'
 import sys
+import stat
 import tarfile
 import zipfile
 
 archive, output = sys.argv[1:]
 try:
+    def write_member(destination, name, kind):
+        if "\x00" in name:
+            raise ValueError("archive member contains NUL")
+        destination.write(name.encode("utf-8", "surrogateescape"))
+        destination.write(b"\0")
+        destination.write(kind.encode("ascii"))
+        destination.write(b"\0")
+
     if archive.endswith(".zip"):
         with zipfile.ZipFile(archive) as source:
-            names = [info.filename for info in source.infolist()]
+            with open(output, "wb") as destination:
+                for info in source.infolist():
+                    mode = (info.external_attr >> 16) & 0xffff if info.create_system == 3 else 0
+                    file_type = stat.S_IFMT(mode)
+                    if file_type == stat.S_IFLNK:
+                        kind = "symlink"
+                    elif file_type == stat.S_IFDIR:
+                        kind = "directory" if info.is_dir() else "special"
+                    elif file_type == stat.S_IFREG:
+                        kind = "regular" if not info.is_dir() else "special"
+                    elif file_type:
+                        kind = "special"
+                    else:
+                        kind = "directory" if info.is_dir() else "regular"
+                    write_member(destination, info.filename, kind)
     else:
         with tarfile.open(archive, "r:*") as source:
-            names = [member.name for member in source.getmembers()]
-    with open(output, "wb") as destination:
-        for name in names:
-            if "\x00" in name:
-                raise ValueError("archive member contains NUL")
-            destination.write(name.encode("utf-8", "surrogateescape"))
-            destination.write(b"\0")
+            with open(output, "wb") as destination:
+                for member in source.getmembers():
+                    if member.isdir():
+                        kind = "directory"
+                    elif member.isreg():
+                        kind = "regular"
+                    elif member.issym():
+                        kind = "symlink"
+                    elif member.islnk():
+                        kind = "hardlink"
+                    else:
+                        kind = "special"
+                    write_member(destination, member.name, kind)
 except Exception as error:
     print(f"archive enumeration failed: {error}", file=sys.stderr)
     raise SystemExit(1)
@@ -1334,7 +1363,22 @@ PY
         fail "could not enumerate archive members: $archive"
     fi
     selected_member=
-    while IFS= read -r -d '' archive_member || [[ -n "$archive_member" ]]; do
+    root_metadata_name=
+    while :; do
+        archive_member=
+        if IFS= read -r -d '' archive_member; then
+            :
+        elif [[ -n "$archive_member" ]]; then
+            rm -f -- "$member_list"
+            fail "archive member stream has an incomplete name: $archive"
+        else
+            break
+        fi
+        member_kind=
+        if ! IFS= read -r -d '' member_kind; then
+            rm -f -- "$member_list"
+            fail "archive member stream has an incomplete type: $archive"
+        fi
         [[ -n "$archive_member" ]] || {
             rm -f -- "$member_list"
             fail "archive contains an empty member name: $archive"
@@ -1354,23 +1398,56 @@ PY
                 fail "archive member path contains dot traversal: $archive"
             }
         done
-        [[ "$archive_member" == */* ]] || {
+        [[ "$member_kind" == directory || "$member_kind" == regular ||
+           "$member_kind" == symlink || "$member_kind" == hardlink ||
+           "$member_kind" == special ]] || {
             rm -f -- "$member_list"
-            fail "archive member has no top-level root: $archive"
+            fail "archive member has an invalid type: $archive"
         }
-        root=${archive_member%%/*}
-        rest=${archive_member#*/}
-        [[ -n "$root" ]] || {
+        if [[ "$archive_member" == */* ]]; then
+            root=${archive_member%%/*}
+            rest=${archive_member#*/}
+            [[ -n "$root" ]] || {
+                rm -f -- "$member_list"
+                fail "archive member has an empty top-level root: $archive"
+            }
+        else
+            [[ "$member_kind" == directory ]] || {
+                rm -f -- "$member_list"
+                fail "archive member has no top-level root: $archive"
+            }
+            root=$archive_member
+            rest=
+        fi
+        if [[ -n "${seen_roots["$root"]+x}" ]]; then
+            :
+        elif ((${#seen_roots[@]} > 0)); then
             rm -f -- "$member_list"
-            fail "archive member has an empty top-level root: $archive"
-        }
+            fail "archive has multiple top-level roots: $archive"
+        fi
+        seen_roots["$root"]=1
         if [[ -n "${seen_archive_members["$archive_member"]+x}" ]]; then
             rm -f -- "$member_list"
             fail "archive contains duplicate members: $archive"
         fi
         seen_archive_members["$archive_member"]=1
-        seen_roots["$root"]=1
+        if [[ -z "$rest" ]]; then
+            [[ "$member_kind" == directory ]] || {
+                rm -f -- "$member_list"
+                fail "top-level root entry is not a directory: $archive"
+            }
+            [[ -z "$root_metadata_name" ]] || {
+                rm -f -- "$member_list"
+                fail "archive has conflicting top-level root metadata: $archive"
+            }
+            root_metadata_name=$archive_member
+            continue
+        fi
         if [[ "$rest" == "$suffix" ]]; then
+            [[ "$member_kind" == regular ]] || {
+                rm -f -- "$member_list"
+                fail "license member is not a regular file: $member_pattern"
+            }
             [[ -z "$selected_member" ]] || {
                 rm -f -- "$member_list"
                 fail "license member pattern matches multiple archive members: $member_pattern"
