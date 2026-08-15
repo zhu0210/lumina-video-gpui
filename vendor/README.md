@@ -15,7 +15,7 @@ inventory change.
 `audit.overlay_inputs` is the single SHA-256 inventory of the 16 regular
 repo-owned Cerbero control files under config, packages, recipes, and patches;
 the build and discovery scripts reject path-set or byte mismatches.
-PulseAudio uses the verified signed `v17.0` tag and peeled commit archive;
+PulseAudio uses the official API's PGP-signed `v17.0` tag and peeled commit archive;
 the archive SHA, root, license/meson bytes, and explicit release-generated
 `GIT_DESCRIBE_FOR_BUILD` value are lock-checked before acquisition.
 
