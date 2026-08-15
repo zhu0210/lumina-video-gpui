@@ -1,0 +1,5 @@
+--- a/recipes/gstreamer-1.0.recipe
++++ b/recipes/gstreamer-1.0.recipe
+@@ -10 +10 @@
+-    bash_completions = ['gst-inspect-1.0', 'gst-launch-1.0']
++    bash_completions = []

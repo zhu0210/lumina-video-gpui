@@ -58,7 +58,7 @@
     "platform": "linux/amd64"
   },
   "packages": ["lumina-audited"],
-  "variants": ["norust", "alsa", "pulse", "va"],
+  "variants": ["norust", "nogi", "nounwind", "alsa", "pulse", "va"],
   "audit": {
     "recipe_allowlist": [
       "gstreamer-1.0",
@@ -91,7 +91,7 @@
       "openssl"
     ],
     "recipe_metadata": [
-      {"recipe": "gstreamer-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz", "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca", "deps": ["glib"], "platform_deps": []},
+      {"recipe": "gstreamer-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.28.6.tar.xz", "sha256": "62b6b9f0ad3147a6dd6420ac64a91180b14e990695bddd353b96041611d052ca", "deps": ["glib"], "platform_deps": [], "overlay_patches": ["gstreamer-1.0-no-bash-completions.patch"]},
       {"recipe": "gst-plugins-base-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-1.28.6.tar.xz", "sha256": "0ba699c7c6c66f4ba640be78cb38a24715add9683f3e3a199f5369dc5a4f04ac", "deps": ["glib", "gstreamer-1.0", "libogg", "zlib", "orc", "opus"], "platform_deps": ["alsa"], "overlay_patches": ["gst-plugins-base-1.0-minimal.patch"]},
       {"recipe": "gst-plugins-good-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-1.28.6.tar.xz", "sha256": "b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df", "deps": ["gstreamer-1.0", "gst-plugins-base-1.0", "libsoup", "orc", "zlib", "libvpx"], "platform_deps": ["alsa", "libpulse"], "overlay_patches": ["gst-plugins-good-1.0-minimal.patch"]},
       {"recipe": "gst-plugins-bad-1.0", "version": "1.28.6", "source_url": "https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.28.6.tar.xz", "sha256": "6636f2c2289ceda52c4aba971338c81e2b5780d3381bd3673c1c116ec87587c3", "deps": ["gstreamer-1.0", "gst-plugins-base-1.0", "zlib", "libxml2", "openssl", "libva"], "platform_deps": ["libdrm"], "overlay_patches": ["gst-plugins-bad-1.0-disable-gpl.patch", "gst-plugins-bad-1.0-no-gpl-deps.patch", "gst-plugins-bad-1.0-minimal.patch"]},

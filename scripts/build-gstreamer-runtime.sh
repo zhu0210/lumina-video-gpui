@@ -238,7 +238,7 @@ jq -e '
     echo "package set must contain only lumina-audited" >&2
     exit 1
 }
-[[ "${variants[*]}" == "norust alsa pulse va" ]] || { echo "variants are not the audited set" >&2; exit 1; }
+[[ "${variants[*]}" == "norust nogi nounwind alsa pulse va" ]] || { echo "variants are not the audited set" >&2; exit 1; }
 [[ "${recipe_allowlist[0]}" == "gstreamer-1.0" ]] || {
     echo "recipe allowlist must start with gstreamer-1.0" >&2
     exit 1
@@ -285,6 +285,10 @@ jq -e 'all(.components[]; (.name and .version and .source_url and (.sha256 | tes
 }
 jq -e '([.components[].sha256] | length) == ([.components[].sha256] | unique | length)' "$lock_file" >/dev/null || {
     echo "component source SHA-256 values must be unique for ownership matching" >&2
+    exit 1
+}
+jq -e '(.components | length == 28) and all(.components[]; (.recipe != "bash-completion" and .recipe != "libunwind" and .recipe != "gobject-introspection"))' "$lock_file" >/dev/null || {
+    echo "lock must contain exactly the 28 audited runtime components" >&2
     exit 1
 }
 jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT")) or (.license | startswith("BSD")) or (.license == "BZIP2-1.0.6") or (.license == "Apache-2.0") or (.license == "Public Domain")))' "$lock_file" >/dev/null || {
@@ -370,9 +374,10 @@ good_minimal_patch="$overlay_dir/patches/gst-plugins-good-1.0-minimal.patch"
 bad_no_gpl_deps_patch="$overlay_dir/patches/gst-plugins-bad-1.0-no-gpl-deps.patch"
 bad_minimal_patch="$overlay_dir/patches/gst-plugins-bad-1.0-minimal.patch"
 openssl_no_ca_patch="$overlay_dir/patches/openssl-no-ca-certificates.patch"
+gstreamer_no_bash_completions_patch="$overlay_dir/patches/gstreamer-1.0-no-bash-completions.patch"
 [[ -f "$base_minimal_patch" && -f "$good_minimal_patch" &&
    -f "$bad_no_gpl_deps_patch" && -f "$bad_minimal_patch" &&
-   -f "$openssl_no_ca_patch" ]] || {
+   -f "$openssl_no_ca_patch" && -f "$gstreamer_no_bash_completions_patch" ]] || {
     fail "minimal recipe patches are missing"
 }
 overlay_package="$overlay_dir/packages/lumina-audited.package"
@@ -408,6 +413,9 @@ grep -F "tarball_checksum = 'b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1
     "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/dev/null || {
     fail "pinned gst-plugins-good recipe checksum is not 1.28.6"
 }
+patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$gstreamer_no_bash_completions_patch" >/dev/null || {
+    fail "could not apply the pinned GStreamer bash-completions patch"
+}
 patch --directory "$cerbero_dir" --batch --forward --fuzz=0 --strip=1 <"$base_minimal_patch" >/dev/null || {
     fail "could not apply the pinned gst-plugins-base minimal patch"
 }
@@ -438,6 +446,13 @@ grep -F "'vpx': 'enabled'" "$cerbero_dir/recipes/gst-plugins-good-1.0.recipe" >/
 grep -F "'opus': 'enabled'" "$cerbero_dir/recipes/gst-plugins-base-1.0.recipe" >/dev/null || {
     fail "minimal gst-plugins-base recipe lost Opus support"
 }
+grep -F "bash_completions = []" "$cerbero_dir/recipes/gstreamer-1.0.recipe" >/dev/null || {
+    fail "patched GStreamer recipe does not disable bash completions"
+}
+if grep -Eq "^[[:space:]]*bash_completions[[:space:]]*=.*(gst-inspect-1\\.0|gst-launch-1\\.0)" \
+    "$cerbero_dir/recipes/gstreamer-1.0.recipe"; then
+    fail "patched GStreamer recipe still lists gst shell completions"
+fi
 grep -F "'gpl': 'disabled'" "$cerbero_dir/recipes/gst-plugins-bad-1.0.recipe" >/dev/null || {
     fail "patched gst-plugins-bad recipe does not disable its actual GPL option"
 }
