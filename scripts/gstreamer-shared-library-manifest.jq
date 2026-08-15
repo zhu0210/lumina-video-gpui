@@ -12,7 +12,7 @@ def shared_library_entries($prefix):
   [ .[]
     | select(.path | startswith($prefix))
     | .path = (.path | ltrimstr($prefix))
-    | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
+    | select(.path | test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)(\\.[0-9]+){0,3}$"))
     | {path, kind, link_target: (.link_target // null)}
   ] | sort_by(.path);
 
@@ -20,8 +20,8 @@ def shared_library_owners($prefix):
   [ .[]
     | select(.path | startswith($prefix))
     | .path = (.path | ltrimstr($prefix))
-    | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
-    | .path |= sub("\\.so(\\..*)?$"; ".so")
+    | select(.path | test("^(lib[A-Za-z0-9_.+-]+\\.so|pulseaudio/lib[A-Za-z0-9_.+-]+\\.so)(\\.[0-9]+){0,3}$"))
+    | .path |= sub("\\.so(\\.[0-9]+){0,3}$"; ".so")
     | {component, path}
   ] as $actual
   | if all($actual | group_by(.path)[]; (map(.component) | unique | length) == 1)

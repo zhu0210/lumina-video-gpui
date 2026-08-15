@@ -42,18 +42,27 @@ shared_library_prefix='vendor/linux-x86_64/lib/x86_64-linux-gnu/'
 jq --arg prefix "$shared_library_prefix" '
     {bundled_files: [.entries[]
         | {kind, path: ($prefix + .path), component: "fixture"}
-          + if .kind == "symlink" then {link_target} else {} end]}
+          + if .kind == "symlink" then {link_target} else {} end]
+      + [{kind: "file", path: ($prefix + "libfixture.so.1.debuginfo"), component: "fixture"}]}
 ' "$inventory" >"$fixture_root/manifest"
 expected_entries=$(jq -c '[.entries[] | {path, kind, link_target: (.link_target // null)}] | sort_by(.path)' "$inventory")
 manifest_entries=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
     'include "gstreamer-shared-library-manifest"; .bundled_files | shared_library_entries($prefix)' \
     "$fixture_root/manifest")
 [[ "$manifest_entries" == "$expected_entries" ]]
+sidecar_entries=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
+    'include "gstreamer-shared-library-manifest"; [.bundled_files[] | select(.path | endswith(".debuginfo"))] | shared_library_entries($prefix)' \
+    "$fixture_root/manifest")
+[[ "$sidecar_entries" == "[]" ]]
 expected_owners=$(jq -c '[.canonical_paths[] | {component: "fixture", path: .}] | sort_by(.path)' "$inventory")
 manifest_owners=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
     'include "gstreamer-shared-library-manifest"; .bundled_files | shared_library_owners($prefix)' \
     "$fixture_root/manifest")
 [[ "$manifest_owners" == "$expected_owners" ]]
+sidecar_owners=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
+    'include "gstreamer-shared-library-manifest"; [.bundled_files[] | select(.path | endswith(".debuginfo"))] | shared_library_owners($prefix)' \
+    "$fixture_root/manifest")
+[[ "$sidecar_owners" == "[]" ]]
 jq '(.bundled_files[] | select(.path | contains("libfixture"))).component = "wrong-owner"' \
     "$fixture_root/manifest" >"$fixture_root/wrong-owner"
 wrong_owners=$(jq -L "$script_dir" -c --arg prefix "$shared_library_prefix" \
