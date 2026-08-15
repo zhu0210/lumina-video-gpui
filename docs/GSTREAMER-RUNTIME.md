@@ -26,6 +26,8 @@ licenses with isolated `gst-inspect-1.0`.
 extracted pinned Cerbero tree and local Cerbero/PipeWire archives, validates
 every locked recipe after the repo patches, and queries only small official
 tag/checksum endpoints. It refuses to download those archives itself.
+The PipeWire archive is addressed to commit
+`b741e0c74f5436f0c925f7741140db0efd32cf4e` and byte-locked by its SHA-256.
 
 ## License and codec policy
 
@@ -99,7 +101,7 @@ Primary references: [GStreamer source index](https://gstreamer.freedesktop.org/s
 [GStreamer HLS demuxer](https://gstreamer.freedesktop.org/documentation/adaptivedemux2/hlsdemux2.html),
 [PipeWire 1.6.8 Meson options](https://raw.githubusercontent.com/PipeWire/pipewire/1.6.8/meson_options.txt),
 [PipeWire 1.6.8 tag](https://gitlab.freedesktop.org/pipewire/pipewire/-/tags/1.6.8),
-[PipeWire 1.6.8 archive](https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/1.6.8/pipewire-1.6.8.tar.gz),
+[PipeWire 1.6.8 commit-addressed archive](https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/b741e0c74f5436f0c925f7741140db0efd32cf4e/pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e.tar.gz),
 [PipeWire 1.6.8 documentation](https://docs.pipewire.org/),
 [Flatpak runtime documentation](https://docs.flatpak.org/en/latest/available-runtimes.html),
 and the [Flathub Freedesktop Platform manifest](https://github.com/flathub/org.freedesktop.Platform).
