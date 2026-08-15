@@ -430,7 +430,7 @@ facts = {"name": None, "version": None, "url": None, "sha256": None,
          "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": [],
          "file_patterns": {}, "file_errors": [], "enable_plugin_targets": [],
          "control_errors": [], "meson_enabled": [], "meson_control_errors": []}
-allowed_plugin_targets = set()
+allowed_file_targets = set()
 meson_assignment_seen = False
 def file_error(name):
     if name not in facts["file_errors"]:
@@ -513,9 +513,9 @@ for node in ast.walk(tree):
                         file_error(target.id)
                     else:
                         facts["file_patterns"][target.id] = values
-                        allowed_plugin_targets.add(id(target))
+                        allowed_file_targets.add(id(target))
 for node in ast.walk(tree):
-    if isinstance(node, ast.Name) and node.id.startswith(("files_plugins_", "files_libs_")) and id(node) not in allowed_plugin_targets:
+    if isinstance(node, ast.Name) and node.id.startswith(("files_plugins_", "files_libs_")) and id(node) not in allowed_file_targets:
         file_error(node.id)
     elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
           and node.value.id == "self" and node.attr.startswith(("files_plugins_", "files_libs_"))):
