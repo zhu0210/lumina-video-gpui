@@ -58,17 +58,17 @@ the runtime inventory remains 29 components.
 `scripts/discover-gstreamer-lock.sh` is metadata-only: it accepts a local
 extracted pinned Cerbero tree and local Cerbero/PipeWire/PulseAudio archives, validates
 every locked recipe after the repo patches, and queries only small official
-checksum, tag/signature, and commit raw-file (`meson.build`/`LGPL`) endpoints.
+checksum and tag/signature endpoints.
 It refuses to download those archives itself.
 The PipeWire archive is addressed to commit
 `b741e0c74f5436f0c925f7741140db0efd32cf4e` and byte-locked by its SHA-256.
-PulseAudio is acquired from the official API's PGP-signed annotated `v17.0` tag (tag object
+PulseAudio is acquired from the official API's annotated `v17.0` tag, which reports a PGP signature (tag object
 `16be4f7accce287fd08519591c6356ffa61aaaf1`, peeled commit
 `1f020889c9aa44ea0f63d7222e8c2b62c3f45f68`) using its commit-addressed
 archive and SHA-256. The archive has no `.tarball-version`; the pinned recipe
-sets `GIT_DESCRIBE_FOR_BUILD=v17.0`, and discovery compares the archive's
-`meson.build`/`LGPL` bytes with the commit raw files before updating the lock.
-GitLab can re-render generated commit archives; any byte drift fails closed
+sets `GIT_DESCRIBE_FOR_BUILD=v17.0`, and discovery verifies the archive's
+`meson.build`/`LGPL` bytes against locked commit facts before updating the lock.
+GitHub can re-render generated commit archives; any byte drift fails closed
 against the lock SHA and requires an explicit lock review/update, never
 automatic acceptance.
 
