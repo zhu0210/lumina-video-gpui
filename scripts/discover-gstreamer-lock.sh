@@ -47,6 +47,38 @@ fail() {
     exit 1
 }
 
+package_files_from_overlay() {
+    python3 - "$1" <<'PY'
+import ast
+import json
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+package_classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Package"]
+if len(package_classes) != 1:
+    raise SystemExit("audited package class must be unique")
+assignments = [
+    node for node in ast.walk(package_classes[0])
+    if isinstance(node, ast.Assign)
+    and any(isinstance(target, ast.Name) and target.id == "files" for target in node.targets)
+]
+if len(assignments) != 1:
+    raise SystemExit("package files assignment must be unique")
+value = assignments[0].value
+if not isinstance(value, (ast.List, ast.Tuple)):
+    raise SystemExit("package files assignment must be a constant list")
+files = []
+for item in value.elts:
+    if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+        raise SystemExit("package files list must contain only strings")
+    files.append(item.value)
+if len(files) != len(set(files)):
+    raise SystemExit("package files list contains duplicates")
+json.dump(files, sys.stdout, separators=(",", ":"))
+print()
+PY
+}
+
 gstreamer_version=$(jq -er '.gstreamer.version' "$lock_file")
 [[ "$gstreamer_version" == 1.28.6 ]] || fail "reviewed lock template only supports GStreamer 1.28.6"
 jq -e '.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]' "$lock_file" >/dev/null || {
@@ -98,6 +130,23 @@ cleanup() { rm -rf "$tmp_dir"; }
 trap cleanup EXIT
 cp -a -- "$cerbero_dir/recipes" "$tmp_dir/recipes"
 overlay_dir="$repo_root/vendor/cerbero-overlay"
+overlay_package="$overlay_dir/packages/lumina-audited.package"
+[[ -f "$overlay_package" ]] || fail "audited Cerbero package is missing"
+if grep -Eq '^[[:space:]]*deps[[:space:]]*=' "$overlay_package"; then
+    fail "audited private package must not depend on an upstream package"
+fi
+overlay_package_files="$tmp_dir/overlay-package-files.json"
+if ! package_files_from_overlay "$overlay_package" >"$overlay_package_files"; then
+    fail "audited package files list is not a unique constant string list"
+fi
+if ! jq -e --slurpfile actual "$overlay_package_files" \
+    '$actual[0] == .audit.package_files' "$lock_file" >/dev/null; then
+    fail "audited package files do not exactly match the lock"
+fi
+if ! jq -er 'if type == "array" and all(.[]; type == "string") then .[] else error("invalid package files") end' \
+    "$overlay_package_files" >"$tmp_dir/validated-package-file-specs"; then
+    fail "validated package files could not be materialized"
+fi
 while IFS= read -r overlay_recipe; do
     [[ -n "$overlay_recipe" ]] || continue
     cp -a -- "$overlay_dir/recipes/$overlay_recipe.recipe" "$tmp_dir/recipes/$overlay_recipe.recipe"
@@ -239,11 +288,11 @@ done < <(jq -er '.audit.recipe_metadata[] | [.recipe, .version, .source_url, .sh
 
 package_plugin_specs="$tmp_dir/plugin-package-specs"
 if ! jq -er '
-    .audit.package_files[] | split(":") as $parts
+    .[] | split(":") as $parts
     | $parts[1:][] | select(startswith("plugins_"))
     | [$parts[0], .] | @tsv
-' "$lock_file" >"$package_plugin_specs" || [[ ! -s "$package_plugin_specs" ]]; then
-    fail "lock package plugin categories are missing or malformed"
+' "$overlay_package_files" >"$package_plugin_specs" || [[ ! -s "$package_plugin_specs" ]]; then
+    fail "audited package plugin categories are missing or malformed"
 fi
 declared_plugin_files="$tmp_dir/declared-plugin-files"
 if ! plugin_set_from_pinned_recipes "$tmp_dir/recipes" "$package_plugin_specs" >"$declared_plugin_files"; then
