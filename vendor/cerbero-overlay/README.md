@@ -40,8 +40,8 @@ overlay input hashes, the post-package exact 21-plugin inventory, and the
 artifact audit are authoritative.
 The lock also names the exact canonical `.so` paths for every selected public
 library and the Pulse private common library. GStreamer core/base use literal
-`libs_lumina` lists (`libgstreamer-1.0`, `libgstbase-1.0`, `libgstnet-1.0` and
-the seven base libraries); controller/check/FFT/RTSP/SDP/GL/app broad-category
+`libs_lumina` lists (two core, six base, and four bad libraries); controller,
+net, RTP, check, FFT, RTSP, SDP, GL, and app broad-category
 spill is not packaged. Build/discovery compare recipe-derived paths, while
 package and artifact checks reject any missing or extra canonical shared file.
 

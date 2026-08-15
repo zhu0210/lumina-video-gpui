@@ -13,7 +13,7 @@ lock_file=${3:-$repo_root/vendor/gstreamer-1.0.lock.json}
     echo "Usage: $0 RUNTIME.tar.xz SOURCES.tar.xz [LOCK]" >&2
     exit 2
 }
-for command_name in jq tar sha256sum mktemp realpath grep awk sed find readelf tr sort cmp comm head; do
+for command_name in jq tar sha256sum mktemp realpath grep awk sed find readelf tr sort cmp comm head python3 readlink; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -70,6 +70,11 @@ manifest=$(tar -xJOf "$artifact" ./runtime-manifest.json)
 jq -e \
     '.schema_version == 2 and (.packages == ["lumina-audited"]) and (.package_files | length >= 7) and .policy.gpl == false and .policy.nonfree == false and .policy.unknown == false and .policy.ugly == false and (.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]) and (.recursive_dt_needed | type == "array") and (.bundled_files | type == "array") and (.components | type == "array") and (.actual_plugin_license | type == "array") and (.shared_library_allowlist | type == "array") and (.bundled_shared_libraries | type == "array")' \
     <<<"$manifest" >/dev/null || fail "runtime manifest policy or inventory is incomplete"
+jq -e '
+    all(.bundled_files[];
+        (.kind == "file" and (has("link_target") | not))
+        or (.kind == "symlink" and (.link_target | type == "string" and length > 0)))
+' <<<"$manifest" >/dev/null || fail "runtime manifest file kinds are malformed"
 jq -e --argjson expected "$(jq -c '.audit.package_files' "$lock_file")" \
     '.package_files == $expected' <<<"$manifest" >/dev/null || fail "runtime manifest package file categories differ from lock"
 jq -e --argjson expected "$(jq -c '.components' "$lock_file")" \
@@ -97,7 +102,9 @@ jq -e --arg prefix 'vendor/linux-x86_64/lib/x86_64-linux-gnu/' \
       | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
       | .path |= sub("\\.so(\\..*)?$"; ".so")
       | {component, path}
-    ] | sort_by(.path) == ($expected | sort_by(.path))
+    ] as $actual
+    | all($actual | group_by(.path)[]; (map(.component) | unique | length) == 1)
+      and (($actual | unique_by(.path) | sort_by(.path)) == ($expected | sort_by(.path)))
 ' <<<"$manifest" >/dev/null || fail "runtime shared-library owner mapping differs from the lock allowlist"
 
 runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/lumina-runtime-audit.XXXXXX")
@@ -108,14 +115,23 @@ trap cleanup EXIT
 tar -xJf "$artifact" -C "$runtime_dir" --no-same-owner
 tar -xJf "$source_artifact" -C "$source_dir" --no-same-owner
 
-while IFS=$'\t' read -r path expected owner; do
-    [[ -f "$runtime_dir/$path" ]] || fail "manifest file is missing: $path"
-    actual=$(sha256sum "$runtime_dir/$path" | awk '{print $1}')
+while IFS=$'\t' read -r kind path expected owner link_target; do
+    if [[ "$kind" == symlink ]]; then
+        [[ -L "$runtime_dir/$path" ]] || fail "manifest symlink is missing: $path"
+        actual_target=$(readlink -- "$runtime_dir/$path")
+        [[ "$actual_target" == "$link_target" ]] || fail "manifest symlink target mismatch: $path"
+        actual=$(printf '%s' "$actual_target" | sha256sum | awk '{print $1}')
+    elif [[ "$kind" == file ]]; then
+        [[ -f "$runtime_dir/$path" && ! -L "$runtime_dir/$path" ]] || fail "manifest file is missing: $path"
+        actual=$(sha256sum "$runtime_dir/$path" | awk '{print $1}')
+    else
+        fail "manifest entry has unsupported kind: $path"
+    fi
     [[ "$actual" == "$expected" ]] || fail "manifest hash mismatch: $path"
     if [[ "$path" == *.so || "$path" == *.so.* ]]; then
         [[ -n "$owner" && "$owner" != metadata ]] || fail "shared library lacks component owner: $path"
     fi
-done < <(jq -r '.bundled_files[] | [.path, .sha256, (.component // "")] | @tsv' <<<"$manifest")
+done < <(jq -r '.bundled_files[] | [.kind, .path, .sha256, (.component // ""), (.link_target // "")] | @tsv' <<<"$manifest")
 
 source_manifest=$(jq -e . "$source_dir/source-manifest.json")
 [[ "$(jq -r '.runtime_tree_sha256' <<<"$source_manifest")" == "$(jq -r '.tree_sha256' <<<"$manifest")" ]] || {
@@ -254,12 +270,15 @@ if ! jq -er '[.audit.shared_library_allowlist[].path] | unique | sort[]' "$lock_
     fail "lock shared-library allowlist cannot produce a unique path set"
 fi
 actual_shared_library_files="$cache_dir/runtime-shared-library-files"
-{
-    find -P "$runtime_root/$runtime_libdir" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf '%f\n'
-    find -P "$runtime_root/${private_runtime_libdirs[0]}" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf 'pulseaudio/%f\n'
-} | sed -E 's/\.so(\..*)?$/.so/' | awk 'seen[$0]++ { bad = 1 } { print } END { exit bad }' | sort >"$actual_shared_library_files" || {
-    fail "runtime shared-library canonical names are ambiguous"
-}
+shared_library_inventory_json="$cache_dir/runtime-shared-library-inventory.json"
+if ! python3 "$script_dir/gstreamer-shared-library-inventory.py" \
+    "$runtime_root" "$runtime_libdir" "${private_runtime_libdirs[0]}" \
+    >"$shared_library_inventory_json"; then
+    fail "runtime shared-library inventory is unsafe or ambiguous"
+fi
+if ! jq -er '.canonical_paths[]' "$shared_library_inventory_json" >"$actual_shared_library_files"; then
+    fail "runtime shared-library inventory is malformed"
+fi
 if ! cmp -s "$actual_shared_library_files" "$expected_shared_library_files"; then
     shared_library_set_diff="$cache_dir/runtime-shared-library-set.diff"
     comm -3 "$expected_shared_library_files" "$actual_shared_library_files" >"$shared_library_set_diff"

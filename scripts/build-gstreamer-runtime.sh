@@ -2170,12 +2170,15 @@ if ! cmp -s "$actual_plugin_files" "$expected_plugin_files"; then
 fi
 
 actual_shared_library_files="$work_dir/package-shared-library-files"
-{
-    find -P "$runtime_root/$archive_runtime_libdir" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf '%f\n'
-    find -P "$runtime_root/${private_runtime_libdirs[0]}" -mindepth 1 -maxdepth 1 -type f -name 'lib*.so*' -printf 'pulseaudio/%f\n'
-} | sed -E 's/\.so(\..*)?$/.so/' | awk 'seen[$0]++ { bad = 1 } { print } END { exit bad }' | sort >"$actual_shared_library_files" || {
-    fail "packaged shared-library canonical names are ambiguous"
-}
+shared_library_inventory_json="$work_dir/package-shared-library-inventory.json"
+if ! python3 "$script_dir/gstreamer-shared-library-inventory.py" \
+    "$runtime_root" "$archive_runtime_libdir" "${private_runtime_libdirs[0]}" \
+    >"$shared_library_inventory_json"; then
+    fail "packaged shared-library inventory is unsafe or ambiguous"
+fi
+if ! jq -er '.canonical_paths[]' "$shared_library_inventory_json" >"$actual_shared_library_files"; then
+    fail "packaged shared-library inventory is malformed"
+fi
 shared_library_set_diff="$work_dir/package-shared-library-set.diff"
 if ! cmp -s "$actual_shared_library_files" "$expected_shared_library_files"; then
     comm -3 "$expected_shared_library_files" "$actual_shared_library_files" >"$shared_library_set_diff"
@@ -2367,11 +2370,20 @@ EOF
 # Normalize the generated vendor tree before hashing so the tree digest covers
 # the exact files that will be packed.
 find "$runtime_root" -exec touch -h -d '@0' {} +
-(cd "$bundle" && find vendor -type f -print0 | sort -z |
-    while IFS= read -r -d '' file; do sha256sum "$file"; done) >"$bundle/tree.sha256"
+(cd "$bundle" && find vendor \( -type f -o -type l \) -print0 | sort -z |
+    while IFS= read -r -d '' file; do
+        if [[ -L "$file" ]]; then
+            link_target=$(readlink -- "$file")
+            [[ -n "$link_target" && ! "$link_target" =~ [[:cntrl:]] ]] || fail "vendor symlink target is unsafe: $file"
+            link_sha=$(printf '%s' "$link_target" | sha256sum | awk '{ print $1 }')
+            printf '%s  %s -> %s\n' "$link_sha" "$file" "$link_target"
+        else
+            sha256sum "$file"
+        fi
+    done) >"$bundle/tree.sha256"
 tree_sha=$(sha256sum "$bundle/tree.sha256" | awk '{ print $1 }')
 file_inventory=$(cd "$bundle" &&
-    find . -type f ! -name inventory.json -print0 | sort -z |
+    find . \( -type f -o -type l \) ! -name inventory.json -print0 | sort -z |
     while IFS= read -r -d '' file; do
         path=${file#./}
         owner=$(jq -r --arg path "$path" '
@@ -2380,8 +2392,15 @@ file_inventory=$(cd "$bundle" &&
         if [[ "$path" == *.so || "$path" == *.so.* ]]; then
             [[ -n "$owner" ]] || fail "bundled shared library has no component owner: $path"
         fi
-        printf '%s\t%s\t%s\n' "$path" "$(sha256sum "$file" | awk '{ print $1 }')" "${owner:-metadata}"
-    done | jq -Rn '[inputs | split("\t") | {path: .[0], sha256: .[1], component: .[2]}]')
+        if [[ -L "$file" ]]; then
+            link_target=$(readlink -- "$file")
+            [[ -n "$link_target" && ! "$link_target" =~ [[:cntrl:]] ]] || fail "bundled symlink target is unsafe: $path"
+            link_sha=$(printf '%s' "$link_target" | sha256sum | awk '{ print $1 }')
+            printf 'symlink\t%s\t%s\t%s\t%s\n' "$path" "$link_sha" "${owner:-metadata}" "$link_target"
+        else
+            printf 'file\t%s\t%s\t%s\t\n' "$path" "$(sha256sum "$file" | awk '{ print $1 }')" "${owner:-metadata}"
+        fi
+    done | jq -Rn '[inputs | split("\t") | {kind: .[0], path: .[1], sha256: .[2], component: .[3]} + if .[0] == "symlink" then {link_target: .[4]} else {} end]')
 shared_library_allowlist=$(jq -c '.audit.shared_library_allowlist' "$lock_file")
 jq -e --arg prefix "vendor/linux-x86_64/$archive_runtime_libdir/" \
     --argjson expected "$shared_library_allowlist" '
@@ -2391,7 +2410,9 @@ jq -e --arg prefix "vendor/linux-x86_64/$archive_runtime_libdir/" \
       | select(.path | test("^(lib[^/]+\\.so(\\..*)?|pulseaudio/lib[^/]+\\.so(\\..*)?)$"))
       | .path |= sub("\\.so(\\..*)?$"; ".so")
       | {component, path}
-    ] | sort_by(.path) == ($expected | sort_by(.path))
+    ] as $actual
+    | all($actual | group_by(.path)[]; (map(.component) | unique | length) == 1)
+      and (($actual | unique_by(.path) | sort_by(.path)) == ($expected | sort_by(.path)))
 ' <<<"$file_inventory" >/dev/null || fail "bundled shared-library owner mapping differs from the lock allowlist"
 plugin_inventory=$(jq -c '.audit.plugin_allowlist' "$lock_file")
 component_inventory=$(jq -c '.components' "$lock_file")
