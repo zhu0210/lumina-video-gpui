@@ -14,7 +14,8 @@ normalization is limited to ALSA, PulseAudio, and PipeWire, with no runtime
 inventory change.
 
 The audited closure is intentionally narrow: only the lock's direct recipe
-categories are built into the single `lumina-audited` package. The matrix
+categories are built into the single `lumina-audited` package, with exactly 21
+GStreamer plugin shared objects selected by repo-owned recipe lists. The matrix
 plugin allowlist records effective license/source, while the build and audit
 run isolated `gst-inspect-1.0` over every bundled plugin. GPL/nonfree/version-3
 FFmpeg options, gst-plugins-ugly, x264, and unknown licenses are rejected.

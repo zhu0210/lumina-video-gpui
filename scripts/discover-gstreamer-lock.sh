@@ -24,7 +24,7 @@ while (($#)); do
         *) usage ;;
     esac
 done
-for command_name in curl git jq sha256sum mktemp mv cp rm grep awk sed realpath patch python3; do
+for command_name in curl git jq sha256sum mktemp mv cp rm grep awk sed realpath patch python3 cmp; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -129,7 +129,8 @@ def strings(node):
     return []
 
 facts = {"name": None, "version": None, "url": None, "sha256": None,
-         "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": []}
+         "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": [],
+         "file_patterns": {}, "file_errors": []}
 for node in ast.walk(tree):
     if not isinstance(node, ast.Assign):
         continue
@@ -152,8 +153,49 @@ for node in ast.walk(tree):
             for key, value in zip(node.value.keys, node.value.values):
                 if isinstance(key, ast.Attribute) and key.attr == "LINUX":
                     facts["platform_deps"] = strings(value)
+        elif target.id.startswith("files_plugins_"):
+            if not isinstance(node.value, (ast.List, ast.Tuple)):
+                facts["file_errors"].append(target.id)
+                continue
+            values = []
+            for item in node.value.elts:
+                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                    facts["file_errors"].append(target.id)
+                    break
+                values.append(item.value)
+            else:
+                facts["file_patterns"][target.id] = values
 print(json.dumps(facts, sort_keys=True))
 PY
+}
+
+plugin_set_from_pinned_recipes() {
+    local recipes_dir=$1 package_specs=$2 recipe category facts patterns pattern basename
+    local pattern_re='^%\(libdir\)s/gstreamer-1\.0/libgst[A-Za-z0-9_+-]+%\(mext\)s$'
+    declare -A seen=()
+    while IFS=$'\t' read -r recipe category; do
+        if ! facts=$(recipe_facts "$recipes_dir/$recipe.recipe"); then
+            return 1
+        fi
+        if ! patterns=$(jq -er --arg key "files_$category" '
+            if ((.file_errors | index($key)) != null) then error("dynamic plugin file list")
+            elif (.file_patterns[$key] | type) != "array" then error("missing plugin file list")
+            else .file_patterns[$key][]
+            end
+        ' <<<"$facts"); then
+            return 1
+        fi
+        while IFS= read -r pattern; do
+            [[ "$pattern" =~ $pattern_re ]] || return 1
+            basename=$(sed 's/%(mext)s$/.so/' <<<"${pattern##*/}")
+            [[ "$basename" == libgst*.so ]] || return 1
+            if [[ -n "${seen[$basename]+x}" ]]; then
+                return 1
+            fi
+            seen["$basename"]=1
+            printf '%s\n' "$basename"
+        done <<<"$patterns"
+    done <"$package_specs"
 }
 
 # Parse the pinned archive's actual post-overlay recipe files. This is the
@@ -194,6 +236,27 @@ while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expect
         'any(.components[]; .recipe == $recipe and .source_url == $url and .sha256 == $sha)' \
         "$lock_file" >/dev/null || fail "component source metadata disagrees: $recipe"
 done < <(jq -er '.audit.recipe_metadata[] | [.recipe, .version, .source_url, .sha256, (.deps | tojson), (.platform_deps | tojson), (.archive_root // "")] | @tsv' "$lock_file")
+
+package_plugin_specs="$tmp_dir/plugin-package-specs"
+if ! jq -er '
+    .audit.package_files[] | split(":") as $parts
+    | $parts[1:][] | select(startswith("plugins_"))
+    | [$parts[0], .] | @tsv
+' "$lock_file" >"$package_plugin_specs" || [[ ! -s "$package_plugin_specs" ]]; then
+    fail "lock package plugin categories are missing or malformed"
+fi
+declared_plugin_files="$tmp_dir/declared-plugin-files"
+if ! plugin_set_from_pinned_recipes "$tmp_dir/recipes" "$package_plugin_specs" >"$declared_plugin_files"; then
+    fail "pinned recipe plugin categories are not the exact lock set"
+fi
+sort -o "$declared_plugin_files" "$declared_plugin_files"
+expected_plugin_files="$tmp_dir/expected-plugin-files"
+if ! jq -er '[.audit.plugin_allowlist[].filename] | unique | sort[]' "$lock_file" >"$expected_plugin_files"; then
+    fail "lock plugin allowlist cannot produce a unique filename set"
+fi
+if ! cmp -s "$declared_plugin_files" "$expected_plugin_files"; then
+    fail "pinned recipe plugin categories differ from the lock allowlist"
+fi
 
 lock_tmp=$(mktemp "${lock_file}.XXXXXX")
 cleanup_lock() { rm -f "$lock_tmp"; }

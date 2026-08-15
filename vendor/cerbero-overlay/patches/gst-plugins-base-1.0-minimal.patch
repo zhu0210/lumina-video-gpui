@@ -34,7 +34,18 @@
      }
 
      files_bins = ['gst-discoverer-1.0', 'gst-play-1.0', 'gst-device-monitor-1.0']
-@@ -174,9 +171,6 @@
+@@ -53,1 +53,11 @@
++    files_plugins_lumina = [
++             '%(libdir)s/gstreamer-1.0/libgstplayback%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstopus%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstalsa%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgsttypefindfunctions%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstvideoconvertscale%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstaudioconvert%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstaudioresample%(mext)s',
++             '%(libdir)s/gstreamer-1.0/libgstvolume%(mext)s',
++    ]
+     files_plugins_core_devel = [
      ]
 
      def prepare(self):
