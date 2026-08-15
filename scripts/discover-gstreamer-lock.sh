@@ -55,6 +55,15 @@ jq -e '.variants == ["norust", "nogi", "nounwind", "alsa", "pulse", "va"]' "$loc
 jq -e '(.components | length == 28) and all(.components[]; (.recipe != "bash-completion" and .recipe != "libunwind" and .recipe != "gobject-introspection"))' "$lock_file" >/dev/null || {
     fail "lock must contain exactly the 28 audited runtime components"
 }
+jq -e '
+    ([.audit.recipe_metadata[] | select(has("archive_root"))] as $roots
+     | ($roots | length == 6)
+     and (($roots | map(.recipe) | sort) == ["alsa", "libdrm", "libpulse", "libva", "openssl", "pipewire"])
+     and all($roots[]; (.archive_root | (type == "string" and length > 0)))
+     and (($roots | map(.archive_root) | unique | length) == ($roots | length))
+     and (([.audit.recipe_metadata[] | select(.overlay == true) | .recipe] | sort) == ["alsa", "libdrm", "libpulse", "libva", "pipewire"])
+    )
+' "$lock_file" >/dev/null || fail "lock archive-root metadata is incomplete"
 gstreamer_url="https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-${gstreamer_version}.tar.xz"
 libav_url="https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-${gstreamer_version}.tar.xz"
 gstreamer_sha=$(curl -fsSL --retry 3 --max-filesize 1048576 "${gstreamer_url}.sha256sum" | awk 'NR == 1 { print $1 }')
@@ -119,19 +128,24 @@ def strings(node):
         return [item.value for item in node.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)]
     return []
 
-facts = {"version": None, "url": None, "sha256": None, "deps": [], "platform_deps": []}
+facts = {"name": None, "version": None, "url": None, "sha256": None,
+         "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": []}
 for node in ast.walk(tree):
     if not isinstance(node, ast.Assign):
         continue
     for target in node.targets:
         if not isinstance(target, ast.Name):
             continue
-        if target.id == "version" and isinstance(node.value, ast.Constant):
+        if target.id == "name" and isinstance(node.value, ast.Constant):
+            facts["name"] = node.value.value
+        elif target.id == "version" and isinstance(node.value, ast.Constant):
             facts["version"] = node.value.value
         elif target.id == "url" and isinstance(node.value, ast.Constant):
             facts["url"] = node.value.value
         elif target.id == "tarball_checksum" and isinstance(node.value, ast.Constant):
             facts["sha256"] = node.value.value
+        elif target.id in ("package_name", "tarball_dirname") and isinstance(node.value, ast.Constant):
+            facts[target.id] = node.value.value
         elif target.id == "deps":
             facts["deps"] = strings(node.value)
         elif target.id == "platform_deps" and isinstance(node.value, ast.Dict):
@@ -145,7 +159,7 @@ PY
 # Parse the pinned archive's actual post-overlay recipe files. This is the
 # discovery-side guard against copying guessed URL/version/checksum/dependency
 # values into the lock.
-while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expected_deps expected_platform; do
+while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expected_deps expected_platform expected_archive_root; do
     recipe_file="$tmp_dir/recipes/$recipe.recipe"
     [[ -f "$recipe_file" ]] || fail "pinned Cerbero recipe is missing: $recipe"
     facts=$(recipe_facts "$recipe_file")
@@ -156,6 +170,21 @@ while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expect
     fi
     [[ "$(jq -c '.deps' <<<"$facts")" == "$expected_deps" ]] || fail "recipe deps disagree: $recipe"
     [[ "$(jq -c '.platform_deps' <<<"$facts")" == "$expected_platform" ]] || fail "recipe Linux platform deps disagree: $recipe"
+    if [[ -n "$expected_archive_root" ]]; then
+        actual_name=$(jq -r '.name // empty' <<<"$facts")
+        actual_version=${actual_version:-$expected_version}
+        actual_package_name=$(jq -r '.package_name // empty' <<<"$facts")
+        actual_tarball_dirname=$(jq -r '.tarball_dirname // empty' <<<"$facts")
+        [[ -n "$actual_name" ]] || fail "recipe name is missing for archive-root validation: $recipe"
+        if [[ -n "$actual_tarball_dirname" ]]; then
+            effective_archive_root=${actual_tarball_dirname//%(version)s/$actual_version}
+        elif [[ -n "$actual_package_name" ]]; then
+            effective_archive_root=$actual_package_name
+        else
+            effective_archive_root="$actual_name-$actual_version"
+        fi
+        [[ "$effective_archive_root" == "$expected_archive_root" ]] || fail "recipe archive root disagrees: $recipe"
+    fi
     raw_url=$(jq -r '.url // empty' <<<"$facts")
     case "$raw_url" in
         ''|gnome://*|xiph://*|*'%(*)'*) ;;
@@ -164,7 +193,7 @@ while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expect
     jq -e --arg recipe "$recipe" --arg url "$expected_url" --arg sha "$expected_sha" \
         'any(.components[]; .recipe == $recipe and .source_url == $url and .sha256 == $sha)' \
         "$lock_file" >/dev/null || fail "component source metadata disagrees: $recipe"
-done < <(jq -er '.audit.recipe_metadata[] | [.recipe, .version, .source_url, .sha256, (.deps | tojson), (.platform_deps | tojson)] | @tsv' "$lock_file")
+done < <(jq -er '.audit.recipe_metadata[] | [.recipe, .version, .source_url, .sha256, (.deps | tojson), (.platform_deps | tojson), (.archive_root // "")] | @tsv' "$lock_file")
 
 lock_tmp=$(mktemp "${lock_file}.XXXXXX")
 cleanup_lock() { rm -f "$lock_tmp"; }

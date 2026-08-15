@@ -291,6 +291,18 @@ jq -e '(.components | length == 28) and all(.components[]; (.recipe != "bash-com
     echo "lock must contain exactly the 28 audited runtime components" >&2
     exit 1
 }
+jq -e '
+    ([.audit.recipe_metadata[] | select(has("archive_root"))] as $roots
+     | ($roots | length == 6)
+     and (($roots | map(.recipe) | sort) == ["alsa", "libdrm", "libpulse", "libva", "openssl", "pipewire"])
+     and all($roots[]; (.archive_root | (type == "string" and length > 0)))
+     and (($roots | map(.archive_root) | unique | length) == ($roots | length))
+     and (([.audit.recipe_metadata[] | select(.overlay == true) | .recipe] | sort) == ["alsa", "libdrm", "libpulse", "libva", "pipewire"])
+    )
+' "$lock_file" >/dev/null || {
+    echo "lock archive-root metadata must cover the five overlay tarball recipes and OpenSSL" >&2
+    exit 1
+}
 jq -e 'all(.components[]; ((.license | startswith("LGPL")) or (.license == "Zlib") or (.license | startswith("MIT")) or (.license | startswith("BSD")) or (.license == "BZIP2-1.0.6") or (.license == "Apache-2.0") or (.license == "Public Domain")))' "$lock_file" >/dev/null || {
     echo "component license policy rejects an unapproved component" >&2
     exit 1
@@ -556,19 +568,24 @@ def strings(node):
         return [item.value for item in node.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)]
     return []
 
-facts = {"version": None, "url": None, "sha256": None, "deps": [], "platform_deps": []}
+facts = {"name": None, "version": None, "url": None, "sha256": None,
+         "package_name": None, "tarball_dirname": None, "deps": [], "platform_deps": []}
 for node in ast.walk(tree):
     if not isinstance(node, ast.Assign):
         continue
     for target in node.targets:
         if not isinstance(target, ast.Name):
             continue
-        if target.id == "version" and isinstance(node.value, ast.Constant):
+        if target.id == "name" and isinstance(node.value, ast.Constant):
+            facts["name"] = node.value.value
+        elif target.id == "version" and isinstance(node.value, ast.Constant):
             facts["version"] = node.value.value
         elif target.id == "url" and isinstance(node.value, ast.Constant):
             facts["url"] = node.value.value
         elif target.id == "tarball_checksum" and isinstance(node.value, ast.Constant):
             facts["sha256"] = node.value.value
+        elif target.id in ("package_name", "tarball_dirname") and isinstance(node.value, ast.Constant):
+            facts[target.id] = node.value.value
         elif target.id == "deps":
             facts["deps"] = strings(node.value)
         elif target.id == "platform_deps" and isinstance(node.value, ast.Dict):
@@ -582,7 +599,7 @@ PY
 # Verify every fetched recipe against the reviewed post-overlay closure. This
 # catches a stale Cerbero archive before fetch-package can add an unreviewed
 # dependency; the lock records final source URLs/checksums and Linux deps.
-while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expected_deps expected_platform; do
+while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expected_deps expected_platform expected_archive_root; do
     recipe_file="$cerbero_dir/recipes/$recipe.recipe"
     [[ -f "$recipe_file" ]] || fail "pinned recipe is missing: $recipe"
     facts=$(recipe_facts "$recipe_file")
@@ -598,7 +615,24 @@ while IFS=$'\t' read -r recipe expected_version expected_url expected_sha expect
     [[ "$(jq -c '.platform_deps' <<<"$facts")" == "$expected_platform" ]] || {
         fail "recipe Linux platform dependency closure disagrees with lock: $recipe"
     }
-done < <(jq -er '.audit.recipe_metadata[] | [.recipe, .version, .source_url, .sha256, (.deps | tojson), (.platform_deps | tojson)] | @tsv' "$lock_file")
+    if [[ -n "$expected_archive_root" ]]; then
+        actual_name=$(jq -r '.name // empty' <<<"$facts")
+        actual_version=${actual_version:-$expected_version}
+        actual_package_name=$(jq -r '.package_name // empty' <<<"$facts")
+        actual_tarball_dirname=$(jq -r '.tarball_dirname // empty' <<<"$facts")
+        [[ -n "$actual_name" ]] || fail "recipe name is missing for archive-root validation: $recipe"
+        if [[ -n "$actual_tarball_dirname" ]]; then
+            effective_archive_root=${actual_tarball_dirname//%(version)s/$actual_version}
+        elif [[ -n "$actual_package_name" ]]; then
+            effective_archive_root=$actual_package_name
+        else
+            effective_archive_root="$actual_name-$actual_version"
+        fi
+        [[ "$effective_archive_root" == "$expected_archive_root" ]] || {
+            fail "recipe archive root disagrees with lock: $recipe"
+        }
+    fi
+done < <(jq -er '.audit.recipe_metadata[] | [.recipe, .version, .source_url, .sha256, (.deps | tojson), (.platform_deps | tojson), (.archive_root // "")] | @tsv' "$lock_file")
 
 zlib_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
