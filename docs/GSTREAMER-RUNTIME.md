@@ -59,6 +59,9 @@ PulseAudio is acquired from the official API's PGP-signed annotated `v17.0` tag 
 archive and SHA-256. The archive has no `.tarball-version`; the pinned recipe
 sets `GIT_DESCRIBE_FOR_BUILD=v17.0`, and discovery compares the archive's
 `meson.build`/`LGPL` bytes with the commit raw files before updating the lock.
+GitLab can re-render generated commit archives; any byte drift fails closed
+against the lock SHA and requires an explicit lock review/update, never
+automatic acceptance.
 
 ## License and codec policy
 

@@ -18,6 +18,8 @@ the build and discovery scripts reject path-set or byte mismatches.
 PulseAudio uses the official API's PGP-signed `v17.0` tag and peeled commit archive;
 the archive SHA, root, license/meson bytes, and explicit release-generated
 `GIT_DESCRIBE_FOR_BUILD` value are lock-checked before acquisition.
+GitLab-generated archive byte drift fails closed against that SHA and requires
+an explicit lock review/update.
 
 The audited closure is intentionally narrow: only the lock's direct recipe
 categories are built into the single `lumina-audited` package, with exactly 21
