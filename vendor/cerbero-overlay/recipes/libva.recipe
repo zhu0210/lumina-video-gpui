@@ -9,7 +9,7 @@ class Recipe(recipe.Recipe):
     btype = BuildType.MESON
     url = 'https://github.com/intel/libva/archive/2.22.0/libva-2.22.0.tar.gz'
     tarball_checksum = '467c418c2640a178c6baad5be2e00d569842123763b80507721ab87eb7af8735'
-    licenses = [License.MIT]
+    licenses = [{License.MIT: ['COPYING']}]
     deps = ['libdrm']
     meson_options = {'with_x11': 'no'}
     files_libs = ['libva', 'libva-drm']

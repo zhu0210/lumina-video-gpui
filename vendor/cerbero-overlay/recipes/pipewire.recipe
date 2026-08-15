@@ -7,7 +7,7 @@ class Recipe(recipe.Recipe):
     btype = BuildType.MESON
     url = 'https://gitlab.freedesktop.org/pipewire/pipewire/-/archive/b741e0c74f5436f0c925f7741140db0efd32cf4e/pipewire-b741e0c74f5436f0c925f7741140db0efd32cf4e.tar.gz'
     tarball_checksum = 'a78762e007a604846fc16c83979ef15bbb69dba1a2923c32bb6e2f18fafa343f'
-    licenses = [{License.MIT: ['LICENSE']}]
+    licenses = [{License.MIT: ['COPYING', 'LICENSE']}]
     deps = [
         'glib', 'libffi', 'openssl', 'gstreamer-1.0', 'gst-plugins-base-1.0',
     ]
