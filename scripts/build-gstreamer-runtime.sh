@@ -1020,7 +1020,7 @@ for node in ast.walk(tree):
                         facts["file_patterns"][target.id] = values
                         allowed_file_targets.add(id(target))
 for node in ast.walk(tree):
-    if isinstance(node, ast.Name) and (node.id.startswith(("files_plugins_", "files_libs_")) or node.id == "files_lumina_private") and id(node) not in allowed_file_targets:
+    if isinstance(node, ast.Name) and (node.id == "files_libs" or node.id.startswith(("files_plugins_", "files_libs_")) or node.id == "files_lumina_private") and id(node) not in allowed_file_targets:
         file_error(node.id)
     elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
           and node.value.id == "self" and (node.attr.startswith(("files_plugins_", "files_libs_")) or node.attr == "files_lumina_private")):
