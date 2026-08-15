@@ -1,6 +1,7 @@
 # The upstream Cerbero recipe is a SystemRecipe.  Build the VA-API user-space
 # libraries so DT_NEEDED does not escape through the host ABI.  libva 2.22's
-# meson_options.txt declares tests/with_x11 as booleans; use 'false' for both.
+# meson_options.txt has no tests option and declares with_x11 as a yes/no/auto
+# combo; use 'no' to keep X11 out.
 class Recipe(recipe.Recipe):
     name = 'libva'
     version = '2.22.0'
@@ -10,5 +11,5 @@ class Recipe(recipe.Recipe):
     tarball_checksum = '467c418c2640a178c6baad5be2e00d569842123763b80507721ab87eb7af8735'
     licenses = [License.MIT]
     deps = ['libdrm']
-    meson_options = {'tests': 'false', 'with_x11': 'false'}
+    meson_options = {'with_x11': 'no'}
     files_libs = ['libva', 'libva-drm']
