@@ -65,7 +65,7 @@
       {"path": "vendor/cerbero-overlay/packages/lumina-audited.package", "sha256": "2b03dbaae4ad8f11d3678bf40ad804b4821905a95f9426c2371e8a09a0cfa8fb"},
       {"path": "vendor/cerbero-overlay/recipes/alsa.recipe", "sha256": "88bda7945683298660b4698376040197b6fb2680383f33bb0a73d27bc2e90ba0"},
       {"path": "vendor/cerbero-overlay/recipes/libdrm.recipe", "sha256": "5aed555e18894553e5db9b6407882fe13adbdd949f4660d2629686a3b9c8a9c0"},
-      {"path": "vendor/cerbero-overlay/recipes/libpulse.recipe", "sha256": "70735bbba02c50ebe26bba2389a8b5ca55eb1af4104996d44d7d581cd1313a30"},
+      {"path": "vendor/cerbero-overlay/recipes/libpulse.recipe", "sha256": "6258e6425e7b484bc7877d0d73c5484f65ea849e0bfb3da19e13171b169b2d09"},
       {"path": "vendor/cerbero-overlay/recipes/libsndfile.recipe", "sha256": "0aef9f5b55e4bdffc89bbb8e9d8e706c7ebc2398d44ff0a206a413ad5bf3cca1"},
       {"path": "vendor/cerbero-overlay/recipes/libva.recipe", "sha256": "a3e3308c19e9bd401abfe670128cfd326a67aa7139f3b46b3eb4f32b306b2654"},
       {"path": "vendor/cerbero-overlay/recipes/pipewire.recipe", "sha256": "8a4c661fe73038096580f5a8d3a256ec2a45992cbb4dc389d19027c358cda74c"},

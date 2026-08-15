@@ -1,7 +1,8 @@
 # Keep only the Pulse client library in the audited user-space closure; the
 # server and optional backends are intentionally not package inputs. The
-# signed v17.0 tag is acquired from its immutable commit archive, which has
-# no .tarball-version file, so the release-generated version is explicit.
+# PGP-signed v17.0 resolves to a commit-addressed generated archive whose
+# renderer bytes are pinned by the lock SHA. It has no .tarball-version file,
+# so the release-generated version is explicit.
 class Recipe(recipe.Recipe):
     name = 'libpulse'
     version = '17.0'
