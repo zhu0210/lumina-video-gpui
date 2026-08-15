@@ -1297,35 +1297,103 @@ extract_license() {
     local archive=$1
     local member_pattern=$2
     local destination=$3
-    local member_list temporary
-    local -a matching_members=()
+    local member_list temporary archive_member root suffix selected_member rest
+    local -A seen_archive_members=()
+    local -A seen_roots=()
+    local -a path_parts=()
     member_list="$work_dir/license-members.$RANDOM"
-    if [[ "$archive" == *.zip ]]; then
-        if ! unzip -Z1 "$archive" "$member_pattern" >"$member_list" 2>/dev/null; then
-            rm -f -- "$member_list"
-            fail "license member pattern is absent from $archive: $member_pattern"
-        fi
-    elif ! tar -tf "$archive" --wildcards -- "$member_pattern" >"$member_list" 2>/dev/null; then
+    [[ "$member_pattern" =~ ^\*/[A-Za-z0-9][A-Za-z0-9._+-]*(/[A-Za-z0-9][A-Za-z0-9._+-]*)*$ ]] || {
+        fail "license member pattern is unsafe: $member_pattern"
+    }
+    suffix=${member_pattern#*/}
+    if ! python3 - "$archive" "$member_list" <<'PY'
+import sys
+import tarfile
+import zipfile
+
+archive, output = sys.argv[1:]
+try:
+    if archive.endswith(".zip"):
+        with zipfile.ZipFile(archive) as source:
+            names = [info.filename for info in source.infolist()]
+    else:
+        with tarfile.open(archive, "r:*") as source:
+            names = [member.name for member in source.getmembers()]
+    with open(output, "wb") as destination:
+        for name in names:
+            if "\x00" in name:
+                raise ValueError("archive member contains NUL")
+            destination.write(name.encode("utf-8", "surrogateescape"))
+            destination.write(b"\0")
+except Exception as error:
+    print(f"archive enumeration failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    then
         rm -f -- "$member_list"
-        fail "license member pattern is absent from $archive: $member_pattern"
+        fail "could not enumerate archive members: $archive"
     fi
-    mapfile -t matching_members <"$member_list"
+    selected_member=
+    while IFS= read -r -d '' archive_member || [[ -n "$archive_member" ]]; do
+        [[ -n "$archive_member" ]] || {
+            rm -f -- "$member_list"
+            fail "archive contains an empty member name: $archive"
+        }
+        [[ ! "$archive_member" =~ [[:cntrl:]] ]] || {
+            rm -f -- "$member_list"
+            fail "archive member contains control characters: $archive"
+        }
+        [[ "$archive_member" != /* && "$archive_member" != *"//"* ]] || {
+            rm -f -- "$member_list"
+            fail "archive member path is absolute or has an empty component: $archive"
+        }
+        IFS=/ read -r -a path_parts <<<"$archive_member"
+        for path_part in "${path_parts[@]}"; do
+            [[ "$path_part" != "." && "$path_part" != ".." ]] || {
+                rm -f -- "$member_list"
+                fail "archive member path contains dot traversal: $archive"
+            }
+        done
+        [[ "$archive_member" == */* ]] || {
+            rm -f -- "$member_list"
+            fail "archive member has no top-level root: $archive"
+        }
+        root=${archive_member%%/*}
+        rest=${archive_member#*/}
+        [[ -n "$root" ]] || {
+            rm -f -- "$member_list"
+            fail "archive member has an empty top-level root: $archive"
+        }
+        if [[ -n "${seen_archive_members["$archive_member"]+x}" ]]; then
+            rm -f -- "$member_list"
+            fail "archive contains duplicate members: $archive"
+        fi
+        seen_archive_members["$archive_member"]=1
+        seen_roots["$root"]=1
+        if [[ "$rest" == "$suffix" ]]; then
+            [[ -z "$selected_member" ]] || {
+                rm -f -- "$member_list"
+                fail "license member pattern matches multiple archive members: $member_pattern"
+            }
+            selected_member=$archive_member
+        fi
+    done <"$member_list"
     rm -f -- "$member_list"
-    ((${#matching_members[@]} == 1)) || {
-        fail "license member pattern is not unique in $archive: $member_pattern"
+    [[ ${#seen_roots[@]} -eq 1 ]] || fail "archive must have exactly one top-level root: $archive"
+    [[ -n "$selected_member" ]] || fail "license member pattern is absent from $archive: $member_pattern"
+    [[ "$selected_member" != -* && "$selected_member" != *'*'* && "$selected_member" != *'?'* &&
+       "$selected_member" != *'['* && "$selected_member" != *']'* ]] || {
+        fail "selected archive license member is not a safe exact path: $selected_member"
     }
-    [[ -n "${matching_members[0]}" ]] || fail "license member name is empty in $archive: $member_pattern"
-    [[ "${matching_members[0]}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*(/[A-Za-z0-9][A-Za-z0-9._+-]*)*$ ]] || {
-        fail "archive license member path is unsafe: ${matching_members[0]}"
-    }
+    [[ ! "$selected_member" =~ [\\] ]] || fail "selected archive license member contains a backslash: $selected_member"
     temporary="$work_dir/license.$RANDOM"
     if [[ "$archive" == *.zip ]]; then
-        unzip -p "$archive" "${matching_members[0]}" >"$temporary" 2>/dev/null || {
+        unzip -p "$archive" "$selected_member" >"$temporary" 2>/dev/null || {
             rm -f -- "$temporary"
             fail "license text is missing from $archive: $member_pattern"
         }
     else
-        tar -xOf "$archive" -- "${matching_members[0]}" >"$temporary" 2>/dev/null || {
+        tar -xOf "$archive" -- "$selected_member" >"$temporary" 2>/dev/null || {
             rm -f -- "$temporary"
             fail "license text is missing from $archive: $member_pattern"
         }
