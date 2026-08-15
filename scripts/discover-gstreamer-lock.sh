@@ -256,11 +256,9 @@ cerbero_commit=$(jq -er --arg tag_object "$cerbero_api_tag_object" '
     else error("Cerbero tag object is not a verified PGP tag") end
 ' <<<"$tag_object_json")
 tag_refs=$(git ls-remote --tags "$cerbero_repo" "refs/tags/${gstreamer_version}" "refs/tags/${gstreamer_version}^{}")
-cerbero_ref_tag_object=$(awk -v ref="refs/tags/$gstreamer_version" '$2 == ref { print $1 }' <<<"$tag_refs")
 cerbero_tag_object=$(awk -v ref="refs/tags/${gstreamer_version}" '$2 == ref { print $1 }' <<<"$tag_refs")
 cerbero_peeled_commit=$(awk -v ref="refs/tags/${gstreamer_version}^{}" '$2 == ref { print $1 }' <<<"$tag_refs")
-[[ "$cerbero_api_tag_object" == "$cerbero_ref_tag_object" && \
-   "$cerbero_tag_object" == "$cerbero_ref_tag_object" && \
+[[ "$cerbero_api_tag_object" == "$cerbero_tag_object" && \
    "$cerbero_tag_object" == 78666745b34b6245a85510ac47a03a5033af4711 && \
    "$cerbero_peeled_commit" == "$cerbero_commit" && \
    "$cerbero_commit" == 59548269f4fd0f701818f0bafdb102959ec81e65 ]] || {
@@ -290,11 +288,9 @@ pulse_api_tag_commit=$(jq -er --arg tag_object "$pulse_api_tag_object" '
     then .object.sha else error("PulseAudio tag lacks the expected PGP signature") end
 ' <<<"$pulse_tag_object_json")
 pulse_tag_refs=$(git ls-remote --tags "$pulse_repo" "refs/tags/$pulse_tag" "refs/tags/$pulse_tag^{}")
-pulse_ref_tag_object=$(awk -v ref="refs/tags/$pulse_tag" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
 pulse_tag_object=$(awk -v ref="refs/tags/$pulse_tag" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
 pulse_tag_commit=$(awk -v ref="refs/tags/$pulse_tag^{}" '$2 == ref { print $1 }' <<<"$pulse_tag_refs")
-[[ "$pulse_api_tag_object" == "$pulse_ref_tag_object" && \
-   "$pulse_tag_object" == "$pulse_ref_tag_object" && \
+[[ "$pulse_api_tag_object" == "$pulse_tag_object" && \
    "$pulse_tag_object" == 16be4f7accce287fd08519591c6356ffa61aaaf1 && \
    "$pulse_api_tag_commit" == "$pulse_tag_commit" && \
    "$pulse_tag_commit" == 1f020889c9aa44ea0f63d7222e8c2b62c3f45f68 ]] || {
