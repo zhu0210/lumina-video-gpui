@@ -19,6 +19,7 @@ target
 .direnv/
 # SPM build artifacts
 .build/
+/ios/lumina-video-bridge/Artifacts/
 /tags
 .zed
 .lsp

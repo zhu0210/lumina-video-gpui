@@ -8,23 +8,31 @@ let package = Package(
         .library(name: "LuminaVideoBridge", targets: ["LuminaVideoBridge"]),
     ],
     targets: [
-        .target(
+        .binaryTarget(
             name: "CLuminaVideo",
-            path: "CHeaders",
-            publicHeadersPath: "include"
+            path: "Artifacts/CLuminaVideo.xcframework"
         ),
         .target(
             name: "LuminaVideoBridge",
             dependencies: ["CLuminaVideo"],
             path: "Sources/LuminaVideoBridge",
             linkerSettings: [
-                .linkedLibrary("lumina_video_ios"),
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio"),
                 .linkedFramework("CoreMedia"),
+                .linkedFramework("CoreVideo"),
+                .linkedFramework("VideoToolbox"),
                 .linkedFramework("Metal"),
                 .linkedFramework("IOSurface"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("Security"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedLibrary("z"),
+                .linkedLibrary("iconv"),
+                .linkedLibrary("bz2"),
+                .linkedLibrary("c++"),
             ]
         ),
     ]

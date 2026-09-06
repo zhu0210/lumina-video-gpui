@@ -212,5 +212,20 @@ echo ""
 echo "  Swift link (device):    ✓"
 echo "  Swift link (simulator): ✓"
 echo ""
+
+# Declare the native library as a real Swift Package binary dependency. App-only
+# library search paths do not propagate to SwiftPM's separate product linker.
+IOS_FRAMEWORK="$ROOT_DIR/ios/lumina-video-bridge/Artifacts/CLuminaVideo.xcframework"
+cmp "$HEADER" "$ROOT_DIR/ios/lumina-video-bridge/CHeaders/include/LuminaVideo.h"
+mkdir -p "$(dirname "$IOS_FRAMEWORK")"
+rm -rf "$IOS_FRAMEWORK"
+xcodebuild -create-xcframework \
+    -library "$ROOT_DIR/target/aarch64-apple-ios/$PROFILE/liblumina_video_ios.a" \
+    -headers "$ROOT_DIR/ios/lumina-video-bridge/CHeaders/include" \
+    -library "$ROOT_DIR/target/aarch64-apple-ios-sim/$PROFILE/liblumina_video_ios.a" \
+    -headers "$ROOT_DIR/ios/lumina-video-bridge/CHeaders/include" \
+    -output "$IOS_FRAMEWORK"
+echo "Swift Package native dependency: $IOS_FRAMEWORK"
+
 echo "Static libraries are in target/<triple>/$PROFILE/liblumina_video_ios.a"
 echo "Done."

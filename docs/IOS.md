@@ -57,10 +57,12 @@ This script:
 1. Cross-compiles `lumina-video-ios` for `aarch64-apple-ios` and `aarch64-apple-ios-sim`
 2. Verifies all expected FFI symbols are exported
 3. Runs a Swift link smoke test for both targets
+4. Packages both libraries and C headers into the Swift Package's local XCFramework
 
 Output:
 - `target/aarch64-apple-ios/release/liblumina_video_ios.a` (device)
 - `target/aarch64-apple-ios-sim/release/liblumina_video_ios.a` (simulator)
+- `ios/lumina-video-bridge/Artifacts/CLuminaVideo.xcframework` (both targets)
 
 ## Integrating into Your App
 
@@ -83,19 +85,11 @@ targets:
   YourApp:
     dependencies:
       - package: LuminaVideoBridge
-    settings:
-      base:
-        LIBRARY_SEARCH_PATHS:
-          - "$(inherited)"
-          - "path/to/lumina-video/target/aarch64-apple-ios-sim/release"
-          - "path/to/lumina-video/target/aarch64-apple-ios/release"
-        OTHER_LDFLAGS:
-          - "$(inherited)"
-          - "-lz"
-          - "-liconv"
-          - "-lbz2"
-          - "-lc++"
 ```
+
+Run `build-ios.sh` before resolving the package. The package declares the generated
+XCFramework as its binary dependency, so Xcode selects the correct device or
+simulator slice without application-specific library search paths.
 
 ### 2. Create a player and render frames
 
@@ -163,7 +157,7 @@ The test harness validates: player lifecycle, Metal zero-copy rendering, playbac
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `Undefined symbols: _lumina_player_*` | Missing static library | Run `./scripts/build-ios.sh` first, check `LIBRARY_SEARCH_PATHS` |
+| `Undefined symbols: _lumina_player_*` | Missing native binary dependency | Run `./scripts/build-ios.sh` before resolving the Swift package; verify `Artifacts/CLuminaVideo.xcframework` exists |
 | `No such module 'LuminaVideoBridge'` | SPM dependency not resolved | Add LuminaVideoBridge package path to your project |
 | `building for 'iOS-simulator', but linking in object file built for 'iOS'` | Wrong library arch | Ensure both `aarch64-apple-ios` and `aarch64-apple-ios-sim` are built |
 | `x86_64` linker errors on simulator | Intel simulator slice | Add `EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64` to build settings |

@@ -79,18 +79,12 @@ jobs:
             -scheme LuminaTestHarness -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath target/ios-device CODE_SIGNING_ALLOWED=NO build
-      - name: Package device and simulator libraries
-        run: |
-          xcodebuild -create-xcframework \
-            -library target/aarch64-apple-ios/release/liblumina_video_ios.a -headers include \
-            -library target/aarch64-apple-ios-sim/release/liblumina_video_ios.a -headers include \
-            -output target/LuminaVideo.xcframework
       - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: ios-application-and-playback
           path: |
-            target/LuminaVideo.xcframework
+            ios/lumina-video-bridge/Artifacts/CLuminaVideo.xcframework
             target/ios-playback.xcresult
             target/ios-device/Build/Products/Release-iphoneos/LuminaTestHarness.app
           if-no-files-found: warn

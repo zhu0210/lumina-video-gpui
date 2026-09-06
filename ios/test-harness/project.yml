@@ -8,16 +8,9 @@ options:
 
 settings:
   base:
-    SWIFT_VERSION: "5.9"
+    SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: minimal
-    LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]:
-      - "$(inherited)"
-      - "$(SRCROOT)/../../target/aarch64-apple-ios-sim/release"
-    LIBRARY_SEARCH_PATHS[sdk=iphoneos*]:
-      - "$(inherited)"
-      - "$(SRCROOT)/../../target/aarch64-apple-ios/release"
     EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
-    OTHER_LDFLAGS: ["$(inherited)", "-lz", "-liconv", "-lbz2", "-lc++"]
 
 packages:
   LuminaVideoBridge:
