@@ -109,9 +109,11 @@ impl NdkImageReaderBridge {
         // 3. `ANativeWindow_toSurface` is an NDK function that creates a Java Surface
         //    object from the native window, returning a local JNI reference
         let surface_jobject = unsafe {
-            let env_ptr = env.get_raw() as *mut jni::sys::JNIEnv;
             let window_ptr = window.ptr().as_ptr();
-            ndk_sys::ANativeWindow_toSurface(env_ptr, window_ptr)
+            // ndk-sys still names JNI through jni-sys 0.3, while jni 0.22 uses
+            // jni-sys 0.4. Both pointers represent the same JNI C ABI; no table
+            // or Java object is copied or reinterpreted by value here.
+            ndk_sys::ANativeWindow_toSurface(env.get_raw().cast(), window_ptr)
         };
 
         if surface_jobject.is_null() {
@@ -121,7 +123,7 @@ impl NdkImageReaderBridge {
         // Wrap in JObject - this is a local reference
         // SAFETY: surface_jobject is a valid non-null jobject from ANativeWindow_toSurface,
         // which returns a local reference valid until the JNI method returns
-        Ok(unsafe { JObject::from_raw(surface_jobject) })
+        Ok(unsafe { JObject::from_raw(env, surface_jobject.cast()) })
     }
 
     /// Set up the image available callback that sends frames to the channel.

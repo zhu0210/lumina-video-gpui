@@ -92,6 +92,7 @@ jobs:
         run: |
           cargo test --locked --package lumina-video-native-frame --features moq
           cargo test --locked --package lumina-video-native-frame --features moq encoded_av_tracks_decode_through_the_moq_source_bin -- --ignored
+          cargo test --locked --package lumina-video-native-frame --features moq encoded_av_tracks_cross_a_real_quic_endpoint -- --ignored
           cargo test --locked --package lumina-video-native-frame native_decoder_policy_is_instance_scoped_and_keeps_parsers -- --ignored
           cargo check --locked --package lumina-video-gpui --features moq
           ffmpeg -y -i fixtures/generated/h264-aac.mp4 -vn -c:a copy /tmp/lumina-audio.aac

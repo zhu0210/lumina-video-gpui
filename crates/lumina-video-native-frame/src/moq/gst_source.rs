@@ -421,6 +421,16 @@ mod tests {
     #[test]
     #[ignore = "requires fixtures/generate.sh and GStreamer H264/AAC decoder plugins"]
     fn encoded_av_tracks_decode_through_the_moq_source_bin() -> Result<(), Error> {
+        run_encoded_fixture(false)
+    }
+
+    #[test]
+    #[ignore = "requires fixture codecs and permission to bind a loopback QUIC endpoint"]
+    fn encoded_av_tracks_cross_a_real_quic_endpoint() -> Result<(), Error> {
+        run_encoded_fixture(true)
+    }
+
+    fn run_encoded_fixture(network: bool) -> Result<(), Error> {
         gst::init()?;
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/generated/h264-aac.mp4");
@@ -485,6 +495,9 @@ mod tests {
             config.description = Some(description(&audio_samples)?);
             config
         };
+        if network {
+            return run_network_fixture(video_samples, audio_samples, video_config, audio_config);
+        }
         let (bin, decoder) = decode_bin()?;
         let (caps, parser) = video_caps(&video_config)?;
         let video = add_track(&bin, &decoder, "video", &caps, parser, false)?;
@@ -551,6 +564,146 @@ mod tests {
         assert!(decoded_audio
             .buffer()
             .is_some_and(|buffer| buffer.size() > 0));
+        Ok(())
+    }
+    fn run_network_fixture(
+        video_samples: Vec<gst::Sample>,
+        audio_samples: Vec<gst::Sample>,
+        video_config: hang::catalog::VideoConfig,
+        audio_config: hang::catalog::AudioConfig,
+    ) -> Result<(), Error> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let _entered = runtime.enter();
+        let origin = moq_net::Origin::random().produce();
+        let mut broadcast =
+            origin.create_broadcast("fixture", moq_net::broadcast::Route::announced())?;
+        let mut catalog = hang::Catalog::default();
+        catalog.video.insert("video", video_config)?;
+        catalog.audio.insert("audio", audio_config)?;
+        let mut catalog_track = broadcast.create_track(
+            hang::Catalog::DEFAULT_NAME,
+            hang::Catalog::default_track_info(),
+        )?;
+        catalog_track.write_frame(
+            moq_net::Timestamp::from_micros(0)?,
+            bytes::Bytes::from(catalog.to_vec()?),
+        )?;
+        let mut video_track = broadcast.create_track("video", hang::container::track_info())?;
+        let mut audio_track = broadcast.create_track("audio", hang::container::track_info())?;
+        let mut config = moq_native::ServerConfig::default();
+        config.bind = Some("127.0.0.1:0".into());
+        config.tls.generate = vec!["localhost".into()];
+        let server = config.init()?.with_publisher(origin.consume());
+        let address = server.local_addr()?;
+        let server_task = runtime.spawn(server.serve_publish(origin.consume()));
+        drop(_entered);
+        let source = GstMoqSource::new(
+            &format!("moq://localhost:{}/fixture", address.port()),
+            Instant::now() + Duration::from_secs(10),
+        )?;
+        let output = gst::Pipeline::new();
+        struct Stop(gst::Pipeline);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let _ = self.0.set_state(gst::State::Null);
+            }
+        }
+        let _stop = Stop(output.clone());
+        let video_sink = gst_app::AppSink::builder().sync(false).build();
+        let audio_sink = gst_app::AppSink::builder().sync(false).build();
+        output.add_many([
+            &source.element,
+            video_sink.upcast_ref(),
+            audio_sink.upcast_ref(),
+        ])?;
+        let weak_video = video_sink.downgrade();
+        let weak_audio = audio_sink.downgrade();
+        source.element.connect_pad_added(move |_, pad| {
+            let sink = if pad.name().starts_with("video") {
+                weak_video.upgrade()
+            } else {
+                weak_audio.upgrade()
+            };
+            if let Some(sink) = sink {
+                if let Some(input) = sink.static_pad("sink") {
+                    let _ = pad.link(&input);
+                }
+            }
+        });
+        output.set_state(gst::State::Playing)?;
+        let publisher = runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Allow cold hardware-decoder startup while the normal bounded queue drops stale groups.
+            for group_index in 0..8_u64 {
+                let mut video = video_track.append_group()?;
+                let mut audio = audio_track.append_group()?;
+                for index in 0..video_samples.len().max(audio_samples.len()) {
+                    for (group, samples) in
+                        [(&mut video, &video_samples), (&mut audio, &audio_samples)]
+                    {
+                        if let Some(sample) = samples.get(index) {
+                            let buffer = sample.buffer().ok_or("encoded buffer missing")?;
+                            let micros = buffer.pts().ok_or("encoded PTS missing")?.useconds()
+                                + group_index * 500_000;
+                            hang::container::Frame {
+                                timestamp: moq_net::Timestamp::from_micros(micros)?,
+                                payload: bytes::Bytes::copy_from_slice(
+                                    buffer.map_readable()?.as_slice(),
+                                ),
+                            }
+                            .write_to(group)?;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(42)).await;
+                }
+                video.finish()?;
+                audio.finish()?;
+            }
+            video_track.finish()?;
+            audio_track.finish()?;
+            // Keep catalog and broadcast alive until the caller finishes checking decoded output.
+            Ok::<_, Error>((broadcast, catalog_track, video_track, audio_track))
+        });
+        let mut timestamps = Vec::new();
+        for _ in 0..20 {
+            let sample = video_sink
+                .try_pull_sample(gst::ClockTime::from_seconds(5))
+                .ok_or_else(|| {
+                    format!(
+                        "QUIC MoQ produced {} video frames; pipeline {:?}; bus {:?}",
+                        timestamps.len(),
+                        output.current_state(),
+                        output
+                            .bus()
+                            .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
+                    )
+                })?;
+            let info = gstreamer_video::VideoInfo::from_caps(
+                sample.caps().ok_or("decoded caps missing")?,
+            )?;
+            assert_eq!((info.width(), info.height()), (320, 180));
+            timestamps.push(
+                sample
+                    .buffer()
+                    .and_then(|buffer| buffer.pts())
+                    .ok_or("decoded PTS missing")?
+                    .useconds(),
+            );
+        }
+        assert!(
+            timestamps.windows(2).all(|pair| pair[1] > pair[0]),
+            "timestamps: {timestamps:?}"
+        );
+        assert!(timestamps.last().copied().unwrap_or_default() > 400_000);
+        let audio = audio_sink
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .ok_or("QUIC MoQ produced no decoded audio")?;
+        assert!(audio.buffer().is_some_and(|buffer| buffer.size() > 0));
+        let _published = runtime.block_on(publisher)??;
+        server_task.abort();
         Ok(())
     }
 }

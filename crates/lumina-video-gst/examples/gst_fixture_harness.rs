@@ -1,17 +1,17 @@
 //! Headless deterministic fixture probe for the public GStreamer session seam.
 
-use std::error::Error;
-use std::io;
-use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-use lumina_video_core::session::{
-    CapabilityTier, MediaSession, SessionCommand, SessionEvent, SessionState,
-};
-use lumina_video_gst::{GstAudioSinkMode, GstMediaSession, PresentationDecision};
-use lumina_video_native_frame::{AcquireSync, NativeMemory};
+    use lumina_video_core::session::{
+        CapabilityTier, MediaSession, SessionCommand, SessionEvent, SessionState,
+    };
+    use lumina_video_gst::{GstAudioSinkMode, GstMediaSession, PresentationDecision};
+    use lumina_video_native_frame::{AcquireSync, NativeMemory};
 
-fn main() -> Result<(), Box<dyn Error>> {
     let Some(source) = std::env::args().nth(1) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -362,4 +362,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         missing_selection_prior_id,
     );
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Err("gst_fixture_harness requires Linux".into())
 }
