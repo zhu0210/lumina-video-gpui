@@ -32,7 +32,7 @@
 
 use crate::android_video::AndroidVideoFrame;
 use jni::objects::JObject;
-use jni::JNIEnv;
+use jni::Env;
 use ndk::hardware_buffer::{HardwareBuffer, HardwareBufferUsage};
 use ndk::media::image_reader::{AcquireResult, Image, ImageFormat, ImageReader};
 use std::sync::mpsc::Sender;
@@ -94,7 +94,7 @@ impl NdkImageReaderBridge {
     /// that must be used before the JNI call returns or converted to a global ref.
     pub fn to_java_surface<'local>(
         &self,
-        env: &mut JNIEnv<'local>,
+        env: &mut Env<'local>,
     ) -> Result<JObject<'local>, NdkImageReaderError> {
         let window = self
             .reader

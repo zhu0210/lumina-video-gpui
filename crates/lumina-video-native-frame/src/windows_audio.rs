@@ -194,7 +194,7 @@ impl AudioQueue {
 
 /// Audio clock based on samples sent to the output device.
 ///
-/// This provides a more reliable clock than `rodio::Sink::get_pos()`,
+/// This provides a more reliable clock than `rodio::Player::get_pos()`,
 /// which can drift on Windows due to buffering.
 ///
 /// The clock tracks:
@@ -389,12 +389,12 @@ impl rodio::Source for QueueAudioSource {
         None
     }
 
-    fn channels(&self) -> u16 {
-        self.channels
+    fn channels(&self) -> rodio::ChannelCount {
+        std::num::NonZeroU16::new(self.channels).unwrap_or(std::num::NonZeroU16::MIN)
     }
 
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
+    fn sample_rate(&self) -> rodio::SampleRate {
+        std::num::NonZeroU32::new(self.sample_rate).unwrap_or(std::num::NonZeroU32::MIN)
     }
 
     fn total_duration(&self) -> Option<Duration> {
@@ -427,9 +427,9 @@ pub struct WindowsAudioPlayback {
     /// Sample-based audio clock for A/V sync
     clock: Arc<AudioClock>,
     /// The rodio output stream (must keep alive)
-    _stream: rodio::OutputStream,
+    _stream: rodio::MixerDeviceSink,
     /// The rodio sink for playback control
-    sink: rodio::Sink,
+    sink: rodio::Player,
     /// Audio format info
     format: AudioFormatInfo,
     /// Whether playback is active
@@ -457,10 +457,13 @@ impl WindowsAudioPlayback {
         queue: Arc<AudioQueue>,
         clock: Arc<AudioClock>,
     ) -> Result<Self, String> {
-        let stream = rodio::OutputStreamBuilder::open_default_stream()
+        if format.channels == 0 || format.sample_rate == 0 {
+            return Err("Audio channel count and sample rate must be nonzero".into());
+        }
+        let stream = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| format!("Failed to open audio output: {}", e))?;
 
-        let sink = rodio::Sink::connect_new(&stream.mixer());
+        let sink = rodio::Player::connect_new(stream.mixer());
 
         let source = QueueAudioSource::new(
             Arc::clone(&queue),

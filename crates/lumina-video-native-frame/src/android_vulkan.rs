@@ -79,26 +79,12 @@ unsafe impl Send for HardwareBufferHandle {}
 unsafe impl Sync for HardwareBufferHandle {}
 
 /// Extension name constants for compile-time checking
-// SAFETY: The byte string is a compile-time NUL-terminated extension name.
-const VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME: &std::ffi::CStr = unsafe {
-    std::ffi::CStr::from_bytes_with_nul_unchecked(
-        b"VK_ANDROID_external_memory_android_hardware_buffer\0",
-    )
-};
-// SAFETY: The byte string is a compile-time NUL-terminated extension name.
+const VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME: &std::ffi::CStr =
+    c"VK_ANDROID_external_memory_android_hardware_buffer";
 const VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME: &std::ffi::CStr =
-    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
-    unsafe {
-        std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_sampler_ycbcr_conversion\0")
-    };
-// SAFETY: The byte string is a compile-time NUL-terminated extension name.
-const VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME: &std::ffi::CStr =
-    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
-    unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_KHR_external_memory\0") };
-// SAFETY: The byte string is a compile-time NUL-terminated extension name.
-const VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME: &std::ffi::CStr =
-    // SAFETY: The byte string is a compile-time NUL-terminated Vulkan extension name.
-    unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_EXT_queue_family_foreign\0") };
+    c"VK_KHR_sampler_ycbcr_conversion";
+const VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME: &std::ffi::CStr = c"VK_KHR_external_memory";
+const VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME: &std::ffi::CStr = c"VK_EXT_queue_family_foreign";
 
 /// Result type for Vulkan operations.
 pub type VulkanResult<T> = Result<T, VulkanError>;
@@ -247,9 +233,7 @@ impl VulkanHardwareBufferContext {
         physical_device: vk::PhysicalDevice,
     ) -> VulkanResult<Self> {
         // Load Android hardware buffer extension function
-        let get_ahb_properties_name = std::ffi::CStr::from_bytes_with_nul_unchecked(
-            b"vkGetAndroidHardwareBufferPropertiesANDROID\0",
-        );
+        let get_ahb_properties_name = c"vkGetAndroidHardwareBufferPropertiesANDROID";
         let get_ahb_properties_ptr =
             instance.get_device_proc_addr(device.handle(), get_ahb_properties_name.as_ptr());
         let get_ahb_properties: PfnGetAndroidHardwareBufferPropertiesANDROID =
@@ -261,17 +245,18 @@ impl VulkanHardwareBufferContext {
                 // SAFETY: Function pointer type matches the Vulkan specification for
                 // vkGetAndroidHardwareBufferPropertiesANDROID. The extension was verified
                 // to be available via get_device_proc_addr returning Some.
-                std::mem::transmute(get_ahb_properties_ptr)
+                std::mem::transmute::<
+                    vk::PFN_vkVoidFunction,
+                    PfnGetAndroidHardwareBufferPropertiesANDROID,
+                >(get_ahb_properties_ptr)
             };
 
         // Load YCbCr conversion functions (try KHR first, then core 1.1)
-        let create_ycbcr_name =
-            std::ffi::CStr::from_bytes_with_nul_unchecked(b"vkCreateSamplerYcbcrConversionKHR\0");
+        let create_ycbcr_name = c"vkCreateSamplerYcbcrConversionKHR";
         let mut create_ycbcr_ptr =
             instance.get_device_proc_addr(device.handle(), create_ycbcr_name.as_ptr());
         if create_ycbcr_ptr.is_none() {
-            let core_name =
-                std::ffi::CStr::from_bytes_with_nul_unchecked(b"vkCreateSamplerYcbcrConversion\0");
+            let core_name = c"vkCreateSamplerYcbcrConversion";
             create_ycbcr_ptr = instance.get_device_proc_addr(device.handle(), core_name.as_ptr());
         }
         let create_ycbcr_conversion: PfnCreateSamplerYcbcrConversion = if create_ycbcr_ptr.is_none()
@@ -283,16 +268,16 @@ impl VulkanHardwareBufferContext {
             // SAFETY: Function pointer type matches the Vulkan specification for
             // vkCreateSamplerYcbcrConversion. The extension was verified to be
             // available via get_device_proc_addr returning Some.
-            std::mem::transmute(create_ycbcr_ptr)
+            std::mem::transmute::<vk::PFN_vkVoidFunction, PfnCreateSamplerYcbcrConversion>(
+                create_ycbcr_ptr,
+            )
         };
 
-        let destroy_ycbcr_name =
-            std::ffi::CStr::from_bytes_with_nul_unchecked(b"vkDestroySamplerYcbcrConversionKHR\0");
+        let destroy_ycbcr_name = c"vkDestroySamplerYcbcrConversionKHR";
         let mut destroy_ycbcr_ptr =
             instance.get_device_proc_addr(device.handle(), destroy_ycbcr_name.as_ptr());
         if destroy_ycbcr_ptr.is_none() {
-            let core_name =
-                std::ffi::CStr::from_bytes_with_nul_unchecked(b"vkDestroySamplerYcbcrConversion\0");
+            let core_name = c"vkDestroySamplerYcbcrConversion";
             destroy_ycbcr_ptr = instance.get_device_proc_addr(device.handle(), core_name.as_ptr());
         }
         let destroy_ycbcr_conversion: PfnDestroySamplerYcbcrConversion =
@@ -304,7 +289,9 @@ impl VulkanHardwareBufferContext {
                 // SAFETY: Function pointer type matches the Vulkan specification for
                 // vkDestroySamplerYcbcrConversion. The extension was verified to be
                 // available via get_device_proc_addr returning Some.
-                std::mem::transmute(destroy_ycbcr_ptr)
+                std::mem::transmute::<vk::PFN_vkVoidFunction, PfnDestroySamplerYcbcrConversion>(
+                    destroy_ycbcr_ptr,
+                )
             };
 
         Ok(Self {

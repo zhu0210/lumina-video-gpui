@@ -73,7 +73,7 @@ pub struct MoqTransport {
     /// Current transport state
     state: Arc<Mutex<TransportState>>,
     /// Active session (set after successful connection)
-    session: Option<moq_lite::Session>,
+    session: Option<moq_net::Session>,
     /// Which protocol was used for the connection
     protocol: MoqProtocol,
 }
@@ -104,7 +104,7 @@ impl MoqTransport {
     ///
     /// This performs the QUIC handshake and MoQ session establishment.
     /// Returns the session for subscribing to tracks.
-    pub async fn connect(&mut self) -> Result<&moq_lite::Session, MoqError> {
+    pub async fn connect(&mut self) -> Result<&moq_net::Session, MoqError> {
         // Helper to set state to Failed - inlined to avoid lifetime issues with async closures
         async fn set_failed(state: &Arc<Mutex<TransportState>>) {
             let mut s = state.lock().await;
@@ -308,7 +308,7 @@ impl MoqTransport {
     }
 
     /// Returns a reference to the active session, if connected.
-    pub fn session(&self) -> Option<&moq_lite::Session> {
+    pub fn session(&self) -> Option<&moq_net::Session> {
         self.session.as_ref()
     }
 

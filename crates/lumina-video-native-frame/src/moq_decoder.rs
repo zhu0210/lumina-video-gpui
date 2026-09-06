@@ -3280,9 +3280,11 @@ pub mod android {
         generate_player_id, try_receive_hardware_buffer_for_player, AndroidVideoFrame,
     };
     use crate::video::AndroidGpuSurface;
-    use jni::objects::{GlobalRef, JClass, JObject, JValue};
+    use jni::objects::{JClass, JObject};
+    use jni::refs::Global;
     use jni::sys::{jint, jlong};
-    use jni::JNIEnv;
+    use jni::EnvUnowned;
+    use jni::{jni_sig, jni_str, JValue};
     use std::collections::VecDeque;
 
     /// Android MoQ decoder using MediaCodec with zero-copy HardwareBuffer output.
@@ -3319,7 +3321,7 @@ pub mod android {
         /// Audio volume (0.0 to 1.0)
         audio_volume: f32,
         /// JNI reference to MoqMediaCodecBridge
-        bridge: Option<GlobalRef>,
+        bridge: Option<Global<JObject<'static>>>,
         /// Unique player ID for frame queue isolation
         player_id: u64,
         /// Pending decoded frames from HardwareBuffer queue
@@ -3419,6 +3421,7 @@ pub mod android {
                 }
             });
 
+            let initial_volume = config.initial_volume;
             Ok(Self {
                 url: moq_url,
                 config,
@@ -3427,7 +3430,7 @@ pub mod android {
                 _owned_runtime: owned_runtime,
                 _runtime: runtime,
                 audio_muted: false,
-                audio_volume: config.initial_volume,
+                audio_volume: initial_volume,
                 bridge: None,
                 player_id,
                 pending_frames: VecDeque::new(),
@@ -3483,89 +3486,105 @@ pub mod android {
 
             // Get JVM and create bridge via JNI
             let vm = Self::get_jvm()?;
-            let mut env = vm.attach_current_thread().map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to attach JNI thread: {}", e))
-            })?;
+            crate::android_video::with_jni(&vm, |env| {
+                // Get Android context
+                let context = unsafe {
+                    JObject::from_raw(env, ndk_context::android_context().context().cast())
+                };
 
-            // Get Android context
-            let context =
-                unsafe { JObject::from_raw(ndk_context::android_context().context().cast()) };
+                // Load MoqMediaCodecBridge class via class loader
+                let class_loader = env
+                    .call_method(
+                        &context,
+                        jni_str!("getClassLoader"),
+                        jni_sig!("()Ljava/lang/ClassLoader;"),
+                        &[],
+                    )
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!("Failed to get class loader: {}", e))
+                    })?
+                    .l()
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!("Failed to get class loader object: {}", e))
+                    })?;
 
-            // Load MoqMediaCodecBridge class via class loader
-            let class_loader = env
-                .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-                .map_err(|e| VideoError::DecoderInit(format!("Failed to get class loader: {}", e)))?
-                .l()
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to get class loader object: {}", e))
+                let class_name = env
+                    .new_string("com.luminavideo.bridge.MoqMediaCodecBridge")
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!(
+                            "Failed to create class name string: {}",
+                            e
+                        ))
+                    })?;
+
+                let bridge_class = env
+                    .call_method(
+                        &class_loader,
+                        jni_str!("loadClass"),
+                        jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
+                        &[JValue::Object(&class_name)],
+                    )
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!(
+                            "Failed to load MoqMediaCodecBridge: {}",
+                            e
+                        ))
+                    })?
+                    .l()
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!("Failed to get bridge class: {}", e))
+                    })?;
+
+                let bridge_class = JClass::cast_local(env, bridge_class)
+                    .map_err(|e| VideoError::DecoderInit(e.to_string()))?;
+
+                // Create MIME type string for MediaCodec
+                let mime_type = env.new_string(codec_type.mime_type()).map_err(|e| {
+                    VideoError::DecoderInit(format!("Failed to create MIME type string: {}", e))
                 })?;
 
-            let class_name = env
-                .new_string("com.luminavideo.bridge.MoqMediaCodecBridge")
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to create class name string: {}", e))
+                // Create bridge: MoqMediaCodecBridge(Context, String mimeType, int width, int height, long playerId)
+                let bridge = env
+                    .new_object(
+                        bridge_class,
+                        jni_sig!("(Landroid/content/Context;Ljava/lang/String;IIJ)V"),
+                        &[
+                            JValue::Object(&context),
+                            JValue::Object(&mime_type),
+                            JValue::Int(width as i32),
+                            JValue::Int(height as i32),
+                            JValue::Long(self.player_id as i64),
+                        ],
+                    )
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!(
+                            "Failed to create MoqMediaCodecBridge: {}",
+                            e
+                        ))
+                    })?;
+
+                let bridge_ref = env.new_global_ref(bridge).map_err(|e| {
+                    VideoError::DecoderInit(format!("Failed to create global ref: {}", e))
                 })?;
 
-            let bridge_class = env
-                .call_method(
-                    &class_loader,
-                    "loadClass",
-                    "(Ljava/lang/String;)Ljava/lang/Class;",
-                    &[JValue::Object(&class_name)],
-                )
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to load MoqMediaCodecBridge: {}", e))
-                })?
-                .l()
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to get bridge class: {}", e))
-                })?;
+                // Start the decoder
+                env.call_method(&bridge_ref, jni_str!("start"), jni_sig!("()V"), &[])
+                    .map_err(|e| {
+                        VideoError::DecoderInit(format!("Failed to start MediaCodec: {}", e))
+                    })?;
 
-            let bridge_class = jni::objects::JClass::from(bridge_class);
+                self.bridge = Some(bridge_ref);
+                self.codec_configured = true;
 
-            // Create MIME type string for MediaCodec
-            let mime_type = env.new_string(codec_type.mime_type()).map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to create MIME type string: {}", e))
-            })?;
+                tracing::info!(
+                    "MoqAndroidDecoder: MediaCodec initialized for {} ({}x{})",
+                    codec_type.mime_type(),
+                    width,
+                    height
+                );
 
-            // Create bridge: MoqMediaCodecBridge(Context, String mimeType, int width, int height, long playerId)
-            let bridge = env
-                .new_object(
-                    bridge_class,
-                    "(Landroid/content/Context;Ljava/lang/String;IIJ)V",
-                    &[
-                        JValue::Object(&context),
-                        JValue::Object(&mime_type),
-                        JValue::Int(width as i32),
-                        JValue::Int(height as i32),
-                        JValue::Long(self.player_id as i64),
-                    ],
-                )
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to create MoqMediaCodecBridge: {}", e))
-                })?;
-
-            let bridge_ref = env.new_global_ref(bridge).map_err(|e| {
-                VideoError::DecoderInit(format!("Failed to create global ref: {}", e))
-            })?;
-
-            // Start the decoder
-            env.call_method(&bridge_ref, "start", "()V", &[])
-                .map_err(|e| {
-                    VideoError::DecoderInit(format!("Failed to start MediaCodec: {}", e))
-                })?;
-
-            self.bridge = Some(bridge_ref);
-            self.codec_configured = true;
-
-            tracing::info!(
-                "MoqAndroidDecoder: MediaCodec initialized for {} ({}x{})",
-                codec_type.mime_type(),
-                width,
-                height
-            );
-
-            Ok(())
+                Ok(())
+            })
         }
 
         /// Submits a NAL unit to MediaCodec for decoding.
@@ -3581,35 +3600,27 @@ pub mod android {
             };
 
             let vm = Self::get_jvm()?;
-            let mut env = vm.attach_current_thread().map_err(|e| {
-                VideoError::DecodeFailed(format!("Failed to attach JNI thread: {}", e))
-            })?;
-
-            // Create byte array from NAL data
-            let byte_array = env.new_byte_array(nal_data.len() as i32).map_err(|e| {
-                VideoError::DecodeFailed(format!("Failed to create byte array: {}", e))
-            })?;
-
-            // Convert u8 slice to i8 slice for JNI
-            let nal_data_i8: Vec<i8> = nal_data.iter().map(|&b| b as i8).collect();
-            env.set_byte_array_region(&byte_array, 0, &nal_data_i8)
-                .map_err(|e| {
-                    VideoError::DecodeFailed(format!("Failed to set byte array data: {}", e))
+            crate::android_video::with_jni(&vm, |env| {
+                let byte_array = env.byte_array_from_slice(nal_data).map_err(|e| {
+                    VideoError::DecodeFailed(format!("Failed to create NAL byte array: {e}"))
                 })?;
 
-            // Submit to MediaCodec: submitNalUnit(byte[] data, long timestampUs)
-            env.call_method(
-                bridge,
-                "submitNalUnit",
-                "([BJ)V",
-                &[
-                    JValue::Object(&byte_array),
-                    JValue::Long(timestamp_us as i64),
-                ],
-            )
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to submit NAL unit: {}", e)))?;
+                // Submit to MediaCodec: submitNalUnit(byte[] data, long timestampUs)
+                env.call_method(
+                    bridge,
+                    jni_str!("submitNalUnit"),
+                    jni_sig!("([BJ)V"),
+                    &[
+                        JValue::Object(&byte_array),
+                        JValue::Long(timestamp_us as i64),
+                    ],
+                )
+                .map_err(|e| {
+                    VideoError::DecodeFailed(format!("Failed to submit NAL unit: {}", e))
+                })?;
 
-            Ok(())
+                Ok(())
+            })
         }
 
         /// Polls for decoded frames from the HardwareBuffer queue.
@@ -3629,26 +3640,9 @@ pub mod android {
         fn convert_to_video_frame(&self, frame: AndroidVideoFrame) -> VideoFrame {
             let pts = Duration::from_nanos(frame.timestamp_ns as u64);
 
-            // Create owner to track HardwareBuffer lifetime
-            struct HardwareBufferOwner {
-                #[allow(dead_code)]
-                buffer: *mut std::ffi::c_void,
-            }
-
-            // SAFETY: AHardwareBuffer is thread-safe per Android NDK docs
-            unsafe impl Send for HardwareBufferOwner {}
-            unsafe impl Sync for HardwareBufferOwner {}
-
-            impl Drop for HardwareBufferOwner {
-                fn drop(&mut self) {
-                    // Don't release here - AndroidVideoFrame::drop handles it
-                    // This owner is just for lifetime tracking
-                }
-            }
-
-            let owner = Arc::new(HardwareBufferOwner {
-                buffer: frame.buffer,
-            });
+            // Retain the complete lease (AHardwareBuffer, producer Image, and fence)
+            // until the GPU surface is released; an inert raw-pointer owner leaks it.
+            let frame = Arc::new(frame);
 
             // Determine pixel format from AHardwareBuffer format
             let pixel_format = if crate::android_video::is_yuv_hardware_buffer_format(frame.format)
@@ -3658,6 +3652,7 @@ pub mod android {
                 PixelFormat::Rgba
             };
 
+            // SAFETY: the surface receives ownership of the live frame lease.
             let surface = unsafe {
                 AndroidGpuSurface::new(
                     frame.buffer,
@@ -3665,21 +3660,16 @@ pub mod android {
                     frame.height,
                     pixel_format,
                     None, // No CPU fallback for zero-copy frames
-                    owner,
+                    frame,
                 )
             };
-
-            // Transfer ownership - prevent AndroidVideoFrame from releasing the buffer
-            // since the AndroidGpuSurface now owns the reference
-            std::mem::forget(frame);
 
             VideoFrame::new(pts, DecodedFrame::Android(surface))
         }
 
         /// Gets the Java VM from NDK context.
         fn get_jvm() -> Result<jni::JavaVM, VideoError> {
-            unsafe { jni::JavaVM::from_raw(ndk_context::android_context().vm().cast()) }
-                .map_err(|e| VideoError::DecoderInit(format!("Failed to get JavaVM: {}", e)))
+            Ok(unsafe { jni::JavaVM::from_raw(ndk_context::android_context().vm().cast()) })
         }
 
         /// Returns the current decoder state.
@@ -3703,9 +3693,10 @@ pub mod android {
             // Release MediaCodec resources via JNI
             if let Some(bridge) = self.bridge.take() {
                 if let Ok(vm) = Self::get_jvm() {
-                    if let Ok(mut env) = vm.attach_current_thread() {
-                        let _ = env.call_method(&bridge, "release", "()V", &[]);
-                    }
+                    let _ = vm.attach_current_thread(|env| {
+                        env.call_method(&bridge, jni_str!("release"), jni_sig!("()V"), &[])
+                            .map(|_| ())
+                    });
                 }
             }
 
@@ -3810,7 +3801,7 @@ pub mod android {
                 .load(Ordering::Relaxed)
         }
 
-        fn audio_handle(&self) -> Option<super::audio::AudioHandle> {
+        fn audio_handle(&self) -> Option<crate::audio::AudioHandle> {
             self.shared.audio.moq_audio_handle.lock().clone()
         }
 
@@ -3841,7 +3832,7 @@ pub mod android {
     /// ExoPlayerBridge - the frame is queued by player_id for isolation.
     #[no_mangle]
     pub extern "C" fn Java_com_luminavideo_bridge_MoqMediaCodecBridge_nativeSubmitHardwareBuffer(
-        env: JNIEnv,
+        env: EnvUnowned,
         class: JClass,
         buffer: JObject,
         timestamp_ns: jlong,
@@ -3854,7 +3845,7 @@ pub mod android {
         // This reuses all the HardwareBuffer acquisition and queue logic
         crate::android_video::Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwareBuffer(
             env,
-            class,
+            class.into(),
             buffer,
             timestamp_ns,
             width,
@@ -3867,15 +3858,14 @@ pub mod android {
     /// JNI callback for codec errors.
     #[no_mangle]
     pub extern "C" fn Java_com_luminavideo_bridge_MoqMediaCodecBridge_nativeOnError(
-        mut env: JNIEnv,
+        mut env: EnvUnowned,
         _class: JClass,
         player_id: jlong,
         error_message: jni::objects::JString,
     ) {
-        let error: String = env
-            .get_string(&error_message)
-            .map(|s| s.into())
-            .unwrap_or_else(|_| "Unknown MediaCodec error".to_string());
+        let error = env
+            .with_env(|env| error_message.try_to_string(env))
+            .resolve::<jni::errors::LogErrorAndDefault>();
 
         tracing::error!(
             "MoqMediaCodecBridge error (player_id={}): {}",
@@ -3887,7 +3877,7 @@ pub mod android {
     /// JNI callback when video dimensions change (e.g., adaptive bitrate switch).
     #[no_mangle]
     pub extern "C" fn Java_com_luminavideo_bridge_MoqMediaCodecBridge_nativeOnVideoSizeChanged(
-        _env: JNIEnv,
+        _env: EnvUnowned,
         _class: JClass,
         player_id: jlong,
         width: jint,

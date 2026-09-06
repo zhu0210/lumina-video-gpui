@@ -16,9 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_channel::Sender;
-use bytes::{Buf, BytesMut};
-use moq_lite::{Origin, PathOwned};
 use moq_native::ClientConfig;
+use moq_net::{Origin, PathOwned};
 
 use crate::moq::MoqUrl;
 use crate::moq_audio::{
@@ -254,10 +253,10 @@ pub(super) struct CatalogResult {
 #[allow(clippy::too_many_arguments)]
 async fn resubscribe_video_track(
     _shared: &Arc<MoqSharedState>,
-    moq_broadcast: &moq_lite::BroadcastConsumer,
-    video_track: &moq_lite::Track,
+    moq_broadcast: &moq_net::broadcast::Consumer,
+    video_track: &super::subscriber::MediaTrack,
     max_latency: Duration,
-    video_consumer: &mut hang::container::OrderedConsumer,
+    video_consumer: &mut super::subscriber::LegacyConsumer,
     idr_gate_enabled: bool,
     waiting_for_valid_idr: &mut bool,
     idr_gate_groups_seen: &mut u8,
@@ -313,8 +312,9 @@ async fn resubscribe_video_track(
         detail,
     );
 
-    *video_consumer = hang::container::OrderedConsumer::new(
-        moq_broadcast.subscribe_track(video_track),
+    *video_consumer = super::subscriber::LegacyConsumer::new(
+        moq_broadcast.clone(),
+        video_track.clone(),
         max_latency,
     );
 
@@ -392,12 +392,13 @@ pub(crate) async fn run_moq_worker(
     let cat = fetch_and_validate_catalog(&moq_broadcast, &shared, &config, label).await?;
 
     // -- Phase 4: Subscribe to video track --
-    let video_track = moq_lite::Track {
+    let video_track = super::subscriber::MediaTrack {
         name: cat.video_track_name.clone(),
         priority: 100,
     };
-    let mut video_consumer = hang::container::OrderedConsumer::new(
-        moq_broadcast.subscribe_track(&video_track),
+    let mut video_consumer = super::subscriber::LegacyConsumer::new(
+        moq_broadcast.clone(),
+        video_track.clone(),
         cat.max_latency,
     );
 
@@ -420,10 +421,12 @@ pub(crate) async fn run_moq_worker(
 
     // Audio track name for re-subscribing when the audio task finishes
     // (track end, error, or stream loop).
-    let audio_track_for_resub: Option<moq_lite::Track> = if audio_task.is_some() {
-        select_preferred_audio_rendition(&cat.catalog).map(|(name, _)| moq_lite::Track {
-            name: name.to_string(),
-            priority: 50,
+    let audio_track_for_resub: Option<super::subscriber::MediaTrack> = if audio_task.is_some() {
+        select_preferred_audio_rendition(&cat.catalog).map(|(name, _)| {
+            super::subscriber::MediaTrack {
+                name: name.to_string(),
+                priority: 50,
+            }
         })
     } else {
         None
@@ -473,7 +476,6 @@ pub(crate) async fn run_moq_worker(
     );
 
     // Pre-allocate reusable buffers to avoid per-frame allocation
-    let mut video_buf = BytesMut::with_capacity(256 * 1024);
     let mut stats_log_counter = 0u64;
     let mut resubscribe_count: u32 = 0;
     let mut recent_resubscribes: VecDeque<Instant> = VecDeque::with_capacity(8);
@@ -662,7 +664,7 @@ pub(crate) async fn run_moq_worker(
                             shared.frame_stats.log_summary(label);
                         }
 
-                        let data = assemble_payload(&frame.payload, &mut video_buf);
+                        let data = frame.payload.clone();
 
                         // Frame dump: record then check if we should disable
                         let mut disable_dump = false;
@@ -1120,7 +1122,7 @@ pub(super) async fn connect_to_relay(
     config: &MoqDecoderConfig,
     label: &str,
 ) -> Result<
-    (moq_lite::OriginConsumer, &'static str, moq_lite::Session),
+    (moq_net::origin::Consumer, &'static str, moq_net::Session),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let quic_probe_timeout = Duration::from_millis(config.transport.connect_timeout_ms.min(1500));
@@ -1181,7 +1183,7 @@ async fn try_connect(
     disable_tls_verify: bool,
     websocket: bool,
     timeout: Duration,
-) -> Result<(moq_lite::OriginConsumer, moq_lite::Session), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(moq_net::origin::Consumer, moq_net::Session), Box<dyn std::error::Error + Send + Sync>>
 {
     let mut cfg = ClientConfig::default();
     if disable_tls_verify {
@@ -1191,12 +1193,12 @@ async fn try_connect(
     if websocket {
         cfg.websocket.delay = Some(Duration::ZERO);
     }
-    let origin = Origin::produce();
+    let origin = Origin::random().produce();
     let consumer = origin.consume();
     let client = cfg.init().map_err(|e| format!("Client init: {e}"))?;
     let session = tokio::time::timeout(
         timeout,
-        client.with_consume(origin).connect(parsed_url.clone()),
+        client.with_subscriber(origin).connect(parsed_url.clone()),
     )
     .await
     .map_err(|_| "Connection timed out")?
@@ -1206,11 +1208,11 @@ async fn try_connect(
 
 /// Wait for a broadcast to be announced, with 10s overall timeout.
 pub(super) async fn discover_broadcast(
-    origin_consumer: &mut moq_lite::OriginConsumer,
+    origin_consumer: &mut moq_net::origin::Consumer,
     specific_broadcast: Option<PathOwned>,
-    url: &MoqUrl,
+    _url: &MoqUrl,
     label: &str,
-) -> Result<moq_lite::BroadcastConsumer, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<moq_net::broadcast::Consumer, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ref path) = specific_broadcast {
         tracing::info!("MoQ {}: Looking for specific broadcast: {:?}", label, path);
     } else {
@@ -1220,99 +1222,46 @@ pub(super) async fn discover_broadcast(
         );
     }
 
-    let discovery_timeout = Duration::from_secs(10);
-    let discovery_start = std::time::Instant::now();
-
-    loop {
-        if discovery_start.elapsed() > discovery_timeout {
-            let msg = if specific_broadcast.is_some() {
-                format!(
-                    "Broadcast discovery timeout - '{}' not found after {:?}",
-                    url.track().unwrap_or("unknown"),
-                    discovery_timeout,
-                )
-            } else {
-                format!(
-                    "Broadcast discovery timeout - no broadcasts found on '{}' after {:?}",
-                    url.namespace(),
-                    discovery_timeout,
-                )
-            };
-            return Err(msg.into());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        if let Some(path) = specific_broadcast {
+            return origin_consumer
+                .request_broadcast(path)
+                .await
+                .map_err(Into::into);
         }
-
-        // If looking for specific broadcast, check if already available
-        if let Some(ref path) = specific_broadcast {
-            if let Some(broadcast) = origin_consumer.consume_broadcast(path.clone()) {
-                tracing::info!("MoQ {}: Found specific broadcast at {:?}", label, path);
+        let mut announcements = origin_consumer.announced();
+        while let Some(announcement) = announcements.next().await {
+            if let Some(broadcast) = announcement.broadcast {
                 return Ok(broadcast);
             }
         }
-
-        // Wait for announcements with a short timeout to allow checking overall timeout
-        let wait_result =
-            tokio::time::timeout(Duration::from_secs(2), origin_consumer.announced()).await;
-
-        match wait_result {
-            Ok(Some((path, Some(broadcast)))) => {
-                if let Some(ref wanted) = specific_broadcast {
-                    if path == *wanted {
-                        tracing::info!("MoQ {}: Found matching broadcast at {:?}", label, path);
-                        return Ok(broadcast);
-                    } else {
-                        tracing::debug!(
-                            "MoQ {}: Ignoring broadcast at {:?}, waiting for {:?}",
-                            label,
-                            path,
-                            wanted,
-                        );
-                        continue;
-                    }
-                } else {
-                    tracing::info!("MoQ {}: Auto-selected broadcast: {:?}", label, path);
-                    return Ok(broadcast);
-                }
-            }
-            Ok(Some((_path, None))) => {
-                continue;
-            }
-            Ok(None) => {
-                return Err("Origin consumer closed without broadcast".into());
-            }
-            Err(_) => {
-                tracing::debug!("MoQ {}: Still waiting for broadcast announcement...", label);
-                continue;
-            }
-        }
-    }
+        Err("Origin closed without a broadcast".into())
+    })
+    .await
+    .map_err(|_| "Broadcast discovery timed out")?
 }
 
 /// Fetch catalog with 5s timeout, validate it, log renditions, and store metadata.
 ///
 /// Returns `(video_track_name, max_latency, catalog)`.
 pub(super) async fn fetch_and_validate_catalog(
-    moq_broadcast: &moq_lite::BroadcastConsumer,
+    moq_broadcast: &moq_net::broadcast::Consumer,
     shared: &Arc<MoqSharedState>,
     config: &MoqDecoderConfig,
     label: &str,
 ) -> Result<CatalogResult, Box<dyn std::error::Error + Send + Sync>> {
-    let mut catalog_consumer =
-        hang::CatalogConsumer::new(moq_broadcast.subscribe_track(&hang::Catalog::default_track()));
-    let catalog_timeout = Duration::from_secs(5);
-    let catalog = match tokio::time::timeout(catalog_timeout, catalog_consumer.next()).await {
-        Ok(Ok(Some(catalog))) => catalog,
-        Ok(Ok(None)) => {
-            return Err(
-                "Catalog track ended before receiving catalog (broadcast may be offline)".into(),
-            );
-        }
-        Ok(Err(e)) => {
-            return Err(format!("Failed to receive catalog: {e}").into());
-        }
-        Err(_) => {
-            return Err("Catalog timeout - broadcast may be offline or has no active video".into());
-        }
-    };
+    let catalog = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut track = moq_broadcast
+            .track(hang::Catalog::DEFAULT_NAME)?
+            .subscribe(hang::Catalog::default_subscription())
+            .await?;
+        let frame = track.read_frame().await?.ok_or("Catalog track ended")?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(hang::Catalog::from_slice(
+            &frame.payload,
+        )?)
+    })
+    .await
+    .map_err(|_| "Catalog timeout")??;
 
     tracing::info!("MoQ {}: Received catalog", label);
 
@@ -1378,21 +1327,12 @@ pub(super) async fn fetch_and_validate_catalog(
         .ok_or("No video track in catalog")?;
 
     // Validate container format — we only support Legacy (raw NAL units)
-    match video_config.container {
-        hang::catalog::Container::Legacy => {
-            tracing::info!("MoQ {}: Container format: Legacy (raw frames)", label);
-        }
-        hang::catalog::Container::Cmaf {
-            timescale,
-            track_id,
-        } => {
-            return Err(format!(
-                "Unsupported container format: CMAF (timescale={}, track_id={}). \
-                 lumina-video only supports Legacy (raw NAL units).",
-                timescale, track_id,
-            )
-            .into());
-        }
+    if !matches!(video_config.container, hang::catalog::Container::Legacy) {
+        return Err(format!(
+            "Unsupported MoQ video container: {:?}",
+            video_config.container
+        )
+        .into());
     }
 
     // Update metadata from catalog
@@ -1466,13 +1406,13 @@ pub(super) async fn fetch_and_validate_catalog(
 /// Set up audio track subscription and spawn decode/playback thread.
 fn setup_audio(
     catalog: &hang::catalog::Catalog,
-    moq_broadcast: &moq_lite::BroadcastConsumer,
+    moq_broadcast: &moq_net::broadcast::Consumer,
     max_latency: Duration,
     config: &MoqDecoderConfig,
     shared: &Arc<MoqSharedState>,
     label: &str,
 ) -> (
-    Option<hang::container::OrderedConsumer>,
+    Option<super::subscriber::LegacyConsumer>,
     Option<LiveEdgeSender<MoqAudioFrame>>,
     Option<MoqAudioThread>,
 ) {
@@ -1495,12 +1435,13 @@ fn setup_audio(
     // don't trigger false positives before the new forward task starts.
     *shared.audio.last_audio_forward_frame_at.lock() = None;
 
-    let audio_track = moq_lite::Track {
+    let audio_track = super::subscriber::MediaTrack {
         name: track_name.to_string(),
         priority: 50,
     };
-    let audio_consumer = hang::container::OrderedConsumer::new(
-        moq_broadcast.subscribe_track(&audio_track),
+    let audio_consumer = super::subscriber::LegacyConsumer::new(
+        moq_broadcast.clone(),
+        audio_track.clone(),
         max_latency,
     );
 
@@ -1565,7 +1506,7 @@ fn setup_audio(
 /// IMPORTANT: `OrderedConsumer::read()` is NOT cancellation-safe — it must run
 /// in its own dedicated task, never in a shared `tokio::select!` loop.
 fn spawn_audio_forward_task(
-    consumer: Option<hang::container::OrderedConsumer>,
+    consumer: Option<super::subscriber::LegacyConsumer>,
     sender: Option<LiveEdgeSender<MoqAudioFrame>>,
     audio_shared: &Arc<crate::moq_decoder::MoqAudioShared>,
     label: &str,
@@ -1581,7 +1522,6 @@ fn spawn_audio_forward_task(
         tracing::info!("MoQ {}: audio forward task started", label_owned);
         // Initial heartbeat so the watchdog knows we're alive before first frame.
         *audio_shared.last_audio_forward_frame_at.lock() = Some(Instant::now());
-        let mut buf = BytesMut::with_capacity(4096);
         let mut frames_forwarded: u64 = 0;
         // Internal timeout: 8s to tolerate Opus DTX / silence suppression
         // periods where the relay legitimately sends no audio packets.
@@ -1598,7 +1538,7 @@ fn spawn_audio_forward_task(
         loop {
             match tokio::time::timeout(READ_TIMEOUT, audio_consumer.read()).await {
                 Ok(Ok(Some(frame))) => {
-                    let data = assemble_payload(&frame.payload, &mut buf);
+                    let data = frame.payload.clone();
                     let pts_us = frame.timestamp.as_micros() as u64;
                     let moq_frame = MoqAudioFrame {
                         timestamp_us: pts_us,
@@ -1665,23 +1605,6 @@ fn spawn_audio_forward_task(
             frames_forwarded,
         );
     }))
-}
-
-/// Assemble a hang payload (chunked BufList) into a contiguous `Bytes`,
-/// reusing `buf` to avoid per-frame allocation.
-///
-/// After `split().freeze()`, the `BytesMut` retains its allocation for reuse.
-pub(super) fn assemble_payload(
-    payload: &hang::container::BufList,
-    buf: &mut BytesMut,
-) -> bytes::Bytes {
-    buf.clear();
-    let needed = payload.remaining();
-    buf.reserve(needed);
-    for chunk in payload {
-        buf.extend_from_slice(chunk);
-    }
-    buf.split().freeze()
 }
 
 /// Deterministic audio thread shutdown with 2s timeout.

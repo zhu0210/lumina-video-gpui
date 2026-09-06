@@ -454,7 +454,7 @@ impl WindowsVideoDecoder {
             D3D11CreateDevice(
                 None, // Default adapter
                 D3D_DRIVER_TYPE_HARDWARE,
-                None, // No software rasterizer
+                windows::Win32::Foundation::HMODULE::default(), // No software rasterizer
                 flags,
                 Some(&feature_levels),
                 D3D11_SDK_VERSION,
@@ -776,12 +776,21 @@ impl WindowsVideoDecoder {
         unsafe {
             let result = reader
                 .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &mf_pd_duration);
-            if let Ok(prop) = result {
-                // Duration is stored as a 64-bit value in 100-nanosecond units
-                // PROPVARIANT wraps imp::PROPVARIANT via #[repr(transparent)]
-                let raw = prop.as_raw();
-                let duration_100ns = raw.Anonymous.Anonymous.Anonymous.hVal.max(0) as u64;
-                return Some(Duration::from_nanos(duration_100ns * 100));
+            if let Ok(mut prop) = result {
+                // Media Foundation specifies VT_UI8; check the tag before reading
+                // the union, and clear any unexpectedly allocated variant payload.
+                let value = &prop.Anonymous.Anonymous;
+                let duration = if value.vt == windows::Win32::System::Variant::VT_UI8 {
+                    value
+                        .Anonymous
+                        .uhVal
+                        .checked_mul(100)
+                        .map(Duration::from_nanos)
+                } else {
+                    None
+                };
+                let _ = windows::Win32::System::Com::StructuredStorage::PropVariantClear(&mut prop);
+                return duration;
             }
         }
         None
@@ -1156,8 +1165,8 @@ impl WindowsVideoDecoder {
 
         // Poll until the query data is available (GPU work complete)
         // GetData returns S_OK when data is ready, S_FALSE when still pending
-        let mut query_data: windows::Win32::Foundation::BOOL = windows::Win32::Foundation::BOOL(0);
-        let data_size = std::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32;
+        let mut query_data: windows::core::BOOL = windows::core::BOOL(0);
+        let data_size = std::mem::size_of::<windows::core::BOOL>() as u32;
 
         // Bound the busy-wait to prevent infinite loops on GPU hangs
         // 5 seconds at ~1000 iterations/ms = 5_000_000 max iterations
@@ -1397,7 +1406,7 @@ impl WindowsVideoDecoder {
             f if f == DXGI_FORMAT_NV12 => {
                 // NV12: Y plane followed by interleaved UV plane
                 let y_size = stride * height as usize;
-                let uv_height = (height as usize + 1) / 2;
+                let uv_height = (height as usize).div_ceil(2);
                 let uv_size = stride * uv_height;
 
                 // SAFETY: The media buffer reports this pointer and validated byte length; the temporary slice does not outlive the buffer lock.
@@ -1489,7 +1498,7 @@ impl WindowsVideoDecoder {
         let frame = match self.output_format {
             OutputFormat::Nv12 => {
                 // For NV12: total_size = stride * height * 1.5
-                let uv_height = (height_usize + 1) / 2;
+                let uv_height = height_usize.div_ceil(2);
                 let total_height = height_usize + uv_height; // Always >= 2 since height_usize >= 1
                 let stride = (current_length as usize / total_height).max(width_usize);
 
@@ -1812,10 +1821,8 @@ impl WindowsVideoDecoder {
             // Could re-read format here, but for now just log
         }
 
-        if flags & (MF_SOURCE_READERF_NEWSTREAM.0 as u32) != 0 {
-            if self.debug_logging {
-                info!("New audio stream detected");
-            }
+        if flags & (MF_SOURCE_READERF_NEWSTREAM.0 as u32) != 0 && self.debug_logging {
+            info!("New audio stream detected");
         }
 
         let sample = match sample {
@@ -1856,14 +1863,18 @@ impl WindowsVideoDecoder {
             16 => {
                 // PCM 16-bit: 2 bytes per sample, little-endian
                 byte_slice
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect()
             }
             24 => {
                 // PCM 24-bit: 3 bytes per sample, convert to 16-bit by taking top 16 bits
                 byte_slice
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         // 24-bit little-endian: [low, mid, high]
                         // Take top 16 bits: mid and high
@@ -1874,7 +1885,9 @@ impl WindowsVideoDecoder {
             32 => {
                 // 32-bit: could be i32 PCM or f32 PCM
                 byte_slice
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         if audio_format.is_float {
                             // 32-bit float: convert f32 [-1.0, 1.0] to i16
@@ -1987,7 +2000,7 @@ impl WindowsVideoDecoder {
 
         let frame = match self.output_format {
             OutputFormat::Nv12 => {
-                let uv_height = (height_usize + 1) / 2;
+                let uv_height = height_usize.div_ceil(2);
                 let y_size = stride * height_usize;
                 let uv_size = stride * uv_height;
                 let required_size = y_size + uv_size;
@@ -2089,16 +2102,18 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
         }
 
         // Convert Duration to 100ns units for Media Foundation
-        let position_100ns = position.as_nanos() as i64 / 100;
+        let position_100ns = i64::try_from(position.as_nanos() / 100).map_err(|_| {
+            VideoError::SeekFailed("seek position exceeds Media Foundation range".into())
+        })?;
 
-        // Construct PROPVARIANT with VT_I8 and the position value.
-        // SAFETY: zeroed PROPVARIANT union is valid; we set vt and hVal before use.
-        let prop_variant: windows::core::PROPVARIANT = unsafe { std::mem::zeroed() };
-        // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
+        let mut prop_variant =
+            windows::Win32::System::Com::StructuredStorage::PROPVARIANT::default();
+        // SAFETY: the default variant has no allocation; set the discriminant and
+        // matching I8 union member before passing its address to Media Foundation.
         unsafe {
-            let raw = prop_variant.as_raw() as *const _ as *mut windows::core::imp::PROPVARIANT;
-            (*raw).Anonymous.Anonymous.vt = windows::Win32::System::Variant::VT_I8.0;
-            (*raw).Anonymous.Anonymous.Anonymous.hVal = position_100ns;
+            let value = &mut *prop_variant.Anonymous.Anonymous;
+            value.vt = windows::Win32::System::Variant::VT_I8;
+            value.Anonymous.hVal = position_100ns;
         }
 
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.

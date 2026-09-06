@@ -30,9 +30,9 @@ npm test
 AudioWorklet audio, catalog discovery, and track-selection APIs. Use its
 `connect`, `start_playback`, `poll_state`, and `copy_to_wgpu_texture` methods
 with the GPUI renderer's device/queue. Its transport requires the bundled
-`MoqLite` global and `moq-audio-worklet.js`; the example HTML includes both.
-The pinned `@moq/lite` 0.2.4 package matches the existing bridge API; moving to
-the renamed `@moq/net` package requires a protocol/API compatibility check.
+`MoqNet` global and `moq-audio-worklet.js`; the example HTML includes both.
+The pinned `@moq/net` 0.3.4 package supplies the current transport API.
+Subscriptions preserve priority, and frame payloads use its structured frame API.
 The HLS example does not claim a live MoQ relay acceptance test.
 
 The JS callback regression verifies EOS/replay registration and cancellation

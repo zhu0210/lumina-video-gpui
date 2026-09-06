@@ -231,13 +231,13 @@ async fn run_discovery(
     // Subscribe directly (like zap.stream's leaveOpen: true)
     // This receives both historical events and real-time updates
     tracing::info!("Nostr discovery: subscribing to live streams...");
-    let sub_output = client.subscribe(vec![filter], None).await?;
-    let sub_id = sub_output.val;
+    // Register before subscribing so fast historical replies cannot be missed.
+    let mut notifications = client.notifications();
+    let sub_output = client.subscribe(filter).await?;
+    let sub_id = sub_output.value;
     let _ = event_tx.send(DiscoveryEvent::Connected(true));
     tracing::info!("Nostr discovery: subscribed, waiting for events...");
 
-    // Get notifications receiver (must be kept alive for the loop)
-    let mut notifications = client.notifications();
     let mut event_count = 0usize;
 
     // Handle events until shutdown
@@ -249,8 +249,8 @@ async fn run_discovery(
         }
 
         // Use timeout to periodically check shutdown flag
-        match tokio::time::timeout(Duration::from_millis(500), notifications.recv()).await {
-            Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
+        match tokio::time::timeout(Duration::from_millis(500), notifications.next()).await {
+            Ok(Some(ClientNotification::Event { event, .. })) => {
                 event_count += 1;
                 if event_count <= 5 || event_count.is_multiple_of(50) {
                     tracing::debug!(
@@ -274,15 +274,13 @@ async fn run_discovery(
                     }
                 }
             }
-            Ok(Ok(RelayPoolNotification::Shutdown)) => {
+            Ok(Some(ClientNotification::Shutdown)) => {
                 tracing::warn!("Nostr discovery: relay pool shutdown");
                 let _ = event_tx.send(DiscoveryEvent::Connected(false));
                 break;
             }
-            Ok(Err(e)) => {
-                tracing::error!("Nostr discovery: notification error: {}", e);
-            }
-            Ok(Ok(_)) => {}
+            Ok(None) => break,
+            Ok(Some(_)) => {}
             Err(_) => {
                 // Timeout - just loop again to check shutdown flag
             }
@@ -290,8 +288,10 @@ async fn run_discovery(
     }
 
     // Cleanup
-    client.unsubscribe(sub_id).await;
-    client.disconnect().await?;
+    if let Err(error) = client.unsubscribe(&sub_id).await {
+        tracing::warn!("Nostr unsubscribe failed: {error}");
+    }
+    client.disconnect().await;
     let _ = event_tx.send(DiscoveryEvent::Connected(false));
 
     Ok(())

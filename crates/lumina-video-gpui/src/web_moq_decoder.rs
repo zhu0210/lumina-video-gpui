@@ -1215,7 +1215,7 @@ impl WebMoqSession {
         }
 
         Some(WebMoqStats {
-            connection_version: get_u32(&val, "connectionVersion"),
+            connection_version: get_str(&val, "connectionVersion").unwrap_or_default(),
             video_decode_queue_size: get_u32(&val, "videoDecodeQueueSize"),
             audio_decode_queue_size: get_u32(&val, "audioDecodeQueueSize"),
             audio_context_state: get_str(&val, "audioContextState")
@@ -1239,8 +1239,8 @@ impl WebMoqSession {
 /// Extended stats for MoQ diagnostics overlay.
 #[derive(Debug, Clone, Default)]
 pub struct WebMoqStats {
-    /// MoQ protocol version (e.g., 0xff070001)
-    pub connection_version: u32,
+    /// Negotiated MoQ protocol version.
+    pub connection_version: String,
     /// Number of encoded video chunks waiting to be decoded
     pub video_decode_queue_size: u32,
     /// Number of encoded audio chunks waiting to be decoded

@@ -26,7 +26,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -60,11 +60,11 @@ jobs:
     steps:
       - name: Bootstrap container
         run: pacman -Syu --noconfirm --needed git curl python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Install GStreamer 1.28 and build dependencies
         run: bash scripts/ci-install-linux.sh
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -79,9 +79,9 @@ jobs:
     steps:
       - name: Bootstrap container
         run: pacman -Syu --noconfirm --needed git curl python
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Install GStreamer 1.28 and build dependencies
         run: bash scripts/ci-install-linux.sh
       - name: Generate deterministic fixtures
@@ -94,6 +94,8 @@ jobs:
           cargo test --locked --package lumina-video-native-frame --features moq encoded_av_tracks_decode_through_the_moq_source_bin -- --ignored
           cargo test --locked --package lumina-video-native-frame native_decoder_policy_is_instance_scoped_and_keeps_parsers -- --ignored
           cargo check --locked --package lumina-video-gpui --features moq
+          ffmpeg -y -i fixtures/generated/h264-aac.mp4 -vn -c:a copy /tmp/lumina-audio.aac
+          LUMINA_AAC_ADTS_FIXTURE=/tmp/lumina-audio.aac cargo test --locked --package lumina-video-native-frame --features moq aac_decodes_real_adts_fixture -- --ignored
       - name: Check GPUI vendored runtime feature
         run: cargo check --locked --package lumina-video-gpui --features vendored-runtime
 
@@ -105,13 +107,13 @@ jobs:
       matrix:
         runner: [macos-15, macos-15-intel]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - name: Install FFmpeg build tools
         run: brew install nasm pkg-config
       - name: Build bundled FFmpeg 9 from lock
         run: bash scripts/build-ffmpeg-runtime.sh "$RUNNER_TEMP/lumina-ffmpeg"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: ${{ matrix.runner }}-ffmpeg-${{ hashFiles('vendor/ffmpeg.lock.json', 'scripts/build-ffmpeg-runtime.sh') }}
       - name: Run tests
@@ -131,20 +133,20 @@ jobs:
     name: Test native video (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Test opt-in Media Foundation and GPU import
         run: cargo test --locked --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --features windows-native-video --all-targets
   check-android:
     name: Check (Android)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6.0.0
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -159,9 +161,9 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
       - name: Check Android native-frame build
-        run: cargo ndk -t arm64-v8a check --locked --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --features android-zero-copy
+        run: cargo ndk -t arm64-v8a check --locked --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --features android-zero-copy,moq
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6.3.0
         with:
           gradle-version: '9.7.1'
       - name: Build and test Android bridge
@@ -171,16 +173,16 @@ jobs:
     name: Test (WebGPU)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: '24'
           cache: npm
           cache-dependency-path: crates/lumina-video-gpui/web/package-lock.json
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: npm ci && npm test && npm run build
         working-directory: crates/lumina-video-gpui/web
       - run: cargo +nightly check --locked -p lumina-video-gpui --target wasm32-unknown-unknown --features moq

@@ -7,7 +7,7 @@ use super::catalog::{AudioTrackInfo, MoqCatalog, VideoTrackInfo};
 use super::error::MoqError;
 
 use bytes::Bytes;
-use moq_lite::{GroupConsumer, TrackConsumer};
+use moq_net::{group::Consumer as GroupConsumer, track::Subscriber as TrackConsumer};
 
 /// State of a track subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +163,7 @@ impl MoqTrackSubscriber {
                     let frame = MoqFrame {
                         group_sequence: self.current_group_seq,
                         frame_index: self.current_frame_idx,
-                        data,
+                        data: data.payload,
                         timestamp_ms: None, // Would need timing info from the stream
                     };
                     self.current_frame_idx += 1;
@@ -184,7 +184,7 @@ impl MoqTrackSubscriber {
         // Try to get the next group
         match consumer.next_group().await {
             Ok(Some(group)) => {
-                self.current_group_seq = group.info.sequence;
+                self.current_group_seq = group.sequence;
                 self.current_frame_idx = 0;
                 self.current_group = Some(group);
 
@@ -195,7 +195,7 @@ impl MoqTrackSubscriber {
                             let frame = MoqFrame {
                                 group_sequence: self.current_group_seq,
                                 frame_index: self.current_frame_idx,
-                                data,
+                                data: data.payload,
                                 timestamp_ms: None,
                             };
                             self.current_frame_idx += 1;
@@ -379,5 +379,169 @@ mod tests {
         assert!(!manager.has_video());
         assert!(!manager.has_audio());
         assert!(manager.catalog().is_none());
+    }
+}
+
+/// Application-level subscription settings for an encoded media rendition.
+#[derive(Clone)]
+pub(super) struct MediaTrack {
+    pub name: String,
+    pub priority: u8,
+}
+
+/// A decoded Legacy envelope; the first object in each group is independently decodable.
+pub(super) struct LegacyFrame {
+    pub timestamp: std::time::Duration,
+    pub payload: Bytes,
+    pub keyframe: bool,
+}
+
+/// Reads every frame in a media group, abandoning stalled groups within the latency budget.
+/// The network crate's track.read_frame() only returns one frame per group (catalog semantics).
+pub(super) struct LegacyConsumer {
+    broadcast: moq_net::broadcast::Consumer,
+    track: MediaTrack,
+    latency: std::time::Duration,
+    subscriber: Option<TrackConsumer>,
+    group: Option<GroupConsumer>,
+    first: bool,
+}
+
+impl LegacyConsumer {
+    pub fn new(
+        broadcast: moq_net::broadcast::Consumer,
+        track: MediaTrack,
+        latency: std::time::Duration,
+    ) -> Self {
+        Self {
+            broadcast,
+            track,
+            latency,
+            subscriber: None,
+            group: None,
+            first: true,
+        }
+    }
+
+    pub async fn read(
+        &mut self,
+    ) -> Result<Option<LegacyFrame>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.subscriber.is_none() {
+            let subscription = moq_net::track::Subscription::default()
+                .with_priority(self.track.priority)
+                .with_latency_max(self.latency);
+            self.subscriber = Some(
+                self.broadcast
+                    .track(&self.track.name)?
+                    .subscribe(subscription)
+                    .await?,
+            );
+        }
+        let subscriber = self
+            .subscriber
+            .as_mut()
+            .ok_or("Media subscription missing")?;
+        loop {
+            if self.group.is_none() {
+                self.group = subscriber.next_group().await?;
+                self.first = true;
+                if self.group.is_none() {
+                    return Ok(None);
+                }
+            }
+            let group = self.group.as_mut().ok_or("Media group missing")?;
+            let result = tokio::time::timeout(
+                self.latency.max(std::time::Duration::from_millis(1)),
+                group.read_frame(),
+            )
+            .await;
+            match result {
+                Ok(Ok(Some(frame))) => {
+                    let frame = hang::container::Frame::decode(frame.payload)?;
+                    let timestamp = std::time::Duration::from_micros(
+                        frame.timestamp.convert(moq_net::Timescale::MICRO)?.value(),
+                    );
+                    let keyframe = std::mem::replace(&mut self.first, false);
+                    return Ok(Some(LegacyFrame {
+                        timestamp,
+                        payload: frame.payload,
+                        keyframe,
+                    }));
+                }
+                Ok(Ok(None)) | Err(_) => {
+                    self.group = None;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn frame(payload: &'static [u8], micros: u64) -> hang::container::Frame {
+        hang::container::Frame {
+            timestamp: moq_net::Timestamp::from_micros(micros).unwrap(),
+            payload: Bytes::from_static(payload),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_reads_every_frame_and_marks_group_start() {
+        let mut broadcast = moq_net::broadcast::Producer::new(Default::default());
+        let mut track = broadcast
+            .create_track("video", hang::container::track_info())
+            .unwrap();
+        let mut group = track.append_group().unwrap();
+        frame(b"key", 10).write_to(&mut group).unwrap();
+        frame(b"delta", 20).write_to(&mut group).unwrap();
+        group.finish().unwrap();
+        let mut reader = LegacyConsumer::new(
+            broadcast.consume(),
+            MediaTrack {
+                name: "video".into(),
+                priority: 100,
+            },
+            Duration::from_millis(20),
+        );
+        let first = reader.read().await.unwrap().unwrap();
+        let second = reader.read().await.unwrap().unwrap();
+        assert!(first.keyframe);
+        assert!(!second.keyframe);
+        assert_eq!(first.payload, b"key"[..]);
+        assert_eq!(second.payload, b"delta"[..]);
+        assert_eq!(second.timestamp, Duration::from_micros(20));
+    }
+
+    #[tokio::test]
+    async fn legacy_skips_stalled_group_within_latency_budget() {
+        let mut broadcast = moq_net::broadcast::Producer::new(Default::default());
+        let mut track = broadcast
+            .create_track("video", hang::container::track_info())
+            .unwrap();
+        let mut stalled = track.append_group().unwrap();
+        frame(b"old", 10).write_to(&mut stalled).unwrap();
+        let mut reader = LegacyConsumer::new(
+            broadcast.consume(),
+            MediaTrack {
+                name: "video".into(),
+                priority: 100,
+            },
+            Duration::from_millis(20),
+        );
+        assert!(reader.read().await.unwrap().unwrap().keyframe);
+        let mut fresh = track.append_group().unwrap();
+        frame(b"fresh", 20).write_to(&mut fresh).unwrap();
+        fresh.finish().unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.payload, b"fresh"[..]);
+        assert!(next.keyframe);
     }
 }

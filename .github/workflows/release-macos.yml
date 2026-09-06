@@ -30,7 +30,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Get version
         id: version
@@ -51,7 +51,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: macos-release-${{ matrix.arch }}
 
@@ -211,7 +211,7 @@ jobs:
         run: shasum -a 256 *.dmg > checksums-${{ matrix.arch }}.txt
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: macos-dmg-${{ matrix.arch }}
           path: |
@@ -223,7 +223,7 @@ jobs:
     needs: build-dmg
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Get version
         id: version
@@ -240,13 +240,13 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download arm64 DMG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: macos-dmg-arm64
           path: ./arm64
 
       - name: Download x86_64 DMG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: macos-dmg-x86_64
           path: ./x86_64
@@ -313,7 +313,7 @@ jobs:
         run: shasum -a 256 *.dmg > checksums-universal.txt
 
       - name: Upload universal DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: macos-dmg-universal
           path: |
@@ -329,7 +329,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           path: artifacts
 

@@ -581,7 +581,7 @@ mod cpal_impl {
                 .default_output_config()
                 .map_err(|e| format!("Failed to get default output config: {e}"))?;
 
-            let device_sample_rate = supported_config.sample_rate().0;
+            let device_sample_rate = supported_config.sample_rate();
             let sample_format = supported_config.sample_format();
             let device_channels = supported_config.channels().clamp(1, 2);
             let mut stream_sample_rate = output_sample_rate.unwrap_or(device_sample_rate);
@@ -617,13 +617,13 @@ mod cpal_impl {
             #[cfg(target_os = "linux")]
             let stream_config = cpal::StreamConfig {
                 channels: device_channels,
-                sample_rate: cpal::SampleRate(stream_sample_rate),
+                sample_rate: stream_sample_rate,
                 buffer_size: cpal::BufferSize::Fixed(1024),
             };
             #[cfg(not(target_os = "linux"))]
             let stream_config = cpal::StreamConfig {
                 channels: device_channels,
-                sample_rate: cpal::SampleRate(stream_sample_rate),
+                sample_rate: stream_sample_rate,
                 buffer_size: cpal::BufferSize::Default,
             };
 
@@ -677,7 +677,7 @@ mod cpal_impl {
             let config = device
                 .default_output_config()
                 .map_err(|e| format!("Failed to get default output config: {e}"))?;
-            Ok(config.sample_rate().0)
+            Ok(config.sample_rate())
         }
 
         /// Returns the device sample rate.
@@ -776,7 +776,7 @@ mod cpal_impl {
 
         let stream = device
             .build_output_stream(
-                config,
+                *config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                     if !playing.load(Ordering::Acquire) {
                         let zero = T::from_sample(0.0f32);
@@ -909,8 +909,8 @@ mod cpal_impl {
         configs.into_iter().any(|cfg| {
             cfg.channels() == channels
                 && cfg.sample_format() == sample_format
-                && sample_rate >= cfg.min_sample_rate().0
-                && sample_rate <= cfg.max_sample_rate().0
+                && sample_rate >= cfg.min_sample_rate()
+                && sample_rate <= cfg.max_sample_rate()
         })
     }
 }

@@ -3,14 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild moq-bundle-entry.js --bundle --format=iife --global-name=MoqLite --outfile=dist/moq-lite-bundle.js --target=es2022 && cp moq-audio-worklet.js dist/ && cp node_modules/hls.js/dist/hls.min.js dist/",
+    "build": "esbuild moq-bundle-entry.js --bundle --format=iife --global-name=MoqNet --outfile=dist/moq-net-bundle.js --target=es2022 && cp moq-audio-worklet.js dist/ && cp node_modules/hls.js/dist/hls.min.js dist/",
     "test": "node --test bridge.test.mjs"
   },
   "dependencies": {
-    "@moq/lite": "0.2.4",
+    "@moq/net": "0.3.4",
     "hls.js": "1.7.2"
   },
   "devDependencies": {
-    "esbuild": "0.25.12"
+    "esbuild": "0.28.2"
   }
 }

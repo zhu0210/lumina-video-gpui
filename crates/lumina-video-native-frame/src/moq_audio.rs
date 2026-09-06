@@ -148,7 +148,7 @@ impl OpusDecoder {
 
 /// AAC-LC decoder using symphonia, producing interleaved f32 `AudioSamples`.
 struct SymphoniaAacDecoder {
-    decoder: Box<dyn symphonia_core::codecs::Decoder>,
+    decoder: Box<dyn symphonia_core::codecs::audio::AudioDecoder>,
     sample_rate: u32,
     channels: u16,
 }
@@ -158,31 +158,28 @@ impl SymphoniaAacDecoder {
     ///
     /// `description` is the AudioSpecificConfig bytes from the catalog, if present.
     fn new(sample_rate: u32, channels: u32, description: Option<&Bytes>) -> Result<Self, String> {
-        use symphonia_core::codecs::{
-            CodecParameters, Decoder as _, DecoderOptions, CODEC_TYPE_AAC,
+        use symphonia_core::audio::layouts::{CHANNEL_LAYOUT_MONO, CHANNEL_LAYOUT_STEREO};
+        use symphonia_core::codecs::audio::{
+            well_known::CODEC_ID_AAC, AudioCodecParameters, AudioDecoderOptions,
         };
 
-        let mut params = CodecParameters::new();
+        let mut params = AudioCodecParameters::new();
         params
-            .for_codec(CODEC_TYPE_AAC)
+            .for_codec(CODEC_ID_AAC)
             .with_sample_rate(sample_rate)
-            .with_channels(
-                symphonia_core::audio::Channels::from_bits(
-                    // stereo = front-left + front-right
-                    if channels >= 2 { 0x3 } else { 0x4 }, // 0x4 = front-centre (mono)
-                )
-                .unwrap_or(
-                    symphonia_core::audio::Channels::FRONT_LEFT
-                        | symphonia_core::audio::Channels::FRONT_RIGHT,
-                ),
-            );
+            .with_channels(if channels >= 2 {
+                CHANNEL_LAYOUT_STEREO
+            } else {
+                CHANNEL_LAYOUT_MONO
+            });
 
         if let Some(desc) = description {
             params.with_extra_data(desc.to_vec().into_boxed_slice());
         }
 
-        let decoder = symphonia_codec_aac::AacDecoder::try_new(&params, &DecoderOptions::default())
-            .map_err(|e| format!("Failed to create AAC decoder: {e}"))?;
+        let decoder =
+            symphonia_codec_aac::AacDecoder::try_new(&params, &AudioDecoderOptions::default())
+                .map_err(|e| format!("Failed to create AAC decoder: {e}"))?;
 
         Ok(Self {
             decoder: Box::new(decoder),
@@ -196,26 +193,25 @@ impl SymphoniaAacDecoder {
     /// If the decoded output has fewer channels than `self.channels` (e.g. mono AAC
     /// but stereo playback), upmixes by duplicating each sample across channels.
     fn decode_frame(&mut self, data: &[u8], timestamp_us: u64) -> Result<AudioSamples, String> {
-        use symphonia_core::formats::Packet;
+        use symphonia_core::packet::PacketRef;
+        use symphonia_core::units::{Duration as PacketDuration, Timestamp};
 
-        let packet = Packet::new_from_slice(0, 0, 0, data);
+        let packet = PacketRef::new(0, Timestamp::new(0), PacketDuration::ZERO, data);
         let decoded = self
             .decoder
-            .decode(&packet)
+            .decode_ref(&packet)
             .map_err(|e| format!("AAC decode error: {e}"))?;
 
-        let spec = *decoded.spec();
-        let decoded_channels = spec.channels.count();
+        let spec = decoded.spec();
+        let decoded_channels = spec.channels().count();
         let num_frames = decoded.frames();
 
         if num_frames == 0 || decoded_channels == 0 {
             return Err("Empty decoded buffer".to_string());
         }
 
-        let mut sample_buf =
-            symphonia_core::audio::SampleBuffer::<f32>::new(num_frames as u64, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-        let raw = sample_buf.samples();
+        let mut raw = Vec::<f32>::new();
+        decoded.copy_to_vec_interleaved(&mut raw);
 
         // Upmix if decoded channels < target channels (e.g. mono → stereo)
         let target_ch = self.channels as usize;
@@ -238,7 +234,7 @@ impl SymphoniaAacDecoder {
             }
             downmixed
         } else {
-            raw.to_vec()
+            raw
         };
 
         Ok(AudioSamples {
@@ -607,6 +603,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opus_decodes_encoded_audio() {
+        let mut encoder =
+            opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        let pcm: Vec<f32> = (0..960)
+            .flat_map(|index| {
+                let sample = (index as f32 * 0.1).sin() * 0.25;
+                [sample, sample]
+            })
+            .collect();
+        let mut packet = [0_u8; 4000];
+        let encoded = encoder.encode_float(&pcm, &mut packet).unwrap();
+        let decoded = OpusDecoder::new(48_000, 2)
+            .unwrap()
+            .decode_frame(&packet[..encoded], 987_654)
+            .unwrap();
+        assert_eq!(decoded.data.len(), pcm.len());
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.pts, Duration::from_micros(987_654));
+        assert!(decoded.data.iter().all(|sample| sample.is_finite()));
+        assert!(decoded.data.iter().any(|sample| sample.abs() > 0.001));
+    }
+
+    #[test]
+    #[ignore = "set LUMINA_AAC_ADTS_FIXTURE to an AAC-LC ADTS fixture"]
+    fn aac_decodes_real_adts_fixture() {
+        let fixture = std::fs::read(std::env::var("LUMINA_AAC_ADTS_FIXTURE").unwrap()).unwrap();
+        let mut decoder =
+            SymphoniaAacDecoder::new(48_000, 2, Some(&Bytes::from_static(&[0x11, 0x90]))).unwrap();
+        let mut remaining = fixture.as_slice();
+        let mut sample_count = 0;
+        let mut peak = 0.0_f32;
+        while !remaining.is_empty() {
+            assert!(remaining.len() >= 7);
+            assert_eq!(remaining[0], 0xff);
+            assert_eq!(remaining[1] & 0xf6, 0xf0);
+            let header_len = if remaining[1] & 1 != 0 { 7 } else { 9 };
+            let frame_len = ((remaining[3] as usize & 3) << 11)
+                | ((remaining[4] as usize) << 3)
+                | (remaining[5] as usize >> 5);
+            assert!(frame_len >= header_len && frame_len <= remaining.len());
+            let decoded = decoder
+                .decode_frame(&remaining[header_len..frame_len], 123_456)
+                .unwrap();
+            assert_eq!(decoded.channels, 2);
+            assert_eq!(decoded.sample_rate, 48_000);
+            assert_eq!(decoded.pts, Duration::from_micros(123_456));
+            assert!(decoded.data.iter().all(|sample| sample.is_finite()));
+            sample_count += decoded.data.len();
+            peak = decoded
+                .data
+                .iter()
+                .fold(peak, |peak, sample| peak.max(sample.abs()));
+            remaining = &remaining[frame_len..];
+        }
+        assert!(sample_count > 1024);
+        assert!(peak > 0.001);
+    }
+
+    #[test]
     fn test_live_edge_sender_non_blocking() {
         let (tx, rx) = crossbeam_channel::bounded(2);
         let sender = LiveEdgeSender::new(tx.clone(), rx.clone());
@@ -663,33 +719,19 @@ mod tests {
         let mut renditions = BTreeMap::new();
         renditions.insert(
             "aac".to_string(),
-            hang::catalog::AudioConfig {
-                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
-                sample_rate: 48000,
-                channel_count: 2,
-                bitrate: None,
-                description: None,
-                container: hang::catalog::Container::Legacy,
-                jitter: None,
-            },
+            hang::catalog::AudioConfig::new(
+                hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                48000,
+                2,
+            ),
         );
         renditions.insert(
             "opus".to_string(),
-            hang::catalog::AudioConfig {
-                codec: hang::catalog::AudioCodec::Opus,
-                sample_rate: 48000,
-                channel_count: 2,
-                bitrate: None,
-                description: None,
-                container: hang::catalog::Container::Legacy,
-                jitter: None,
-            },
+            hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48000, 2),
         );
 
-        let catalog = hang::catalog::Catalog {
-            audio: hang::catalog::Audio { renditions },
-            ..Default::default()
-        };
+        let mut catalog = hang::catalog::Catalog::default();
+        catalog.audio.renditions = renditions;
 
         let (name, cfg) = select_preferred_audio_rendition(&catalog).unwrap();
         assert_eq!(name, "opus");
@@ -703,21 +745,11 @@ mod tests {
         let mut renditions = BTreeMap::new();
         renditions.insert(
             "opus".to_string(),
-            hang::catalog::AudioConfig {
-                codec: hang::catalog::AudioCodec::Opus,
-                sample_rate: 48000,
-                channel_count: 2,
-                bitrate: None,
-                description: None,
-                container: hang::catalog::Container::Legacy,
-                jitter: None,
-            },
+            hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48000, 2),
         );
 
-        let catalog = hang::catalog::Catalog {
-            audio: hang::catalog::Audio { renditions },
-            ..Default::default()
-        };
+        let mut catalog = hang::catalog::Catalog::default();
+        catalog.audio.renditions = renditions;
 
         let (name, _) = select_preferred_audio_rendition(&catalog).unwrap();
         assert_eq!(name, "opus");
@@ -725,26 +757,14 @@ mod tests {
 
     #[test]
     fn test_audio_codec_from_config() {
-        let aac_cfg = hang::catalog::AudioConfig {
-            codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
-            sample_rate: 48000,
-            channel_count: 2,
-            bitrate: None,
-            description: None,
-            container: hang::catalog::Container::Legacy,
-            jitter: None,
-        };
+        let aac_cfg = hang::catalog::AudioConfig::new(
+            hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+            48000,
+            2,
+        );
         assert_eq!(audio_codec_from_config(&aac_cfg), MoqAudioCodec::Aac);
 
-        let opus_cfg = hang::catalog::AudioConfig {
-            codec: hang::catalog::AudioCodec::Opus,
-            sample_rate: 48000,
-            channel_count: 2,
-            bitrate: None,
-            description: None,
-            container: hang::catalog::Container::Legacy,
-            jitter: None,
-        };
+        let opus_cfg = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48000, 2);
         assert_eq!(audio_codec_from_config(&opus_cfg), MoqAudioCodec::Opus);
     }
 
@@ -755,33 +775,23 @@ mod tests {
         let mut renditions = BTreeMap::new();
         renditions.insert(
             "audio0".to_string(),
-            hang::catalog::AudioConfig {
-                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
-                sample_rate: 44100,
-                channel_count: 2,
-                bitrate: None,
-                description: None,
-                container: hang::catalog::Container::Legacy,
-                jitter: None,
-            },
+            hang::catalog::AudioConfig::new(
+                hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                44100,
+                2,
+            ),
         );
         renditions.insert(
             "audio1".to_string(),
-            hang::catalog::AudioConfig {
-                codec: hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
-                sample_rate: 48000,
-                channel_count: 2,
-                bitrate: None,
-                description: None,
-                container: hang::catalog::Container::Legacy,
-                jitter: None,
-            },
+            hang::catalog::AudioConfig::new(
+                hang::catalog::AudioCodec::AAC(hang::catalog::AAC { profile: 2 }),
+                48000,
+                2,
+            ),
         );
 
-        let catalog = hang::catalog::Catalog {
-            audio: hang::catalog::Audio { renditions },
-            ..Default::default()
-        };
+        let mut catalog = hang::catalog::Catalog::default();
+        catalog.audio.renditions = renditions;
 
         let (name, cfg) = select_preferred_audio_rendition(&catalog).unwrap();
         assert_eq!(name, "audio1");

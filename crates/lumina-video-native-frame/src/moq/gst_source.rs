@@ -110,11 +110,12 @@ impl GstMoqSource {
             let _connection = (session, origin);
             let mut tasks = tokio::task::JoinSet::new();
             for (name, appsrc, video) in tracks {
-                let consumer = hang::container::OrderedConsumer::new(
-                    broadcast.subscribe_track(&moq_lite::Track {
+                let consumer = super::subscriber::LegacyConsumer::new(
+                    broadcast.clone(),
+                    super::subscriber::MediaTrack {
                         name,
                         priority: if video { 100 } else { 50 },
-                    }),
+                    },
                     catalog.max_latency,
                 );
                 tasks.spawn(forward_track(
@@ -327,12 +328,11 @@ fn running_pts(timestamp: u64, origin: u64, base: u64, paused: u64) -> Option<u6
 }
 
 async fn forward_track(
-    mut consumer: hang::container::OrderedConsumer,
+    mut consumer: super::subscriber::LegacyConsumer,
     appsrc: gst_app::AppSrc,
     video: bool,
     timeline: Arc<Timeline>,
 ) -> Result<(), Error> {
-    let mut scratch = bytes::BytesMut::new();
     let mut waiting_for_keyframe = video;
     let mut wait_started = Instant::now();
     loop {
@@ -382,8 +382,7 @@ async fn forward_track(
             current_base.saturating_sub(initial_base),
         )
         .ok_or("MoQ publisher timestamp moved before the session origin")?;
-        let mut buffer =
-            gst::Buffer::from_slice(worker::assemble_payload(&frame.payload, &mut scratch));
+        let mut buffer = gst::Buffer::from_slice(frame.payload.clone());
         let buffer_ref = buffer
             .get_mut()
             .ok_or("MoQ encoded buffer is not writable")?;
@@ -466,27 +465,25 @@ mod tests {
             let map = buffer.map_readable()?;
             Ok(bytes::Bytes::copy_from_slice(map.as_slice()))
         };
-        let video_config = hang::catalog::VideoConfig {
-            codec: "avc1.64001f".parse()?,
-            description: Some(description(&video_samples)?),
-            coded_width: Some(320),
-            coded_height: Some(180),
-            display_ratio_width: None,
-            display_ratio_height: None,
-            bitrate: None,
-            framerate: Some(30.0),
-            optimize_for_latency: Some(true),
-            container: hang::catalog::Container::Legacy,
-            jitter: None,
+        let video_config = {
+            let mut config = hang::catalog::VideoConfig::new(
+                "avc1.64001f".parse::<hang::catalog::VideoCodec>()?,
+            );
+            config.description = Some(description(&video_samples)?);
+            config.coded_width = Some(320);
+            config.coded_height = Some(180);
+            config.framerate = Some(30.0);
+            config.optimize_for_latency = Some(true);
+            config
         };
-        let audio_config = hang::catalog::AudioConfig {
-            codec: "mp4a.40.2".parse()?,
-            sample_rate: 48000,
-            channel_count: 2,
-            description: Some(description(&audio_samples)?),
-            bitrate: None,
-            container: hang::catalog::Container::Legacy,
-            jitter: None,
+        let audio_config = {
+            let mut config = hang::catalog::AudioConfig::new(
+                "mp4a.40.2".parse::<hang::catalog::AudioCodec>()?,
+                48000,
+                2,
+            );
+            config.description = Some(description(&audio_samples)?);
+            config
         };
         let (bin, decoder) = decode_bin()?;
         let (caps, parser) = video_caps(&video_config)?;

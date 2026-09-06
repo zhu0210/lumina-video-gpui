@@ -2,7 +2,7 @@
  * lumina-video MoQ Transport Bridge
  *
  * Self-contained JavaScript bridge for MoQ live streaming with:
- * - Transport connection via @moq/lite (bundled as window.MoqLite)
+ * - Transport connection via @moq/net (bundled as window.MoqNet)
  * - Catalog JSON parsing
  * - WebCodecs VideoDecoder for video tracks
  * - WebCodecs AudioDecoder + AudioWorklet for audio tracks
@@ -10,7 +10,7 @@
  * Called from Rust/WASM via wasm_bindgen(module = "/web/moq-transport-bridge.js")
  *
  * Architecture:
- *   WASM ←→ moq-transport-bridge.js ←→ MoqLite (IIFE bundle) ←→ Relay (WebTransport/WS)
+ *   WASM ←→ moq-transport-bridge.js ←→ MoqNet (IIFE bundle) ←→ Relay (WebTransport/WS)
  *                                    ├→ WebCodecs VideoDecoder → VideoFrame (polled by WASM)
  *                                    └→ WebCodecs AudioDecoder → AudioWorklet (autonomous)
  */
@@ -100,6 +100,14 @@ class MoqSession {
   close() {
     this._closed = true;
     this.state = "closed";
+    for (const handles of [activeVideoDecoders, activeAudioHandles]) {
+      for (const [id, handle] of handles) {
+        if (handle.sessionId === this.id) {
+          handle.close();
+          handles.delete(id);
+        }
+      }
+    }
     if (this._catalogTrack) {
       try { this._catalogTrack.close(); } catch (_) { /* ignore */ }
     }
@@ -188,7 +196,7 @@ class AudioHandle {
       try { this.gainNode.disconnect(); } catch (_) { /* ignore */ }
     }
     if (this.context) {
-      try { this.context.close(); } catch (_) { /* ignore */ }
+      try { this.context.close().catch(() => {}); } catch (_) { /* ignore */ }
     }
     if (this._track) {
       try { this._track.close(); } catch (_) { /* ignore */ }
@@ -485,8 +493,8 @@ function hexToBytes(hex) {
  * @returns {Promise<number>} Session ID
  */
 export async function moqConnect(url, namespace) {
-  const Moq = window.MoqLite;
-  if (!Moq) throw new Error("MoqLite bundle not loaded. Include moq-lite-bundle.js before WASM.");
+  const Moq = window.MoqNet;
+  if (!Moq) throw new Error("MoqNet bundle not loaded. Include moq-net-bundle.js before WASM.");
 
   const id = sessionIdCounter++;
   const session = new MoqSession(id, url, namespace);
@@ -497,14 +505,10 @@ export async function moqConnect(url, namespace) {
 
     // Race WebTransport and WebSocket with no head start for either.
     // Add a timeout to avoid hanging if both transports fail to settle.
-    const connectPromise = Moq.Connection.connect(new URL(url), {
+    const connection = await Moq.Connection.connect(new URL(url), {
       websocket: { delay: 0 },
+      signal: AbortSignal.timeout(10_000),
     });
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Connection timed out after 10s")), 10_000)
-    );
-
-    const connection = await Promise.race([connectPromise, timeoutPromise]);
 
     if (session._closed) {
       connection.close();
@@ -513,7 +517,7 @@ export async function moqConnect(url, namespace) {
 
     session.connection = connection;
     session.state = "connected";
-    console.log("[moq-transport] Connected, version:", connection.version?.toString(16));
+    console.log("[moq-transport] Connected, version:", connection.version);
 
     // Monitor connection lifecycle
     connection.closed.then(
@@ -526,7 +530,7 @@ export async function moqConnect(url, namespace) {
     console.log("[moq-transport] Subscribing to catalog.json");
 
     // Subscribe to catalog.json (priority 100)
-    const catalogTrack = broadcast.subscribe("catalog.json", 100);
+    const catalogTrack = broadcast.subscribe("catalog.json", { priority: 100 });
     session._catalogTrack = catalogTrack;
 
     // Fetch catalog asynchronously
@@ -534,8 +538,8 @@ export async function moqConnect(url, namespace) {
 
     return id;
   } catch (err) {
-    session.state = "error";
-    session.error = err.message || String(err);
+    session.close();
+    activeSessions.delete(id);
     console.error("[moq-transport] Connect failed:", err);
     throw err;
   }
@@ -550,7 +554,7 @@ async function fetchCatalog(session, track) {
     const frame = await track.readFrame();
     if (!frame || session._closed) return;
 
-    const text = new TextDecoder().decode(frame);
+    const text = new TextDecoder().decode(frame.payload);
     console.debug("[moq-transport] Received catalog:", text);
 
     session.catalog = parseCatalog(text);
@@ -573,7 +577,7 @@ async function fetchCatalogUpdates(session, track) {
       const frame = await track.readFrame();
       if (!frame || session._closed) break;
 
-      const text = new TextDecoder().decode(frame);
+      const text = new TextDecoder().decode(frame.payload);
       console.debug("[moq-transport] Catalog update:", text);
       session.catalog = parseCatalog(text);
     }
@@ -653,58 +657,64 @@ export function moqStartVideo(
   handle._abortController = new AbortController();
   activeVideoDecoders.set(id, handle);
 
-  // Create WebCodecs VideoDecoder
-  const decoder = new VideoDecoder({
-    output: (frame) => {
-      if (handle.closed) { frame.close(); return; }
-      if (handle.lastFrame) { handle.lastFrame.close(); }
-      handle.lastFrame = frame;
-      handle.frameCount++;
+  try {
+    // Create WebCodecs VideoDecoder
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        if (handle.closed) { frame.close(); return; }
+        if (handle.lastFrame) { handle.lastFrame.close(); }
+        handle.lastFrame = frame;
+        handle.frameCount++;
 
-      const sess = activeSessions.get(sessionId);
-      if (sess) sess.stats.videoFrames++;
+        const sess = activeSessions.get(sessionId);
+        if (sess) sess.stats.videoFrames++;
 
-      try {
-        onFrame(frame.timestamp, frame.displayWidth, frame.displayHeight, frame.duration || 0);
-      } catch (e) {
-        console.error("[moq-transport] Video frame callback error:", e);
-      }
-    },
-    error: (e) => {
-      handle.errorMessage = e.message;
-      handle.closed = true;
-      console.error("[moq-transport] VideoDecoder error:", e);
-      try { onError(e.message); } catch (_) { /* ignore */ }
-    },
-  });
+        try {
+          onFrame(frame.timestamp, frame.displayWidth, frame.displayHeight, frame.duration || 0);
+        } catch (e) {
+          console.error("[moq-transport] Video frame callback error:", e);
+        }
+      },
+      error: (e) => {
+        handle.errorMessage = e.message;
+        handle.close();
+        console.error("[moq-transport] VideoDecoder error:", e);
+        try { onError(e.message); } catch (_) { /* ignore */ }
+      },
+    });
 
-  // Configure decoder
-  const config = {
-    codec,
-    optimizeForLatency: true,
-  };
-  if (width > 0) config.codedWidth = width;
-  if (height > 0) config.codedHeight = height;
-  if (description) {
-    config.description = hexToBytes(description);
+    // Configure decoder
+    const config = {
+      codec,
+      optimizeForLatency: true,
+    };
+    if (width > 0) config.codedWidth = width;
+    if (height > 0) config.codedHeight = height;
+    if (description) {
+      config.description = hexToBytes(description);
+    }
+
+    handle.decoder = decoder;
+    decoder.configure(config);
+
+    // Subscribe to track and start decode loop
+    const track = session.broadcast.subscribe(trackName, { priority: 60 });
+    handle._track = track;
+
+    if (containerKind === "cmaf") {
+      runCmafVideoLoop(handle, track, timescale);
+    } else {
+      runLegacyVideoLoop(handle, track);
+    }
+
+    session.state = "playing";
+    console.debug("[moq-transport] Started video decoder", id, "for track", trackName);
+    return id;
+  } catch (error) {
+    handle.close();
+    activeVideoDecoders.delete(id);
+    throw error;
   }
-
-  decoder.configure(config);
-  handle.decoder = decoder;
-
-  // Subscribe to track and start decode loop
-  const track = session.broadcast.subscribe(trackName, 60);
-  handle._track = track;
-
-  if (containerKind === "cmaf") {
-    runCmafVideoLoop(handle, track, timescale);
-  } else {
-    runLegacyVideoLoop(handle, track);
-  }
-
-  session.state = "playing";
-  console.debug("[moq-transport] Started video decoder", id, "for track", trackName);
-  return id;
 }
 
 async function runLegacyVideoLoop(handle, track) {
@@ -719,8 +729,8 @@ async function runLegacyVideoLoop(handle, track) {
           const frame = await withTimeout(group.readFrame(), TRANSPORT_READ_TIMEOUT_MS);
           if (!frame || handle.closed) break;
 
-          const { value: timestamp, length } = decodeVarInt(frame, 0);
-          const payload = frame.subarray(length);
+          const { value: timestamp, length } = decodeVarInt(frame.payload, 0);
+          const payload = frame.payload.subarray(length);
 
           if (handle.decoder.state === "configured") {
             await waitForDecodeCapacity(handle.decoder, MAX_VIDEO_DECODE_QUEUE);
@@ -766,7 +776,7 @@ async function processCmafVideoGroup(handle, group, timescale) {
       const segment = await withTimeout(group.readFrame(), TRANSPORT_READ_TIMEOUT_MS);
       if (!segment || handle.closed) break;
 
-      const samples = decodeCmafSegment(segment, timescale);
+      const samples = decodeCmafSegment(segment.payload, timescale);
       for (const sample of samples) {
         if (handle.closed || handle.decoder.state !== "configured") break;
 
@@ -853,134 +863,142 @@ export async function moqStartAudio(
     return -1;
   }
 
+  if (session._closed) return -1;
+
   const id = audioIdCounter++;
   const handle = new AudioHandle(id, sessionId);
   handle._abortController = new AbortController();
   activeAudioHandles.set(id, handle);
 
-  // Create AudioContext
-  const context = new AudioContext({
-    latencyHint: "interactive",
-    sampleRate,
-  });
-  handle.context = context;
-
-  // Create GainNode for volume control
-  const gainNode = context.createGain();
-  gainNode.gain.value = handle.volume;
-  gainNode.connect(context.destination);
-  handle.gainNode = gainNode;
-
-  // Load AudioWorklet
   try {
-    await context.audioWorklet.addModule("moq-audio-worklet.js");
-  } catch (err) {
-    console.error("[moq-transport] Failed to load audio worklet:", err);
-    handle.close();
-    activeAudioHandles.delete(id);
-    return -1;
-  }
+    // Create AudioContext
+    const context = new AudioContext({
+      latencyHint: "interactive",
+      sampleRate,
+    });
+    handle.context = context;
 
-  if (handle.closed || context.state === "closed") {
-    handle.close();
-    activeAudioHandles.delete(id);
-    return -1;
-  }
+    // Create GainNode for volume control
+    const gainNode = context.createGain();
+    gainNode.gain.value = handle.volume;
+    gainNode.connect(context.destination);
+    handle.gainNode = gainNode;
 
-  // Create AudioWorkletNode
-  const workletNode = new AudioWorkletNode(context, "moq-audio-render", {
-    channelCount: channels,
-    channelCountMode: "explicit",
-  });
-  workletNode.connect(gainNode);
-  handle.workletNode = workletNode;
-
-  // Initialize ring buffer in worklet
-  // 500ms gives enough headroom for startup transient + jitter.
-  // The buffer fills to 100% during stall, then drains during the
-  // startup burst; at 200ms it would drop to <10%, causing noise.
-  workletNode.port.postMessage({
-    type: "init",
-    rate: sampleRate,
-    channels,
-    latency: 500,
-  });
-
-  // Listen for state updates from worklet
-  workletNode.port.onmessage = (event) => {
-    if (event.data.type === "state") {
-      handle.stalled = event.data.stalled;
-      handle.timestampMs = event.data.timestamp / 1000; // us → ms
-      handle.underflowSamples = event.data.underflowSamples ?? 0;
-      handle.bufferLength = event.data.bufferLength ?? 0;
-      handle.bufferCapacity = event.data.bufferCapacity ?? 0;
-    } else if (event.data.type === "diag") {
-      console.debug(
-        `[ring-diag] output rms=${event.data.outRms}`,
-        `writes=${event.data.writes} gaps=${event.data.gaps}`,
-        `overflows=${event.data.overflows} drops=${event.data.drops}`
-      );
+    // Load AudioWorklet
+    try {
+      await context.audioWorklet.addModule("moq-audio-worklet.js");
+    } catch (err) {
+      console.error("[moq-transport] Failed to load audio worklet:", err);
+      handle.close();
+      activeAudioHandles.delete(id);
+      return -1;
     }
-  };
 
-  // Create AudioDecoder
-  const decoder = new AudioDecoder({
-    output: (audioData) => {
-      if (handle.closed) { audioData.close(); return; }
+    if (handle.closed || context.state === "closed") {
+      handle.close();
+      activeAudioHandles.delete(id);
+      return -1;
+    }
 
-      handle.frameCount++;
-      const sess = activeSessions.get(sessionId);
-      if (sess) sess.stats.audioFrames++;
+    // Create AudioWorkletNode
+    const workletNode = new AudioWorkletNode(context, "moq-audio-render", {
+      channelCount: channels,
+      channelCountMode: "explicit",
+    });
+    workletNode.connect(gainNode);
+    handle.workletNode = workletNode;
 
-      // Allocate Float32Array per channel — copyTo() requires a destination
-      // buffer; these are transferred to the AudioWorklet via postMessage
-      // (zero-copy via Transferable), so the allocation is not wasted.
-      const channelData = [];
-      for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
-        const data = new Float32Array(audioData.numberOfFrames);
-        audioData.copyTo(data, { format: "f32-planar", planeIndex: ch });
-        channelData.push(data);
+    // Initialize ring buffer in worklet
+    // 500ms gives enough headroom for startup transient + jitter.
+    // The buffer fills to 100% during stall, then drains during the
+    // startup burst; at 200ms it would drop to <10%, causing noise.
+    workletNode.port.postMessage({
+      type: "init",
+      rate: sampleRate,
+      channels,
+      latency: 500,
+    });
+
+    // Listen for state updates from worklet
+    workletNode.port.onmessage = (event) => {
+      if (event.data.type === "state") {
+        handle.stalled = event.data.stalled;
+        handle.timestampMs = event.data.timestamp / 1000; // us → ms
+        handle.underflowSamples = event.data.underflowSamples ?? 0;
+        handle.bufferLength = event.data.bufferLength ?? 0;
+        handle.bufferCapacity = event.data.bufferCapacity ?? 0;
+      } else if (event.data.type === "diag") {
+        console.debug(
+          `[ring-diag] output rms=${event.data.outRms}`,
+          `writes=${event.data.writes} gaps=${event.data.gaps}`,
+          `overflows=${event.data.overflows} drops=${event.data.drops}`
+        );
       }
+    };
 
-      workletNode.port.postMessage(
-        { type: "data", data: channelData, timestamp: audioData.timestamp },
-        channelData.map((d) => d.buffer),
-      );
+    // Create AudioDecoder
+    const decoder = new AudioDecoder({
+      output: (audioData) => {
+        if (handle.closed) { audioData.close(); return; }
 
-      audioData.close();
-    },
-    error: (err) => {
-      console.error("[moq-transport] AudioDecoder error:", err);
-    },
-  });
-  handle.decoder = decoder;
+        handle.frameCount++;
+        const sess = activeSessions.get(sessionId);
+        if (sess) sess.stats.audioFrames++;
 
-  // Configure decoder
-  const decoderConfig = {
-    codec,
-    sampleRate,
-    numberOfChannels: channels,
-  };
-  if (description) {
-    decoderConfig.description = hexToBytes(description);
+        // Allocate Float32Array per channel — copyTo() requires a destination
+        // buffer; these are transferred to the AudioWorklet via postMessage
+        // (zero-copy via Transferable), so the allocation is not wasted.
+        const channelData = [];
+        for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
+          const data = new Float32Array(audioData.numberOfFrames);
+          audioData.copyTo(data, { format: "f32-planar", planeIndex: ch });
+          channelData.push(data);
+        }
+
+        workletNode.port.postMessage(
+          { type: "data", data: channelData, timestamp: audioData.timestamp },
+          channelData.map((d) => d.buffer),
+        );
+
+        audioData.close();
+      },
+      error: (err) => {
+        console.error("[moq-transport] AudioDecoder error:", err);
+      },
+    });
+    handle.decoder = decoder;
+
+    // Configure decoder
+    const decoderConfig = {
+      codec,
+      sampleRate,
+      numberOfChannels: channels,
+    };
+    if (description) {
+      decoderConfig.description = hexToBytes(description);
+    }
+    decoder.configure(decoderConfig);
+
+    // Subscribe to track and start decode loop
+    const track = session.broadcast.subscribe(trackName, { priority: 80 });
+    handle._track = track;
+
+    if (containerKind === "cmaf") {
+      runCmafAudioLoop(handle, track, timescale);
+    } else {
+      runLegacyAudioLoop(handle, track);
+    }
+
+    // Resume AudioContext (may need user gesture)
+    context.resume().catch(() => {});
+
+    console.debug("[moq-transport] Started audio", id, "for track", trackName);
+    return id;
+  } catch (error) {
+    handle.close();
+    activeAudioHandles.delete(id);
+    throw error;
   }
-  decoder.configure(decoderConfig);
-
-  // Subscribe to track and start decode loop
-  const track = session.broadcast.subscribe(trackName, 80);
-  handle._track = track;
-
-  if (containerKind === "cmaf") {
-    runCmafAudioLoop(handle, track, timescale);
-  } else {
-    runLegacyAudioLoop(handle, track);
-  }
-
-  // Resume AudioContext (may need user gesture)
-  context.resume().catch(() => {});
-
-  console.debug("[moq-transport] Started audio", id, "for track", trackName);
-  return id;
 }
 
 async function runLegacyAudioLoop(handle, track) {
@@ -995,8 +1013,8 @@ async function runLegacyAudioLoop(handle, track) {
           const frame = await withTimeout(group.readFrame(), TRANSPORT_READ_TIMEOUT_MS);
           if (!frame || handle.closed) break;
 
-          const { value: timestamp, length } = decodeVarInt(frame, 0);
-          const payload = frame.subarray(length);
+          const { value: timestamp, length } = decodeVarInt(frame.payload, 0);
+          const payload = frame.payload.subarray(length);
 
           if (handle.decoder.state === "configured") {
             await waitForDecodeCapacity(handle.decoder, MAX_AUDIO_DECODE_QUEUE);
@@ -1041,7 +1059,7 @@ async function processCmafAudioGroup(handle, group, timescale) {
       const segment = await withTimeout(group.readFrame(), TRANSPORT_READ_TIMEOUT_MS);
       if (!segment || handle.closed) break;
 
-      const samples = decodeCmafSegment(segment, timescale);
+      const samples = decodeCmafSegment(segment.payload, timescale);
       for (const sample of samples) {
         if (handle.closed || handle.decoder.state !== "configured") break;
 

@@ -162,6 +162,8 @@ mod tests {
     use super::*;
     use crate::{DmaBufMemoryPlane, DmaBufObject};
     use std::fs::File;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn linux_uapi_payloads_and_ioctl_numbers_match_kernel_abi() {
@@ -177,7 +179,7 @@ mod tests {
         merges: usize,
         fail_export_at: Option<usize>,
         fail_merge: bool,
-        exported_fds: Vec<RawFd>,
+        exported_peers: Vec<UnixStream>,
         merged_inputs: Vec<(RawFd, RawFd)>,
     }
 
@@ -187,9 +189,10 @@ mod tests {
             if self.fail_export_at == Some(self.exports) {
                 return Err("export failed".into());
             }
-            let fd = OwnedFd::from(File::open("/dev/null").map_err(|e| e.to_string())?);
-            self.exported_fds.push(fd.as_raw_fd());
-            Ok(fd)
+            let (fence, peer) = UnixStream::pair().map_err(|e| e.to_string())?;
+            peer.set_nonblocking(true).map_err(|e| e.to_string())?;
+            self.exported_peers.push(peer);
+            Ok(fence.into())
         }
 
         fn merge(&mut self, left: OwnedFd, right: OwnedFd) -> Result<OwnedFd, String> {
@@ -209,11 +212,10 @@ mod tests {
         }
     }
 
-    fn fd_is_closed(fd: RawFd) -> bool {
-        // SAFETY: `fd` is only inspected; fcntl does not take ownership or
-        // mutate the descriptor, and the test expects EBADF after its owner
-        // has been dropped.
-        unsafe { libc::fcntl(fd, libc::F_GETFD) == -1 }
+    fn peer_is_closed(mut peer: &UnixStream) -> bool {
+        // EOF proves that this exported socket was closed, even if another
+        // test has already reused its raw descriptor number.
+        matches!(peer.read(&mut [0]), Ok(0))
     }
 
     fn memory() -> Result<DmaBufMemory, Box<dyn std::error::Error>> {
@@ -254,7 +256,7 @@ mod tests {
             merges: 0,
             fail_export_at: None,
             fail_merge: false,
-            exported_fds: Vec::new(),
+            exported_peers: Vec::new(),
             merged_inputs: Vec::new(),
         };
         let result = fold_exported_sync_files(&memory()?, &mut ops)?;
@@ -271,13 +273,13 @@ mod tests {
             merges: 0,
             fail_export_at: Some(2),
             fail_merge: false,
-            exported_fds: Vec::new(),
+            exported_peers: Vec::new(),
             merged_inputs: Vec::new(),
         };
         assert!(fold_exported_sync_files(&memory()?, &mut ops).is_err());
         assert_eq!(ops.exports, 2);
-        assert_eq!(ops.exported_fds.len(), 1);
-        assert!(ops.exported_fds.iter().copied().all(fd_is_closed));
+        assert_eq!(ops.exported_peers.len(), 1);
+        assert!(ops.exported_peers.iter().all(peer_is_closed));
         Ok(())
     }
 
@@ -288,18 +290,15 @@ mod tests {
             merges: 0,
             fail_export_at: None,
             fail_merge: true,
-            exported_fds: Vec::new(),
+            exported_peers: Vec::new(),
             merged_inputs: Vec::new(),
         };
         assert!(fold_exported_sync_files(&memory()?, &mut ops).is_err());
         assert_eq!(ops.exports, 2);
         assert_eq!(ops.merges, 1);
         assert_eq!(ops.merged_inputs.len(), 1);
-        let Some(&(left, right)) = ops.merged_inputs.first() else {
-            return Err("merge inputs were not recorded".into());
-        };
-        assert!(fd_is_closed(left));
-        assert!(fd_is_closed(right));
+        assert_eq!(ops.exported_peers.len(), 2);
+        assert!(ops.exported_peers.iter().all(peer_is_closed));
         Ok(())
     }
 }

@@ -1,1 +1,1 @@
-export * from "@moq/lite";
+export * from "@moq/net";

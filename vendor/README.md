@@ -44,8 +44,9 @@ recipe URL rather than the GStreamer mirror. Discovery reads that exact pinned
 recipe and records its checksum while constructing only the official GStreamer
 mirror URL; the formal build verifies the recipe again and pre-seeds
 `$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz` before the
-dependency-aware Cerbero fetch. This is one locked acquisition exception, not
-the recursive closure/license/source inventory deferred to issue #19.
+dependency-aware Cerbero fetch. FFmpeg is built from the shared `ffmpeg.lock.json`. WebRTC audio processing
+uses the canonical `www.freedesktop.org` source with the checksum from Cerbero;
+the bare hostname rejects CI downloads.
 
 The generated standalone artifact has this runtime layout:
 
@@ -73,8 +74,7 @@ and creates a versioned registry under external `XDG_CACHE_HOME` (or
 `$HOME/.cache`). It refuses a missing or unwritable cache and never writes the
 bundle. The Rust seam only validates that launcher-established contract; a
 missing or incomplete bundle is a decoder initialization error and never falls
-back to host plugins. Final Lumina executable packaging/integration is deferred
-to issue #19.
+back to host plugins.
 
 ## Scope boundary
 
@@ -104,12 +104,14 @@ python3 scripts/test-smoke-gstreamer-runtime.py
 
 ## Release readiness
 
-The legacy `release-linux.yml` system-package build and Flatpak platform are
-checked for GStreamer >= 1.28 before packaging. This version check is necessary,
-but does not establish #19 compliance. The standalone application still needs
-to be integrated with the locked runtime and its launcher. The checked-in
-`flatpak/io.github.lumina_video.Demo.yml` is also a legacy template: its 1.24
-sources and missing generated Cargo sources are not a usable release build.
+`package-gstreamer.yml` and `release-linux.yml` compile the demo against the
+same Cerbero SDK, using `--build-demo`, and include it with the runtime. Extract
+the artifact and run `./lumina-video-demo`; its launcher selects the bundled
+libraries before the executable loads. The build uses Ubuntu 24.04/glibc 2.39.
+The release workflow publishes this standalone archive rather than system
+packages that require an unavailable distribution GStreamer version.
+
+The checked-in Flatpak/AUR templates are not used by this release workflow.
 
 Before claiming production artifacts, #19 still requires the complete playback
 and audio plugin/shared-library closure, GPL/ugly exclusion, component versions

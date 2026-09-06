@@ -8,9 +8,12 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 lock_file="$repo_root/vendor/gstreamer-1.0.lock.json"
 output_dir="$repo_root/dist/gstreamer-runtime"
+build_demo=false
+build_cargo_home=${CARGO_HOME:-$HOME/.cargo}
+build_rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
 
 usage() {
-    echo "Usage: $0 [--lock PATH] [--output DIR]" >&2
+    echo "Usage: $0 [--lock PATH] [--output DIR] [--build-demo]" >&2
     exit 2
 }
 
@@ -25,6 +28,10 @@ while (($#)); do
             (($# >= 2)) || usage
             output_dir=$2
             shift 2
+            ;;
+        --build-demo)
+            build_demo=true
+            shift
             ;;
         *) usage ;;
     esac
@@ -231,9 +238,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export HOME="$work_dir/home"
-export XDG_CACHE_HOME="$work_dir/cache"
-mkdir -p "$HOME" "$XDG_CACHE_HOME"
+build_home="$work_dir/home"
+build_cache_home="$work_dir/cache"
+mkdir -p "$build_home" "$build_cache_home"
 
 download_and_verify() {
     local url=$1
@@ -285,17 +292,17 @@ zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "
 # Seed Cerbero's source cache with the lock-owned release tarballs. The
 # remaining closure is fetched by Cerbero's pinned recipes in the fetch phase.
 download_and_verify "$gstreamer_url" "$gstreamer_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/gstreamer-1.0/gstreamer-${gstreamer_version}.tar.xz"
+    "$build_cache_home/cerbero-sources/gstreamer-1.0/gstreamer-${gstreamer_version}.tar.xz"
 download_and_verify "$libav_url" "$libav_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/$libav_package/$libav_filename"
+    "$build_cache_home/cerbero-sources/$libav_package/$libav_filename"
 download_and_verify "$zlib_url" "$zlib_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz"
+    "$build_cache_home/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz"
 # The bare freedesktop.org host rejects CI downloads (HTTP 418), while the
 # canonical www host serves the identical archive. Preserve Cerbero's checksum.
 download_and_verify "$webrtc_url" "$webrtc_sha" \
-    "$XDG_CACHE_HOME/cerbero-sources/webrtc-audio-processing-${webrtc_version}/webrtc-audio-processing-${webrtc_version}.tar.gz"
+    "$build_cache_home/cerbero-sources/webrtc-audio-processing-${webrtc_version}/webrtc-audio-processing-${webrtc_version}.tar.gz"
 
-cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive -c "$cerbero_dir/config/linux.config" -v norust)
+cerbero=(env HOME="$build_home" XDG_CACHE_HOME="$build_cache_home" "$cerbero_dir/cerbero-uninstalled" --non-interactive -c "$cerbero_dir/config/linux.config" -v norust)
 "${cerbero[@]}" fetch-bootstrap --system=no --toolchains=no --build-tools=yes --jobs=2
 for package in "${packages[@]}"; do
     "${cerbero[@]}" fetch-package "$package" --deps --jobs=2
@@ -675,6 +682,25 @@ This standalone runtime is the union of upstream Cerbero packages named in
 vendor/gstreamer-1.0.lock.json. It is an upstream meta-package bootstrap for
 Lumina, not the recursive closure/license/source inventory planned for #19.
 EOF
+
+if $build_demo; then
+    build_cargo=$(command -v cargo) || fail "cargo is required for --build-demo"
+    build_target_dir="$repo_root/target/bundled-linux"
+    "${cerbero[@]}" run env CARGO_HOME="$build_cargo_home" RUSTUP_HOME="$build_rustup_home" \
+        CARGO_TARGET_DIR="$build_target_dir" "$build_cargo" build \
+        --manifest-path "$repo_root/Cargo.toml" --release --locked \
+        --package lumina-video-demo --features vendored-runtime
+    mkdir -p "$bundle/bin"
+    cp "$build_target_dir/release/lumina-video-demo" "$bundle/bin/"
+    cat >"$bundle/lumina-video-demo" <<'APP_LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+bundle_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec "$bundle_root/vendor/linux-x86_64/bin/lumina-gstreamer-runtime" \
+    "$bundle_root/bin/lumina-video-demo" "$@"
+APP_LAUNCHER
+    chmod 0755 "$bundle/lumina-video-demo"
+fi
 
 # Normalize the generated vendor tree before hashing so the tree digest covers
 # the exact files that will be packed.

@@ -14,9 +14,11 @@ use tracing::info;
 
 use parking_lot::Mutex;
 
-use jni::objects::{GlobalRef, JByteBuffer, JClass, JObject, JValue};
+use jni::objects::{JByteBuffer, JClass, JObject};
+use jni::refs::{Global, Reference};
 use jni::sys::{jboolean, jint, jlong};
-use jni::{JNIEnv, JavaVM};
+use jni::{jni_sig, jni_str, JValue};
+use jni::{Env, EnvUnowned, JavaVM};
 
 use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, VideoDecoderBackend, VideoError, VideoFrame,
@@ -32,56 +34,30 @@ use crate::video::{
 fn get_jvm() -> Result<JavaVM, VideoError> {
     // SAFETY: ndk_context::android_context() returns a valid pointer when called
     // from an Android app that has been properly initialized by android-activity.
-    unsafe { JavaVM::from_raw(ndk_context::android_context().vm().cast()) }
-        .map_err(|e| VideoError::DecoderInit(format!("Failed to get JavaVM: {}", e)))
+    Ok(unsafe { JavaVM::from_raw(ndk_context::android_context().vm().cast()) })
+}
+
+/// Runs a fallible media operation in a bounded JNI local frame.
+pub(crate) fn with_jni<T>(
+    vm: &JavaVM,
+    f: impl FnOnce(&mut Env<'_>) -> Result<T, VideoError>,
+) -> Result<T, VideoError> {
+    vm.attach_current_thread(|env| Ok::<_, jni::errors::Error>(f(env)))
+        .map_err(|error| VideoError::Generic(format!("JNI operation failed: {error}")))?
 }
 
 /// Fetches the Android SDK API level via JNI and logs device info for diagnostics.
 fn fetch_android_api_level() -> Option<i32> {
     let vm = get_jvm().ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
-
-    let version_class = env.find_class("android/os/Build$VERSION").ok()?;
-    let sdk_int = env
-        .get_static_field(&version_class, "SDK_INT", "I")
-        .ok()?
-        .i()
-        .ok()?;
-
-    // Log device model/manufacturer for diagnostics
-    let build_class = env.find_class("android/os/Build").ok()?;
-
-    let model_obj = env
-        .get_static_field(&build_class, "MODEL", "Ljava/lang/String;")
-        .ok()
-        .and_then(|v| v.l().ok());
-    let model: String = if let Some(ref obj) = model_obj {
-        env.get_string(obj.into())
-            .map(|s| s.into())
-            .unwrap_or_else(|_| "unknown".to_string())
-    } else {
-        "unknown".to_string()
-    };
-
-    let mfr_obj = env
-        .get_static_field(&build_class, "MANUFACTURER", "Ljava/lang/String;")
-        .ok()
-        .and_then(|v| v.l().ok());
-    let manufacturer: String = if let Some(ref obj) = mfr_obj {
-        env.get_string(obj.into())
-            .map(|s| s.into())
-            .unwrap_or_else(|_| "unknown".to_string())
-    } else {
-        "unknown".to_string()
-    };
-
-    tracing::debug!(
-        "Android device: API {}, {} {}",
-        sdk_int,
-        manufacturer,
-        model
-    );
-    Some(sdk_int)
+    vm.attach_current_thread(|env| -> jni::errors::Result<i32> {
+        let version = env.find_class(jni_str!("android/os/Build$VERSION"))?;
+        let sdk = env
+            .get_static_field(&version, jni_str!("SDK_INT"), jni_sig!("I"))?
+            .i()?;
+        tracing::debug!("Android device API: {sdk}");
+        Ok(sdk)
+    })
+    .ok()
 }
 
 /// State shared between Rust and JNI callbacks.
@@ -118,7 +94,7 @@ struct SharedState {
 /// Tracking: lumina-video-5hd
 pub struct AndroidVideoDecoder {
     /// JNI reference to ExoPlayerBridge instance
-    bridge: GlobalRef,
+    bridge: Global<JObject<'static>>,
     /// Shared state between Rust and JNI
     state: Arc<Mutex<SharedState>>,
     /// Video metadata
@@ -188,172 +164,178 @@ impl AndroidVideoDecoder {
     pub fn new(url: &str) -> Result<Self, VideoError> {
         // Get JNI environment
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to attach JNI thread: {}", e)))?;
+        with_jni(&vm, |env| {
+            // Get Android context
+            // SAFETY: The Android activity initialized ndk_context and returned a
+            // valid local context reference for this JNI call.
+            let context =
+                unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
 
-        // Get Android context
-        // SAFETY: The Android activity initialized ndk_context and returned a
-        // valid local context reference for this JNI call.
-        let context = unsafe { JObject::from_raw(ndk_context::android_context().context().cast()) };
+            // Create shared state for JNI callbacks
+            let state = Arc::new(Mutex::new(SharedState {
+                width: 0,
+                height: 0,
+                duration_ms: 0,
+                playback_state: 0,
+                last_error: None,
+            }));
 
-        // Create shared state for JNI callbacks
-        let state = Arc::new(Mutex::new(SharedState {
-            width: 0,
-            height: 0,
-            duration_ms: 0,
-            playback_state: 0,
-            last_error: None,
-        }));
+            // Create native handle (stores raw pointer to Arc for JNI callbacks)
+            let native_handle = create_native_handle(Arc::clone(&state));
 
-        // Create native handle (stores raw pointer to Arc for JNI callbacks)
-        let native_handle = create_native_handle(Arc::clone(&state));
+            // Helper to release handle on error - prevents Arc leak if initialization fails
+            let release_on_error = |e: VideoError| {
+                release_native_handle(native_handle);
+                e
+            };
 
-        // Helper to release handle on error - prevents Arc leak if initialization fails
-        let release_on_error = |e: VideoError| {
-            release_native_handle(native_handle);
-            e
-        };
+            // Use LuminaVideo.createPlayer() for self-contained ExoPlayer creation.
+            // This creates a dedicated HandlerThread, builds ExoPlayer on it, and sets up
+            // ImageReader — all blocking until ready via CountDownLatch.
 
-        // Use LuminaVideo.createPlayer() for self-contained ExoPlayer creation.
-        // This creates a dedicated HandlerThread, builds ExoPlayer on it, and sets up
-        // ImageReader — all blocking until ready via CountDownLatch.
+            // Get the app's class loader (native threads can't use find_class for app classes)
+            let class_loader = env
+                .call_method(
+                    &context,
+                    jni_str!("getClassLoader"),
+                    jni_sig!("()Ljava/lang/ClassLoader;"),
+                    &[],
+                )
+                .map_err(|e| {
+                    release_on_error(VideoError::DecoderInit(format!(
+                        "Failed to get class loader: {}",
+                        e
+                    )))
+                })?
+                .l()
+                .map_err(|e| {
+                    release_on_error(VideoError::DecoderInit(format!(
+                        "Failed to get class loader object: {}",
+                        e
+                    )))
+                })?;
 
-        // Get the app's class loader (native threads can't use find_class for app classes)
-        let class_loader = env
-            .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to get class loader: {}",
-                    e
-                )))
-            })?
-            .l()
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to get class loader object: {}",
-                    e
-                )))
-            })?;
+            // Load LuminaVideo class via app classloader
+            let class_name = env
+                .new_string("com.luminavideo.bridge.LuminaVideo")
+                .map_err(|e| {
+                    release_on_error(VideoError::DecoderInit(format!(
+                        "Failed to create class name string: {}",
+                        e
+                    )))
+                })?;
 
-        // Load LuminaVideo class via app classloader
-        let class_name = env
-            .new_string("com.luminavideo.bridge.LuminaVideo")
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to create class name string: {}",
-                    e
-                )))
-            })?;
+            let lumina_class = env
+                .call_method(
+                    &class_loader,
+                    jni_str!("loadClass"),
+                    jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
+                    &[JValue::Object(&class_name)],
+                )
+                .map_err(|e| {
+                    release_on_error(VideoError::DecoderInit(format!(
+                        "Failed to load LuminaVideo class: {}",
+                        e
+                    )))
+                })?
+                .l()
+                .map_err(|e| {
+                    release_on_error(VideoError::DecoderInit(format!(
+                        "Failed to get LuminaVideo class: {}",
+                        e
+                    )))
+                })?;
 
-        let lumina_class = env
-            .call_method(
-                &class_loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[JValue::Object(&class_name)],
-            )
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to load LuminaVideo class: {}",
-                    e
-                )))
-            })?
-            .l()
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to get LuminaVideo class: {}",
-                    e
-                )))
-            })?;
+            let lumina_class = JClass::cast_local(env, lumina_class)
+                .map_err(|e| release_on_error(VideoError::DecoderInit(e.to_string())))?;
+            // Call LuminaVideo.createPlayer(nativeHandle) — blocks until ExoPlayer is ready
+            let bridge_obj = env
+                .call_static_method(
+                    lumina_class,
+                    jni_str!("createPlayer"),
+                    jni_sig!("(J)Lcom/luminavideo/bridge/ExoPlayerBridge;"),
+                    &[JValue::Long(native_handle)],
+                )
+                .map_err(|e| {
+                    release_on_error(VideoError::DecoderInit(format!(
+                        "LuminaVideo.createPlayer() failed: {}",
+                        e
+                    )))
+                })?
+                .l()
+                .map_err(|e| {
+                    release_on_error(VideoError::DecoderInit(format!(
+                        "Failed to get bridge object: {}",
+                        e
+                    )))
+                })?;
 
-        // Call LuminaVideo.createPlayer(nativeHandle) — blocks until ExoPlayer is ready
-        let bridge_obj = env
-            .call_static_method(
-                JClass::from(lumina_class),
-                "createPlayer",
-                "(J)Lcom/luminavideo/bridge/ExoPlayerBridge;",
-                &[JValue::Long(native_handle)],
-            )
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "LuminaVideo.createPlayer() failed: {}",
-                    e
-                )))
-            })?
-            .l()
-            .map_err(|e| {
-                release_on_error(VideoError::DecoderInit(format!(
-                    "Failed to get bridge object: {}",
-                    e
-                )))
-            })?;
-
-        if bridge_obj.is_null() {
-            return Err(release_on_error(VideoError::DecoderInit(
+            if bridge_obj.is_null() {
+                return Err(release_on_error(VideoError::DecoderInit(
                 "LuminaVideo not initialized. Call LuminaVideo.init(activity) in your Activity.onCreate().".into()
             )));
-        }
+            }
 
-        // Create global reference
-        let bridge_ref = env.new_global_ref(bridge_obj).map_err(|e| {
-            release_on_error(VideoError::DecoderInit(format!(
-                "Failed to create global ref: {}",
-                e
-            )))
-        })?;
+            // Create global reference
+            let bridge_ref = env.new_global_ref(bridge_obj).map_err(|e| {
+                release_on_error(VideoError::DecoderInit(format!(
+                    "Failed to create global ref: {}",
+                    e
+                )))
+            })?;
 
-        // Query player ID from bridge (generated by nativeGeneratePlayerId in Kotlin)
-        let player_id = env
-            .call_method(&bridge_ref, "getPlayerId", "()J", &[])
-            .ok()
-            .and_then(|v| v.j().ok())
-            .unwrap_or(0) as u64;
+            // Query player ID from bridge (generated by nativeGeneratePlayerId in Kotlin)
+            let player_id = env
+                .call_method(&bridge_ref, jni_str!("getPlayerId"), jni_sig!("()J"), &[])
+                .ok()
+                .and_then(|v| v.j().ok())
+                .unwrap_or(0) as u64;
 
-        info!("AndroidVideoDecoder: player_id={}", player_id);
+            info!("AndroidVideoDecoder: player_id={}", player_id);
 
-        // Initial metadata (will be updated by callbacks)
-        let metadata = VideoMetadata {
-            width: 1920,
-            height: 1080,
-            duration: None,
-            frame_rate: 30.0,
-            codec: "mediacodec".to_string(),
-            pixel_aspect_ratio: 1.0,
-            start_time: None, // MediaCodec doesn't expose stream start time
-        };
+            // Initial metadata (will be updated by callbacks)
+            let metadata = VideoMetadata {
+                width: 1920,
+                height: 1080,
+                duration: None,
+                frame_rate: 30.0,
+                codec: "mediacodec".to_string(),
+                pixel_aspect_ratio: 1.0,
+                start_time: None, // MediaCodec doesn't expose stream start time
+            };
 
-        // Check if AHardwareBuffer zero-copy is available (API 29+ required)
-        let ahardwarebuffer_available = {
-            let api_level = fetch_android_api_level().unwrap_or(0);
-            let available = api_level >= 29;
-            if available {
-                info!(
+            // Check if AHardwareBuffer zero-copy is available (API 29+ required)
+            let ahardwarebuffer_available = {
+                let api_level = fetch_android_api_level().unwrap_or(0);
+                let available = api_level >= 29;
+                if available {
+                    info!(
                     "AHardwareBuffer zero-copy available (API {}). \
                      Note: Java/Kotlin ExoPlayerBridge must be configured to expose AHardwareBuffer.",
                     api_level
                 );
-            } else {
-                info!(
+                } else {
+                    info!(
                     "AHardwareBuffer zero-copy not available (API {} < 29). Using CPU fallback.",
                     api_level
                 );
-            }
-            // ExoPlayerBridge.kt submits HardwareBuffers via JNI to HARDWARE_BUFFER_QUEUE.
-            // The VulkanYuvPipeline handles YUV→RGB conversion on GPU.
-            available
-        };
+                }
+                // ExoPlayerBridge.kt submits HardwareBuffers via JNI to HARDWARE_BUFFER_QUEUE.
+                // The VulkanYuvPipeline handles YUV→RGB conversion on GPU.
+                available
+            };
 
-        Ok(Self {
-            bridge: bridge_ref,
-            state,
-            metadata,
-            native_handle,
-            last_position: Duration::ZERO,
-            url: url.to_string(),
-            started: false,
-            ahardwarebuffer_available,
-            player_id,
+            Ok(Self {
+                bridge: bridge_ref,
+                state,
+                metadata,
+                native_handle,
+                last_position: Duration::ZERO,
+                url: url.to_string(),
+                started: false,
+                ahardwarebuffer_available,
+                player_id,
+            })
         })
     }
 
@@ -364,25 +346,23 @@ impl AndroidVideoDecoder {
         }
 
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to attach JNI thread: {}", e)))?;
+        with_jni(&vm, |env| {
+            let url_jstring = env.new_string(&self.url).map_err(|e| {
+                VideoError::DecoderInit(format!("Failed to create URL string: {}", e))
+            })?;
 
-        let url_jstring = env
-            .new_string(&self.url)
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create URL string: {}", e)))?;
+            env.call_method(
+                &self.bridge,
+                jni_str!("play"),
+                jni_sig!("(Ljava/lang/String;)V"),
+                &[JValue::Object(&url_jstring)],
+            )
+            .map_err(|e| VideoError::DecoderInit(format!("Failed to start playback: {}", e)))?;
 
-        env.call_method(
-            &self.bridge,
-            "play",
-            "(Ljava/lang/String;)V",
-            &[JValue::Object(&url_jstring)],
-        )
-        .map_err(|e| VideoError::DecoderInit(format!("Failed to start playback: {}", e)))?;
-
-        self.started = true;
-        tracing::info!("Started ExoPlayer playback for {}", self.url);
-        Ok(())
+            self.started = true;
+            tracing::info!("Started ExoPlayer playback for {}", self.url);
+            Ok(())
+        })
     }
 
     /// Checks shared state for errors or EOS.
@@ -442,9 +422,10 @@ impl Drop for AndroidVideoDecoder {
         // Release ExoPlayer resources FIRST to stop all callbacks
         // before invalidating the native handle
         if let Ok(vm) = get_jvm() {
-            if let Ok(mut env) = vm.attach_current_thread() {
-                let _ = env.call_method(&self.bridge, "release", "()V", &[]);
-            }
+            let _ = vm.attach_current_thread(|env| {
+                env.call_method(&self.bridge, jni_str!("release"), jni_sig!("()V"), &[])
+                    .map(|_| ())
+            });
         }
 
         // Now safe to release the native handle (decrements Arc refcount)
@@ -470,15 +451,13 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
         }
 
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::Generic(format!("Failed to attach JNI thread: {}", e)))?;
+        with_jni(&vm, |env| {
+            env.call_method(&self.bridge, jni_str!("pause"), jni_sig!("()V"), &[])
+                .map_err(|e| VideoError::Generic(format!("Failed to pause ExoPlayer: {}", e)))?;
 
-        env.call_method(&self.bridge, "pause", "()V", &[])
-            .map_err(|e| VideoError::Generic(format!("Failed to pause ExoPlayer: {}", e)))?;
-
-        tracing::info!("Paused ExoPlayer playback");
-        Ok(())
+            tracing::info!("Paused ExoPlayer playback");
+            Ok(())
+        })
     }
 
     fn resume(&mut self) -> Result<(), VideoError> {
@@ -487,15 +466,13 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
         }
 
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::Generic(format!("Failed to attach JNI thread: {}", e)))?;
+        with_jni(&vm, |env| {
+            env.call_method(&self.bridge, jni_str!("resume"), jni_sig!("()V"), &[])
+                .map_err(|e| VideoError::Generic(format!("Failed to resume ExoPlayer: {}", e)))?;
 
-        env.call_method(&self.bridge, "resume", "()V", &[])
-            .map_err(|e| VideoError::Generic(format!("Failed to resume ExoPlayer: {}", e)))?;
-
-        tracing::info!("Resumed ExoPlayer playback");
-        Ok(())
+            tracing::info!("Resumed ExoPlayer playback");
+            Ok(())
+        })
     }
 
     fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError> {
@@ -510,11 +487,16 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
         });
         if fallback {
             let vm = get_jvm()?;
-            let mut env = vm
-                .attach_current_thread()
-                .map_err(|e| VideoError::Generic(format!("JNI attach failed: {e}")))?;
-            env.call_method(&self.bridge, "enableCpuFallback", "()V", &[])
-                .map_err(|e| VideoError::DecodeFailed(format!("CPU fallback failed: {e}")))?;
+            vm.attach_current_thread(|env| {
+                env.call_method(
+                    &self.bridge,
+                    jni_str!("enableCpuFallback"),
+                    jni_sig!("()V"),
+                    &[],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| VideoError::DecodeFailed(format!("CPU fallback failed: {e}")))?;
         }
 
         // Check for errors or EOS from callbacks
@@ -536,16 +518,19 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
 
     fn seek(&mut self, position: Duration) -> Result<(), VideoError> {
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::SeekFailed(format!("Failed to attach JNI thread: {}", e)))?;
+        with_jni(&vm, |env| {
+            let position_ms = position.as_millis() as i64;
 
-        let position_ms = position.as_millis() as i64;
-
-        env.call_method(&self.bridge, "seek", "(J)V", &[JValue::Long(position_ms)])
+            env.call_method(
+                &self.bridge,
+                jni_str!("seek"),
+                jni_sig!("(J)V"),
+                &[JValue::Long(position_ms)],
+            )
             .map_err(|e| VideoError::SeekFailed(format!("Seek failed: {}", e)))?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn metadata(&self) -> &VideoMetadata {
@@ -606,49 +591,55 @@ impl AndroidVideoDecoder {
     /// Sets the muted state for audio playback.
     pub fn set_muted(&self, muted: bool) -> Result<(), VideoError> {
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to attach JNI thread: {}", e)))?;
+        with_jni(&vm, |env| {
+            env.call_method(
+                &self.bridge,
+                jni_str!("setMuted"),
+                jni_sig!("(Z)V"),
+                &[JValue::Bool(muted)],
+            )
+            .map_err(|e| VideoError::DecodeFailed(format!("setMuted failed: {}", e)))?;
 
-        env.call_method(
-            &self.bridge,
-            "setMuted",
-            "(Z)V",
-            &[JValue::Bool(muted as u8)],
-        )
-        .map_err(|e| VideoError::DecodeFailed(format!("setMuted failed: {}", e)))?;
-
-        tracing::debug!("Set muted: {}", muted);
-        Ok(())
+            tracing::debug!("Set muted: {}", muted);
+            Ok(())
+        })
     }
 
     /// Sets the volume for audio playback.
     pub fn set_volume(&self, volume: f32) -> Result<(), VideoError> {
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to attach JNI thread: {}", e)))?;
-
-        env.call_method(&self.bridge, "setVolume", "(F)V", &[JValue::Float(volume)])
+        with_jni(&vm, |env| {
+            env.call_method(
+                &self.bridge,
+                jni_str!("setVolume"),
+                jni_sig!("(F)V"),
+                &[JValue::Float(volume)],
+            )
             .map_err(|e| VideoError::DecodeFailed(format!("setVolume failed: {}", e)))?;
 
-        tracing::debug!("Set volume: {}", volume);
-        Ok(())
+            tracing::debug!("Set volume: {}", volume);
+            Ok(())
+        })
     }
 
     /// Gets the current playback position.
     pub fn get_position(&self) -> Result<Duration, VideoError> {
         let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| VideoError::DecodeFailed(format!("Failed to attach JNI thread: {}", e)))?;
+        with_jni(&vm, |env| {
+            let result = env
+                .call_method(
+                    &self.bridge,
+                    jni_str!("getCurrentPosition"),
+                    jni_sig!("()J"),
+                    &[],
+                )
+                .map_err(|e| {
+                    VideoError::DecodeFailed(format!("getCurrentPosition failed: {}", e))
+                })?;
 
-        let result = env
-            .call_method(&self.bridge, "getCurrentPosition", "()J", &[])
-            .map_err(|e| VideoError::DecodeFailed(format!("getCurrentPosition failed: {}", e)))?;
-
-        let position_ms = result.j().unwrap_or(0);
-        Ok(Duration::from_millis(position_ms as u64))
+            let position_ms = result.j().unwrap_or(0);
+            Ok(Duration::from_millis(position_ms as u64))
+        })
     }
 
     /// Gets the video duration.
@@ -662,22 +653,14 @@ impl AndroidVideoDecoder {
 
         // Fall back to querying ExoPlayer directly
         let vm = get_jvm().ok()?;
-        let mut env = match vm.attach_current_thread() {
-            Ok(env) => env,
-            Err(_) => return None,
-        };
-
-        let result = match env.call_method(&self.bridge, "getDuration", "()J", &[]) {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
-
-        let duration_ms = result.j().unwrap_or(0);
-        if duration_ms > 0 {
-            Some(Duration::from_millis(duration_ms as u64))
-        } else {
-            None
-        }
+        vm.attach_current_thread(|env| -> jni::errors::Result<Option<Duration>> {
+            let duration_ms = env
+                .call_method(&self.bridge, jni_str!("getDuration"), jni_sig!("()J"), &[])?
+                .j()?;
+            Ok((duration_ms > 0).then(|| Duration::from_millis(duration_ms as u64)))
+        })
+        .ok()
+        .flatten()
     }
 
     /// Returns true if AHardwareBuffer zero-copy is available (Android API 29+).
@@ -1107,16 +1090,17 @@ pub fn generate_player_id() -> u64 {
 /// Used for zero-copy rendering via Vulkan external memory.
 pub(crate) struct AndroidImageOwner {
     vm: JavaVM,
-    image: GlobalRef,
+    image: Global<JObject<'static>>,
 }
 
 impl Drop for AndroidImageOwner {
     fn drop(&mut self) {
         // GPU consumers retain this owner until their completion callback.
-        if let Ok(mut env) = self.vm.attach_current_thread() {
-            if let Err(error) = env.call_method(&self.image, "close", "()V", &[]) {
-                tracing::error!("Failed to release completed Android Image: {error}");
-            }
+        if let Err(error) = self.vm.attach_current_thread(|env| {
+            env.call_method(&self.image, jni_str!("close"), jni_sig!("()V"), &[])
+                .map(|_| ())
+        }) {
+            tracing::error!("Failed to release completed Android Image: {error}");
         }
     }
 }
@@ -1157,7 +1141,7 @@ impl AndroidVideoFrame {
 // - The raw AHardwareBuffer pointer is an opaque handle that Android guarantees
 //   is safe to use from any thread (per NDK documentation).
 // - AHardwareBuffer_release() is explicitly documented as thread-safe.
-// - Copied metadata and JNI GlobalRef/JavaVM are Send + Sync. The acquired
+// - Copied metadata and JNI Global<JObject<'static>>/JavaVM are Send + Sync. The acquired
 //   Image is retained exclusively for lifetime management until this frame drops.
 // - The pointer is not mutated after creation; only Drop reads it.
 unsafe impl Send for AndroidVideoFrame {}
@@ -1297,7 +1281,7 @@ pub fn release_player_queue(player_id: u64) {
 /// IDs start from 1; 0 is reserved for legacy shared queue fallback.
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeGeneratePlayerId(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
 ) -> jlong {
     generate_player_id() as jlong
@@ -1314,7 +1298,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeGeneratePlay
 /// - `player_id`: The player ID returned by nativeGeneratePlayerId
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeReleasePlayer(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     player_id: jlong,
 ) {
@@ -1335,7 +1319,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeReleasePlaye
 /// Future work: Implement proper thread-local NDK ImageReader management.
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnVideoSizeChanged(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     native_handle: jlong,
     width: jint,
@@ -1367,7 +1351,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnVideoSizeC
 /// Maps to ExoPlayer's Player.STATE_* constants (1=IDLE, 2=BUFFERING, 3=READY, 4=ENDED).
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnPlaybackStateChanged(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     native_handle: jlong,
     state_value: jint,
@@ -1388,21 +1372,24 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnPlaybackSt
 /// Called by ExoPlayerBridge when ExoPlayer encounters a playback error.
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnError(
-    mut env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     native_handle: jlong,
     error_message: jni::objects::JString,
 ) {
-    let error: String = env
-        .get_string(&error_message)
-        .map(|s| s.into())
-        .unwrap_or_else(|_| "Unknown error".to_string());
+    env.with_env(|env| -> jni::errors::Result<_> {
+        let error: String = error_message
+            .try_to_string(env)
+            .unwrap_or_else(|_| "Unknown error".to_string());
 
-    tracing::error!("nativeOnError: handle={}, error={}", native_handle, error);
-    if let Some(state) = get_native_state(native_handle) {
-        let mut state = state.lock();
-        state.last_error = Some(error);
-    }
+        tracing::error!("nativeOnError: handle={}, error={}", native_handle, error);
+        if let Some(state) = get_native_state(native_handle) {
+            let mut state = state.lock();
+            state.last_error = Some(error);
+        }
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// JNI entry point for duration change notification.
@@ -1410,7 +1397,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnError(
 /// Called by ExoPlayerBridge when the video duration becomes known.
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnDurationChanged(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _this: JObject,
     native_handle: jlong,
     duration_ms: jlong,
@@ -1430,7 +1417,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnDurationCh
 /// producer fence. AHardwareBuffer references alone do not prevent pool reuse.
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitImageFrame(
-    env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     image: JObject,
     buffer: JObject,
@@ -1439,21 +1426,23 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitImageF
     height: jint,
     player_id: jlong,
 ) -> jboolean {
-    let (Ok(vm), Ok(image)) = (env.get_java_vm(), env.new_global_ref(image)) else {
-        return 0;
-    };
-    submit_hardware_buffer(
-        env,
-        buffer,
-        timestamp_ns,
-        width,
-        height,
-        player_id,
-        -1,
-        Some(AndroidImageOwner { vm, image }),
-    );
-    // Rust owns Image.close from this point, including any rejected-frame drop.
-    1
+    env.with_env(|env| -> jni::errors::Result<_> {
+        let vm = env.get_java_vm()?;
+        let image = env.new_global_ref(image)?;
+        submit_hardware_buffer(
+            env.get_raw().cast(),
+            buffer,
+            timestamp_ns,
+            width,
+            height,
+            player_id,
+            -1,
+            Some(AndroidImageOwner { vm, image }),
+        );
+        // Rust owns Image.close from this point, including any rejected-frame drop.
+        Ok(true)
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// Snapshots a YUV_420_888 Image on the bridge's dedicated handler thread.
@@ -1461,7 +1450,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitImageF
 /// escape to the renderer. This is the explicit system-memory playback path.
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitCpuFrame(
-    env: JNIEnv,
+    mut env: EnvUnowned,
     _this: JObject,
     y: JByteBuffer,
     y_row: jint,
@@ -1477,71 +1466,75 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitCpuFra
     height: jint,
     player_id: jlong,
 ) -> jboolean {
-    let snapshot = || -> Result<VideoFrame, VideoError> {
-        if width <= 0 || height <= 0 || timestamp_ns < 0 || player_id <= 0 {
-            return Err(VideoError::DecodeFailed(
-                "invalid Android frame metadata".into(),
-            ));
-        }
-        let width = width as usize;
-        let height = height as usize;
-        let copy = |buffer: &JByteBuffer, row: jint, pixel: jint, w, h| {
-            let invalid = || VideoError::DecodeFailed("invalid Android direct image buffer".into());
-            let row = usize::try_from(row).map_err(|_| invalid())?;
-            let pixel = usize::try_from(pixel).map_err(|_| invalid())?;
-            let address = env
-                .get_direct_buffer_address(buffer)
-                .map_err(|_| invalid())?;
-            let length = env
-                .get_direct_buffer_capacity(buffer)
-                .map_err(|_| invalid())?;
-            if address.is_null() || length > isize::MAX as usize {
-                return Err(invalid());
+    env.with_env(|env| -> jni::errors::Result<_> {
+        let snapshot = || -> Result<VideoFrame, VideoError> {
+            if width <= 0 || height <= 0 || timestamp_ns < 0 || player_id <= 0 {
+                return Err(VideoError::DecodeFailed(
+                    "invalid Android frame metadata".into(),
+                ));
             }
-            // SAFETY: Kotlin passes sliced direct Image.Plane buffers and keeps
-            // the acquired Image alive until this synchronous call returns. JNI
-            // supplies the buffer's allocation and capacity; we only read it.
-            let bytes = unsafe { std::slice::from_raw_parts(address, length) };
-            crate::video::copy_strided_plane(bytes, w, h, row, pixel)
+            let width = width as usize;
+            let height = height as usize;
+            let copy = |buffer: &JByteBuffer, row: jint, pixel: jint, w, h| {
+                let invalid =
+                    || VideoError::DecodeFailed("invalid Android direct image buffer".into());
+                let row = usize::try_from(row).map_err(|_| invalid())?;
+                let pixel = usize::try_from(pixel).map_err(|_| invalid())?;
+                let address = env
+                    .get_direct_buffer_address(buffer)
+                    .map_err(|_| invalid())?;
+                let length = env
+                    .get_direct_buffer_capacity(buffer)
+                    .map_err(|_| invalid())?;
+                if address.is_null() || length > isize::MAX as usize {
+                    return Err(invalid());
+                }
+                // SAFETY: Kotlin passes sliced direct Image.Plane buffers and keeps
+                // the acquired Image alive until this synchronous call returns. JNI
+                // supplies the buffer's allocation and capacity; we only read it.
+                let bytes = unsafe { std::slice::from_raw_parts(address, length) };
+                crate::video::copy_strided_plane(bytes, w, h, row, pixel)
+            };
+            let planes = vec![
+                copy(&y, y_row, y_pixel, width, height)?,
+                copy(&u, u_row, u_pixel, width.div_ceil(2), height.div_ceil(2))?,
+                copy(&v, v_row, v_pixel, width.div_ceil(2), height.div_ceil(2))?,
+            ];
+            Ok(VideoFrame::new(
+                Duration::from_nanos(timestamp_ns as u64),
+                DecodedFrame::Cpu(CpuFrame::new(
+                    PixelFormat::Yuv420p,
+                    width as u32,
+                    height as u32,
+                    planes,
+                )),
+            ))
         };
-        let planes = vec![
-            copy(&y, y_row, y_pixel, width, height)?,
-            copy(&u, u_row, u_pixel, width.div_ceil(2), height.div_ceil(2))?,
-            copy(&v, v_row, v_pixel, width.div_ceil(2), height.div_ceil(2))?,
-        ];
-        Ok(VideoFrame::new(
-            Duration::from_nanos(timestamp_ns as u64),
-            DecodedFrame::Cpu(CpuFrame::new(
-                PixelFormat::Yuv420p,
-                width as u32,
-                height as u32,
-                planes,
-            )),
-        ))
-    };
-    match snapshot() {
-        Ok(frame) => {
-            init_player_queues();
-            if let Some(queues) = PLAYER_QUEUES.get() {
-                let mut queues = queues.write();
-                let state = queues
-                    .entry(player_id as u64)
-                    .or_insert_with(|| PlayerState {
-                        queue: VecDeque::new(),
-                        cpu_frame: None,
-                        cpu_fallback_requested: false,
-                        stats: PerPlayerStats::new(),
-                    });
-                state.cpu_frame = Some(frame);
-                return 1;
+        match snapshot() {
+            Ok(frame) => {
+                init_player_queues();
+                if let Some(queues) = PLAYER_QUEUES.get() {
+                    let mut queues = queues.write();
+                    let state = queues
+                        .entry(player_id as u64)
+                        .or_insert_with(|| PlayerState {
+                            queue: VecDeque::new(),
+                            cpu_frame: None,
+                            cpu_fallback_requested: false,
+                            stats: PerPlayerStats::new(),
+                        });
+                    state.cpu_frame = Some(frame);
+                    return Ok(true);
+                }
+                Ok(false)
             }
-            0
+            Err(error) => {
+                tracing::error!("Android CPU snapshot failed: {error}");
+                Ok(false)
+            }
         }
-        Err(error) => {
-            tracing::error!("Android CPU snapshot failed: {error}");
-            0
-        }
-    }
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// JNI entry point for HardwareBuffer submission from Kotlin.
@@ -1558,7 +1551,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitCpuFra
 /// - `fence_fd` is the sync fence from the producer (-1 if none/already signaled)
 #[no_mangle]
 pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwareBuffer(
-    env: JNIEnv,
+    env: EnvUnowned,
     _this: JObject,
     buffer: JObject,
     timestamp_ns: jlong,
@@ -1568,7 +1561,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
     fence_fd: jint,
 ) {
     submit_hardware_buffer(
-        env,
+        env.as_raw().cast(),
         buffer,
         timestamp_ns,
         width,
@@ -1581,7 +1574,7 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
 
 #[allow(clippy::too_many_arguments)]
 fn submit_hardware_buffer(
-    env: JNIEnv,
+    env: *mut std::ffi::c_void,
     buffer: JObject,
     timestamp_ns: jlong,
     width: jint,
@@ -1622,7 +1615,7 @@ fn submit_hardware_buffer(
     // SAFETY: JNI returned this AHardwareBuffer pointer for the live Java
     // buffer; the pointer is checked for null before any further use.
     let ahb = unsafe {
-        let env_ptr = env.get_raw() as *mut std::ffi::c_void;
+        let env_ptr = env;
         let buffer_ptr = buffer.as_raw() as *mut std::ffi::c_void;
         AHardwareBuffer_fromHardwareBuffer(env_ptr, buffer_ptr)
     };

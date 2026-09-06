@@ -30,22 +30,10 @@ tokio = { workspace = true }
 # MoQ (Media over QUIC) transport and Nostr discovery.
 async-channel = { version = "2.0", optional = true }
 bytes = { version = "1.5", optional = true }
-hang = {
-  git = "https://github.com/kixelated/moq",
-  rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca",
-  optional = true,
-}
-moq-lite = {
-  git = "https://github.com/kixelated/moq",
-  rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca",
-  optional = true,
-}
-moq-native = {
-  git = "https://github.com/kixelated/moq",
-  rev = "baabd55c7a8dd6c85d6e1e329a776208bd1107ca",
-  optional = true,
-}
-nostr-sdk = { version = "0.37", optional = true }
+hang = { version = "=0.20.10", optional = true }
+moq-net = { version = "=0.2.18", optional = true }
+moq-native = { version = "=0.19.16", optional = true }
+nostr-sdk = { version = "0.45.2", optional = true }
 quinn = { version = "0.11", optional = true }
 
 # Android native decoder + zero-copy
@@ -66,7 +54,6 @@ webpki-roots = { workspace = true }
 [target.'cfg(target_os = "ios")'.dependencies]
 block2 = { workspace = true }
 dispatch2 = "0.3"
-metal = { workspace = true }
 objc2 = { workspace = true }
 objc2-av-foundation = { workspace = true }
 objc2-core-foundation = {
@@ -84,10 +71,10 @@ profiling = { version = "1.0" }
 ash = { version = "0.38" }
 gio = { workspace = true }
 drm-fourcc = { version = "2.2" }
-gstreamer = { version = "0.24" }
-gstreamer-allocators = { version = "0.24" }
-gstreamer-app = { version = "0.24", features = ["v1_24"] }
-gstreamer-video = { version = "0.24", features = ["v1_24"] }
+gstreamer = { version = "0.25.3" }
+gstreamer-allocators = { version = "0.25" }
+gstreamer-app = { version = "0.25.2", features = ["v1_24"] }
+gstreamer-video = { version = "0.25", features = ["v1_24"] }
 libc = { version = "0.2" }
 opus = { workspace = true }
 symphonia-codec-aac = { workspace = true }
@@ -98,7 +85,7 @@ symphonia-core = { workspace = true }
 block2 = { workspace = true }
 cpal = { workspace = true }
 ffmpeg-next = { workspace = true }
-metal = { workspace = true }
+objc2-metal = { workspace = true }
 objc2 = { workspace = true }
 objc2-av-foundation = { workspace = true }
 objc2-core-foundation = {
@@ -118,13 +105,13 @@ symphonia-core = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 profiling = { version = "1.0", optional = true }
 rodio = {
-  version = "0.21",
+  version = "0.22.2",
   default-features = false,
   features = ["playback", "symphonia-all"],
   optional = true
 }
 windows = {
-  version = "0.58",
+  version = "0.62.2",
   features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -151,7 +138,7 @@ moq = [
   "async-channel",
   "bytes",
   "hang",
-  "moq-lite",
+  "moq-net",
   "moq-native",
   "nostr-sdk",
   "quinn",
