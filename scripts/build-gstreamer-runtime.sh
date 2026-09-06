@@ -665,6 +665,11 @@ export GIO_USE_TLS=openssl
 # honors these variables while retaining normal certificate validation.
 export SSL_CERT_FILE="$runtime_root/etc/ssl/certs/ca-certificates.crt"
 export SSL_CERT_DIR="$runtime_root/etc/ssl/certs"
+if [[ -f "$runtime_root/share/lumina/fonts.conf" ]]; then
+    export FONTCONFIG_FILE="$runtime_root/share/lumina/fonts.conf"
+    export XKB_CONFIG_ROOT="$runtime_root/share/X11/xkb"
+    export XLOCALEDIR="$runtime_root/share/X11/locale"
+fi
 
 (($#)) || fail 'usage: lumina-gstreamer-runtime COMMAND [ARGUMENT ...]'
 exec "$@"
@@ -720,6 +725,29 @@ APP_LAUNCHER
     chmod 0755 "$bundle/lumina-video-demo"
 fi
 
+dynamic_libraries=(--require-library libvulkan.so.1)
+probe_desktop_flags=()
+if $build_demo; then
+    # GPUI's Wayland and XCB bindings use dlopen, unlike xkbcommon/fontconfig.
+    dynamic_libraries+=(--require-library libwayland-client.so.0 --require-library libxcb.so.1)
+    probe_desktop_flags=(-DLUMINA_DESKTOP -lfontconfig -lxkbcommon)
+    mkdir -p "$runtime_root/share/lumina/fonts" "$runtime_root/share/X11"
+    cp "$repo_root/crates/lumina-video-demo/assets/GoNotoKurrent-Regular.ttf" "$runtime_root/share/lumina/fonts/"
+    for data in xkb locale; do
+        [[ -d "/usr/share/X11/$data" ]] || fail "builder X11 data missing: $data"
+        cp -aL "/usr/share/X11/$data" "$runtime_root/share/X11/"
+    done
+    cat >"$runtime_root/share/lumina/fonts.conf" <<'FONTCONFIG'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
+  <dir prefix="relative">fonts</dir>
+  <cachedir prefix="xdg">fontconfig</cachedir>
+</fontconfig>
+FONTCONFIG
+fi
+
 # Upstream Linux packages expect these dynamically loaded GIO plugins from
 # the system. A private runtime must carry the modules from its own GLib build.
 sdk_prefix="$cerbero_dir/build/dist/linux_x86_64"
@@ -735,13 +763,14 @@ cp /etc/ssl/certs/ca-certificates.crt "$runtime_root/etc/ssl/certs/"
 # Exercise dlopen and GIO extension discovery in the clean smoke container;
 # this does not require a display, Vulkan device, network, or media packages.
 "${cerbero[@]}" run cc "$script_dir/runtime-load-probe.c" \
-    -I"$sdk_prefix/include/glib-2.0" -I"$sdk_libdir/glib-2.0/include" \
+    -I"$sdk_prefix/include" -I"$sdk_prefix/include/glib-2.0" -I"$sdk_libdir/glib-2.0/include" \
     -L"$sdk_libdir" -lgio-2.0 -lgobject-2.0 -lglib-2.0 -ldl \
+    "${probe_desktop_flags[@]}" \
     -o "$runtime_root/bin/lumina-runtime-probe"
 
 python3 "$script_dir/collect-runtime-libraries.py" \
     --bundle "$bundle" --prefix "$sdk_prefix" \
-    --require-library libvulkan.so.1 \
+    "${dynamic_libraries[@]}" \
     --libdir "$runtime_root/$archive_runtime_libdir" \
     --manifest "$runtime_root/elf-dependencies.json"
 assert_symlink_tree "$runtime_root"
