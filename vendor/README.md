@@ -36,8 +36,12 @@ archives use Debian's native `lib/x86_64-linux-gnu` directory, and the
 standalone runtime preserves the entire native `lib/` tree. The
 `lib/x86_64-linux-gnu` and `lib/python3.12` directories remain siblings, so
 Python purelib stays at `lib/python3.12/site-packages`; no path components are
-stripped, and `/opt` roots are rejected. These package-specific allowlists are
-the #18 bootstrap boundary, not the recursive closure audit planned for #19.
+stripped, and `/opt` roots are rejected. After assembling these packages and
+the optional demo, the build recursively resolves every ELF `DT_NEEDED` entry
+from the same Cerbero SDK and Ubuntu builder. Added libraries and their hashes
+are recorded in `elf-dependencies.json`. glibc and hardware-specific GPU drivers
+remain host-owned; generic graphics loaders are bundled. Missing dependencies
+fail the build.
 
 Cerbero 1.28.6 routes one required dependency, zlib 1.3.1, through its
 recipe URL rather than the GStreamer mirror. Discovery reads that exact pinned
@@ -113,8 +117,8 @@ packages that require an unavailable distribution GStreamer version.
 
 The checked-in Flatpak/AUR templates are not used by this release workflow.
 
-Before claiming production artifacts, #19 still requires the complete playback
-and audio plugin/shared-library closure, GPL/ugly exclusion, component versions
+Before claiming production artifacts, #19 still requires validation of dynamically
+loaded playback and audio components, GPL/ugly exclusion, component versions
 and checksums with licenses, full license texts and corresponding source/patch
 archives, plus isolated standalone and Flatpak playback of the MP4, Matroska,
 HLS VOD/live, audio and track fixtures. The #18 MP4 smoke and its driver regression

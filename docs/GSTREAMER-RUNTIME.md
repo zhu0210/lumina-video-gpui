@@ -43,8 +43,14 @@ that launcher as their entrypoint: it establishes exact private
 unversioned plugin variables, and a writable registry/cache outside the bundle.
 The Rust vendored-runtime seam validates this contract and reports
 `DecoderInit` when it is absent or mismatched; it does not mutate process-wide
-environment state. Final Lumina executable packaging/integration is deferred
-to issue #19.
+environment state. Release workflows build the Lumina demo against the same
+SDK and include its executable and launcher in the standalone archive.
+
+The build also scans all bundled ELF files, recursively copies missing
+`DT_NEEDED` libraries from the Cerbero SDK or Ubuntu builder, and records their
+origins and hashes in `elf-dependencies.json`. glibc and hardware-specific GPU
+drivers remain host-owned. Unresolved dependencies fail packaging; dynamically
+loaded components still require playback coverage.
 
 The lock fixes the source archives, Cerbero revision, OCI image, package set,
 variants, and required components. Those locked inputs make the build

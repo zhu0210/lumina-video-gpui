@@ -3430,6 +3430,9 @@ mod tests {
                 && observation.is_live_known
                 && observation.is_live
                 && observation.seekability_known
+                // The decoder may deliver a frame before the fixture server
+                // records completion of the response that supplied it.
+                && live_control.highest_served_sequence().is_some()
             {
                 break;
             }
