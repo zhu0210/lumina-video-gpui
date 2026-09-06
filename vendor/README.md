@@ -43,6 +43,11 @@ are recorded in `elf-dependencies.json`. glibc and hardware-specific GPU drivers
 remain host-owned; generic graphics loaders are bundled. Missing dependencies
 fail the build.
 
+Vulkan's loader and the GIO TLS/proxy modules are included explicitly because
+they are loaded dynamically. The launcher selects the private GIO modules and
+the builder's bundled CA trust store without disabling certificate validation.
+The isolated smoke also checks Vulkan loading and GIO TLS initialization.
+
 Cerbero 1.28.6 routes one required dependency, zlib 1.3.1, through its
 recipe URL rather than the GStreamer mirror. Discovery reads that exact pinned
 recipe and records its checksum while constructing only the official GStreamer

@@ -302,6 +302,14 @@ download_and_verify "$zlib_url" "$zlib_sha" \
 download_and_verify "$webrtc_url" "$webrtc_sha" \
     "$build_cache_home/cerbero-sources/webrtc-audio-processing-${webrtc_version}/webrtc-audio-processing-${webrtc_version}.tar.gz"
 
+# The WavPack origin has served different bytes for the same release name.
+# Use the official mirror, still checked against the locked Cerbero recipe.
+wavpack_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/wavpack.recipe")
+wavpack_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/wavpack.recipe")
+[[ "$wavpack_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$wavpack_sha" =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid locked WavPack recipe"
+download_and_verify "https://gstreamer.freedesktop.org/src/mirror/wavpack/wavpack-${wavpack_version}.tar.xz" \
+    "$wavpack_sha" "$build_cache_home/cerbero-sources/wavpack-${wavpack_version}/wavpack-${wavpack_version}.tar.xz"
+
 cerbero=(env HOME="$build_home" XDG_CACHE_HOME="$build_cache_home" "$cerbero_dir/cerbero-uninstalled" --non-interactive -c "$cerbero_dir/config/linux.config" -v norust)
 "${cerbero[@]}" fetch-bootstrap --system=no --toolchains=no --build-tools=yes --jobs=2
 for package in "${packages[@]}"; do
@@ -650,6 +658,13 @@ export GST_PLUGIN_SCANNER=
 export GST_REGISTRY_1_0="$registry_path"
 export GST_REGISTRY=
 export GST_REGISTRY_REUSE_PLUGIN_SCANNER=no
+export GIO_MODULE_DIR="$lib_dir/gio/modules"
+export GIO_EXTRA_MODULES=
+export GIO_USE_TLS=openssl
+# glib-networking's OpenSSL backend uses X509_STORE_set_default_paths, which
+# honors these variables while retaining normal certificate validation.
+export SSL_CERT_FILE="$runtime_root/etc/ssl/certs/ca-certificates.crt"
+export SSL_CERT_DIR="$runtime_root/etc/ssl/certs"
 
 (($#)) || fail 'usage: lumina-gstreamer-runtime COMMAND [ARGUMENT ...]'
 exec "$@"
@@ -689,6 +704,7 @@ if $build_demo; then
     build_cargo=$(command -v cargo) || fail "cargo is required for --build-demo"
     build_target_dir="$repo_root/target/bundled-linux"
     "${cerbero[@]}" run env CARGO_HOME="$build_cargo_home" RUSTUP_HOME="$build_rustup_home" \
+        PKG_CONFIG_LIBDIR=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
         CARGO_TARGET_DIR="$build_target_dir" "$build_cargo" build \
         --manifest-path "$repo_root/Cargo.toml" --release --locked \
         --package lumina-video-demo --features vendored-runtime
@@ -704,8 +720,28 @@ APP_LAUNCHER
     chmod 0755 "$bundle/lumina-video-demo"
 fi
 
+# Upstream Linux packages expect these dynamically loaded GIO plugins from
+# the system. A private runtime must carry the modules from its own GLib build.
+sdk_prefix="$cerbero_dir/build/dist/linux_x86_64"
+sdk_libdir="$sdk_prefix/$archive_source_libdir"
+mkdir -p "$runtime_root/$archive_runtime_libdir/gio/modules" "$runtime_root/etc/ssl/certs"
+for module in libgioopenssl.so libgiolibproxy.so; do
+    [[ -f "$sdk_libdir/gio/modules/$module" ]] || fail "GIO module missing from SDK: $module"
+    cp -L "$sdk_libdir/gio/modules/$module" "$runtime_root/$archive_runtime_libdir/gio/modules/"
+done
+[[ -s /etc/ssl/certs/ca-certificates.crt ]] || fail "builder CA trust store missing"
+cp /etc/ssl/certs/ca-certificates.crt "$runtime_root/etc/ssl/certs/"
+
+# Exercise dlopen and GIO extension discovery in the clean smoke container;
+# this does not require a display, Vulkan device, network, or media packages.
+"${cerbero[@]}" run cc "$script_dir/runtime-load-probe.c" \
+    -I"$sdk_prefix/include/glib-2.0" -I"$sdk_libdir/glib-2.0/include" \
+    -L"$sdk_libdir" -lgio-2.0 -lgobject-2.0 -lglib-2.0 -ldl \
+    -o "$runtime_root/bin/lumina-runtime-probe"
+
 python3 "$script_dir/collect-runtime-libraries.py" \
-    --bundle "$bundle" --prefix "$cerbero_dir/build/dist/linux_x86_64" \
+    --bundle "$bundle" --prefix "$sdk_prefix" \
+    --require-library libvulkan.so.1 \
     --libdir "$runtime_root/$archive_runtime_libdir" \
     --manifest "$runtime_root/elf-dependencies.json"
 assert_symlink_tree "$runtime_root"

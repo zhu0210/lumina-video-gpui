@@ -79,6 +79,7 @@ tar -xzf /input/runtime.tar.gz -C /runtime
 [[ -x "$runtime/bin/gst-launch-1.0" ]] || exit 1
 [[ -d "$plugin_dir" ]] || exit 1
 [[ -x "$scanner" ]] || exit 1
+"$launcher" "$runtime/bin/lumina-runtime-probe"
 
 contract=$(
     "$launcher" env

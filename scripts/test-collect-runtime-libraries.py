@@ -56,6 +56,13 @@ class ClosureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unresolved DT_NEEDED.*libmissing"):
             collector.collect(self.bundle, self.prefix, self.libdir, [])
 
+    def test_explicit_dlopen_library_includes_its_dependencies(self):
+        leaf = self.library(self.system, "libleaf.so.1", "int leaf(void) { return 1; }")
+        self.library(self.system, "libvulkan.so.1", "int leaf(void); int loader(void) { return leaf(); }", [leaf])
+        result = collector.collect(self.bundle, self.prefix, self.libdir,
+                                   [self.system], ["libvulkan.so.1"])
+        self.assertEqual(set(result["copied"]), {"libvulkan.so.1", "libleaf.so.1"})
+
     def test_host_boundaries_do_not_exclude_generic_graphics_loaders(self):
         for name in ("libc.so.6", "libpthread.so.0", "ld-linux-x86-64.so.2"):
             self.assertTrue(collector.GLIBC.fullmatch(name))

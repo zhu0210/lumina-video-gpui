@@ -39,7 +39,7 @@ def library_index(roots):
     return result
 
 
-def collect(bundle, prefix, libdir, system_roots):
+def collect(bundle, prefix, libdir, system_roots, required_libraries=()):
     bundle, prefix, libdir = bundle.resolve(), prefix.resolve(), libdir.resolve()
     if not libdir.is_relative_to(bundle):
         raise ValueError("runtime library directory must be inside the bundle")
@@ -48,6 +48,31 @@ def collect(bundle, prefix, libdir, system_roots):
     system_libraries = library_index(system_roots)
     queue = [path for path in sorted(bundle.rglob("*")) if not path.is_symlink() and is_elf(path)]
     visited, copied, external = set(), {}, {}
+    def require(name, requiring):
+        if Path(name).name != name or name in (".", ".."):
+            raise ValueError(f"non-portable DT_NEEDED {name!r} in {requiring}")
+        reason = "host-glibc" if GLIBC.fullmatch(name) else "host-gpu-driver" if DRIVER.fullmatch(name) else None
+        if reason:
+            external[name] = reason
+            return
+        destination = libdir / name
+        if not destination.is_file():
+            source = prefix_libraries.get(name) or system_libraries.get(name)
+            if source is None or not is_elf(source):
+                raise ValueError(f"unresolved DT_NEEDED {name!r} required by {requiring}")
+            # Copy the actual file under its SONAME, without builder symlinks.
+            shutil.copy2(source.resolve(), destination)
+            copied[name] = {
+                "origin": "cerbero" if source.is_relative_to(prefix) else "builder",
+                "source": str(source.relative_to(prefix)) if source.is_relative_to(prefix) else str(source),
+                "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            }
+        queue.append(destination)
+
+    # Some normal application dependencies (e.g. Vulkan) are loaded with dlopen
+    # and therefore cannot be discovered by inspecting DT_NEEDED alone.
+    for name in required_libraries:
+        require(name, "explicit dynamic dependency")
     while queue:
         binary = queue.pop()
         identity = binary.resolve()
@@ -55,28 +80,7 @@ def collect(bundle, prefix, libdir, system_roots):
             continue
         visited.add(identity)
         for name in needed(binary):
-            if Path(name).name != name or name in (".", ".."):
-                raise ValueError(f"non-portable DT_NEEDED {name!r} in {binary}")
-            reason = "host-glibc" if GLIBC.fullmatch(name) else "host-gpu-driver" if DRIVER.fullmatch(name) else None
-            if reason:
-                external[name] = reason
-                continue
-            destination = libdir / name
-            if destination.is_file():
-                queue.append(destination)
-                continue
-            source = prefix_libraries.get(name) or system_libraries.get(name)
-            if source is None or not is_elf(source):
-                raise ValueError(f"unresolved DT_NEEDED {name!r} required by {binary.relative_to(bundle)}")
-            # Dereference source symlinks under the requested SONAME: the copied
-            # file is self-contained and cannot retain an absolute builder link.
-            shutil.copy2(source.resolve(), destination)
-            copied[name] = {
-                "origin": "cerbero" if source.is_relative_to(prefix) else "builder",
-                "source": str(source.relative_to(prefix)) if source.is_relative_to(prefix) else str(source),
-                "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
-            }
-            queue.append(destination)
+            require(name, binary.relative_to(bundle))
     manifest = {"copied": dict(sorted(copied.items())), "host_requirements": dict(sorted(external.items()))}
     return manifest
 
@@ -87,12 +91,14 @@ def main():
     parser.add_argument("--prefix", required=True, type=Path)
     parser.add_argument("--libdir", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--require-library", action="append", default=[])
     args = parser.parse_args()
     # This runs only in the already verified Ubuntu x86_64 builder. Include
     # private directories such as pulseaudio/ for transitive SONAMEs absent
-    # from ldconfig's public cache. No file is copied unless DT_NEEDED names it.
+    # from ldconfig's public cache. Only needed or explicitly requested libraries
+    # are copied.
     manifest = collect(args.bundle, args.prefix, args.libdir,
-                       [Path("/usr/lib/x86_64-linux-gnu"), Path("/lib/x86_64-linux-gnu"), Path("/usr/lib")])
+                       [Path("/usr/lib/x86_64-linux-gnu"), Path("/lib/x86_64-linux-gnu"), Path("/usr/lib")], args.require_library)
     args.manifest.write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Completed ELF closure: {len(manifest['copied'])} libraries copied")
 

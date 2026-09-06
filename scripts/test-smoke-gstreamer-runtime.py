@@ -16,6 +16,7 @@ import subprocess, sys
 assert '-i' in sys.argv or '--interactive' in sys.argv, 'container stdin is closed'
 script = sys.stdin.read()
 assert 'gst-launch-1.0' in script, 'playback script was not delivered'
+assert 'lumina-runtime-probe' in script, 'dynamic loader and TLS checks are missing'
 subprocess.run(['bash', '-n'], input=script, text=True, check=True)
 # A container failure must propagate through the driver.
 sys.exit(42)
