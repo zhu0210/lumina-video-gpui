@@ -101,7 +101,8 @@ build_target() {
     SDK_PATH="$(xcrun --sdk "$SDK" --show-sdk-path)"
 
     echo "Building $CRATE for $TARGET (SDK: $SDK)..."
-    SDKROOT="$SDK_PATH" cargo build -p "$CRATE" --target "$TARGET" $CARGO_FLAG 2>&1
+    SDKROOT="$SDK_PATH" cargo build --locked --manifest-path "$ROOT_DIR/Cargo.toml" \
+        -p "$CRATE" --target "$TARGET" $CARGO_FLAG 2>&1
 
     local LIB="$ROOT_DIR/target/$TARGET/$PROFILE/lib${CRATE//-/_}.a"
     if [[ ! -f "$LIB" ]]; then
@@ -159,7 +160,7 @@ let state = lumina_player_state(nil)
 lumina_frame_release(nil)
 SWIFT
 
-LINK_FRAMEWORKS="-framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Metal -framework IOSurface -framework QuartzCore -framework Security -framework CoreFoundation -framework SystemConfiguration"
+LINK_FRAMEWORKS="-framework AVFoundation -framework AudioToolbox -framework CoreAudio -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework Metal -framework IOSurface -framework QuartzCore -framework Security -framework CoreFoundation -framework SystemConfiguration"
 
 swift_link_test() {
     local TARGET_TRIPLE="$1"

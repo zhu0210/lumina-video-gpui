@@ -165,7 +165,11 @@ public final class LuminaVideoPlayer: ObservableObject {
     /// Seeks to a position in seconds.
     public func seek(to position: TimeInterval) {
         guard let ptr = playerPtr else { return }
-        lumina_player_seek(ptr, position)
+        if lumina_player_seek(ptr, position) == LUMINA_OK {
+            // End-of-stream pauses polling; a seek must observe the new frame/state
+            // even when the caller does not explicitly resume playback.
+            resumeDisplayLink()
+        }
     }
 
     // MARK: - Audio session

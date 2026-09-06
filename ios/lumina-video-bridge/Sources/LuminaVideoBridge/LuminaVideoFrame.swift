@@ -19,7 +19,8 @@ public final class LuminaVideoFrame: @unchecked Sendable {
     public let height: Int
 
     /// IOSurface for zero-copy Metal rendering.
-    /// ARC-retained — safe to hold beyond this object's lifetime.
+    /// ARC retains the storage, but consumers must retain this complete frame until
+    /// GPU completion to keep the decoder from recycling its buffer-pool lease.
     public let ioSurface: IOSurface?
 
     init(framePtr: OpaquePointer) {

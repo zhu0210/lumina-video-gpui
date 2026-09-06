@@ -7,7 +7,7 @@ import UIKit
 /// UIView backed by CAMetalLayer that renders IOSurface frames via Metal.
 ///
 /// Zero-copy path: IOSurface → MTLTexture (no CPU readback).
-/// Falls back to a "No IOSurface" label on simulator if CPU-only decode returns nil.
+/// Frames without an IOSurface cannot be rendered by this view.
 final class MetalVideoUIView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
 
@@ -16,6 +16,9 @@ final class MetalVideoUIView: UIView {
     private var commandQueue: MTLCommandQueue?
     private var pipelineState: MTLRenderPipelineState?
     private var sampler: MTLSamplerState?
+
+    /// Reports GPU completion for the harness playback regression.
+    var onFrameCompleted: ((MTLCommandBufferStatus) -> Void)?
 
     // Cached descriptor — reused when frame dimensions haven't changed
     private var cachedTexDesc: MTLTextureDescriptor?
@@ -128,6 +131,14 @@ final class MetalVideoUIView: UIView {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
 
+        // Retaining the texture alone does not retain the decoder's buffer-pool lease.
+        // Keep the complete frame alive until the GPU has finished reading it.
+        let completion = onFrameCompleted
+        commandBuffer.addCompletedHandler { [frame] buffer in
+            withExtendedLifetime(frame) {}
+            let status = buffer.status
+            DispatchQueue.main.async { completion?(status) }
+        }
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }

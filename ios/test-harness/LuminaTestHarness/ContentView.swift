@@ -15,6 +15,7 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            guard ProcessInfo.processInfo.environment["LUMINA_HARNESS_TESTING"] != "1" else { return }
             viewModel.load(url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8")
         }
         .statusBarHidden(isFullscreen)
@@ -501,7 +502,7 @@ extension VideoViewModel: LuminaVideoPlayerDelegate {
             }
 
             // Render path: zero-copy if IOSurface present
-            self.renderPath = frame.ioSurface != nil ? "Zero-copy (IOSurface)" : "CPU fallback"
+            self.renderPath = frame.ioSurface != nil ? "Zero-copy (IOSurface)" : "Unsupported frame (no IOSurface)"
 
             // FPS + A/V sync
             self.recordFrameArrival()

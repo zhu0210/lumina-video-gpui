@@ -1,0 +1,96 @@
+name: iOS application and playback
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/ios.yml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - include/**
+      - ios/**
+      - scripts/build-ios.sh
+      - fixtures/generate.sh
+  pull_request:
+    paths:
+      - .github/workflows/ios.yml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - include/**
+      - ios/**
+      - scripts/build-ios.sh
+      - fixtures/generate.sh
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  application:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ios-application
+      - name: Install fixture and project tools
+        run: brew install ffmpeg xcodegen
+      - name: Generate local playback fixture
+        run: ./fixtures/generate.sh
+      - name: Build native libraries and verify Swift linkage
+        run: ./scripts/build-ios.sh
+      - name: Check GPUI video on both iOS targets
+        run: |
+          unset SDKROOT
+          cargo check --locked -p lumina-video-gpui --target aarch64-apple-ios
+          cargo check --locked -p lumina-video-gpui --target aarch64-apple-ios-sim
+      - name: Generate test application
+        working-directory: ios/test-harness
+        run: xcodegen generate
+      - name: Test playback on an available iPhone simulator
+        shell: bash
+        run: |
+          simulator_udid=$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(device["udid"] for group in devices.values() for device in group
+                     if device.get("isAvailable") and device["name"].startswith("iPhone")))')
+          xcodebuild -project ios/test-harness/LuminaTestHarness.xcodeproj \
+            -scheme LuminaTestHarness -configuration Debug \
+            -destination "platform=iOS Simulator,id=$simulator_udid" \
+            -derivedDataPath target/ios-harness \
+            -resultBundlePath target/ios-playback.xcresult \
+            CODE_SIGNING_ALLOWED=NO test
+      - name: Build unsigned iPhone application
+        run: |
+          xcodebuild -project ios/test-harness/LuminaTestHarness.xcodeproj \
+            -scheme LuminaTestHarness -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath target/ios-device CODE_SIGNING_ALLOWED=NO build
+      - name: Package device and simulator libraries
+        run: |
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/liblumina_video_ios.a -headers include \
+            -library target/aarch64-apple-ios-sim/release/liblumina_video_ios.a -headers include \
+            -output target/LuminaVideo.xcframework
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: ios-application-and-playback
+          path: |
+            target/LuminaVideo.xcframework
+            target/ios-playback.xcresult
+            target/ios-device/Build/Products/Release-iphoneos/LuminaTestHarness.app
+          if-no-files-found: warn

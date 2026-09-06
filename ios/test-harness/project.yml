@@ -10,6 +10,14 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     SWIFT_STRICT_CONCURRENCY: minimal
+    LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]:
+      - "$(inherited)"
+      - "$(SRCROOT)/../../target/aarch64-apple-ios-sim/release"
+    LIBRARY_SEARCH_PATHS[sdk=iphoneos*]:
+      - "$(inherited)"
+      - "$(SRCROOT)/../../target/aarch64-apple-ios/release"
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+    OTHER_LDFLAGS: ["$(inherited)", "-lz", "-liconv", "-lbz2", "-lc++"]
 
 packages:
   LuminaVideoBridge:
@@ -30,14 +38,27 @@ targets:
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: "YES"
-        LIBRARY_SEARCH_PATHS:
-          - "$(inherited)"
-          - "$(SRCROOT)/../../target/aarch64-apple-ios-sim/release"
-          - "$(SRCROOT)/../../target/aarch64-apple-ios/release"
-        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
-        OTHER_LDFLAGS:
-          - "$(inherited)"
-          - "-lz"
-          - "-liconv"
-          - "-lbz2"
-          - "-lc++"
+  LuminaPlaybackTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - LuminaPlaybackTests
+      - path: ../../fixtures/generated/h264-aac.mp4
+        buildPhase: resources
+    dependencies:
+      - target: LuminaTestHarness
+      - package: LuminaVideoBridge
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+
+schemes:
+  LuminaTestHarness:
+    build:
+      targets:
+        LuminaTestHarness: all
+    test:
+      targets:
+        - LuminaPlaybackTests
+      environmentVariables:
+        LUMINA_HARNESS_TESTING: "1"
