@@ -606,8 +606,7 @@ impl MacOSVideoDecoder {
         // app startup, so AVPlayer may stay in Unknown status indefinitely.
         // We pump here to give AVFoundation time to load the media.
         {
-            // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
-            let run_loop = unsafe { NSRunLoop::currentRunLoop() };
+            let run_loop = NSRunLoop::currentRunLoop();
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut interval = NSDate::dateWithTimeIntervalSinceNow(0.01);
             loop {
@@ -625,10 +624,7 @@ impl MacOSVideoDecoder {
                     );
                     break;
                 }
-                // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
-                unsafe {
-                    run_loop.runUntilDate(&interval);
-                }
+                run_loop.runUntilDate(&interval);
                 // Refresh the interval for next iteration
                 interval = NSDate::dateWithTimeIntervalSinceNow(0.01);
             }

@@ -58,6 +58,11 @@ jobs:
       - name: Install FFmpeg build tools
         run: brew install nasm pkg-config
 
+      - name: Restore locked FFmpeg runtime
+        uses: actions/cache@v6.1.0
+        with:
+          path: ${{ runner.temp }}/lumina-ffmpeg
+          key: ffmpeg-${{ matrix.runner }}-${{ hashFiles('vendor/ffmpeg.lock.json', 'scripts/build-ffmpeg-runtime.sh') }}
       - name: Build bundled FFmpeg 9 from lock
         run: bash scripts/build-ffmpeg-runtime.sh "$RUNNER_TEMP/lumina-ffmpeg"
 
