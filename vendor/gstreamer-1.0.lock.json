@@ -25,6 +25,11 @@
       "filename": "ffmpeg-9.0.1.tar.xz",
       "url": "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz",
       "sha256": "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"
+    },
+    "webrtc_audio_processing": {
+      "version": "2.1",
+      "url": "https://www.freedesktop.org/software/pulseaudio/webrtc-audio-processing/webrtc-audio-processing-2.1.tar.gz",
+      "sha256": "35e86b986d02ea15f3d04741a1a5a735ba399bc0fac0ee089c39480e35fc3253"
     }
   },
   "cerbero": {

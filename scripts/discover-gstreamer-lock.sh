@@ -101,6 +101,14 @@ zlib_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" <<<"$zli
 }
 zlib_filename="zlib-${zlib_version}.tar.gz"
 zlib_url="https://gstreamer.freedesktop.org/src/mirror/zlib/${zlib_filename}"
+webrtc_recipe=$(tar -xOf "$archive_tmp" --wildcards '*/recipes/webrtc-audio-processing.recipe')
+webrtc_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" <<<"$webrtc_recipe")
+webrtc_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" <<<"$webrtc_recipe")
+[[ "$webrtc_version" =~ ^[0-9]+\.[0-9]+$ && "$webrtc_sha" =~ ^[[:xdigit:]]{64}$ ]] || {
+    echo "invalid Cerbero WebRTC audio processing recipe" >&2
+    exit 1
+}
+webrtc_url="https://www.freedesktop.org/software/pulseaudio/webrtc-audio-processing/webrtc-audio-processing-${webrtc_version}.tar.gz"
 
 archive_layout='{
   "source_libdir": "lib/x86_64-linux-gnu",
@@ -148,6 +156,9 @@ jq -n \
     --arg zlib_filename "$zlib_filename" \
     --arg zlib_url "$zlib_url" \
     --arg zlib_sha "$zlib_sha" \
+    --arg webrtc_version "$webrtc_version" \
+    --arg webrtc_url "$webrtc_url" \
+    --arg webrtc_sha "$webrtc_sha" \
     --arg cerbero_repo "$cerbero_repo" \
     --arg cerbero_tag "$gstreamer_version" \
     --arg cerbero_tag_object "$cerbero_tag_object" \
@@ -163,7 +174,8 @@ jq -n \
       sources: {
         ffmpeg: $ffmpeg[0],
         gst_libav: {package: "gst-libav-1.0", filename: ("gst-libav-" + $version + ".tar.xz"), url: $libav_url, sha256: $libav_sha},
-        zlib: {version: $zlib_version, filename: $zlib_filename, url: $zlib_url, sha256: $zlib_sha}
+        zlib: {version: $zlib_version, filename: $zlib_filename, url: $zlib_url, sha256: $zlib_sha},
+        webrtc_audio_processing: {version: $webrtc_version, url: $webrtc_url, sha256: $webrtc_sha}
       },
       cerbero: {repository: $cerbero_repo, tag: $cerbero_tag, tag_object: $cerbero_tag_object, commit: $cerbero_commit, archive: {url: $cerbero_archive_url, sha256: $cerbero_archive_sha}},
       target: {os: "linux", architecture: "x86_64", distribution: "ubuntu", distribution_version: "24.04", glibc: "2.39"},

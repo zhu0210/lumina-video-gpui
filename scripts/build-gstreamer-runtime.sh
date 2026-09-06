@@ -114,6 +114,9 @@ zlib_version=$(jq -er '.sources.zlib.version' "$lock_file")
 zlib_filename=$(jq -er '.sources.zlib.filename' "$lock_file")
 zlib_url=$(jq -er '.sources.zlib.url' "$lock_file")
 zlib_sha=$(jq -er '.sources.zlib.sha256' "$lock_file")
+webrtc_version=$(jq -er '.sources.webrtc_audio_processing.version' "$lock_file")
+webrtc_url=$(jq -er '.sources.webrtc_audio_processing.url' "$lock_file")
+webrtc_sha=$(jq -er '.sources.webrtc_audio_processing.sha256' "$lock_file")
 cerbero_tag=$(jq -er '.cerbero.tag' "$lock_file")
 cerbero_tag_object=$(jq -er '.cerbero.tag_object' "$lock_file")
 cerbero_commit=$(jq -er '.cerbero.commit' "$lock_file")
@@ -139,6 +142,9 @@ mapfile -t variants < <(jq -er '.variants[]' "$lock_file")
 [[ "$gstreamer_version" =~ ^1\.28\.[0-9]+$ ]] || { echo "unsupported GStreamer version" >&2; exit 1; }
 [[ "$gstreamer_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid GStreamer checksum" >&2; exit 1; }
 [[ "$libav_sha" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid gst-libav checksum" >&2; exit 1; }
+[[ "$webrtc_version" =~ ^[0-9]+\.[0-9]+$ ]] || fail "invalid WebRTC audio processing version"
+[[ "$webrtc_sha" =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid WebRTC audio processing checksum"
+[[ "$webrtc_url" == "https://www.freedesktop.org/software/pulseaudio/webrtc-audio-processing/webrtc-audio-processing-${webrtc_version}.tar.gz" ]] || fail "unexpected WebRTC audio processing source"
 [[ "$zlib_version" == 1.3.1 ]] || { echo "unsupported zlib version" >&2; exit 1; }
 [[ "$zlib_filename" == zlib-1.3.1.tar.gz ]] || { echo "unsupported zlib filename" >&2; exit 1; }
 [[ "$zlib_url" == https://gstreamer.freedesktop.org/src/mirror/zlib/zlib-1.3.1.tar.gz ]] || {
@@ -263,6 +269,8 @@ PY_FFMPEG
 
 grep -F "tarball_checksum = '$gstreamer_sha'" "$cerbero_dir/recipes/gstreamer-1.0.recipe" >/dev/null
 grep -F "tarball_checksum = '$libav_sha'" "$cerbero_dir/recipes/gst-libav-1.0.recipe" >/dev/null
+grep -F "version = '$webrtc_version'" "$cerbero_dir/recipes/webrtc-audio-processing.recipe" >/dev/null
+grep -F "tarball_checksum = '$webrtc_sha'" "$cerbero_dir/recipes/webrtc-audio-processing.recipe" >/dev/null
 zlib_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")
 [[ "$zlib_recipe_version" == "$zlib_version" ]] || {
@@ -274,7 +282,7 @@ zlib_recipe_sha=$(sed -n "s/^[[:space:]]*tarball_checksum = '\([^']*\)'$/\1/p" "
     exit 1
 }
 
-# Seed Cerbero's source cache with the two lock-owned release tarballs. The
+# Seed Cerbero's source cache with the lock-owned release tarballs. The
 # remaining closure is fetched by Cerbero's pinned recipes in the fetch phase.
 download_and_verify "$gstreamer_url" "$gstreamer_sha" \
     "$XDG_CACHE_HOME/cerbero-sources/gstreamer-1.0/gstreamer-${gstreamer_version}.tar.xz"
@@ -282,6 +290,10 @@ download_and_verify "$libav_url" "$libav_sha" \
     "$XDG_CACHE_HOME/cerbero-sources/$libav_package/$libav_filename"
 download_and_verify "$zlib_url" "$zlib_sha" \
     "$XDG_CACHE_HOME/cerbero-sources/zlib-1.3.1/zlib-1.3.1.tar.gz"
+# The bare freedesktop.org host rejects CI downloads (HTTP 418), while the
+# canonical www host serves the identical archive. Preserve Cerbero's checksum.
+download_and_verify "$webrtc_url" "$webrtc_sha" \
+    "$XDG_CACHE_HOME/cerbero-sources/webrtc-audio-processing-${webrtc_version}/webrtc-audio-processing-${webrtc_version}.tar.gz"
 
 cerbero=("$cerbero_dir/cerbero-uninstalled" --non-interactive -c "$cerbero_dir/config/linux.config" -v norust)
 "${cerbero[@]}" fetch-bootstrap --system=no --toolchains=no --build-tools=yes --jobs=2
