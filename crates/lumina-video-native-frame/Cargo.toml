@@ -144,7 +144,7 @@ windows = {
 [features]
 default = []
 vendored-runtime = []
-windows-native-video = ["profiling", "rodio", "windows"]
+windows-native-video = ["profiling", "rodio", "windows", "zero-copy"]
 zero-copy = []
 android-zero-copy = []
 moq = [

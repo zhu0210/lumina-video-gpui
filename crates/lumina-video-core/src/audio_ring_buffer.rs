@@ -56,6 +56,9 @@ struct RingBufferShared {
     /// Write position (monotonically increasing, never wraps — use mask for index).
     /// Only modified by producer.
     write_pos: AtomicUsize,
+    /// End of the producer's current write, including unpublished samples.
+    /// Readers use this to reject slots being overwritten before `write_pos` advances.
+    write_head: AtomicUsize,
     /// Read position (monotonically increasing, never wraps — use mask for index).
     /// Only modified by consumer.
     read_pos: AtomicUsize,
@@ -143,6 +146,7 @@ pub fn audio_ring_buffer(config: RingBufferConfig) -> (RingBufferProducer, RingB
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         write_pos: AtomicUsize::new(0),
+        write_head: AtomicUsize::new(0),
         read_pos: AtomicUsize::new(0),
         mask,
         capacity,
@@ -204,11 +208,12 @@ impl RingBufferProducer {
             s.overflow_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Atomic slot writes avoid undefined behavior if producer and consumer
-        // touch the same slot concurrently during overwrite scenarios.
+        // Announce overwrite before touching slots. A consumer acquiring a new
+        // sample must also see this reservation, even before write_pos commits it.
+        s.write_head.store(wp.wrapping_add(len), Ordering::Release);
         let mut idx = wp & mask;
         for &sample in samples {
-            s.buffer[idx].store(sample.to_bits(), Ordering::Relaxed);
+            s.buffer[idx].store(sample.to_bits(), Ordering::Release);
             idx = (idx + 1) & mask;
         }
 
@@ -319,7 +324,12 @@ impl RingBufferConsumer {
         }
 
         let idx = rp & s.mask;
-        let sample = f32::from_bits(s.buffer[idx].load(Ordering::Relaxed));
+        let sample = f32::from_bits(s.buffer[idx].load(Ordering::Acquire));
+        if s.write_head.load(Ordering::Acquire).wrapping_sub(rp) > s.capacity {
+            // The slot may belong to an unpublished future write. Do not return
+            // it as the old position or spin in the audio callback; retry next read.
+            return ReadSample::Empty;
+        }
         s.read_pos.store(rp.wrapping_add(1), Ordering::Release);
         s.total_read.fetch_add(1, Ordering::Relaxed);
 
@@ -514,6 +524,21 @@ mod tests {
         let cm = consumer.metrics();
         assert_eq!(cm.total_read, 2);
         assert_eq!(cm.fill_samples, 3);
+    }
+
+    #[test]
+    fn unpublished_overwrite_is_not_read_as_an_old_sample() {
+        let (producer, mut consumer) = audio_ring_buffer(RingBufferConfig {
+            capacity_samples: 1024,
+            prefill_samples: 1,
+        });
+        producer.write(&[1.0]);
+        // Pause a producer between overwriting a slot and committing write_pos.
+        let shared = &producer.shared;
+        shared.write_head.store(1025, Ordering::Release);
+        shared.buffer[0].store(1025.0_f32.to_bits(), Ordering::Release);
+        assert_eq!(consumer.read_sample(), ReadSample::Empty);
+        assert_eq!(shared.read_pos.load(Ordering::Relaxed), 0);
     }
 
     #[test]

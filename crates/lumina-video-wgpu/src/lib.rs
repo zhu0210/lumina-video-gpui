@@ -6,8 +6,9 @@
 //! memory, and other CPU formats return the lease unchanged.
 //!
 //! Borrowed [`lumina_video_native_frame::video::DecodedFrame`] values remain a
-//! compatibility path for CPU frames. Borrowed native GPU surfaces return a
-//! typed unsupported error until #7 connects producers to the owned seam.
+//! compatibility path for CPU frames. Apple IOSurfaces additionally retain their
+//! producer pool lease through GPU-tracked texture destruction for direct aliasing.
+//! Other borrowed native surfaces return a typed unsupported error.
 //! Platform-specific import backends stay in the private `zero_copy` module;
 //! they are maintained internally and are not part of this crate's public API.
 
@@ -36,3 +37,8 @@ pub use frame_to_texture::{
 
 #[cfg(target_os = "linux")]
 pub use dmabuf_import::{import_external_dmabuf_nv12, ImportedNv12Texture, Nv12ImportError};
+
+#[cfg(target_os = "android")]
+mod android_import;
+#[cfg(target_os = "android")]
+pub use android_import::{AndroidFrameImporter, PreparedAndroidFrame};

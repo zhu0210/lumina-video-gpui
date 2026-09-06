@@ -8,19 +8,19 @@ members = [
   "crates/lumina-video-wgpu",
   "crates/lumina-video-gpui",
   "crates/lumina-video-demo",
-  # "crates/lumina-video-ios",
+  "crates/lumina-video-ios",
 ]
 
 [workspace.dependencies]
 # wgpu — shared with GPUI (must match the pinned Zed-compatible fork)
 wgpu = {
   git = "https://github.com/zhu0210/wgpu.git",
-  rev = "4e18c6630ec587d5b6491858fa725b82f4502b4e"
+  rev = "7f824a60dbab63d8149a1d0655ab838f1b24f51a"
 }
 # wgpu-hal for zero-copy platform import
 wgpu-hal = {
   git = "https://github.com/zhu0210/wgpu.git",
-  rev = "4e18c6630ec587d5b6491858fa725b82f4502b4e"
+  rev = "7f824a60dbab63d8149a1d0655ab838f1b24f51a"
 }
 
 # Video/audio dependencies
@@ -126,26 +126,6 @@ async-task = {
   rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e"
 }
 calloop = { git = "https://github.com/zed-industries/calloop" }
-libwebrtc = {
-  git = "https://github.com/zed-industries/livekit-rust-sdks",
-  rev = "c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
-}
-livekit = {
-  git = "https://github.com/zed-industries/livekit-rust-sdks",
-  rev = "c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
-}
-notify = {
-  git = "https://github.com/zed-industries/notify",
-  rev = "faecbc33db4f59313e5225ef766bfd9e54a54cfd"
-}
-notify-types = {
-  git = "https://github.com/zed-industries/notify",
-  rev = "faecbc33db4f59313e5225ef766bfd9e54a54cfd"
-}
-webrtc-sys = {
-  git = "https://github.com/zed-industries/livekit-rust-sdks",
-  rev = "c3a55bbc207008f1ca3474b6037fdd3c443cad0f"
-}
 windows-capture = {
   git = "https://github.com/zed-industries/windows-capture.git",
   rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9"

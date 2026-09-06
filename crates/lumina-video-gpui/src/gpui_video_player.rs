@@ -6,15 +6,14 @@
 //! # Architecture
 //!
 //! ```text
-//! Linux: GstMediaSession (GStreamer decode + A/V timing), except MoQ URLs
-//! which use CorePlayer's native MoQ decoder.
+//! Linux: GstMediaSession owns GStreamer decode and A/V timing, including MoQ.
 //!   │ one try_next_event() per animation tick
 //!   ├─ Intel Vulkan + NV12: Gst DMABuf + SyncFile
 //!   │    → bounded import worker → one multiplanar external texture
 //!   │    → same-frame pending surface → normal renderer acquire/render/release
 //!   └─ system fallback: native_frame_lease_to_textures()  ← lumina-video-wgpu
 //!        NV12: Y(R8) + CbCr(RG8) → surface((y, cbcr, size)) [GPU YUV→RGB]
-//!        RGBA: single RGBA8       → surface((tex, desc))     [passthrough]
+//!        RGBA: single RGBA8       → surface(RgbaTextureSource)     [passthrough]
 //!   ▼
 //! GPUI surface() element  ←  gpui renderer
 //! ```
@@ -22,7 +21,7 @@
 //! GPUI's `surface()` supports NV12 natively with a built-in shader, so
 //! YUV frames (NV12, YUV420p) avoid the CPU YUV→RGB conversion entirely.
 //! Linux GStreamer frames use the owned lease API; borrowed native GPU
-//! surfaces remain rejected at the non-Linux compatibility seam.
+//! surfaces on Apple retain their producer leases through GPU-tracked texture destruction.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,29 +31,28 @@ use std::time::Instant;
 use gpui::*;
 use gpui_wgpu::wgpu;
 use lumina_video_core::session::{
-    CapabilityDowngradeReason, CapabilityTier, FrameRealization, RendererOutcome,
+    AudioTrack, CapabilityDowngradeReason, CapabilityTier, FrameRealization, RendererOutcome,
+    SessionError,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 #[cfg(target_os = "linux")]
 use gpui_wgpu::{ExternalFrameRequest, ExternalNv12Frame, ExternalOwnership};
 #[cfg(target_os = "linux")]
 use lumina_video_core::session::{
-    ConversionMode, DecodeResidency, ImportMode, MediaSession, SessionError, SessionEvent,
+    ConversionMode, DecodeResidency, ImportMode, MediaSession, SessionEvent,
     SessionState as CoreSessionState, SynchronizationMode,
 };
 use lumina_video_core::subtitles::{SubtitleError, SubtitleStyle, SubtitleTrack};
 #[cfg(target_os = "linux")]
 use lumina_video_gst::{GstMediaSession, PresentationDecision, DEFAULT_OPEN_TIMEOUT};
-#[cfg(any(not(target_os = "linux"), feature = "moq"))]
+#[cfg(not(target_os = "linux"))]
 use lumina_video_native_frame::player::CorePlayer;
 use lumina_video_native_frame::video::{VideoMetadata, VideoState};
-#[cfg(any(not(target_os = "linux"), feature = "moq"))]
+#[cfg(not(target_os = "linux"))]
 use lumina_video_wgpu::decoded_frame_to_textures;
 use lumina_video_wgpu::GpuFrameTextures;
-#[cfg(any(not(target_os = "linux"), feature = "moq"))]
-use lumina_video_wgpu::LegacyFrameIngestionError;
 #[cfg(target_os = "linux")]
 use lumina_video_wgpu::{import_external_dmabuf_nv12, ImportedNv12Texture, Nv12ImportError};
 #[cfg(target_os = "linux")]
@@ -69,6 +67,7 @@ struct ExternalPresentation {
     width: u32,
     height: u32,
     color_transform: [[f32; 4]; 4],
+    color_transfer: gpui::VideoTransferFunction,
 }
 
 #[cfg(target_os = "linux")]
@@ -137,7 +136,7 @@ struct DirectImportWorker {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn try_send_drop_oldest<T>(sender: &Sender<T>, drop_receiver: &Receiver<T>, item: T) -> bool {
     match sender.try_send(item) {
         Ok(()) => true,
@@ -192,6 +191,43 @@ impl DirectImportWorker {
 impl Drop for DirectImportWorker {
     fn drop(&mut self) {
         let _ = self.thread.take();
+    }
+}
+
+#[cfg(target_os = "android")]
+struct AndroidImportWorker {
+    input: Sender<lumina_video_native_frame::android_video::AndroidVideoFrame>,
+    input_drop: Receiver<lumina_video_native_frame::android_video::AndroidVideoFrame>,
+    output: Receiver<Result<lumina_video_wgpu::PreparedAndroidFrame, String>>,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidImportWorker {
+    fn new(device: Arc<wgpu::Device>) -> Option<Self> {
+        let (input, receiver) = crossbeam_channel::bounded(1);
+        let input_drop = receiver.clone();
+        let (sender, output) = crossbeam_channel::bounded(1);
+        let output_drop = output.clone();
+        std::thread::Builder::new()
+            .name("lumina-ahb-import".into())
+            .spawn(move || {
+                let mut importer = lumina_video_wgpu::AndroidFrameImporter::default();
+                while let Ok(frame) = receiver.recv() {
+                    // SAFETY: only unmodified ImageReader frames enter this
+                    // mailbox. The bridge retains Image ownership and completes
+                    // producer acquire before delivery; GPUI submits commands
+                    // before sampling the returned texture.
+                    let prepared = unsafe { importer.prepare(frame, &device) }
+                        .map_err(|error| error.to_string());
+                    let _ = try_send_drop_oldest(&sender, &output_drop, prepared);
+                }
+            })
+            .ok()?;
+        Some(Self {
+            input,
+            input_drop,
+            output,
+        })
     }
 }
 
@@ -287,25 +323,6 @@ fn video_state(state: &CoreSessionState) -> VideoState {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinuxPlaybackRoute {
-    Gst,
-    #[cfg(feature = "moq")]
-    Core,
-}
-
-#[cfg(target_os = "linux")]
-fn linux_playback_route(url: &str) -> LinuxPlaybackRoute {
-    #[cfg(feature = "moq")]
-    if url.starts_with("moq://") || url.starts_with("moqs://") {
-        return LinuxPlaybackRoute::Core;
-    }
-
-    let _ = url;
-    LinuxPlaybackRoute::Gst
-}
-
 // ---------------------------------------------------------------------------
 // Player state
 // ---------------------------------------------------------------------------
@@ -316,9 +333,9 @@ fn linux_playback_route(url: &str) -> LinuxPlaybackRoute {
 /// decode/audio/sync and manages GPU texture upload for GPUI's `surface()`
 /// element.
 pub struct GpuiVideoPlayer {
-    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    #[cfg(not(target_os = "linux"))]
     background_executor: BackgroundExecutor,
-    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    #[cfg(not(target_os = "linux"))]
     core: Option<CorePlayer>,
     #[cfg(target_os = "linux")]
     session: Option<GstMediaSession>,
@@ -346,9 +363,23 @@ pub struct GpuiVideoPlayer {
     #[cfg(target_os = "linux")]
     pending_external_retirement: bool,
     config: GpuiVideoPlayerConfig,
+    #[cfg(target_os = "android")]
+    android_import: Option<AndroidImportWorker>,
+    #[cfg(target_os = "android")]
+    android_import_disabled: bool,
+    #[cfg(target_os = "android")]
+    android_fallback_pending: bool,
+    #[cfg(target_os = "android")]
+    android_previous_textures: Option<GpuFrameTextures>,
+    #[cfg(target_os = "android")]
+    android_pending: bool,
+    #[cfg(target_os = "android")]
+    android_native_presented: bool,
+    #[cfg(target_os = "android")]
+    android_retirement_pending: bool,
 
     // GPU state
-    gpu_context: Option<GpuContextHandle>,
+    gpu_context: Option<WgpuContextHandle>,
     /// Current frame as GPU textures (NV12 or RGBA variant).
     frame_textures: Option<GpuFrameTextures>,
     /// Cached textures for reuse (Y, CbCr, RGBA).
@@ -362,6 +393,9 @@ pub struct GpuiVideoPlayer {
     metadata: Option<VideoMetadata>,
     state: VideoState,
     buffering_percent: i32,
+    audio_tracks: Vec<AudioTrack>,
+    selected_audio_track_id: Option<String>,
+    audio_track_selection_error: Option<String>,
 
     // Init state
     loading_started: bool,
@@ -388,42 +422,31 @@ impl GpuiVideoPlayer {
 
     pub fn with_config(url: impl Into<String>, config: GpuiVideoPlayerConfig, cx: &App) -> Self {
         let url = url.into();
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         let background_executor = cx.background_executor().clone();
-        #[cfg(all(target_os = "linux", not(feature = "moq")))]
-        let _ = cx;
         #[cfg(target_os = "linux")]
-        let route = linux_playback_route(&url);
+        let _ = cx;
         #[cfg(not(target_os = "linux"))]
         let core = Some(CorePlayer::new(url.clone()));
-        #[cfg(all(target_os = "linux", feature = "moq"))]
-        let core = match route {
-            LinuxPlaybackRoute::Core => Some(CorePlayer::new(url.clone())),
-            LinuxPlaybackRoute::Gst => None,
-        };
         #[cfg(target_os = "linux")]
-        let session = match route {
-            LinuxPlaybackRoute::Gst => Some(
-                GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
-                    url.clone(),
-                    false,
-                    lumina_video_gst::GstAudioSinkMode::Auto,
-                    config.lifecycle_timeout,
-                    config.open_timeout,
-                    0,
-                    CapabilityTier::DirectAlias,
-                ),
+        let session = Some(
+            GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
+                url.clone(),
+                false,
+                lumina_video_gst::GstAudioSinkMode::Auto,
+                config.lifecycle_timeout,
+                config.open_timeout,
+                0,
+                CapabilityTier::DirectAlias,
             ),
-            #[cfg(feature = "moq")]
-            LinuxPlaybackRoute::Core => None,
-        };
+        );
         let muted = config.muted;
         let volume = config.volume;
         #[allow(unused_mut)]
         let mut player = Self {
-            #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+            #[cfg(not(target_os = "linux"))]
             background_executor,
-            #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+            #[cfg(not(target_os = "linux"))]
             core,
             #[cfg(target_os = "linux")]
             session,
@@ -451,6 +474,20 @@ impl GpuiVideoPlayer {
             #[cfg(target_os = "linux")]
             pending_external_retirement: false,
             config,
+            #[cfg(target_os = "android")]
+            android_import: None,
+            #[cfg(target_os = "android")]
+            android_import_disabled: false,
+            #[cfg(target_os = "android")]
+            android_fallback_pending: false,
+            #[cfg(target_os = "android")]
+            android_previous_textures: None,
+            #[cfg(target_os = "android")]
+            android_pending: false,
+            #[cfg(target_os = "android")]
+            android_native_presented: false,
+            #[cfg(target_os = "android")]
+            android_retirement_pending: false,
             gpu_context: None,
             frame_textures: None,
             y_cache: None,
@@ -461,6 +498,9 @@ impl GpuiVideoPlayer {
             metadata: None,
             state: VideoState::Loading,
             buffering_percent: 0,
+            audio_tracks: Vec::new(),
+            selected_audio_track_id: None,
+            audio_track_selection_error: None,
             loading_started: false,
             initialized: false,
             loop_seek_pending: false,
@@ -469,7 +509,7 @@ impl GpuiVideoPlayer {
             show_subtitles: true,
             subtitle_style: SubtitleStyle::default(),
         };
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = player.core.as_mut() {
             core.set_muted(muted);
             core.set_volume((volume * 100.0) as u32);
@@ -487,6 +527,15 @@ impl GpuiVideoPlayer {
     /// uploaded GPU texture until the new session presents a frame.
     pub fn open(&mut self, url: impl Into<String>, _cx: &App) {
         let url = url.into();
+        self.audio_tracks.clear();
+        self.selected_audio_track_id = None;
+        self.audio_track_selection_error = None;
+        #[cfg(target_os = "android")]
+        {
+            self.reset_android_import();
+            self.android_import_disabled = false;
+            self.android_fallback_pending = false;
+        }
         #[cfg(target_os = "linux")]
         let next_generation = self
             .session
@@ -496,9 +545,9 @@ impl GpuiVideoPlayer {
         // CorePlayer teardown retains its join semantics, so move the old
         // backend to GPUI's background executor before replacing it. The
         // GStreamer session drop is already fire-and-forget.
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         let old_core = self.core.take();
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(old_core) = old_core {
             self.background_executor
                 .spawn(async move { drop(old_core) })
@@ -509,23 +558,13 @@ impl GpuiVideoPlayer {
         #[cfg(target_os = "linux")]
         drop(old_session);
 
-        #[cfg(target_os = "linux")]
-        let route = linux_playback_route(&url);
-        #[cfg(all(target_os = "linux", feature = "moq"))]
-        {
-            self.core = match route {
-                LinuxPlaybackRoute::Core => Some(CorePlayer::new(url.clone())),
-                LinuxPlaybackRoute::Gst => None,
-            };
-        }
         #[cfg(not(target_os = "linux"))]
         {
             self.core = Some(CorePlayer::new(url.clone()));
         }
         #[cfg(target_os = "linux")]
         {
-            self.session = match route {
-                LinuxPlaybackRoute::Gst => Some(
+            self.session = Some(
                     GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
                         url.clone(),
                         false,
@@ -535,17 +574,14 @@ impl GpuiVideoPlayer {
                         next_generation,
                         CapabilityTier::DirectAlias,
                     ),
-                ),
-                #[cfg(feature = "moq")]
-                LinuxPlaybackRoute::Core => None,
-            };
+                );
             if let Some(session) = self.session.as_ref() {
                 let audio = session.audio_handle();
                 audio.set_muted(self.config.muted);
                 audio.set_volume((self.config.volume.clamp(0.0, 1.0) * 100.0) as u32);
             }
         }
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.set_muted(self.config.muted);
             core.set_volume((self.config.volume * 100.0) as u32);
@@ -594,7 +630,7 @@ impl GpuiVideoPlayer {
 
     pub fn with_muted(mut self, muted: bool) -> Self {
         self.config.muted = muted;
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.set_muted(muted);
         }
@@ -607,7 +643,7 @@ impl GpuiVideoPlayer {
 
     pub fn with_volume(mut self, volume: f32) -> Self {
         self.config.volume = volume.clamp(0.0, 1.0);
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.set_volume((self.config.volume * 100.0) as u32);
         }
@@ -699,7 +735,7 @@ impl GpuiVideoPlayer {
     // -----------------------------------------------------------------------
 
     pub fn play(&mut self) {
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.play();
             return;
@@ -711,7 +747,7 @@ impl GpuiVideoPlayer {
     }
 
     pub fn pause(&mut self) {
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.pause();
             return;
@@ -731,7 +767,9 @@ impl GpuiVideoPlayer {
     }
 
     pub fn seek(&mut self, position: Duration) {
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(target_os = "android")]
+        self.reset_android_import();
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.seek(position);
             return;
@@ -742,9 +780,40 @@ impl GpuiVideoPlayer {
         }
     }
 
+    /// Discovered source audio tracks. Currently populated by GStreamer on Linux.
+    pub fn audio_tracks(&self) -> &[AudioTrack] {
+        &self.audio_tracks
+    }
+
+    /// The last confirmed selection; a queued request does not change this value.
+    pub fn selected_audio_track_id(&self) -> Option<&str> {
+        self.selected_audio_track_id.as_deref()
+    }
+
+    /// Most recent asynchronous selection failure, cleared by a new request or success.
+    pub fn audio_track_selection_error(&self) -> Option<&str> {
+        self.audio_track_selection_error.as_deref()
+    }
+
+    /// Request selection by the stable id returned by `audio_tracks`.
+    /// Success means queued; observe `selected_audio_track_id` for confirmation.
+    pub fn select_audio_track(&mut self, id: impl Into<String>) -> Result<(), SessionError> {
+        let id = id.into();
+        #[cfg(target_os = "linux")]
+        if let Some(session) = self.session.as_mut() {
+            session.command(lumina_video_core::session::SessionCommand::SelectAudioTrack { id })?;
+            self.audio_track_selection_error = None;
+            return Ok(());
+        }
+        let _ = id;
+        Err(SessionError::Unsupported(
+            "audio track selection is unavailable for this backend".into(),
+        ))
+    }
+
     pub fn toggle_mute(&mut self) {
         self.config.muted = !self.config.muted;
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.set_muted(self.config.muted);
         }
@@ -756,7 +825,7 @@ impl GpuiVideoPlayer {
 
     pub fn set_volume(&mut self, volume: f32) {
         self.config.volume = volume.clamp(0.0, 1.0);
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.set_volume((self.config.volume * 100.0) as u32);
         }
@@ -858,7 +927,7 @@ impl GpuiVideoPlayer {
     }
 
     pub fn dimensions(&self) -> Option<(u32, u32)> {
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_ref() {
             return core.dimensions();
         }
@@ -869,7 +938,7 @@ impl GpuiVideoPlayer {
     }
 
     pub fn frame_rate(&self) -> Option<f32> {
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_ref() {
             return core.frame_rate();
         }
@@ -889,7 +958,7 @@ impl GpuiVideoPlayer {
 
     /// Returns the audio handle for external volume/mute control.
     pub fn audio_handle(&self) -> &lumina_video_core::audio::AudioHandle {
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_ref() {
             return core.audio_handle();
         }
@@ -915,7 +984,49 @@ impl GpuiVideoPlayer {
         self.frame_realization
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    pub fn frame_realization(&self) -> Option<FrameRealization> {
+        use lumina_video_core::session::{
+            ConversionMode, DecodeMode, DecodeResidency, ImportMode, SynchronizationMode,
+        };
+        let textures = self.frame_textures.as_ref()?;
+        let native = self.android_native_presented;
+        Some(FrameRealization {
+            decode: if self
+                .core
+                .as_ref()
+                .is_some_and(|core| core.android_player_id() != 0)
+            {
+                DecodeMode::Hardware
+            } else {
+                DecodeMode::Software
+            },
+            residency: if native {
+                DecodeResidency::NativeGpu
+            } else {
+                DecodeResidency::SystemMemory
+            },
+            import: if native {
+                ImportMode::GpuCopy
+            } else {
+                ImportMode::CpuUpload
+            },
+            conversion: if native {
+                ConversionMode::GpuBlit
+            } else if matches!(textures, GpuFrameTextures::Nv12 { .. }) {
+                ConversionMode::YuvShader
+            } else {
+                ConversionMode::None
+            },
+            synchronization: if native {
+                SynchronizationMode::CpuWait
+            } else {
+                SynchronizationMode::None
+            },
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub fn frame_realization(&self) -> Option<FrameRealization> {
         None
     }
@@ -934,7 +1045,13 @@ impl GpuiVideoPlayer {
             })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    pub fn capability(&self) -> Option<CapabilityTier> {
+        self.frame_realization()
+            .map(FrameRealization::capability_tier)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     /// Returns the capability tier last committed by the renderer.
     pub fn capability(&self) -> Option<CapabilityTier> {
         None
@@ -1007,7 +1124,19 @@ impl GpuiVideoPlayer {
     pub fn retire_external_frame(&mut self, window: &mut Window) {
         #[cfg(target_os = "linux")]
         self.retire_external_frame_now(window);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "android")]
+        {
+            if self.android_pending
+                || self.android_native_presented
+                || self.android_retirement_pending
+            {
+                let _ = window.clear_external_frame();
+                let _ = window.take_external_frame_outcome();
+            }
+            self.reset_android_import();
+            self.android_retirement_pending = false;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = window;
     }
 
@@ -1212,15 +1341,15 @@ impl GpuiVideoPlayer {
         let Some(gpu) = self.gpu_context.as_ref() else {
             return;
         };
-        let adapter_info = gpu.adapter.get_info();
+        let adapter_info = gpu.adapter().get_info();
         let supported = adapter_info.backend == wgpu::Backend::Vulkan
             && adapter_info.vendor == 0x8086
             && gpu
-                .device
+                .device()
                 .features()
                 .contains(wgpu::Features::TEXTURE_FORMAT_NV12);
         if supported {
-            if let Some(worker) = DirectImportWorker::new(Arc::clone(&gpu.device)) {
+            if let Some(worker) = DirectImportWorker::new(Arc::clone(gpu.device())) {
                 self.direct_alias_supported = Some(true);
                 self.direct_import = Some(worker);
             } else {
@@ -1333,11 +1462,24 @@ impl GpuiVideoPlayer {
 
     #[cfg(target_os = "linux")]
     fn stage_imported_frame(&mut self, window: &mut Window, imported: ImportedNv12Texture) {
+        use lumina_video_native_frame::ColorTransfer;
+        let color_transfer = match imported.color_transfer {
+            ColorTransfer::Srgb => gpui::VideoTransferFunction::Srgb,
+            ColorTransfer::Bt601 | ColorTransfer::Bt709 => gpui::VideoTransferFunction::Bt709,
+            _ => {
+                self.disable_direct_import(
+                    RendererOutcome::Unsupported,
+                    CapabilityDowngradeReason::UnsupportedColor,
+                );
+                return;
+            }
+        };
         let presentation = ExternalPresentation {
             texture: Arc::clone(&imported.texture),
             width: imported.width,
             height: imported.height,
             color_transform: imported.color_transform,
+            color_transfer,
         };
         // SAFETY: `imported.texture` is the exact NV12 Arc created on this window's
         // matching Vulkan device, with wgpu RESOURCE tracking. Its imported image is
@@ -1500,22 +1642,154 @@ impl GpuiVideoPlayer {
             if self.presentation_transition == PresentationTransition::Fatal {
                 return;
             }
-            #[cfg(feature = "moq")]
-            if self.core.is_some() {
-                self.update_core();
-            } else {
-                self.update_linux(window);
-            }
-
-            #[cfg(not(feature = "moq"))]
             self.update_linux(window);
         }
 
         #[cfg(not(target_os = "linux"))]
         self.update_core();
+        #[cfg(target_os = "android")]
+        self.update_android_import(window);
     }
 
-    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    #[cfg(target_os = "android")]
+    fn observe_android_cpu_upload(&mut self) {
+        // The decoder only emits CPU frames after an explicit native-path failure
+        // or on sources/platform versions that cannot provide an owned GPU frame.
+        self.android_retirement_pending |= self.android_pending || self.android_native_presented;
+        self.android_import = None;
+        self.android_import_disabled = true;
+        self.android_fallback_pending = false;
+        self.android_pending = false;
+        self.android_previous_textures = None;
+        self.android_native_presented = false;
+    }
+
+    #[cfg(target_os = "android")]
+    fn reset_android_import(&mut self) {
+        self.android_import = None;
+        if self.android_pending {
+            self.frame_textures = self.android_previous_textures.take();
+        }
+        self.android_pending = false;
+        self.android_retirement_pending = true;
+    }
+
+    #[cfg(target_os = "android")]
+    fn downgrade_android_import(&mut self, reason: &str) {
+        if self.android_import_disabled {
+            return;
+        }
+        tracing::warn!(
+            "Android native import unavailable; requesting system-memory delivery: {reason}"
+        );
+        self.android_import_disabled = true;
+        self.reset_android_import();
+        self.android_fallback_pending = true;
+    }
+
+    #[cfg(target_os = "android")]
+    fn update_android_import(&mut self, window: &mut Window) {
+        use gpui_wgpu::{ExternalFrameOutcome, ExternalFrameRequest, ExternalRgbaFrame};
+        if self.android_retirement_pending {
+            let _ = window.clear_external_frame();
+            let _ = window.take_external_frame_outcome();
+            self.android_retirement_pending = false;
+        }
+        if self.android_pending {
+            match window.take_external_frame_outcome() {
+                Some(ExternalFrameOutcome::Accepted) => {
+                    self.android_pending = false;
+                    self.android_native_presented = true;
+                    self.android_previous_textures = None;
+                }
+                Some(_) => {
+                    self.downgrade_android_import("renderer rejected prepared GPU conversion")
+                }
+                None => {}
+            }
+        }
+        if self.android_fallback_pending {
+            if let Some(core) = self.core.as_ref() {
+                self.android_fallback_pending =
+                    !lumina_video_native_frame::android_video::request_cpu_fallback_for_player(
+                        core.android_player_id(),
+                    );
+            }
+        }
+        if self.android_import_disabled {
+            return;
+        }
+        let player_id = self.core.as_ref().map_or(0, CorePlayer::android_player_id);
+        // MoQ and uninitialized CorePlayer instances do not use the ExoPlayer bridge.
+        if player_id == 0 {
+            return;
+        }
+        if self.android_import.is_none() {
+            let Some(gpu) = self.gpu_context.as_ref() else {
+                return;
+            };
+            self.android_import = AndroidImportWorker::new(Arc::clone(gpu.device()));
+            if self.android_import.is_none() {
+                self.downgrade_android_import("could not start import worker");
+                return;
+            }
+        }
+        if let Some(frame) =
+            lumina_video_native_frame::android_video::try_receive_hardware_buffer_for_player(
+                player_id,
+            )
+        {
+            let sent = self.android_import.as_ref().is_some_and(|worker| {
+                try_send_drop_oldest(&worker.input, &worker.input_drop, frame)
+            });
+            if !sent {
+                self.downgrade_android_import("import worker disconnected");
+                return;
+            }
+        }
+        if self.android_pending {
+            return;
+        }
+        let prepared = self
+            .android_import
+            .as_ref()
+            .and_then(|worker| worker.output.try_recv().ok());
+        let prepared = match prepared {
+            Some(Ok(frame)) => frame,
+            Some(Err(error)) => {
+                self.downgrade_android_import(&error);
+                return;
+            }
+            None => return,
+        };
+        let texture = Arc::clone(&prepared.texture);
+        let (width, height) = (prepared.width, prepared.height);
+        // SAFETY: the importer records conversion on this window's exact device.
+        // Commands initialize this texture to RESOURCE before sampling; its HAL
+        // callback retains every Vulkan resource and the producer Image lease.
+        let frame = match unsafe { ExternalRgbaFrame::new(prepared.texture, prepared.commands) } {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.downgrade_android_import(&error.to_string());
+                return;
+            }
+        };
+        let outcome = window.submit_external_frame(ExternalFrameRequest::PreparedRgba(frame));
+        // Discard only the staging echo; certification arrives after queue submit.
+        let _ = window.take_external_frame_outcome();
+        if outcome != ExternalFrameOutcome::Accepted {
+            self.downgrade_android_import("could not stage prepared GPU conversion");
+            return;
+        }
+        self.android_previous_textures = self.frame_textures.replace(GpuFrameTextures::Rgba {
+            texture,
+            width,
+            height,
+        });
+        self.android_pending = true;
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn update_core(&mut self) {
         // Start async decoder init
         if !self.loading_started {
@@ -1634,9 +1908,27 @@ impl GpuiVideoPlayer {
                                 PresentationDecision::Empty
                             }
                         }
-                        SessionEvent::AudioTracks { .. }
-                        | SessionEvent::AudioTrackSelected { .. }
-                        | SessionEvent::AudioTrackSelectionFailed { .. } => {
+                        SessionEvent::AudioTracks {
+                            tracks,
+                            selected_id,
+                        } => {
+                            self.audio_tracks = tracks;
+                            self.selected_audio_track_id = selected_id;
+                            PresentationDecision::Hold
+                        }
+                        SessionEvent::AudioTrackSelected { track } => {
+                            self.selected_audio_track_id = Some(track.id);
+                            self.audio_track_selection_error = None;
+                            PresentationDecision::Hold
+                        }
+                        SessionEvent::AudioTrackSelectionFailed {
+                            requested_id,
+                            prior_restored_id,
+                            reason,
+                        } => {
+                            self.selected_audio_track_id = prior_restored_id;
+                            self.audio_track_selection_error =
+                                Some(format!("{requested_id}: {reason}"));
                             PresentationDecision::Hold
                         }
                         SessionEvent::StateChanged { state } => {
@@ -1725,8 +2017,8 @@ impl GpuiVideoPlayer {
                 let realization = self.cpu_frame_realization(&frame);
                 match native_frame_lease_to_textures(
                     frame,
-                    &gpu.device,
-                    &gpu.queue,
+                    gpu.device(),
+                    gpu.queue(),
                     &mut self.y_cache,
                     &mut self.cbcr_cache,
                     &mut self.rgba_cache,
@@ -1781,7 +2073,7 @@ impl GpuiVideoPlayer {
     /// - Staged external NV12 frames: one multiplanar texture during the
     ///   renderer ownership window, before realization is certified
     /// - CPU-fallback NV12 frames: RGBA passthrough
-    /// - RGBA frames: `surface((tex, desc))` — passthrough
+    /// - RGBA frames: `surface(RgbaTextureSource)` — passthrough
     /// - No frame: black placeholder
     pub fn surface_element(&self) -> impl IntoElement {
         #[cfg(target_os = "linux")]
@@ -1796,6 +2088,7 @@ impl GpuiVideoPlayer {
             );
             let color_transform = gpui::Nv12ColorTransform {
                 yuv_to_rgb: frame.color_transform,
+                transfer: frame.color_transfer,
             };
             return div()
                 .size_full()
@@ -1819,6 +2112,7 @@ impl GpuiVideoPlayer {
                         size(DevicePixels(*width as i32), DevicePixels(*height as i32));
                     let color_transform = gpui::Nv12ColorTransform {
                         yuv_to_rgb: *color_transform,
+                        transfer: gpui::VideoTransferFunction::Srgb,
                     };
                     // Surface must request explicit size; otherwise flex containers
                     // allocate zero bounds to auto-sized children with only aspect_ratio,
@@ -1843,20 +2137,19 @@ impl GpuiVideoPlayer {
                     width,
                     height,
                 } => {
-                    let desc = GpuTextureDescriptor {
-                        size: size(DevicePixels(*width as i32), DevicePixels(*height as i32)),
-                        format: GpuTextureFormat::Rgba8Unorm,
-                        color_space: GpuTextureColorSpace::Srgb,
+                    let Ok(source) = RgbaTextureSource::new(
+                        texture.clone(),
+                        size(DevicePixels(*width as i32), DevicePixels(*height as i32)),
+                        GpuTextureAlphaMode::Opaque,
+                        GpuTextureColorSpace::Srgb,
+                    ) else {
+                        return div().size_full().bg(rgb(0x000000)).into_element();
                     };
                     // Same rationale as NV12 above: explicit size avoids zero
                     // layout bounds inside flex containers.
                     div()
                         .size_full()
-                        .child(
-                            surface((texture.clone(), desc))
-                                .size_full()
-                                .object_fit(ObjectFit::Contain),
-                        )
+                        .child(surface(source).size_full().object_fit(ObjectFit::Contain))
                         .into_element()
                 }
             }
@@ -1928,9 +2221,9 @@ impl GpuiVideoPlayer {
     /// Returns a buffering overlay element (shown when playing but buffering < 100%).
     pub fn buffering_overlay(&self) -> Option<impl IntoElement> {
         let pct = self.buffering_percent;
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         let is_audio_stall = self.core.as_ref().is_some_and(CorePlayer::is_audio_stall);
-        #[cfg(all(target_os = "linux", not(feature = "moq")))]
+        #[cfg(target_os = "linux")]
         let is_audio_stall = false;
         if (pct >= 100 && !is_audio_stall) || !self.is_playing() {
             return None;
@@ -2005,7 +2298,7 @@ impl GpuiVideoPlayer {
     // Private methods
     // -----------------------------------------------------------------------
 
-    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    #[cfg(not(target_os = "linux"))]
     fn start_async_init(&mut self) {
         let Some(core) = self.core.as_mut() else {
             return;
@@ -2017,7 +2310,7 @@ impl GpuiVideoPlayer {
         core.init_decoder();
     }
 
-    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    #[cfg(not(target_os = "linux"))]
     fn check_init_complete(&mut self) {
         let Some(core) = self.core.as_mut() else {
             return;
@@ -2036,7 +2329,7 @@ impl GpuiVideoPlayer {
         }
     }
 
-    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    #[cfg(not(target_os = "linux"))]
     fn poll_and_upload_frames(&mut self) {
         let gpu = match self.gpu_context.as_ref() {
             Some(g) => g,
@@ -2077,8 +2370,8 @@ impl GpuiVideoPlayer {
         if let Some(video_frame) = last_frame {
             let textures = decoded_frame_to_textures(
                 &video_frame.frame,
-                &gpu.device,
-                &gpu.queue,
+                gpu.device(),
+                gpu.queue(),
                 &mut self.y_cache,
                 &mut self.cbcr_cache,
                 &mut self.rgba_cache,
@@ -2089,18 +2382,18 @@ impl GpuiVideoPlayer {
                     if self.frame_textures.is_none() {
                         tracing::info!("First video frame uploaded to GPU");
                     }
+                    #[cfg(target_os = "android")]
+                    self.observe_android_cpu_upload();
                     self.frame_textures = Some(tex);
                 }
-                Err(LegacyFrameIngestionError::UnsupportedNativeSurface) => {
-                    tracing::warn!(
-                        "Frame upload rejected borrowed native GPU surface; keeping previous texture"
-                    );
+                Err(error) => {
+                    tracing::warn!("Frame upload failed: {error}; keeping previous texture");
                 }
             }
         }
     }
 
-    #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+    #[cfg(not(target_os = "linux"))]
     fn try_preview_frame(&mut self) {
         if self.frame_textures.is_some() {
             return;
@@ -2117,8 +2410,8 @@ impl GpuiVideoPlayer {
 
         let textures = decoded_frame_to_textures(
             &frame.frame,
-            &gpu.device,
-            &gpu.queue,
+            gpu.device(),
+            gpu.queue(),
             &mut self.y_cache,
             &mut self.cbcr_cache,
             &mut self.rgba_cache,
@@ -2127,12 +2420,12 @@ impl GpuiVideoPlayer {
         match textures {
             Ok(tex) => {
                 tracing::debug!("Preview frame uploaded to GPU");
+                #[cfg(target_os = "android")]
+                self.observe_android_cpu_upload();
                 self.frame_textures = Some(tex);
             }
-            Err(LegacyFrameIngestionError::UnsupportedNativeSurface) => {
-                tracing::warn!(
-                    "Preview rejected borrowed native GPU surface; keeping previous texture"
-                );
+            Err(error) => {
+                tracing::warn!("Preview upload failed: {error}; keeping previous texture");
             }
         }
     }
@@ -2149,38 +2442,11 @@ impl Drop for GpuiVideoPlayer {
             self.pending_external = None;
             self.direct_import.take();
         }
-        #[cfg(any(not(target_os = "linux"), feature = "moq"))]
+        #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.take() {
             self.background_executor
                 .spawn(async move { drop(core) })
                 .detach();
-        }
-    }
-}
-
-#[cfg(all(test, target_os = "linux", feature = "moq"))]
-mod tests {
-    use super::{linux_playback_route, LinuxPlaybackRoute};
-
-    #[test]
-    fn routes_moq_to_core_and_other_sources_to_gst() {
-        assert_eq!(
-            linux_playback_route("moq://localhost/live/video"),
-            LinuxPlaybackRoute::Core
-        );
-        assert_eq!(
-            linux_playback_route("moqs://relay.example/live/video"),
-            LinuxPlaybackRoute::Core
-        );
-
-        for source in [
-            "sample.mp4",
-            "file:///tmp/sample.mp4",
-            "http://example.com/sample.mp4",
-            "https://example.com/sample.m3u8",
-            "hls://example.com/live/stream",
-        ] {
-            assert_eq!(linux_playback_route(source), LinuxPlaybackRoute::Gst);
         }
     }
 }
@@ -2195,7 +2461,10 @@ mod color_boundary_tests {
             [9.0, 10.0, 11.0, 12.0],
             [13.0, 14.0, 15.0, 16.0],
         ];
-        let copied = gpui::Nv12ColorTransform { yuv_to_rgb: source };
+        let copied = gpui::Nv12ColorTransform {
+            yuv_to_rgb: source,
+            transfer: gpui::VideoTransferFunction::Srgb,
+        };
         assert_eq!(copied.yuv_to_rgb, source);
     }
 }

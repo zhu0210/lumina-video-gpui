@@ -159,12 +159,11 @@ async fn http_req_with_limit(
     // from Rust native code. On other platforms, use native system roots.
     #[cfg(target_os = "android")]
     let https = {
-        let builder = HttpsConnectorBuilder::new()
+        HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
-            .build();
-        builder
+            .build()
     };
 
     #[cfg(not(target_os = "android"))]

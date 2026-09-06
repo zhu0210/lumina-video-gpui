@@ -53,6 +53,12 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "zero-copy")]
+struct SharedVideoTexture {
+    texture: ID3D11Texture2D,
+    handle: std::os::windows::io::OwnedHandle,
+}
+
 // ============================================================================
 // Media Foundation Lifecycle Guard
 // ============================================================================
@@ -178,7 +184,7 @@ impl Drop for ComGuard {
     }
 }
 use windows::{
-    core::{Interface, HSTRING, PCWSTR},
+    core::{Interface, HSTRING},
     Win32::{
         Foundation::HANDLE,
         Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0},
@@ -266,7 +272,7 @@ pub struct WindowsVideoDecoder {
     context: ID3D11DeviceContext,
 
     /// DXGI device manager for MF↔D3D11 integration.
-    dxgi_manager: IMFDXGIDeviceManager,
+    _dxgi_manager: IMFDXGIDeviceManager,
 
     /// Video metadata (dimensions, duration, codec, etc.).
     metadata: VideoMetadata,
@@ -283,22 +289,18 @@ pub struct WindowsVideoDecoder {
     /// Staging texture for CPU readback (reused to avoid allocations).
     staging_texture: Option<ID3D11Texture2D>,
 
-    /// Shared texture for zero-copy rendering via D3D11→D3D12 interop.
-    /// Created with D3D11_RESOURCE_MISC_SHARED_NTHANDLE flag.
+    /// Three reusable textures; a consumer lease prevents overwrite until GPU completion.
     #[cfg(feature = "zero-copy")]
-    shared_texture: Option<ID3D11Texture2D>,
-
-    /// Shared NT handle for the shared texture.
-    /// Obtained via IDXGIResource1::CreateSharedHandle().
-    #[cfg(feature = "zero-copy")]
-    shared_handle: Option<HANDLE>,
+    shared_textures: Vec<Arc<SharedVideoTexture>>,
 
     /// Whether zero-copy is enabled (feature flag + successful shared texture creation).
     #[cfg(feature = "zero-copy")]
     zero_copy_enabled: bool,
+    #[cfg(feature = "zero-copy")]
+    cpu_fallback_requested: Arc<AtomicBool>,
 
     /// Count of frames using CPU fallback (for zero-copy tracking).
-    /// Incremented each frame since zero-copy to wgpu is not yet available.
+    /// Incremented only when native sharing is unavailable or fails.
     #[cfg(feature = "zero-copy")]
     cpu_fallback_count: AtomicU64,
 
@@ -406,18 +408,18 @@ impl WindowsVideoDecoder {
             source_reader,
             device,
             context,
-            dxgi_manager,
+            _dxgi_manager: dxgi_manager,
             metadata,
             position: Duration::ZERO,
             eof: AtomicBool::new(false),
             hw_accel,
             staging_texture: None,
             #[cfg(feature = "zero-copy")]
-            shared_texture: None,
-            #[cfg(feature = "zero-copy")]
-            shared_handle: None,
+            shared_textures: Vec::with_capacity(3),
             #[cfg(feature = "zero-copy")]
             zero_copy_enabled: true, // Will be disabled if shared texture creation fails
+            #[cfg(feature = "zero-copy")]
+            cpu_fallback_requested: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "zero-copy")]
             cpu_fallback_count: AtomicU64::new(0),
             #[cfg(feature = "zero-copy")]
@@ -854,6 +856,25 @@ impl WindowsVideoDecoder {
         let pts = Duration::from_nanos(timestamp.max(0) as u64 * 100);
         self.position = pts;
 
+        #[cfg(feature = "zero-copy")]
+        if self.cpu_fallback_requested.swap(false, Ordering::AcqRel) {
+            self.zero_copy_enabled = false;
+            self.shared_textures.clear();
+            warn!("Native renderer import failed; switching to CPU delivery fallback");
+        }
+
+        // Drop on overload instead of overwriting an image still sampled by the renderer.
+        #[cfg(feature = "zero-copy")]
+        if self.zero_copy_enabled
+            && self.shared_textures.len() >= 3
+            && self
+                .shared_textures
+                .iter()
+                .all(|slot| Arc::strong_count(slot) > 1)
+        {
+            return Ok(None);
+        }
+
         // Extract frame data from sample
         let frame = self.extract_frame(&sample)?;
 
@@ -967,12 +988,15 @@ impl WindowsVideoDecoder {
 
             if is_bgra {
                 match self.get_or_create_shared_texture(desc.Width, desc.Height, desc.Format) {
-                    Ok((shared_texture, shared_handle)) => {
+                    Ok(shared) => {
+                        use std::os::windows::io::AsRawHandle;
+                        let shared_texture = &shared.texture;
+                        let shared_handle = HANDLE(shared.handle.as_raw_handle());
                         // Copy from decoded texture to shared texture
                         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                         unsafe {
                             self.context.CopySubresourceRegion(
-                                &shared_texture,
+                                shared_texture,
                                 0, // Destination subresource
                                 0,
                                 0,
@@ -995,8 +1019,7 @@ impl WindowsVideoDecoder {
                         match self.wait_for_gpu() {
                             Ok(()) => {
                                 // GPU sync succeeded - safe to hand off to D3D12
-                                let owner: Arc<dyn std::any::Any + Send + Sync> =
-                                    Arc::new(shared_texture.clone());
+                                let owner: Arc<dyn std::any::Any + Send + Sync> = shared;
 
                                 // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
                                 let surface = unsafe {
@@ -1007,6 +1030,9 @@ impl WindowsVideoDecoder {
                                         PixelFormat::Bgra,
                                         None, // cpu_fallback: TODO(lumina-video) - map D3D11 texture and extract
                                         owner,
+                                    )
+                                    .with_cpu_fallback_request(
+                                        Arc::clone(&self.cpu_fallback_requested),
                                     )
                                 };
 
@@ -1187,27 +1213,22 @@ impl WindowsVideoDecoder {
         width: u32,
         height: u32,
         format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
-    ) -> Result<(ID3D11Texture2D, HANDLE), VideoError> {
-        // Check if existing shared texture is compatible
-        if let (Some(ref shared), Some(handle)) = (&self.shared_texture, self.shared_handle) {
+    ) -> Result<Arc<SharedVideoTexture>, VideoError> {
+        // Only the pool's sole reference permits producer writes. Imported textures
+        // retain the same Arc until their submitted GPU work completes.
+        for shared in &self.shared_textures {
+            if Arc::strong_count(shared) != 1 {
+                continue;
+            }
             let mut desc = D3D11_TEXTURE2D_DESC::default();
-            // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
-            unsafe {
-                shared.GetDesc(&mut desc);
-            }
+            // SAFETY: the pool owns a live D3D11 texture and GetDesc initializes desc.
+            unsafe { shared.texture.GetDesc(&mut desc) };
             if desc.Width == width && desc.Height == height && desc.Format == format {
-                return Ok((shared.clone(), handle));
+                return Ok(Arc::clone(shared));
             }
-            // Close old handle before creating new one
-            if !handle.is_invalid() {
-                // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
-                unsafe {
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
-                }
-            }
-            self.shared_texture = None;
-            self.shared_handle = None;
         }
+        self.shared_textures
+            .retain(|shared| Arc::strong_count(shared) > 1);
 
         // Create new shared texture with NT handle support
         let desc = D3D11_TEXTURE2D_DESC {
@@ -1221,9 +1242,9 @@ impl WindowsVideoDecoder {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE,
-            CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG(0),
-            MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32,
         };
 
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
@@ -1255,7 +1276,7 @@ impl WindowsVideoDecoder {
             dxgi_resource
                 .CreateSharedHandle(
                     None::<*const SECURITY_ATTRIBUTES>,
-                    DXGI_SHARED_RESOURCE_READ,
+                    DXGI_SHARED_RESOURCE_READ.0,
                     None,
                 )
                 .map_err(|e| {
@@ -1270,10 +1291,16 @@ impl WindowsVideoDecoder {
             );
         }
 
-        self.shared_texture = Some(shared_texture.clone());
-        self.shared_handle = Some(shared_handle);
-
-        Ok((shared_texture, shared_handle))
+        use std::os::windows::io::FromRawHandle;
+        // SAFETY: CreateSharedHandle returned a new owned NT handle. OwnedHandle
+        // closes it only after both the decoder pool and all GPU leases release it.
+        let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(shared_handle.0) };
+        let shared = Arc::new(SharedVideoTexture {
+            texture: shared_texture,
+            handle,
+        });
+        self.shared_textures.push(Arc::clone(&shared));
+        Ok(shared)
     }
 
     /// Gets or creates a staging texture for CPU readback.
@@ -2133,19 +2160,8 @@ impl Drop for WindowsVideoDecoder {
         // Release staging texture
         self.staging_texture = None;
 
-        // Close shared handle to prevent NT handle leak
         #[cfg(feature = "zero-copy")]
-        if let Some(handle) = self.shared_handle.take() {
-            if !handle.is_invalid() {
-                // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
-                unsafe {
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
-                }
-                if self.debug_logging {
-                    debug!("Closed shared NT handle");
-                }
-            }
-        }
+        self.shared_textures.clear();
 
         // Note: MFShutdown is handled by the _mf_guard Arc<MfGuard>.
         // It will only call MFShutdown when the last decoder is dropped.

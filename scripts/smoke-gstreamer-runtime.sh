@@ -44,7 +44,7 @@ required_elements=$(jq -r '.required_elements[] | [.name, .filename] | @tsv' "$l
 # The smoke container has no network and receives only the built runtime and
 # deterministic MP4 fixture. The artifact launcher owns every runtime
 # environment variable; this shell only supplies a clean HOME.
-docker run --rm --pull=always --network none \
+docker run --rm -i --pull=always --network none \
     --env "EXPECTED_GSTREAMER_VERSION=$expected_version" \
     --env "RUNTIME_LIBDIR=$runtime_libdir" \
     --env "REQUIRED_ELEMENTS=$required_elements" \
@@ -52,6 +52,7 @@ docker run --rm --pull=always --network none \
     -v "$fixture:/input/h264-aac.mp4:ro" \
     "$builder_image" /bin/bash -s <<'EOF'
 set -euo pipefail
+export LC_ALL=C
 
 runtime_home=$(mktemp -d)
 trap 'rm -rf "$runtime_home"' EXIT
@@ -112,7 +113,7 @@ while IFS=$'\t' read -r element filename; do
         exit 1
     }
     actual=$("$launcher" "$runtime/bin/gst-inspect-1.0" "$element" |
-        sed -n 's/^[[:space:]]*Filename *: //p' | sed -n '1p')
+        sed -n 's/^[[:space:]]*Filename[[:space:]]\{1,\}//p' | sed -n '1p')
     [[ "$actual" == "$plugin_dir/$filename" ]] || {
         echo "$element resolved to $actual, expected $plugin_dir/$filename" >&2
         exit 1
@@ -124,7 +125,8 @@ done <<<"$REQUIRED_ELEMENTS"
     exit 1
 }
 
-"$launcher" "$runtime/bin/gst-launch-1.0" -e playbin3 \
+timeout --signal=TERM --kill-after=5s 60s \
+    "$launcher" "$runtime/bin/gst-launch-1.0" -e playbin3 \
     uri=file:///input/h264-aac.mp4 \
     video-sink=fakesink audio-sink=fakesink
 EOF

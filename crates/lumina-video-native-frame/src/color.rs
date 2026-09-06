@@ -303,22 +303,23 @@ pub fn render_decision(color: ColorMetadata) -> ColorRenderDecision {
     // coordinates: each UV texel is centered over its 2x2 luma block.
     // MPEG2/H_COSITED needs a -0.5 luma-pixel horizontal shift, which the
     // fixed shader cannot carry.
-    if matches!(color.transfer, ColorTransfer::Srgb)
-        && matches!(
-            (
-                color.matrix,
-                color.range,
-                color.chroma_horizontal,
-                color.chroma_vertical
-            ),
-            (
-                ColorMatrix::Bt601 | ColorMatrix::Bt709,
-                ColorRange::Full | ColorRange::Limited,
-                ChromaHorizontal::Centered,
-                ChromaVertical::Centered
-            )
+    if matches!(
+        color.transfer,
+        ColorTransfer::Srgb | ColorTransfer::Bt601 | ColorTransfer::Bt709
+    ) && matches!(
+        (
+            color.matrix,
+            color.range,
+            color.chroma_horizontal,
+            color.chroma_vertical
+        ),
+        (
+            ColorMatrix::Bt601 | ColorMatrix::Bt709,
+            ColorRange::Full | ColorRange::Limited,
+            ChromaHorizontal::Centered,
+            ChromaVertical::Centered
         )
-    {
+    ) {
         ColorRenderDecision::Gpu(matrix)
     } else {
         ColorRenderDecision::CpuRgba(matrix)
@@ -729,11 +730,19 @@ mod tests {
             ColorRenderDecision::Gpu(_)
         ));
         assert_eq!(yuv_to_rgb_matrix(color.matrix, color.range), bt601);
-        color.transfer = ColorTransfer::Bt709;
+        for transfer in [ColorTransfer::Bt601, ColorTransfer::Bt709] {
+            color.transfer = transfer;
+            assert!(matches!(
+                render_decision(color),
+                ColorRenderDecision::Gpu(transform) if Some(transform) == bt601
+            ));
+        }
+        color.transfer = ColorTransfer::Gamma22;
         assert!(matches!(
             render_decision(color),
-            ColorRenderDecision::CpuRgba(transform) if Some(transform) == bt601
+            ColorRenderDecision::CpuRgba(_)
         ));
+        color.transfer = ColorTransfer::Bt709;
         color.chroma_horizontal = ChromaHorizontal::Cosited;
         assert!(matches!(
             render_decision(color),

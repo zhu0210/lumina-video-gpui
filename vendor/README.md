@@ -93,3 +93,27 @@ registry/plugin/scanner paths, and a deterministic H.264/AAC MP4 reaching EOS:
 ./scripts/smoke-gstreamer-runtime.sh \
   dist/gstreamer-runtime/gstreamer-runtime-linux-x86_64.tar.gz
 ```
+
+The container receives the smoke script through stdin; playback must reach EOS
+within 60 seconds. The driver regression check needs Python 3, Bash and jq,
+but does not build a runtime or require Docker:
+
+```bash
+python3 scripts/test-smoke-gstreamer-runtime.py
+```
+
+## Release readiness
+
+The legacy `release-linux.yml` system-package build and Flatpak platform are
+checked for GStreamer >= 1.28 before packaging. This version check is necessary,
+but does not establish #19 compliance. The standalone application still needs
+to be integrated with the locked runtime and its launcher. The checked-in
+`flatpak/io.github.lumina_video.Demo.yml` is also a legacy template: its 1.24
+sources and missing generated Cargo sources are not a usable release build.
+
+Before claiming production artifacts, #19 still requires the complete playback
+and audio plugin/shared-library closure, GPL/ugly exclusion, component versions
+and checksums with licenses, full license texts and corresponding source/patch
+archives, plus isolated standalone and Flatpak playback of the MP4, Matroska,
+HLS VOD/live, audio and track fixtures. The #18 MP4 smoke and its driver regression
+check do not establish any of those wider guarantees.

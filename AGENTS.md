@@ -1,59 +1,46 @@
 # Agent Rules
 
-Rules are enforced. If you skip one, your PR will be rejected.
+## Scope and workflow
 
-## Before Every Commit
+Read `CONTEXT.md` and relevant decisions in `docs/adr/` before changing architecture.
+Preserve existing user changes. Prefer small fixes to shared causes over parallel implementations.
+Use `rtk` for shell commands when available; `rtk proxy` supports commands without a dedicated wrapper.
+Local instructions guide implementation; they do not require extra approval for work the user already authorized.
 
-```bash
-cargo fmt
-cargo check
-cargo clippy -- -D warnings
-cargo test
-# Must return nothing — local paths break everyone's build
-grep -rE 'path = "(/|\.\.)' **/Cargo.toml
-```
+## Validation
 
-For platform-specific changes, also verify relevant features:
+Before committing Rust changes, run `cargo fmt --check`, `cargo check`,
+`cargo clippy -- -D warnings`, and `cargo test` for the affected workspace/packages.
+Run `cargo fmt` when formatting needs updating. Documentation-only changes need no Rust build.
+Run feature and target checks only for features present in the manifests and targets/toolchains
+available on the host. Report unavailable checks and pre-existing failures accurately; do not
+change unrelated code or weaken tests just to make checks pass.
 
-```bash
-# Windows: Media Foundation + DXVA2 (opt-in)
-cargo check --features windows-native-video
-# MoQ: Media over QUIC live streaming
-cargo check --features moq
-# Vendored GStreamer runtime (Linux only)
-cargo check --features vendored-runtime
-```
+Portable manifests must not contain absolute local paths. Relative path dependencies must
+resolve inside the workspace. Use pinned git dependencies for maintained external projects;
+temporary local Cargo overrides are allowed for cross-repository validation but must not be committed.
+Check manifests with `rg 'path\s*=\s*"/' --glob Cargo.toml` (no matches is success).
 
-## NEVER (zero exceptions)
+## Correctness and media performance
 
-- `unwrap()` or `expect()` in library code — use `?`, `.get()`, `if let`
-- Unguarded indexing (`arr[i]`) — use `.get(i)`
-- Block the render/UI loop — use `poll_promise`, channels, background threads
-- Local path deps in Cargo.toml — use `git = "..."` with rev or branch
-- CPU pixel copies in steady-state decode/render — zero-copy or document why
-- Heap allocs, blocking I/O, or unbounded queues in per-frame hot paths
-- Mutex contention in frame-critical paths — use lock-free or bounded SPSC
-- `unsafe` without a `// SAFETY:` comment explaining the invariant
-- Vendor external code — use git deps in Cargo.toml
-- Global or thread-local state — state belongs in structs
-- Hack tests to pass CI — find and fix root causes
+- Handle fallible input without panicking. Avoid `unwrap()`/`expect()` in production library code;
+  tests may assert invariants. Index only where bounds are proven; otherwise use checked access.
+- Keep blocking I/O, waits, avoidable allocations, and contended locks out of render/per-frame paths.
+- Keep queues bounded. For live overload, drop stale frames rather than accumulate latency.
+- Keep one presentation authority per media session; preserve audio/video drift correction.
+- Seek and network discontinuities must have bounded resynchronization and a timeout.
+- Use native-memory frame delivery as the normal playback path. CPU pixel upload is only a last
+  fallback after native import is unavailable or fails; expose the reason and never label it zero-copy.
+- Every unsafe block/implementation needs a `SAFETY` comment explaining ownership, lifetime,
+  synchronization, and other relevant invariants.
+- Prefer state owned by structs. Process-wide runtime initialization is allowed when required by
+  platform APIs; avoid mutable global playback state.
+- Use dependencies rather than copying external implementations into this repository.
 
-## Media Rules
+## Project references
 
-- One master clock (audio or wall). Enforce drift correction.
-- Bounded queues with `drop_oldest` for live streams.
-- On overload: drop frames, never grow latency.
-- On discontinuity (seek/network gap): bounded resync with timeout.
-- See [docs/MOQ_BEST_PRACTICES.md](docs/MOQ_BEST_PRACTICES.md) for MoQ transport rules.
-
-## Platform Features
-
-Native hardware decoders are always-on per platform (detected via `cfg(target_os = "...")`).
-No feature flags are needed for macOS (AVFoundation/VideoToolbox), Linux (GStreamer/VA-API),
-or Android (MediaCodec). FFmpeg is included automatically on macOS for MKV/WebM support.
-
-| Feature | Platform | Backend |
-|---|---|---|
-| `windows-native-video` | Windows | Media Foundation + DXVA2/D3D11VA (opt-in) |
-| `moq` | Desktop | MoQ live streaming over QUIC + Nostr discovery |
-| `vendored-runtime` | Linux | Bundle GStreamer libraries with the binary |
+Cargo manifests and target-specific implementations define current platform/feature support.
+Do not assume legacy feature names or backend descriptions still apply.
+See `docs/MOQ_BEST_PRACTICES.md` when changing MoQ transport,
+`docs/agents/issue-tracker.md` for tracker operations,
+`docs/agents/triage-labels.md` for labels, and `docs/agents/domain.md` for domain documentation.

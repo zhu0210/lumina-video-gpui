@@ -234,10 +234,10 @@ impl std::fmt::Display for ResubscribeReason {
 }
 
 /// Result of catalog fetch and validation, avoiding positional tuple.
-struct CatalogResult {
-    video_track_name: String,
-    max_latency: Duration,
-    catalog: hang::catalog::Catalog,
+pub(super) struct CatalogResult {
+    pub(super) video_track_name: String,
+    pub(super) max_latency: Duration,
+    pub(super) catalog: hang::catalog::Catalog,
     /// Whether the selected video rendition is H.264.
     selected_is_h264: bool,
     /// Codec description (avcC/hvcC) from catalog, if present.
@@ -1053,7 +1053,7 @@ pub(crate) async fn run_moq_worker(
 ///
 /// Handles both cdn.moq.dev style (namespace in URL) and zap.stream style
 /// (UUID namespace = broadcast path).
-fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
+pub(super) fn build_connect_url(url: &MoqUrl) -> (String, Option<PathOwned>) {
     // moqs:// → https (real TLS), moq:// → http (self-signed cert dance).
     // Matches transport.rs connect() logic. moq-native uses the scheme to
     // decide whether to fetch the server's self-signed cert hash via HTTP.
@@ -1115,7 +1115,7 @@ fn sanitize_path(s: &str) -> String {
 ///
 /// Returns (OriginConsumer, protocol_name, Session).
 /// The session must be kept alive for the worker lifetime.
-async fn connect_to_relay(
+pub(super) async fn connect_to_relay(
     parsed_url: &url::Url,
     config: &MoqDecoderConfig,
     label: &str,
@@ -1205,7 +1205,7 @@ async fn try_connect(
 }
 
 /// Wait for a broadcast to be announced, with 10s overall timeout.
-async fn discover_broadcast(
+pub(super) async fn discover_broadcast(
     origin_consumer: &mut moq_lite::OriginConsumer,
     specific_broadcast: Option<PathOwned>,
     url: &MoqUrl,
@@ -1290,7 +1290,7 @@ async fn discover_broadcast(
 /// Fetch catalog with 5s timeout, validate it, log renditions, and store metadata.
 ///
 /// Returns `(video_track_name, max_latency, catalog)`.
-async fn fetch_and_validate_catalog(
+pub(super) async fn fetch_and_validate_catalog(
     moq_broadcast: &moq_lite::BroadcastConsumer,
     shared: &Arc<MoqSharedState>,
     config: &MoqDecoderConfig,
@@ -1671,7 +1671,10 @@ fn spawn_audio_forward_task(
 /// reusing `buf` to avoid per-frame allocation.
 ///
 /// After `split().freeze()`, the `BytesMut` retains its allocation for reuse.
-fn assemble_payload(payload: &hang::container::BufList, buf: &mut BytesMut) -> bytes::Bytes {
+pub(super) fn assemble_payload(
+    payload: &hang::container::BufList,
+    buf: &mut BytesMut,
+) -> bytes::Bytes {
     buf.clear();
     let needed = payload.remaining();
     buf.reserve(needed);

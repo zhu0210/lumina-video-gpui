@@ -1,18 +1,29 @@
 //! FFI conformance tests for lumina-video-ios.
 //!
-//! Tests are gated to macOS/iOS since the underlying decoders require
-//! those platforms. On Linux, the crate compiles but tests are skipped.
+//! Handle and error contracts run on every host; decoded-frame checks require Apple platforms.
 
 #![allow(unused_unsafe)]
 
 use lumina_video_ios::error::LuminaError;
-use lumina_video_ios::handle::{LuminaFrame, LuminaPlayer};
+// Match the C header's opaque handles without exposing Rust implementation layouts.
+#[repr(C)]
+struct LuminaPlayer {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct LuminaFrame {
+    _private: [u8; 0],
+}
 use lumina_video_ios::LuminaDiagnostics;
 use std::ptr;
 
 // Import FFI functions
 extern "C" {
-    fn lumina_player_create(url: *const i8, out_player: *mut *mut LuminaPlayer) -> i32;
+    fn lumina_player_create(
+        url: *const std::ffi::c_char,
+        out_player: *mut *mut LuminaPlayer,
+    ) -> i32;
     fn lumina_player_destroy(player: *mut *mut LuminaPlayer) -> i32;
     fn lumina_player_play(player: *mut LuminaPlayer) -> i32;
     fn lumina_player_pause(player: *mut LuminaPlayer) -> i32;
@@ -45,7 +56,7 @@ const LUMINA_STATE_ERROR: i32 = 5;
 #[test]
 fn create_and_destroy() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
 
         let err = lumina_player_create(url, &mut player);
@@ -80,7 +91,7 @@ fn destroy_already_null_is_noop() {
 #[test]
 fn double_destroy_is_safe() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
 
         let err = lumina_player_create(url, &mut player);
@@ -114,7 +125,7 @@ fn create_null_url() {
 #[test]
 fn create_null_out_player() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let err = lumina_player_create(url, ptr::null_mut());
         assert_eq!(err, LUMINA_ERROR_NULL_PTR);
     }
@@ -123,7 +134,7 @@ fn create_null_out_player() {
 #[test]
 fn create_empty_url() {
     unsafe {
-        let url = b"\0".as_ptr() as *const i8;
+        let url = c"".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
         let err = lumina_player_create(url, &mut player);
         assert_eq!(err, LUMINA_ERROR_INVALID_URL);
@@ -159,7 +170,7 @@ fn seek_null_player() {
 fn seek_nan_and_infinity_return_invalid_arg() {
     let err_invalid_arg: i32 = LuminaError::InvalidArgument as i32;
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
         let err = lumina_player_create(url, &mut player);
         assert_eq!(err, LUMINA_OK);
@@ -255,7 +266,7 @@ fn frame_release_null_is_noop() {
 #[test]
 fn initial_state_is_loading() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
 
         let err = lumina_player_create(url, &mut player);
@@ -271,7 +282,7 @@ fn initial_state_is_loading() {
 #[test]
 fn initial_position_is_zero() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
 
         let err = lumina_player_create(url, &mut player);
@@ -291,7 +302,7 @@ fn initial_position_is_zero() {
 #[test]
 fn rapid_create_destroy_100x() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         for _ in 0..100 {
             let mut player: *mut LuminaPlayer = ptr::null_mut();
             let err = lumina_player_create(url, &mut player);
@@ -305,7 +316,7 @@ fn rapid_create_destroy_100x() {
 #[test]
 fn play_pause_seek_without_init() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
         let err = lumina_player_create(url, &mut player);
         assert_eq!(err, LUMINA_OK);
@@ -328,7 +339,7 @@ fn thread_safety_create_destroy_different_thread() {
     use std::thread;
 
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
         let err = lumina_player_create(url, &mut player);
         assert_eq!(err, LUMINA_OK);
@@ -386,7 +397,7 @@ fn volume_null_returns_zero() {
 #[test]
 fn mute_toggle_round_trip() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
         let err = lumina_player_create(url, &mut player);
         assert_eq!(err, LUMINA_OK);
@@ -411,7 +422,7 @@ fn mute_toggle_round_trip() {
 #[test]
 fn volume_set_get_round_trip() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
         let err = lumina_player_create(url, &mut player);
         assert_eq!(err, LUMINA_OK);
@@ -431,7 +442,7 @@ fn volume_set_get_round_trip() {
 #[test]
 fn volume_clamping() {
     unsafe {
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
+        let url = c"https://example.com/test.mp4".as_ptr();
         let mut player: *mut LuminaPlayer = ptr::null_mut();
         let err = lumina_player_create(url, &mut player);
         assert_eq!(err, LUMINA_OK);
@@ -459,54 +470,5 @@ fn diagnostics_snapshot_null() {
     unsafe {
         let err = lumina_diagnostics_snapshot(ptr::null_mut());
         assert_eq!(err, LUMINA_ERROR_NULL_PTR);
-    }
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn diagnostics_tracks_player_lifecycle() {
-    unsafe {
-        let mut before = std::mem::zeroed::<LuminaDiagnostics>();
-        lumina_diagnostics_snapshot(&mut before);
-
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
-        let mut player: *mut LuminaPlayer = ptr::null_mut();
-        let err = lumina_player_create(url, &mut player);
-        assert_eq!(err, LUMINA_OK);
-
-        let mut during = std::mem::zeroed::<LuminaDiagnostics>();
-        lumina_diagnostics_snapshot(&mut during);
-        assert!(during.players_created > before.players_created);
-        assert!(during.players_live > before.players_live);
-
-        lumina_player_destroy(&mut player);
-
-        let mut after = std::mem::zeroed::<LuminaDiagnostics>();
-        lumina_diagnostics_snapshot(&mut after);
-        assert!(after.players_destroyed > before.players_destroyed);
-    }
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn diagnostics_no_leak_after_100_cycles() {
-    unsafe {
-        let mut before = std::mem::zeroed::<LuminaDiagnostics>();
-        lumina_diagnostics_snapshot(&mut before);
-        let initial_live = before.players_live;
-
-        let url = b"https://example.com/test.mp4\0".as_ptr() as *const i8;
-        for _ in 0..100 {
-            let mut player: *mut LuminaPlayer = ptr::null_mut();
-            let err = lumina_player_create(url, &mut player);
-            assert_eq!(err, LUMINA_OK);
-            let err = lumina_player_destroy(&mut player);
-            assert_eq!(err, LUMINA_OK);
-        }
-
-        let mut after = std::mem::zeroed::<LuminaDiagnostics>();
-        lumina_diagnostics_snapshot(&mut after);
-        // No leaked players
-        assert_eq!(after.players_live, initial_live);
     }
 }

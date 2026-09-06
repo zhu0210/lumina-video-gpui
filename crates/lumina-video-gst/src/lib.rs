@@ -1389,7 +1389,6 @@ fn run_worker(
         }
     };
     let mut fallback_attempted = false;
-    let mut automatic_downgrade_recorded = false;
     let mut unsupported_color_recorded = false;
     let mut decoder =
         match GStreamerDecoder::new_with_requested_tier_and_audio_sink_and_timeouts_and_control_and_tls_ca_file(
@@ -1644,7 +1643,7 @@ fn run_worker(
             );
             live_gap.disarm();
         }
-        if !playback.playing {
+        if !playback.playing && !decoder.has_pending_preroll() {
             match commands.recv_timeout(Duration::from_millis(25)) {
                 Ok(command) => {
                     if !process_command(
@@ -1848,22 +1847,23 @@ fn run_worker(
                 }
                 update_gst_observation(&state, &decoder, frame_sender.len());
             }
-            Err(error @ VideoError::UnsupportedFormat(_)) => {
-                if requested_tier == CapabilityTier::DirectAlias && !automatic_downgrade_recorded {
-                    automatic_downgrade_recorded = true;
-                    record_downgrade_reason(&state, native_downgrade_reason(&error));
-                }
-                dropped_frames.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
             Err(error)
-                if is_decode_or_open_failure(&error)
+                if (is_decode_or_open_failure(&error)
+                    || matches!(error, VideoError::UnsupportedFormat(_)))
                     && !fallback_attempted
                     && requested_tier == CapabilityTier::DirectAlias
                     && decoder.decode_mode() == DecodeMode::Hardware =>
             {
                 fallback_attempted = true;
-                record_downgrade_reason(&state, hardware_downgrade_reason(&error));
+                let reason = if matches!(error, VideoError::UnsupportedFormat(_)) {
+                    native_downgrade_reason(&error)
+                } else {
+                    hardware_downgrade_reason(&error)
+                };
+                record_downgrade_reason(&state, reason);
+                // The rejected frame may be the only paused preroll. Reopen
+                // once under the existing timeout rather than waiting forever
+                // for a next frame that cannot arrive while paused.
                 match rebuild_system_memory_decoder(
                     &mut decoder,
                     &source,
@@ -3244,6 +3244,57 @@ mod tests {
                 )
             })?;
         Ok((resumed, buffering_seen))
+    }
+
+    #[test]
+    fn paused_session_presents_open_and_seek_preroll() -> Result<(), Box<dyn std::error::Error>> {
+        let root = fixture_root().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "run fixtures/generate.sh first")
+        })?;
+        let mut session =
+            GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
+                root.join("h264-aac.mp4").to_string_lossy().into_owned(),
+                false,
+                GstAudioSinkMode::Fake,
+                Duration::from_secs(5),
+                0,
+            );
+        assert!(
+            pump_session_until(&mut session, Duration::from_secs(10), |event, _| matches!(
+                event,
+                Some(SessionEvent::Frame { .. })
+            ))?,
+            "{:?}",
+            session.snapshot()
+        );
+        assert!(!matches!(
+            session.snapshot().state,
+            SessionState::Playing { .. }
+        ));
+        assert!(!pump_session_until(
+            &mut session,
+            Duration::from_millis(150),
+            |event, _| matches!(event, Some(SessionEvent::Frame { .. }))
+        )?);
+
+        let target = Duration::from_millis(750);
+        session.command(SessionCommand::Seek { position: target })?;
+        assert!(pump_session_until(
+            &mut session,
+            Duration::from_secs(10),
+            |event, snapshot| matches!(
+                event,
+                Some(SessionEvent::Frame { pts, .. }) if *pts >= target
+            ) && matches!(snapshot.state, SessionState::Paused { .. })
+        )?);
+        assert_eq!(session.stream_generation(), 1);
+        assert!(!pump_session_until(
+            &mut session,
+            Duration::from_millis(150),
+            |event, _| matches!(event, Some(SessionEvent::Frame { .. }))
+        )?);
+        session.command(SessionCommand::Stop)?;
+        Ok(())
     }
 
     #[test]

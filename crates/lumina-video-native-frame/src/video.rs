@@ -287,6 +287,7 @@ pub struct WindowsGpuSurface {
     /// Reference to keep the underlying D3D11 texture alive.
     /// Uses Arc<dyn Any + Send + Sync> to hide D3D11 types from public API.
     _owner: Arc<dyn std::any::Any + Send + Sync>,
+    cpu_fallback_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
@@ -311,6 +312,22 @@ impl WindowsGpuSurface {
             format,
             cpu_fallback,
             _owner: owner,
+            cpu_fallback_requested: None,
+        }
+    }
+    pub(crate) fn with_cpu_fallback_request(
+        mut self,
+        requested: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.cpu_fallback_requested = Some(requested);
+        self
+    }
+
+    /// Requests system-memory delivery after a native import failure.
+    /// No pixels are read back until the decoder processes its next frame.
+    pub fn request_cpu_fallback(&self) {
+        if let Some(requested) = &self.cpu_fallback_requested {
+            requested.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -325,6 +342,7 @@ impl Clone for WindowsGpuSurface {
             format: self.format,
             cpu_fallback: self.cpu_fallback.clone(),
             _owner: Arc::clone(&self._owner),
+            cpu_fallback_requested: self.cpu_fallback_requested.clone(),
         }
     }
 }
@@ -783,6 +801,58 @@ impl CpuFrame {
     pub fn plane(&self, index: usize) -> Option<&Plane> {
         self.planes.get(index)
     }
+}
+
+/// Copies an Android image plane while honoring row padding and interleaved
+/// chroma samples. The caller keeps the Image acquired until this returns.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn copy_strided_plane(
+    source: &[u8],
+    width: usize,
+    height: usize,
+    row_stride: usize,
+    pixel_stride: usize,
+) -> Result<Plane, VideoError> {
+    let invalid = || VideoError::DecodeFailed("invalid Android image plane layout".into());
+    if width == 0 || height == 0 || pixel_stride == 0 {
+        return Err(invalid());
+    }
+    let row_bytes = (width - 1)
+        .checked_mul(pixel_stride)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(invalid)?;
+    let required = (height - 1)
+        .checked_mul(row_stride)
+        .and_then(|n| n.checked_add(row_bytes))
+        .ok_or_else(invalid)?;
+    if row_stride < row_bytes || required > source.len() {
+        return Err(invalid());
+    }
+    let size = width.checked_mul(height).ok_or_else(invalid)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(size).map_err(|_| invalid())?;
+    data.resize(size, 0);
+    for (y, output) in data.chunks_exact_mut(width).enumerate() {
+        let start = y * row_stride;
+        let row = source.get(start..start + row_bytes).ok_or_else(invalid)?;
+        for (out, sample) in output.iter_mut().zip(row.iter().step_by(pixel_stride)) {
+            *out = *sample;
+        }
+    }
+    Ok(Plane {
+        data,
+        stride: width,
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn strided_android_plane_copy_preserves_chroma_and_rejects_truncation() {
+    let plane = copy_strided_plane(&[1, 9, 2, 9, 0, 0, 3, 9, 4], 2, 2, 6, 2).unwrap();
+    assert_eq!(plane.data, [1, 2, 3, 4]);
+    assert_eq!(plane.stride, 2);
+    assert!(copy_strided_plane(&[1, 9, 2], 2, 2, 6, 2).is_err());
+    assert!(copy_strided_plane(&[1, 2], 2, 1, 2, 0).is_err());
 }
 
 /// A decoded video frame, either CPU-accessible or platform-specific GPU surface.

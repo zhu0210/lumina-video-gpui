@@ -168,8 +168,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<DmaBufExportSyncFile>(), 8);
         assert_eq!(std::mem::size_of::<SyncMergeData>(), 48);
         assert_eq!(DMA_BUF_SYNC_READ, 1);
-        assert_eq!(DMA_BUF_IOCTL_EXPORT_SYNC_FILE as u64, 0xc008_6202);
-        assert_eq!(SYNC_IOC_MERGE as u64, 0xc030_3e03);
+        assert_eq!(DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 0xc008_6202);
+        assert_eq!(SYNC_IOC_MERGE, 0xc030_3e03);
     }
 
     struct FakeOps {

@@ -52,7 +52,12 @@ jobs:
             libclang-dev
 
       - name: Build release binary
-        run: cargo build --release --locked --package lumina-video-demo
+        run: |
+          if ! pkg-config --atleast-version=1.28 gstreamer-1.0; then
+            echo '::error::Linux media sessions require GStreamer >= 1.28. This runner cannot build a supported system package. Ubuntu 24.04 requires the locked standalone runtime; see issue #19 and vendor/README.md.'
+            exit 1
+          fi
+          cargo build --release --locked --package lumina-video-demo
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -94,7 +99,7 @@ jobs:
             "Section: video" \
             "Priority: optional" \
             "Architecture: amd64" \
-            "Depends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-vaapi, libvulkan1" \
+            "Depends: libgstreamer1.0-0 (>= 1.28), gstreamer1.0-plugins-base (>= 1.28), gstreamer1.0-plugins-good (>= 1.28), gstreamer1.0-plugins-bad (>= 1.28), gstreamer1.0-libav (>= 1.28), gstreamer1.0-vaapi, libvulkan1" \
             "Maintainer: alltheseas <alltheseas@users.noreply.github.com>" \
             "Description: Hardware-accelerated GPUI video player demo" \
             " lumina-video-demo demonstrates the lumina-video video player library" \
@@ -148,11 +153,12 @@ jobs:
             "License:        MIT OR Apache-2.0" \
             "URL:            https://github.com/lumina-video/lumina-video" \
             "" \
-            "Requires:       gstreamer1-plugins-base" \
-            "Requires:       gstreamer1-plugins-good" \
-            "Requires:       gstreamer1-plugins-bad-free" \
+            "Requires:       gstreamer1 >= 1.28" \
+            "Requires:       gstreamer1-plugins-base >= 1.28" \
+            "Requires:       gstreamer1-plugins-good >= 1.28" \
+            "Requires:       gstreamer1-plugins-bad-free >= 1.28" \
             "Requires:       vulkan-loader" \
-            "Requires:       gstreamer1-plugin-libav" \
+            "Requires:       gstreamer1-plugin-libav >= 1.28" \
             "Requires:       gstreamer1-vaapi" \
             "" \
             "%description" \
@@ -195,6 +201,14 @@ jobs:
           sudo apt-get install -y flatpak flatpak-builder
           sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           sudo flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+
+      - name: Verify Flatpak media runtime
+        run: |
+          GST_VERSION=$(flatpak run --command=gst-inspect-1.0 org.freedesktop.Platform//24.08 --version | awk '/^GStreamer / { print $2 }')
+          if [ -z "$GST_VERSION" ] || ! dpkg --compare-versions "$GST_VERSION" ge 1.28; then
+            echo '::error::The selected Flatpak platform lacks GStreamer >= 1.28. Integrate the locked runtime per issue #19 before packaging; do not ship against the legacy platform plugins.'
+            exit 1
+          fi
 
       - name: Download binary
         uses: actions/download-artifact@v4

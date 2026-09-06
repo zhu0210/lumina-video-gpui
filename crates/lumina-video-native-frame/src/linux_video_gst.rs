@@ -378,12 +378,6 @@ fn negotiated_video_caps() -> gst::Caps {
                 .build(),
             gst::CapsFeatures::new(["memory:DMABuf"]),
         )
-        .structure_with_features(
-            gst::Structure::builder("video/x-raw")
-                .field("format", "NV12")
-                .build(),
-            gst::CapsFeatures::new_empty(),
-        )
         .build()
 }
 
@@ -713,6 +707,8 @@ impl Default for GstLifecycleControl {
 /// - Audio playback with volume control
 pub struct GStreamerDecoder {
     pipeline: gst::Pipeline,
+    #[cfg(feature = "moq")]
+    _moq_source: Option<crate::moq::gst_source::GstMoqSource>,
     appsink: gst_app::AppSink,
     network_source: bool,
     certificate_rejected: Arc<AtomicBool>,
@@ -1180,15 +1176,50 @@ impl GStreamerDecoder {
 
         // Build the pipeline
         let pipeline = gst::Pipeline::new();
+        if requested_tier != CapabilityTier::SystemMemoryUpload {
+            install_native_decoder_policy(&pipeline);
+        }
         let network_source = url.starts_with("http://") || url.starts_with("https://");
         let certificate_rejected = Arc::new(AtomicBool::new(false));
         let first_byte_seen = Arc::new(AtomicBool::new(false));
 
         // Source element - handles HTTP, HTTPS, file://
-        let source = gst::ElementFactory::make("uridecodebin3")
-            .property("uri", url)
-            .build()
-            .map_err(|e| VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}")))?;
+        #[cfg(feature = "moq")]
+        let moq_source = if url.starts_with("moq://") || url.starts_with("moqs://") {
+            Some(crate::moq::gst_source::GstMoqSource::new(
+                url,
+                init_deadline,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "moq")]
+        let live_moq_source = moq_source.is_some();
+        #[cfg(not(feature = "moq"))]
+        let live_moq_source = false;
+        #[cfg(feature = "moq")]
+        let moq_element = moq_source.as_ref().map(|source| source.element.clone());
+        #[cfg(not(feature = "moq"))]
+        let moq_element: Option<gst::Element> = None;
+        let source = if let Some(source) = moq_element {
+            source
+        } else {
+            gst::ElementFactory::make("uridecodebin3")
+                .property("uri", url)
+                .build()
+                .map_err(|e| {
+                    VideoError::DecoderInit(format!("Failed to create uridecodebin3: {e}"))
+                })?
+        };
+
+        if requested_tier != CapabilityTier::SystemMemoryUpload
+            && source.find_property("caps").is_some()
+        {
+            let mut caps = negotiated_video_caps();
+            caps.make_mut()
+                .append(gst::Caps::builder("audio/x-raw").any_features().build());
+            source.set_property("caps", &caps);
+        }
 
         let tls_ca_file = tls_ca_file
             .map(|path| {
@@ -1241,7 +1272,14 @@ impl GStreamerDecoder {
         }
 
         // === Video elements ===
-        let videoconvert = gst::ElementFactory::make("videoconvert")
+        // DMA_DRM is opaque to videoconvert; using it in the native path
+        // prevents decoder negotiation even when it would otherwise pass through.
+        let video_filter = if requested_tier == CapabilityTier::SystemMemoryUpload {
+            "videoconvert"
+        } else {
+            "identity"
+        };
+        let videoconvert = gst::ElementFactory::make(video_filter)
             .build()
             .map_err(|e| VideoError::DecoderInit(format!("Failed to create videoconvert: {e}")))?;
 
@@ -1257,6 +1295,15 @@ impl GStreamerDecoder {
             .sync(true)
             .qos(true)
             .build();
+
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .propose_allocation(|_, query| {
+                    query.add_allocation_meta::<gst_video::VideoMeta>(None);
+                    true
+                })
+                .build(),
+        );
 
         // === Audio elements ===
         let audioconvert = gst::ElementFactory::make("audioconvert")
@@ -1369,10 +1416,14 @@ impl GStreamerDecoder {
             }
         });
 
-        // Set pipeline to Paused to get metadata without starting playback
-        // (Playing state would autoplay the video)
+        // Live appsrc cannot preroll while PAUSED. Run it until the first sample,
+        // then pause below; the media-session worker applies the autoplay intent.
         pipeline
-            .set_state(gst::State::Paused)
+            .set_state(if live_moq_source {
+                gst::State::Playing
+            } else {
+                gst::State::Paused
+            })
             .map_err(|e| VideoError::DecoderInit(format!("Failed to start pipeline: {e:?}")))?;
 
         // Wait for pipeline to reach paused state (preroll) or error
@@ -1621,8 +1672,17 @@ impl GStreamerDecoder {
         } else {
             requested_tier
         };
+        if live_moq_source {
+            pipeline.set_state(gst::State::Paused).map_err(|error| {
+                VideoError::DecoderInit(format!(
+                    "Failed to pause initialized MoQ pipeline: {error}"
+                ))
+            })?;
+        }
         Ok(Self {
             pipeline,
+            #[cfg(feature = "moq")]
+            _moq_source: moq_source,
             appsink,
             network_source,
             certificate_rejected,
@@ -1783,9 +1843,29 @@ impl GStreamerDecoder {
     /// Converts a GStreamer sample to an owned CPU VideoFrame.
     fn video_info_from_caps(caps: &gst::CapsRef) -> Result<gst_video::VideoInfo, VideoError> {
         if gst_video::is_dma_drm_caps(caps) {
-            return gst_video::VideoInfoDmaDrm::from_caps(caps)
+            let info = gst_video::VideoInfoDmaDrm::from_caps(caps)
                 .and_then(|info| info.to_video_info())
-                .map_err(|e| VideoError::DecodeFailed(format!("Invalid DMA_DRM caps: {e}")));
+                .map_err(|e| VideoError::DecodeFailed(format!("Invalid DMA_DRM caps: {e}")))?;
+            // DMA_DRM loses chroma-site when resolving its opaque format.
+            // Restore explicit metadata or ordinary NV12's JPEG default
+            // without allocating a new caps object for every decoded frame.
+            if info.format() == gst_video::VideoFormat::Nv12 && info.chroma_site().is_empty() {
+                let chroma_site = caps
+                    .structure(0)
+                    .and_then(|s| s.get::<&str>("chroma-site").ok())
+                    .map(|site| {
+                        site.parse::<gst_video::VideoChromaSite>()
+                            .unwrap_or(gst_video::VideoChromaSite::empty())
+                    })
+                    .unwrap_or(gst_video::VideoChromaSite::JPEG);
+                return gst_video::VideoInfo::builder_from_info(&info)
+                    .chroma_site(chroma_site)
+                    .build()
+                    .map_err(|e| {
+                        VideoError::DecodeFailed(format!("Invalid DMA_DRM metadata: {e}"))
+                    });
+            }
+            return Ok(info);
         }
         gst_video::VideoInfo::from_caps(caps)
             .map_err(|e| VideoError::DecodeFailed(format!("Invalid video caps: {e}")))
@@ -1802,10 +1882,7 @@ impl GStreamerDecoder {
 
         let video_info = Self::video_info_from_caps(caps)?;
 
-        let pts = buffer
-            .pts()
-            .map(|t| Duration::from_nanos(t.nseconds()))
-            .unwrap_or(self.position);
+        let pts = sample_position(&sample).unwrap_or(self.position);
 
         self.sample_to_cpu_frame(
             buffer,
@@ -1830,10 +1907,7 @@ impl GStreamerDecoder {
             .caps()
             .ok_or_else(|| VideoError::DecodeFailed("Sample has no caps".to_string()))?;
         let video_info = Self::video_info_from_caps(caps)?;
-        let pts = buffer
-            .pts()
-            .map(|time| Duration::from_nanos(time.nseconds()))
-            .unwrap_or(self.position);
+        let pts = sample_position(&sample).unwrap_or(self.position);
         let width = video_info.width();
         let height = video_info.height();
         let color = color_metadata_from_video_info(&video_info);
@@ -2593,15 +2667,10 @@ impl GStreamerDecoder {
         // Record seek direction BEFORE updating position (for stale frame detection)
         self.last_seek_backward = position < self.position;
 
-        // Choose seek flags based on direction:
-        // - Forward: KEY_UNIT for fast keyframe-based seeking
-        // - Backward: ACCURATE for reliable frame-accurate seeking
-        //   (KEY_UNIT + SNAP_BEFORE caused video freeze, see notedeck-vid-w4r)
-        let flags = if self.last_seek_backward {
-            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE
-        } else {
-            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT
-        };
+        // Let GStreamer decode from the keyframe to the requested position.
+        // KEY_UNIT exposed an earlier keyframe after forward seeks, especially
+        // in paused previews where no later frame could correct the position.
+        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
 
         if let Err(e) = self
             .pipeline
@@ -2728,14 +2797,10 @@ impl GStreamerDecoder {
             let Some(sample) = sample else {
                 continue;
             };
-            let frame = match self.sample_to_frame(sample.clone()) {
-                Ok(frame) => frame,
-                Err(error) => {
-                    self.restore_paused_after_seek(deadline);
-                    return Err(error);
-                }
-            };
-            if self.is_stale_frame(frame.pts, discarded, 5) {
+            // Seek filtering only needs the timestamp. Mapping pixels here
+            // breaks opaque DMA-BUF frames and duplicates CPU conversion.
+            let pts = sample_position(&sample).unwrap_or(self.position);
+            if self.is_stale_frame(pts, discarded, 5) {
                 discarded = discarded.saturating_add(1);
                 continue;
             }
@@ -3038,6 +3103,12 @@ impl GStreamerDecoder {
         }
     }
 
+    /// Whether opening or seeking has queued a frame that can be presented
+    /// without advancing a paused pipeline.
+    pub fn has_pending_preroll(&self) -> bool {
+        self.preroll_sample.is_some()
+    }
+
     /// Decodes one sample into the owned native-frame contract. This keeps the
     /// transitional legacy `VideoDecoderBackend` return available without
     /// exposing GStreamer objects through the new adapter seam.
@@ -3181,6 +3252,69 @@ impl VideoDecoderBackend for GStreamerDecoder {
     }
 }
 
+/// decodebin3 has no autoplug-select signal. Reject incompatible candidates
+/// through their normal ACCEPT_CAPS query, before decodebin3 selects them.
+/// This policy belongs to this pipeline; it never mutates registry ranks.
+fn install_native_decoder_policy(pipeline: &gst::Pipeline) {
+    pipeline.connect_deep_element_added(|_, _, element| {
+        let Some(factory) = element.factory() else {
+            return;
+        };
+        let Some(classification) = factory.metadata("klass") else {
+            return;
+        };
+        if !classification.split('/').any(|part| part == "Decoder")
+            || !classification.split('/').any(|part| part == "Video")
+        {
+            return;
+        }
+        let supports_dmabuf = factory.static_pad_templates().iter().any(|template| {
+            template.direction() == gst::PadDirection::Src
+                && caps_support_dmabuf(&template.caps())
+        });
+        if supports_dmabuf {
+            return;
+        }
+        let Some(sink) = element.static_pad("sink") else {
+            return;
+        };
+        tracing::debug!(decoder = %factory.name(), "Skipping decoder without DMA-BUF output for native session");
+        // The candidate is added before decodebin3 asks its sink to accept
+        // encoded caps. HANDLED returns a successful query with a negative
+        // answer, so decodebin3 releases it and tries the next factory.
+        let _ = sink.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+            if let Some(query) = info.query_mut() {
+                if let gst::QueryViewMut::AcceptCaps(query) = query.view_mut() {
+                    query.set_result(false);
+                    return gst::PadProbeReturn::Handled;
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    });
+}
+
+fn caps_support_dmabuf(caps: &gst::CapsRef) -> bool {
+    caps.iter_with_features().any(|(structure, features)| {
+        structure.name() == "video/x-raw"
+            && !features.is_any()
+            && features.contains("memory:DMABuf")
+    })
+}
+
+/// Container PTS can have an arbitrary origin (notably MPEG-TS/HLS). Expose
+/// stream time, the same timeline used by seek and pipeline position queries.
+fn sample_position(sample: &gst::Sample) -> Option<Duration> {
+    let pts = sample.buffer()?.pts()?;
+    let position = match sample.segment() {
+        Some(segment) => segment
+            .downcast_ref::<gst::ClockTime>()?
+            .to_stream_time(pts)?,
+        None => pts,
+    };
+    Some(Duration::from_nanos(position.nseconds()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3200,6 +3334,75 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore = "requires GStreamer libav and H264 parser plugins"]
+    fn native_decoder_policy_is_instance_scoped_and_keeps_parsers() {
+        use gst::prelude::*;
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        super::install_native_decoder_policy(&pipeline);
+        let decoder = gst::ElementFactory::make("avdec_h264").build().unwrap();
+        let parser = gst::ElementFactory::make("h264parse").build().unwrap();
+        let caps = "video/x-h264,stream-format=avc,alignment=au"
+            .parse::<gst::Caps>()
+            .unwrap();
+        let rank = decoder.factory().unwrap().rank();
+        pipeline.add_many([&decoder, &parser]).unwrap();
+        assert!(!decoder.static_pad("sink").unwrap().query_accept_caps(&caps));
+        assert!(parser.static_pad("sink").unwrap().query_accept_caps(&caps));
+        let independent = gst::ElementFactory::make("avdec_h264").build().unwrap();
+        assert!(independent
+            .static_pad("sink")
+            .unwrap()
+            .query_accept_caps(&caps));
+        assert_eq!(decoder.factory().unwrap().rank(), rank);
+    }
+
+    #[test]
+    fn native_decoder_caps_require_explicit_dmabuf_support() {
+        gst::init().unwrap();
+        for caps in [
+            "video/x-raw(memory:DMABuf),format=DMA_DRM",
+            "video/x-raw(memory:CUDAMemory);video/x-raw(memory:DMABuf)",
+        ] {
+            assert!(super::caps_support_dmabuf(
+                &caps.parse::<gst::Caps>().unwrap()
+            ));
+        }
+        for caps in [
+            "ANY",
+            "video/x-raw(ANY)",
+            "video/x-raw(memory:CUDAMemory);video/x-raw",
+            "audio/x-raw(memory:DMABuf)",
+        ] {
+            assert!(!super::caps_support_dmabuf(
+                &caps.parse::<gst::Caps>().unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn sample_position_uses_segment_stream_time() -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        let mut buffer = gst::Buffer::new();
+        buffer
+            .get_mut()
+            .unwrap()
+            .set_pts(gst::ClockTime::from_mseconds(62_750));
+        let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        segment.set_start(gst::ClockTime::from_seconds(62));
+        segment.set_time(gst::ClockTime::ZERO);
+        let sample = gst::Sample::builder()
+            .buffer(&buffer)
+            .segment(&segment)
+            .build();
+        assert_eq!(
+            super::sample_position(&sample),
+            Some(Duration::from_millis(750))
+        );
+        Ok(())
+    }
 
     struct DropProbe(Arc<AtomicBool>);
 
@@ -3430,19 +3633,36 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_caps_prefer_dma_drm_then_system_nv12() -> Result<(), Box<dyn std::error::Error>> {
+    fn native_negotiation_excludes_cpu_memory() -> Result<(), Box<dyn std::error::Error>> {
         gst::init()?;
         let caps = negotiated_video_caps();
-        assert_eq!(caps.size(), 2);
+        assert_eq!(caps.size(), 1);
         let first = caps.structure(0).ok_or("missing DMA_DRM caps")?;
-        let second = caps.structure(1).ok_or("missing NV12 caps")?;
         assert_eq!(first.name().as_str(), "video/x-raw");
         assert_eq!(first.get::<String>("format")?, "DMA_DRM");
-        assert_eq!(second.get::<String>("format")?, "NV12");
         assert!(caps
             .features(0)
             .is_some_and(|features| features.contains("memory:DMABuf")));
-        assert!(caps.features(1).is_some_and(|features| features.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn dma_drm_color_defaults_match_resolved_nv12() -> Result<(), Box<dyn std::error::Error>> {
+        gst::init()?;
+        for chroma in ["", ",chroma-site=mpeg2"] {
+            let native = gst::Caps::from_str(&format!(
+                "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12:0x0100000000000009,width=320,height=180,colorimetry=bt709{chroma}"
+            ))?;
+            let ordinary = gst::Caps::from_str(&format!(
+                "video/x-raw,format=NV12,width=320,height=180,colorimetry=bt709{chroma}"
+            ))?;
+            let native_info = super::GStreamerDecoder::video_info_from_caps(&native)?;
+            let ordinary_info = gst_video::VideoInfo::from_caps(&ordinary)?;
+            assert_eq!(
+                super::color_metadata_from_video_info(&native_info),
+                super::color_metadata_from_video_info(&ordinary_info)
+            );
+        }
         Ok(())
     }
 

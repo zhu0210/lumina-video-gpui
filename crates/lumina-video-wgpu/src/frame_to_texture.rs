@@ -42,20 +42,11 @@ fn safe_write_texture(
     layout: wgpu::TexelCopyBufferLayout,
     extent: wgpu::Extent3d,
 ) {
-    let required =
-        layout.bytes_per_row.unwrap_or(0) as usize * layout.rows_per_image.unwrap_or(1) as usize;
-    if data.len() < required {
-        tracing::warn!(
-            "write_texture skipped: buffer {} bytes < needed {} bytes \
-             (bpr={}, rows={}, extent={}x{}x{})",
-            data.len(),
-            required,
-            layout.bytes_per_row.unwrap_or(0),
-            layout.rows_per_image.unwrap_or(0),
-            extent.width,
-            extent.height,
-            extent.depth_or_array_layers,
-        );
+    let Some(bytes_per_pixel) = texture.format().block_copy_size(None) else {
+        return;
+    };
+    if !valid_upload_layout(data.len(), layout, extent, bytes_per_pixel) {
+        tracing::warn!("write_texture skipped: invalid plane stride or truncated buffer");
         return;
     }
     queue.write_texture(
@@ -68,6 +59,53 @@ fn safe_write_texture(
         data,
         layout,
         extent,
+    );
+}
+
+// These uploads use uncompressed, single-layer planes. The final row need not
+// include padding, and trailing allocation bytes do not describe the row stride.
+fn valid_upload_layout(
+    data_len: usize,
+    layout: wgpu::TexelCopyBufferLayout,
+    extent: wgpu::Extent3d,
+    bytes_per_pixel: u32,
+) -> bool {
+    let row_bytes = u64::from(extent.width) * u64::from(bytes_per_pixel);
+    let stride = u64::from(layout.bytes_per_row.unwrap_or(0));
+    if bytes_per_pixel == 0
+        || !stride.is_multiple_of(u64::from(bytes_per_pixel))
+        || !layout.offset.is_multiple_of(u64::from(bytes_per_pixel))
+        || extent.width == 0
+        || extent.height == 0
+        || extent.depth_or_array_layers != 1
+        || stride < row_bytes
+        || layout
+            .rows_per_image
+            .is_some_and(|rows| rows < extent.height)
+    {
+        return false;
+    }
+    layout
+        .offset
+        .checked_add(stride * u64::from(extent.height - 1))
+        .and_then(|size| size.checked_add(row_bytes))
+        .is_some_and(|size| size <= data_len as u64)
+}
+
+fn upload_plane(queue: &wgpu::Queue, texture: &wgpu::Texture, plane: PlaneRef<'_>) {
+    let Ok(stride) = u32::try_from(plane.stride) else {
+        return;
+    };
+    safe_write_texture(
+        queue,
+        texture,
+        plane.data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(stride),
+            rows_per_image: Some(texture.height()),
+        },
+        texture.size(),
     );
 }
 
@@ -91,7 +129,7 @@ pub enum GpuFrameTextures {
         height: u32,
         color_transform: [[f32; 4]; 4],
     },
-    /// Single RGBA8Unorm texture.
+    /// Single RGBA8Unorm or BGRA8Unorm texture (sampling handles channel order).
     /// Use with `surface((texture, descriptor))`.
     Rgba {
         texture: Arc<wgpu::Texture>,
@@ -176,11 +214,18 @@ impl<'a> CpuFrameRef<'a> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// A borrowed native GPU surface cannot cross the legacy rendering boundary.
+/// A decoded frame could not cross the legacy rendering boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyFrameIngestionError {
     /// Native GPU surfaces are reserved for the owned producer seam in #7.
     UnsupportedNativeSurface,
+    /// A supported native surface could not be imported by this renderer.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        all(target_os = "windows", feature = "windows-native-video")
+    ))]
+    NativeImportFailed,
 }
 
 impl std::fmt::Display for LegacyFrameIngestionError {
@@ -190,16 +235,20 @@ impl std::fmt::Display for LegacyFrameIngestionError {
                 f,
                 "borrowed native GPU surfaces are unsupported; use the owned lease seam"
             ),
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                all(target_os = "windows", feature = "windows-native-video")
+            ))]
+            Self::NativeImportFailed => write!(f, "native GPU surface import failed"),
         }
     }
 }
 
 impl std::error::Error for LegacyFrameIngestionError {}
 
-/// Converts legacy borrowed CPU frames for GPUI's `surface()`.
-///
-/// Native GPU surfaces are rejected until #7 connects producers to the owned
-/// [`NativeFrameLease`](lumina_video_native_frame::NativeFrameLease) seam.
+/// Uploads CPU frames or aliases Apple IOSurfaces with GPU-tracked producer leases.
+/// Apple imports do not copy pixels; unsupported native formats return an error.
 pub fn decoded_frame_to_textures(
     frame: &DecodedFrame,
     device: &wgpu::Device,
@@ -208,10 +257,95 @@ pub fn decoded_frame_to_textures(
     cbcr_cache: &mut Option<Arc<wgpu::Texture>>,
     rgba_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<GpuFrameTextures, LegacyFrameIngestionError> {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if let DecodedFrame::MacOS(surface) = frame {
+        return import_macos_frame(surface, device);
+    }
+    #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+    if let DecodedFrame::Windows(surface) = frame {
+        return import_windows_frame(surface, device);
+    }
     let cpu = classify_legacy_frame(frame)?;
     Ok(upload_cpu_frame_as_textures(
         cpu, device, queue, y_cache, cbcr_cache, rgba_cache,
     ))
+}
+
+#[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+fn import_windows_frame(
+    surface: &lumina_video_native_frame::video::WindowsGpuSurface,
+    device: &wgpu::Device,
+) -> Result<GpuFrameTextures, LegacyFrameIngestionError> {
+    let format = match surface.format {
+        PixelFormat::Bgra => wgpu::TextureFormat::Bgra8Unorm,
+        PixelFormat::Rgba => wgpu::TextureFormat::Rgba8Unorm,
+        _ => {
+            surface.request_cpu_fallback();
+            return Err(LegacyFrameIngestionError::UnsupportedNativeSurface);
+        }
+    };
+    let owner = surface.clone();
+    // SAFETY: the decoder completes its D3D11 copy before publishing the frame.
+    // The callback retains the pool lease and shared handle until wgpu retires
+    // GPU uses; the importer validates the D3D12 layout and shared-state contract.
+    let texture = unsafe {
+        crate::zero_copy::windows::import_d3d11_shared_handle(
+            device,
+            windows::Win32::Foundation::HANDLE(surface.shared_handle.0),
+            surface.width,
+            surface.height,
+            format,
+            Some(Box::new(move || drop(owner))),
+        )
+    }
+    .map_err(|error| {
+        surface.request_cpu_fallback();
+        tracing::warn!("D3D11 shared texture import failed; requested CPU fallback: {error}");
+        LegacyFrameIngestionError::NativeImportFailed
+    })?;
+    Ok(GpuFrameTextures::Rgba {
+        texture: Arc::new(texture),
+        width: surface.width,
+        height: surface.height,
+    })
+}
+
+/// Bind the decoder pool lease to wgpu's GPU-tracked texture destruction.
+/// Retaining only IOSurface would not prevent CVPixelBuffer pool reuse.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn import_macos_frame(
+    surface: &lumina_video_native_frame::video::MacOSGpuSurface,
+    device: &wgpu::Device,
+) -> Result<GpuFrameTextures, LegacyFrameIngestionError> {
+    let format = match surface.format {
+        PixelFormat::Bgra => wgpu::TextureFormat::Bgra8Unorm,
+        PixelFormat::Rgba => wgpu::TextureFormat::Rgba8Unorm,
+        _ => return Err(LegacyFrameIngestionError::UnsupportedNativeSurface),
+    };
+    let owner = surface.clone();
+    // SAFETY: MacOSGpuSurface retains the decoder-completed CVPixelBuffer and
+    // guarantees its extent/format. The HAL drop callback keeps its pool lease
+    // alive through GPU-tracked texture destruction, preventing producer reuse
+    // while any renderer submission still samples the image.
+    let texture = unsafe {
+        crate::zero_copy::macos::import_iosurface_with_drop_callback(
+            device,
+            surface.io_surface,
+            surface.width,
+            surface.height,
+            format,
+            Some(Box::new(move || drop(owner))),
+        )
+    }
+    .map_err(|error| {
+        tracing::warn!("IOSurface import failed: {error}");
+        LegacyFrameIngestionError::NativeImportFailed
+    })?;
+    Ok(GpuFrameTextures::Rgba {
+        texture: Arc::new(texture),
+        width: surface.width,
+        height: surface.height,
+    })
 }
 
 fn classify_legacy_frame(frame: &DecodedFrame) -> Result<&CpuFrame, LegacyFrameIngestionError> {
@@ -284,6 +418,11 @@ impl NativeFrameIngestionError {
 }
 
 fn owned_nv12_color_transform(color: ColorMetadata) -> Option<[[f32; 4]; 4]> {
+    // The legacy two-plane result carries only a matrix, unlike the native
+    // DMA-BUF result which also carries its transfer function to the renderer.
+    if color.transfer != ColorTransfer::Srgb {
+        return None;
+    }
     match render_decision(color) {
         ColorRenderDecision::Gpu(transform) => Some(transform),
         ColorRenderDecision::CpuRgba(_)
@@ -492,6 +631,24 @@ pub fn decoded_frame_to_texture(
     queue: &wgpu::Queue,
     texture_cache: &mut Option<Arc<wgpu::Texture>>,
 ) -> Result<Arc<wgpu::Texture>, LegacyFrameIngestionError> {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if let DecodedFrame::MacOS(surface) = frame {
+        return match import_macos_frame(surface, device)? {
+            GpuFrameTextures::Rgba { texture, .. } => Ok(texture),
+            GpuFrameTextures::Nv12 { .. } => {
+                Err(LegacyFrameIngestionError::UnsupportedNativeSurface)
+            }
+        };
+    }
+    #[cfg(all(target_os = "windows", feature = "windows-native-video"))]
+    if let DecodedFrame::Windows(surface) = frame {
+        return match import_windows_frame(surface, device)? {
+            GpuFrameTextures::Rgba { texture, .. } => Ok(texture),
+            GpuFrameTextures::Nv12 { .. } => {
+                Err(LegacyFrameIngestionError::UnsupportedNativeSurface)
+            }
+        };
+    }
     let cpu = classify_legacy_frame(frame)?;
     Ok(upload_cpu_frame(cpu, device, queue, texture_cache))
 }
@@ -533,89 +690,11 @@ fn upload_nv12(
         "lumina_video_cbcr",
     );
 
-    // Upload Y plane (R8Unorm: 1 byte/pixel)
-    // Compute layout from actual data to be robust against stride mismatches
-    if let Some(y_plane) = frame.plane(0) {
-        let y_bytes_per_row = if height > 0 {
-            (y_plane.data.len() / height as usize) as u32
-        } else {
-            0
-        };
-        // For R8Unorm, 1 byte = 1 pixel; extent width ≤ bytes_per_row
-        let y_extent_width = y_bytes_per_row.min(width);
-        if y_bytes_per_row == 0 || y_extent_width == 0 {
-            tracing::warn!("NV12 Y plane: zero size, skipping upload");
-            return GpuFrameTextures::Nv12 {
-                y_texture,
-                cb_cr_texture: cbcr_texture,
-                width,
-                height,
-                color_transform,
-            };
-        }
-        if y_bytes_per_row != width {
-            tracing::warn!(
-                "NV12 Y plane: computed bpr={y_bytes_per_row} differs from width={width} — stride={}, data_len={}, height={height}",
-                y_plane.stride,
-                y_plane.data.len(),
-            );
-        }
-        safe_write_texture(
-            queue,
-            &y_texture,
-            y_plane.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(y_bytes_per_row),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width: y_extent_width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+    if let Some(plane) = frame.plane(0) {
+        upload_plane(queue, &y_texture, plane);
     }
-
-    // Upload interleaved CbCr plane (Rg8Unorm: 2 bytes/pixel)
-    // Compute layout from actual data to be robust against stride mismatches
-    if let Some(uv_plane) = frame.plane(1) {
-        let uv_bytes_per_row = if cbcr_height > 0 {
-            (uv_plane.data.len() / cbcr_height as usize) as u32
-        } else {
-            0
-        };
-        // For Rg8Unorm, 2 bytes = 1 pixel pair; extent width = bytes_per_row / 2
-        let uv_extent_width = (uv_bytes_per_row / 2).min(cbcr_width.max(1));
-        if uv_bytes_per_row == 0 || uv_extent_width == 0 {
-            tracing::warn!("NV12 CbCr plane: zero size, skipping upload");
-            return GpuFrameTextures::Nv12 {
-                y_texture,
-                cb_cr_texture: cbcr_texture,
-                width,
-                height,
-                color_transform,
-            };
-        }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &cbcr_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            uv_plane.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(uv_bytes_per_row),
-                rows_per_image: Some(cbcr_height),
-            },
-            wgpu::Extent3d {
-                width: uv_extent_width,
-                height: cbcr_height.max(1),
-                depth_or_array_layers: 1,
-            },
-        );
+    if let Some(plane) = frame.plane(1) {
+        upload_plane(queue, &cbcr_texture, plane);
     }
 
     GpuFrameTextures::Nv12 {
@@ -664,41 +743,8 @@ fn upload_yuv420p_as_nv12(
         "lumina_video_y",
     );
 
-    // Upload Y plane (R8Unorm: 1 byte/pixel)
-    // Compute layout from actual data to be robust against stride mismatches
-    if let Some(y_plane) = frame.plane(0) {
-        let y_bytes_per_row = if height > 0 {
-            (y_plane.data.len() / height as usize) as u32
-        } else {
-            0
-        };
-        // For R8Unorm, 1 byte = 1 pixel; extent width ≤ bytes_per_row
-        let y_extent_width = y_bytes_per_row.min(width);
-        if y_bytes_per_row == 0 || y_extent_width == 0 {
-            tracing::warn!("YUV420p Y plane: zero size, skipping upload");
-            return GpuFrameTextures::Nv12 {
-                y_texture,
-                cb_cr_texture: cbcr_texture,
-                width,
-                height,
-                color_transform,
-            };
-        }
-        safe_write_texture(
-            queue,
-            &y_texture,
-            y_plane.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(y_bytes_per_row),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width: y_extent_width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+    if let Some(plane) = frame.plane(0) {
+        upload_plane(queue, &y_texture, plane);
     }
 
     // Interleave U and V planes into CbCr (Rg8Unorm)
@@ -776,81 +822,16 @@ fn upload_rgba(
 ) -> GpuFrameTextures {
     let width = frame.width;
     let height = frame.height;
-
-    let texture = get_or_create_texture(
-        device,
-        cache,
-        width,
-        height,
-        wgpu::TextureFormat::Rgba8Unorm,
-        "lumina_video_rgba",
-    );
-
+    // Native BGRA sampling performs the swizzle without a per-frame CPU copy.
+    let format = if frame.format == PixelFormat::Bgra {
+        wgpu::TextureFormat::Bgra8Unorm
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
+    };
+    let texture = get_or_create_texture(device, cache, width, height, format, "lumina_video_rgba");
     if let Some(plane) = frame.plane(0) {
-        if frame.format == PixelFormat::Bgra {
-            // BGRA → RGBA: swizzle in-place
-            let rgba = bgra_to_rgba(plane.data);
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba.as_slice(),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            // Prevent drop reuse warning
-            let _ = rgba;
-        } else {
-            // RGBA: direct upload (Rgba8Unorm: 4 bytes/pixel)
-            // Compute layout from actual data to be robust against stride mismatches
-            let rgba_bytes_per_row = if height > 0 {
-                (plane.data.len() / height as usize) as u32
-            } else {
-                0
-            };
-            // For Rgba8Unorm, 4 bytes = 1 pixel; extent width = bytes_per_row / 4
-            let rgba_extent_width = (rgba_bytes_per_row / 4).min(width);
-            if rgba_bytes_per_row == 0 || rgba_extent_width == 0 {
-                tracing::warn!("RGBA upload: zero size, skipping upload");
-                return GpuFrameTextures::Rgba {
-                    texture,
-                    width,
-                    height,
-                };
-            }
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                plane.data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(rgba_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width: rgba_extent_width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        upload_plane(queue, &texture, plane);
     }
-
     GpuFrameTextures::Rgba {
         texture,
         width,
@@ -974,14 +955,7 @@ pub fn cpu_frame_to_rgba(frame: &CpuFrame) -> Vec<u8> {
 
 fn cpu_frame_ref_to_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
     match frame.format {
-        PixelFormat::Rgba => frame
-            .plane(0)
-            .map(|plane| plane.data.to_vec())
-            .unwrap_or_default(),
-        PixelFormat::Bgra => frame
-            .plane(0)
-            .map(|plane| bgra_to_rgba(plane.data))
-            .unwrap_or_default(),
+        PixelFormat::Rgba | PixelFormat::Bgra => packed_rgba(frame),
         PixelFormat::Rgb24 => rgb24_to_rgba(frame),
         PixelFormat::Yuv420p => yuv420p_to_rgba(frame),
         PixelFormat::Nv12 => nv12_to_rgba(frame),
@@ -994,15 +968,35 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     (r, g, b)
 }
 
-fn bgra_to_rgba(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(4) {
-        let (Some(&b), Some(&g), Some(&r), Some(&a)) =
-            (chunk.first(), chunk.get(1), chunk.get(2), chunk.get(3))
-        else {
-            continue;
+fn packed_rgba(frame: CpuFrameRef<'_>) -> Vec<u8> {
+    let Some(plane) = frame.plane(0) else {
+        return Vec::new();
+    };
+    let Some(row_bytes) = (frame.width as usize).checked_mul(4) else {
+        return Vec::new();
+    };
+    let Some(size) = row_bytes.checked_mul(frame.height as usize) else {
+        return Vec::new();
+    };
+    if row_bytes == 0 || plane.stride < row_bytes {
+        return Vec::new();
+    }
+    let mut out = vec![0; size];
+    for (row, output) in out.chunks_exact_mut(row_bytes).enumerate() {
+        let Some(start) = row.checked_mul(plane.stride) else {
+            break;
         };
-        out.extend_from_slice(&[r, g, b, a]);
+        let Some(end) = start.checked_add(row_bytes) else {
+            break;
+        };
+        if let Some(input) = plane.data.get(start..end) {
+            output.copy_from_slice(input);
+            if frame.format == PixelFormat::Bgra {
+                for pixel in output.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+            }
+        }
     }
     out
 }
@@ -1137,10 +1131,70 @@ mod tests {
     };
 
     #[test]
-    fn test_bgra_to_rgba() {
-        let bgra = vec![0u8, 128, 255, 255];
-        let rgba = bgra_to_rgba(&bgra);
-        assert_eq!(rgba, vec![255, 128, 0, 255]);
+    fn upload_layout_preserves_stride_without_requiring_last_row_padding() {
+        let layout = wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(12),
+            rows_per_image: Some(2),
+        };
+        let extent = wgpu::Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_array_layers: 1,
+        };
+        assert!(valid_upload_layout(20, layout, extent, 4));
+        assert!(valid_upload_layout(32, layout, extent, 4));
+        assert!(!valid_upload_layout(19, layout, extent, 4));
+        assert!(!valid_upload_layout(
+            32,
+            wgpu::TexelCopyBufferLayout {
+                bytes_per_row: Some(4),
+                ..layout
+            },
+            extent,
+            4
+        ));
+        assert!(!valid_upload_layout(
+            32,
+            wgpu::TexelCopyBufferLayout {
+                bytes_per_row: Some(9),
+                ..layout
+            },
+            extent,
+            4
+        ));
+        assert!(!valid_upload_layout(
+            32,
+            wgpu::TexelCopyBufferLayout {
+                offset: u64::MAX,
+                ..layout
+            },
+            extent,
+            4
+        ));
+    }
+
+    #[test]
+    fn packed_rgba_respects_padding_and_bgra_channel_order() {
+        for (format, expected) in [
+            (PixelFormat::Rgba, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            (PixelFormat::Bgra, vec![3, 2, 1, 4, 7, 6, 5, 8]),
+        ] {
+            let frame = CpuFrameRef {
+                format,
+                width: 1,
+                height: 2,
+                planes: [
+                    Some(PlaneRef {
+                        data: &[1, 2, 3, 4, 99, 99, 99, 99, 5, 6, 7, 8],
+                        stride: 8,
+                    }),
+                    None,
+                    None,
+                ],
+            };
+            assert_eq!(cpu_frame_ref_to_rgba(frame), expected);
+        }
     }
 
     #[test]

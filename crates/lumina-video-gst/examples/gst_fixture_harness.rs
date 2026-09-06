@@ -9,25 +9,35 @@ use lumina_video_core::session::{
     CapabilityTier, MediaSession, SessionCommand, SessionEvent, SessionState,
 };
 use lumina_video_gst::{GstAudioSinkMode, GstMediaSession, PresentationDecision};
-use lumina_video_native_frame::NativeMemory;
+use lumina_video_native_frame::{AcquireSync, NativeMemory};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let Some(source) = std::env::args().nth(1) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: fixture_harness <fixture path or URL>",
+            "usage: gst_fixture_harness <fixture path or URL> [--native]",
         )
         .into());
     };
 
+    let native = std::env::args()
+        .skip(2)
+        .any(|argument| argument == "--native");
     let source_kind = source.clone();
-    let mut session = GstMediaSession::new_with_autoplay_and_audio_sink_and_timeout_and_generation(
-        source,
-        true,
-        GstAudioSinkMode::Fake,
-        Duration::from_secs(2),
-        0,
-    );
+    let mut session =
+        GstMediaSession::new_with_autoplay_and_audio_sink_and_timeouts_and_generation_and_tier(
+            source,
+            !native,
+            GstAudioSinkMode::Fake,
+            Duration::from_secs(2),
+            lumina_video_gst::DEFAULT_OPEN_TIMEOUT,
+            0,
+            if native {
+                CapabilityTier::DirectAlias
+            } else {
+                CapabilityTier::SystemMemoryUpload
+            },
+        );
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut polls = 0_u32;
     let mut frames = 0_u32;
@@ -47,6 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let seek_target = Duration::from_millis(750);
     let mut seek_pts = None;
     let mut resumed_seen = false;
+    let mut native_resume_requested = false;
     let mut replay_requested = false;
     let mut replayed_seen = false;
     let mut frames_before_replay = 0_u32;
@@ -106,7 +117,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                if !matches!(frame.memory, NativeMemory::Cpu(_)) {
+                if native {
+                    let NativeMemory::DmaBuf(memory) = &frame.memory else {
+                        return Err(io::Error::other(format!(
+                            "native fixture fell back to CPU: decode={:?} downgrade={:?}",
+                            session.decode_mode(),
+                            session.latest_downgrade_reason()
+                        ))
+                        .into());
+                    };
+                    memory.validate()?;
+                    if memory.owner.is_none() || !matches!(&frame.acquire, AcquireSync::SyncFile(_))
+                    {
+                        return Err(io::Error::other(
+                            "native frame lacks producer owner or explicit sync-file",
+                        )
+                        .into());
+                    }
+                    if frames == 1 {
+                        println!("native-first-frame pts={:?} extent={:?} format={:?} fourcc={:?} modifier={:?} objects={} memory_planes={} format_planes={} decode={:?} producer_owner=true acquire=SyncFile renderer=not-attached", frame.descriptor.pts, frame.descriptor.extent, frame.descriptor.format, memory.drm_fourcc, memory.modifier, memory.objects.len(), memory.memory_planes.len(), memory.format_planes.len(), session.decode_mode());
+                    }
+                    if seek_seen && !native_resume_requested {
+                        // Native mode verifies that a paused seek produces a new
+                        // owned frame before resuming the GStreamer clock.
+                        session.command(SessionCommand::Play)?;
+                        native_resume_requested = true;
+                    }
+                } else if !matches!(frame.memory, NativeMemory::Cpu(_)) {
                     return Err(io::Error::other("fixture frame crossed as non-CPU memory").into());
                 }
             }
@@ -133,7 +170,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .audio_tracks
             .iter()
             .any(|track| track.codec.to_ascii_lowercase().contains("opus"));
+        // Complete the independent seek exercise before selecting audio:
+        // a seek intentionally cancels an in-flight selection operation.
         if source_kind.contains("dual-aac")
+            && seek_seen
+            && resumed_seen
             && audio_selection_requested.is_none()
             && snapshot.audio_tracks.len() >= 2
         {
@@ -185,7 +226,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 position: seek_target,
             })?;
             seek_generation = Some(session.stream_generation());
-            session.command(SessionCommand::Play)?;
+            if !native {
+                session.command(SessionCommand::Play)?;
+            }
             controls_requested = true;
         }
         if controls_requested {
@@ -238,7 +281,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 || missing_selection_prior_id != audio_selection_requested))
     {
         return Err(io::Error::other(format!(
-            "fixture session incomplete: metadata={metadata_seen} audio_tracks={audio_tracks_seen} opus={opus_track_seen} audio_selection_requested={audio_selection_requested:?} audio_selection_seen={audio_selection_seen} missing_selection_requested={missing_selection_requested} missing_selection_failed={missing_selection_failed} missing_selection_prior_id={missing_selection_prior_id:?} playing={playing_seen} buffering={buffering_seen} frames={frames} ended={ended_seen} replayed={replayed_seen} paused={paused_seen} resumed={resumed_seen} seek={seek_seen} seek_pts={seek_pts:?} duration={duration_seen} expected_duration={expected_duration_seen} position={position_seen} post_seek_position={post_seek_position_seen}"
+            "fixture session incomplete: decode={:?} downgrade={:?} state={:?} metadata={metadata_seen} audio_tracks={audio_tracks_seen} opus={opus_track_seen} audio_selection_requested={audio_selection_requested:?} audio_selection_seen={audio_selection_seen} missing_selection_requested={missing_selection_requested} missing_selection_failed={missing_selection_failed} missing_selection_prior_id={missing_selection_prior_id:?} playing={playing_seen} buffering={buffering_seen} frames={frames} ended={ended_seen} replayed={replayed_seen} paused={paused_seen} resumed={resumed_seen} seek={seek_seen} seek_pts={seek_pts:?} duration={duration_seen} expected_duration={expected_duration_seen} position={position_seen} post_seek_position={post_seek_position_seen}", session.decode_mode(), session.latest_downgrade_reason(), session.snapshot().state
         ))
         .into());
     }
@@ -259,8 +302,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         ))
         .into());
     }
-    if session.snapshot().capability != CapabilityTier::SystemMemoryUpload {
-        return Err(io::Error::other("fixture capability was not system-memory upload").into());
+    let expected_capability = if native {
+        CapabilityTier::DirectAlias
+    } else {
+        CapabilityTier::SystemMemoryUpload
+    };
+    if session.snapshot().capability != expected_capability {
+        return Err(io::Error::other(format!(
+            "fixture capability was not {expected_capability:?}"
+        ))
+        .into());
     }
     if !GstMediaSession::handles_audio_internally() {
         return Err(io::Error::other("GStreamer audio path is not enabled").into());
@@ -286,7 +337,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     println!(
-        "metadata={} playing={} buffering={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability=SystemMemoryUpload audio_switch={} invalid_id={} invalid_id_prior={:?}",
+        "metadata={} playing={} buffering={} frames={} polls={} ended={} replayed={} paused={} resumed={} seek={} seek_pts={:?} duration={} expected_duration={} position={} post_seek_position={} muted=true volume=25 dropped_frames={} audio=gstreamer connected={} buffers_seen={} capability={:?} renderer=not-attached audio_switch={} invalid_id={} invalid_id_prior={:?}",
         metadata_seen,
         playing_seen,
         buffering_seen,
@@ -305,6 +356,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         session.dropped_frame_count(),
         audio_connected_seen,
         audio_buffers_seen,
+        expected_capability,
         audio_switch_evidence,
         invalid_id_evidence,
         missing_selection_prior_id,

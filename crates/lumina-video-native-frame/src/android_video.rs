@@ -1,42 +1,10 @@
-//! Android video decoder using ExoPlayer via JNI.
+//! Android playback via ExoPlayer on a dedicated Kotlin handler thread.
 //!
-//! This module provides video decoding on Android using ExoPlayer,
-//! which automatically handles hardware acceleration via MediaCodec.
-//!
-//! # Self-Contained API
-//!
-//! Call `LuminaVideo.init(activity)` once in your Activity's `onCreate()`, then
-//! `VideoPlayer::with_wgpu(url)` works self-contained — no Kotlin ExoPlayer setup needed.
-//!
-//! `AndroidVideoDecoder::new()` calls `LuminaVideo.createPlayer(nativeHandle)` via JNI,
-//! which creates ExoPlayer on a dedicated HandlerThread with a Looper.
-//!
-//! # Zero-Copy GPU Rendering
-//!
-//! ```text
-//! LuminaVideo.createPlayer() → ExoPlayer → ImageReader → HardwareBuffer → JNI → Vulkan Import
-//! ```
-//!
-//! With the `zero-copy` feature enabled:
-//! - YUV HardwareBuffers are imported directly into Vulkan via `VulkanYuvPipeline`
-//! - GPU-side YUV→RGB conversion eliminates CPU copies
-//!
-//! Without zero-copy or when import fails, frames use CPU fallback (ByteBuffer extraction).
-//!
-//! ## Requirements
-//!
-//! - Android API 26+ (HardwareBuffer)
-//! - `zero-copy` feature enabled
-//! - Vulkan backend with `VK_ANDROID_external_memory_android_hardware_buffer`
-//!
-//! ## Implementation Files
-//!
-//! - `android/lumina-video-bridge/LuminaVideo.kt` - Static init + createPlayer()
-//! - `android/lumina-video-bridge/ExoPlayerBridge.kt` - Kotlin bridge
-//! - `android_video.rs` - JNI entry points and frame queue
-//! - `zero_copy.rs` - Vulkan AHardwareBuffer import
-//!
-//! Tracking: lumina-video-5hd
+//! ExoPlayer owns decode, audio, and presentation timing. Native frames retain
+//! their producer Image through GPU consumption. If synchronization or native
+//! import is unavailable, CPU-readable YUV Images are snapshotted on the
+//! bridge handler thread before Image release and delivered through CorePlayer.
+//! Legacy AHardwareBuffer entry points remain for the separate MoQ path.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -46,13 +14,13 @@ use tracing::info;
 
 use parking_lot::Mutex;
 
-use jni::objects::{GlobalRef, JClass, JObject, JValue};
-use jni::sys::{jint, jlong};
+use jni::objects::{GlobalRef, JByteBuffer, JClass, JObject, JValue};
+use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 
 use crate::video::{
-    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
-    VideoFrame, VideoMetadata,
+    CpuFrame, DecodedFrame, HwAccelType, PixelFormat, VideoDecoderBackend, VideoError, VideoFrame,
+    VideoMetadata,
 };
 
 /// Gets the Java VM from the Android context.
@@ -389,21 +357,6 @@ impl AndroidVideoDecoder {
         })
     }
 
-    /// Creates a minimal placeholder frame with the last known playback position.
-    /// This keeps the decode loop alive without resetting playback position.
-    fn create_placeholder_frame(&self) -> VideoFrame {
-        let placeholder = CpuFrame::new(
-            PixelFormat::Rgba,
-            1,
-            1,
-            vec![Plane {
-                data: vec![0, 0, 0, 255],
-                stride: 4,
-            }],
-        );
-        VideoFrame::new(self.last_position, DecodedFrame::Cpu(placeholder))
-    }
-
     /// Starts playback if not already started.
     fn start_playback(&mut self) -> Result<(), VideoError> {
         if self.started {
@@ -453,9 +406,7 @@ impl AndroidVideoDecoder {
     /// Waits for a frame to be available with timeout.
     /// Returns true if a frame is ready, false on timeout.
     ///
-    /// Checks the HardwareBuffer queue directly — frames arrive via
-    /// `nativeSubmitHardwareBuffer` and are consumed by the render thread
-    /// in `video_texture.rs::prepare()`.
+    /// Checks this player's bounded mailbox populated on the bridge handler thread.
     fn wait_for_frame(&self, max_wait_ms: u64) -> Result<bool, VideoError> {
         const STATE_ENDED: i32 = 4;
 
@@ -551,37 +502,36 @@ impl VideoDecoderBackend for AndroidVideoDecoder {
         // Start playback on first decode_next call
         self.start_playback()?;
 
+        let fallback = PLAYER_QUEUES.get().is_some_and(|queues| {
+            queues
+                .write()
+                .get_mut(&self.player_id)
+                .is_some_and(|state| std::mem::take(&mut state.cpu_fallback_requested))
+        });
+        if fallback {
+            let vm = get_jvm()?;
+            let mut env = vm
+                .attach_current_thread()
+                .map_err(|e| VideoError::Generic(format!("JNI attach failed: {e}")))?;
+            env.call_method(&self.bridge, "enableCpuFallback", "()V", &[])
+                .map_err(|e| VideoError::DecodeFailed(format!("CPU fallback failed: {e}")))?;
+        }
+
         // Check for errors or EOS from callbacks
         if let Some(result) = self.check_state_for_early_return() {
             return result;
         }
 
-        // Wait for a HardwareBuffer frame or error/EOS.
-        // Actual frame delivery to the render thread happens independently via
-        // try_receive_hardware_buffer_for_player() in video_texture.rs::prepare().
-        // This loop serves as a heartbeat for error/EOS detection and position updates.
-        let frame_ready = self.wait_for_frame(100)?;
-
-        if !frame_ready {
-            return Ok(Some(self.create_placeholder_frame()));
+        if !self.wait_for_frame(100)? {
+            return Ok(None);
         }
-
-        // Update position from cached bridge state
-        let vm = get_jvm();
-        if let Ok(vm) = vm {
-            if let Ok(mut env) = vm.attach_current_thread() {
-                if let Ok(pos) = env.call_method(&self.bridge, "getCurrentPosition", "()J", &[]) {
-                    if let Ok(pos_ms) = pos.j() {
-                        if pos_ms >= 0 {
-                            self.last_position = Duration::from_millis(pos_ms as u64);
-                        }
-                    }
-                }
-            }
+        let frame = PLAYER_QUEUES
+            .get()
+            .and_then(|queues| queues.write().get_mut(&self.player_id)?.cpu_frame.take());
+        if let Some(frame) = frame.as_ref() {
+            self.last_position = frame.pts;
         }
-
-        // Return placeholder — the real frame is delivered via HardwareBuffer queue
-        Ok(Some(self.create_placeholder_frame()))
+        Ok(frame)
     }
 
     fn seek(&mut self, position: Duration) -> Result<(), VideoError> {
@@ -794,6 +744,8 @@ fn with_player_stats(player_id: u64, f: impl FnOnce(&PerPlayerStats)) {
     let mut guard = queues.write();
     let state = guard.entry(player_id).or_insert_with(|| PlayerState {
         queue: VecDeque::new(),
+        cpu_frame: None,
+        cpu_fallback_requested: false,
         stats: PerPlayerStats::new(),
     });
     f(&state.stats);
@@ -951,12 +903,15 @@ use std::sync::OnceLock;
 /// Per-player frame queues for HardwareBuffer submissions.
 /// Each player has its own queue to avoid frame stealing between players.
 /// Max queue size per player to prevent unbounded memory growth.
-const MAX_QUEUE_SIZE_PER_PLAYER: usize = 8;
+const MAX_QUEUE_SIZE_PER_PLAYER: usize = 1;
 
 /// Per-player state combining the frame queue and zero-copy stats.
 /// Co-locating these avoids the need for a separate global stats map.
 struct PlayerState {
     queue: VecDeque<AndroidVideoFrame>,
+    /// Latest CPU snapshot; old frames are dropped on overload.
+    cpu_frame: Option<VideoFrame>,
+    cpu_fallback_requested: bool,
     stats: PerPlayerStats,
 }
 
@@ -1150,6 +1105,23 @@ pub fn generate_player_id() -> u64 {
 
 /// Represents a video frame backed by an AHardwareBuffer.
 /// Used for zero-copy rendering via Vulkan external memory.
+pub(crate) struct AndroidImageOwner {
+    vm: JavaVM,
+    image: GlobalRef,
+}
+
+impl Drop for AndroidImageOwner {
+    fn drop(&mut self) {
+        // GPU consumers retain this owner until their completion callback.
+        if let Ok(mut env) = self.vm.attach_current_thread() {
+            if let Err(error) = env.call_method(&self.image, "close", "()V", &[]) {
+                tracing::error!("Failed to release completed Android Image: {error}");
+            }
+        }
+    }
+}
+
+/// An owned AHardwareBuffer plus its producer Image and acquire fence.
 pub struct AndroidVideoFrame {
     /// Raw AHardwareBuffer pointer (owned, must call AHardwareBuffer_release on drop)
     pub buffer: *mut std::ffi::c_void,
@@ -1169,13 +1141,24 @@ pub struct AndroidVideoFrame {
     /// The consumer (Vulkan) must wait on this fence before reading the buffer.
     /// This is critical for correct synchronization with hardware video decoders.
     pub fence_fd: i32,
+    /// Keeps the producer Image acquired until GPU consumption has completed.
+    pub(crate) image_owner: Option<AndroidImageOwner>,
+}
+
+impl AndroidVideoFrame {
+    /// Whether this frame prevents ImageReader from recycling producer pixels.
+    /// A bare AHardwareBuffer reference only retains the allocation.
+    pub fn owns_producer_image(&self) -> bool {
+        self.image_owner.is_some()
+    }
 }
 
 // SAFETY: AndroidVideoFrame can be sent and shared between threads because:
 // - The raw AHardwareBuffer pointer is an opaque handle that Android guarantees
 //   is safe to use from any thread (per NDK documentation).
 // - AHardwareBuffer_release() is explicitly documented as thread-safe.
-// - All other fields (width, height, timestamp_ns, format, player_id) are Copy types.
+// - Copied metadata and JNI GlobalRef/JavaVM are Send + Sync. The acquired
+//   Image is retained exclusively for lifetime management until this frame drops.
 // - The pointer is not mutated after creation; only Drop reads it.
 unsafe impl Send for AndroidVideoFrame {}
 // SAFETY: AndroidVideoFrame's opaque buffer handle and copied metadata are
@@ -1233,8 +1216,24 @@ pub fn try_receive_hardware_buffer_for_player(player_id: u64) -> Option<AndroidV
 
     // Per-player mode: pop from this player's dedicated queue
     let queues = PLAYER_QUEUES.get()?;
-    let mut queues_guard = queues.write();
-    queues_guard.get_mut(&player_id)?.queue.pop_front()
+    let mut queues_guard = queues.try_write()?;
+    queues_guard.get_mut(&player_id)?.queue.pop_back()
+}
+
+/// Requests the system-memory tier after a renderer rejects native import.
+/// The decoder worker performs the JNI request; callers never wait on Java.
+pub fn request_cpu_fallback_for_player(player_id: u64) -> bool {
+    let Some(queues) = PLAYER_QUEUES.get() else {
+        return false;
+    };
+    let Some(mut queues) = queues.try_write() else {
+        return false;
+    };
+    let Some(state) = queues.get_mut(&player_id) else {
+        return false;
+    };
+    state.cpu_fallback_requested = true;
+    true
 }
 
 /// Gets the next available HardwareBuffer frame, if any (legacy single-player mode).
@@ -1258,7 +1257,7 @@ pub fn has_pending_hardware_buffer(player_id: u64) -> bool {
                 queues
                     .read()
                     .get(&player_id)
-                    .map(|s| !s.queue.is_empty())
+                    .map(|s| s.cpu_frame.is_some() || !s.queue.is_empty())
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -1427,6 +1426,124 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeOnDurationCh
     }
 }
 
+/// Takes ownership of an acquired Image after the bridge has waited for its
+/// producer fence. AHardwareBuffer references alone do not prevent pool reuse.
+#[no_mangle]
+pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitImageFrame(
+    env: JNIEnv,
+    _this: JObject,
+    image: JObject,
+    buffer: JObject,
+    timestamp_ns: jlong,
+    width: jint,
+    height: jint,
+    player_id: jlong,
+) -> jboolean {
+    let (Ok(vm), Ok(image)) = (env.get_java_vm(), env.new_global_ref(image)) else {
+        return 0;
+    };
+    submit_hardware_buffer(
+        env,
+        buffer,
+        timestamp_ns,
+        width,
+        height,
+        player_id,
+        -1,
+        Some(AndroidImageOwner { vm, image }),
+    );
+    // Rust owns Image.close from this point, including any rejected-frame drop.
+    1
+}
+
+/// Snapshots a YUV_420_888 Image on the bridge's dedicated handler thread.
+/// The Image remains acquired for this entire call; no decoder-owned pointers
+/// escape to the renderer. This is the explicit system-memory playback path.
+#[no_mangle]
+pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitCpuFrame(
+    env: JNIEnv,
+    _this: JObject,
+    y: JByteBuffer,
+    y_row: jint,
+    y_pixel: jint,
+    u: JByteBuffer,
+    u_row: jint,
+    u_pixel: jint,
+    v: JByteBuffer,
+    v_row: jint,
+    v_pixel: jint,
+    timestamp_ns: jlong,
+    width: jint,
+    height: jint,
+    player_id: jlong,
+) -> jboolean {
+    let snapshot = || -> Result<VideoFrame, VideoError> {
+        if width <= 0 || height <= 0 || timestamp_ns < 0 || player_id <= 0 {
+            return Err(VideoError::DecodeFailed(
+                "invalid Android frame metadata".into(),
+            ));
+        }
+        let width = width as usize;
+        let height = height as usize;
+        let copy = |buffer: &JByteBuffer, row: jint, pixel: jint, w, h| {
+            let invalid = || VideoError::DecodeFailed("invalid Android direct image buffer".into());
+            let row = usize::try_from(row).map_err(|_| invalid())?;
+            let pixel = usize::try_from(pixel).map_err(|_| invalid())?;
+            let address = env
+                .get_direct_buffer_address(buffer)
+                .map_err(|_| invalid())?;
+            let length = env
+                .get_direct_buffer_capacity(buffer)
+                .map_err(|_| invalid())?;
+            if address.is_null() || length > isize::MAX as usize {
+                return Err(invalid());
+            }
+            // SAFETY: Kotlin passes sliced direct Image.Plane buffers and keeps
+            // the acquired Image alive until this synchronous call returns. JNI
+            // supplies the buffer's allocation and capacity; we only read it.
+            let bytes = unsafe { std::slice::from_raw_parts(address, length) };
+            crate::video::copy_strided_plane(bytes, w, h, row, pixel)
+        };
+        let planes = vec![
+            copy(&y, y_row, y_pixel, width, height)?,
+            copy(&u, u_row, u_pixel, width.div_ceil(2), height.div_ceil(2))?,
+            copy(&v, v_row, v_pixel, width.div_ceil(2), height.div_ceil(2))?,
+        ];
+        Ok(VideoFrame::new(
+            Duration::from_nanos(timestamp_ns as u64),
+            DecodedFrame::Cpu(CpuFrame::new(
+                PixelFormat::Yuv420p,
+                width as u32,
+                height as u32,
+                planes,
+            )),
+        ))
+    };
+    match snapshot() {
+        Ok(frame) => {
+            init_player_queues();
+            if let Some(queues) = PLAYER_QUEUES.get() {
+                let mut queues = queues.write();
+                let state = queues
+                    .entry(player_id as u64)
+                    .or_insert_with(|| PlayerState {
+                        queue: VecDeque::new(),
+                        cpu_frame: None,
+                        cpu_fallback_requested: false,
+                        stats: PerPlayerStats::new(),
+                    });
+                state.cpu_frame = Some(frame);
+                return 1;
+            }
+            0
+        }
+        Err(error) => {
+            tracing::error!("Android CPU snapshot failed: {error}");
+            0
+        }
+    }
+}
+
 /// JNI entry point for HardwareBuffer submission from Kotlin.
 ///
 /// Called by ExoPlayerBridge.nativeSubmitHardwareBuffer().
@@ -1449,6 +1566,29 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
     height: jint,
     player_id: jlong,
     fence_fd: jint,
+) {
+    submit_hardware_buffer(
+        env,
+        buffer,
+        timestamp_ns,
+        width,
+        height,
+        player_id,
+        fence_fd,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_hardware_buffer(
+    env: JNIEnv,
+    buffer: JObject,
+    timestamp_ns: jlong,
+    width: jint,
+    height: jint,
+    player_id: jlong,
+    fence_fd: jint,
+    image_owner: Option<AndroidImageOwner>,
 ) {
     // Ensure queues are initialized
     if HARDWARE_BUFFER_QUEUE.get().is_none() {
@@ -1494,14 +1634,21 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
         return;
     }
 
-    // Query the buffer format using AHardwareBuffer_describe
+    // Imported VkImages must match the actual allocation, not caller metadata.
     // SAFETY: `ahb` is the non-null pointer returned above and `desc` points to
     // a valid stack descriptor for the NDK to fill.
-    let format = unsafe {
+    let desc = unsafe {
         let mut desc = std::mem::zeroed::<AHardwareBufferDesc>();
         AHardwareBuffer_describe(ahb, &mut desc);
-        desc.format
+        desc
     };
+    if desc.width == 0 || desc.height == 0 || desc.layers != 1 {
+        tracing::warn!("Unsupported Android video allocation dimensions/layers");
+        return;
+    }
+    if width <= 0 || height <= 0 || desc.width != width as u32 || desc.height != height as u32 {
+        tracing::debug!("Using AHardwareBuffer allocation dimensions instead of image metadata");
+    }
 
     // Acquire a reference to keep the buffer alive
     // Rust now owns this reference and will release it when AndroidVideoFrame is dropped
@@ -1515,12 +1662,13 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
 
     let frame = AndroidVideoFrame {
         buffer: ahb,
-        width: width as u32,
-        height: height as u32,
+        width: desc.width,
+        height: desc.height,
         timestamp_ns,
-        format,
+        format: desc.format,
         player_id: player_id_u64,
         fence_fd,
+        image_owner,
     };
 
     // Route to the appropriate queue based on player_id
@@ -1539,6 +1687,8 @@ pub extern "C" fn Java_com_luminavideo_bridge_ExoPlayerBridge_nativeSubmitHardwa
                 .entry(player_id_u64)
                 .or_insert_with(|| PlayerState {
                     queue: VecDeque::new(),
+                    cpu_frame: None,
+                    cpu_fallback_requested: false,
                     stats: PerPlayerStats::new(),
                 });
 

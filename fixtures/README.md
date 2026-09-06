@@ -33,8 +33,8 @@ example:
 
 ```bash
 # The harness uses GStreamer's deterministic fake audio sink.
-cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/vp9-opus.mkv
-cargo run -p lumina-video-gst --example fixture_harness -- fixtures/generated/dual-aac.mkv
+cargo run -p lumina-video-gst --example gst_fixture_harness -- fixtures/generated/vp9-opus.mkv
+cargo run -p lumina-video-gst --example gst_fixture_harness -- fixtures/generated/dual-aac.mkv
 ```
 
 The deterministic HTTP redirect, HTTPS-success, invalid-certificate, range,
@@ -60,3 +60,10 @@ counter, exercises pause/play, mute/volume, seek, and EOS replay, and verifies
 that GStreamer owns the audio path. The harness keeps the adapter's default
 two-second worker operation bound. No GPU or private GStreamer element is
 required.
+
+For native Linux validation, append `--native` to the same harness command.
+This mode requires a hardware decoder exporting DMA-BUF and fails on CPU fallback.
+It checks an owned, explicitly synchronized first frame while paused, a paused
+seek preroll, playback, EOS and replay. It reports DRM format/modifier and plane
+counts. This verifies decoded frame delivery; it does not certify renderer
+submission (`renderer=not-attached`).

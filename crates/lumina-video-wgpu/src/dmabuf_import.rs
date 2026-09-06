@@ -255,6 +255,8 @@ pub struct ImportedNv12Texture {
     pub width: u32,
     pub height: u32,
     pub color_transform: [[f32; 4]; 4],
+    /// Encoded transfer function applied by the renderer after the YUV matrix.
+    pub color_transfer: lumina_video_native_frame::ColorTransfer,
 }
 
 /// Failure from [`import_external_dmabuf_nv12`]. Every variant retains the source lease.
@@ -977,6 +979,7 @@ fn import_vulkan_nv12(
             hal_texture,
             &texture_descriptor,
             wrap.initial_state,
+            true, // Producer pixels are initialized; lazy clearing would destroy them.
         )
     };
     Ok(ImportedNv12Texture {
@@ -985,6 +988,7 @@ fn import_vulkan_nv12(
         width,
         height,
         color_transform,
+        color_transfer: descriptor.color.transfer,
     })
 }
 

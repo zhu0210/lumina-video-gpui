@@ -486,14 +486,8 @@ impl CorePlayer {
 
     /// Starts playback with a specific mute state.
     pub fn play_with_muted(&mut self, muted: bool) {
+        self.set_muted(muted);
         if let Some(ref thread) = self.decode_thread {
-            #[cfg(any(
-                target_os = "android",
-                target_os = "ios",
-                target_os = "linux",
-                target_os = "macos"
-            ))]
-            thread.set_muted(muted);
             thread.play();
             self.scheduler.start();
             self.state = VideoState::Playing {
@@ -787,12 +781,6 @@ impl CorePlayer {
     /// Sets the muted state and syncs to the decode thread.
     pub fn set_muted(&mut self, muted: bool) {
         self.audio_handle.set_muted(muted);
-        #[cfg(any(
-            target_os = "android",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos"
-        ))]
         if let Some(ref thread) = self.decode_thread {
             thread.set_muted(muted);
         }

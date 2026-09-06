@@ -14,7 +14,8 @@ tracing = { workspace = true }
 wgpu = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-metal = { workspace = true }
+objc2 = { workspace = true }
+objc2-metal = "0.3.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = { version = "0.38" }
@@ -23,11 +24,12 @@ wgpu = { workspace = true, features = ["vulkan-portability"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ash = { version = "0.38" }
+libc = "0.2"
 wgpu = { workspace = true, features = ["vulkan"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = {
-  version = "0.58",
+  version = "0.62",
   features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -40,4 +42,4 @@ windows = {
 
 [features]
 default = []
-windows-native-video = []
+windows-native-video = ["lumina-video-native-frame/windows-native-video"]

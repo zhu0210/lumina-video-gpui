@@ -1,26 +1,7 @@
 /**
- * ExoPlayer Bridge for lumina-video zero-copy video rendering.
- *
- * This class bridges ExoPlayer's video output to lumina-video's Rust rendering pipeline
- * using Android's HardwareBuffer API for zero-copy GPU frame sharing.
- *
- * # Usage
- *
- * Created internally by [LuminaVideo.createPlayer]. Do not construct directly.
- *
- * # Requirements
- *
- * - Android API 26+ (HardwareBuffer)
- * - ExoPlayer 2.x or Media3
- * - lumina-video native library loaded
- *
- * # Frame Format
- *
- * Uses [ImageFormat.PRIVATE] for HardwareBuffer extraction. ExoPlayer's decoder
- * typically produces YUV data (NV12/Y8Cb8Cr8_420). The Rust side handles both:
- * - RGBA buffers: direct single-plane Vulkan import
- * - YUV buffers: true zero-copy via VkSamplerYcbcrConversion, with CPU-assisted
- *   lockPlanes fallback when the Vulkan YUV path is unavailable
+ * ExoPlayer bridge retaining native Images through GPU consumption.
+ * Native frames are the default. CPU-readable YUV output is selected only when
+ * producer synchronization or renderer import is unavailable.
  */
 package com.luminavideo.bridge
 
@@ -28,6 +9,7 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.hardware.HardwareBuffer
 import android.media.ImageReader
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -42,10 +24,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Bridge between ExoPlayer and lumina-video's Rust zero-copy rendering.
+ * Bridge between ExoPlayer and lumina-video's Rust rendering.
  *
- * Extracts HardwareBuffer from decoded video frames via ImageReader
- * and submits them to Rust via JNI for GPU-accelerated display.
+ * Retains native ImageReader frames through GPU consumption, with explicit
+ * system-memory fallback when native synchronization or import is unavailable.
  *
  * Instances are created by [LuminaVideo.createPlayer] — do not construct directly.
  */
@@ -55,7 +37,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         private const val TAG = "ExoPlayerBridge"
 
         /** Maximum number of images to hold in the ImageReader buffer */
-        private const val MAX_IMAGES = 3
+        // Held GPU frames, one pending native frame, and acquireLatestImage headroom.
+        private const val MAX_IMAGES = 8
 
         /** Timeout for ExoPlayer creation on the HandlerThread */
         private const val INIT_TIMEOUT_SECONDS = 5L
@@ -84,6 +67,11 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     // Dedicated Looper thread for ExoPlayer (ExoPlayer requires a Looper thread)
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
+    // Before API 33 Java Image exposes no producer fence. Use the safe last tier.
+    private var cpuFallback = Build.VERSION.SDK_INT < 33
+    // MediaCodec surface timestamps are release times, not media PTS. Keep a
+    // bounded correspondence until ImageReader returns the associated image.
+    private val frameTimestamps = LinkedHashMap<Long, Long>()
 
     // Volume before muting (to restore on unmute)
     private var volumeBeforeMute: Float = 1.0f
@@ -161,6 +149,18 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                     .build()
                     .apply {
                         setVideoScalingMode(androidx.media3.common.C.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+                        setVideoFrameMetadataListener { presentationTimeUs, releaseTimeNs, _, _ ->
+                            synchronized(frameTimestamps) {
+                                if (frameTimestamps.size >= MAX_IMAGES * 2) {
+                                    val oldest = frameTimestamps.keys.iterator()
+                                    if (oldest.hasNext()) {
+                                        oldest.next()
+                                        oldest.remove()
+                                    }
+                                }
+                                frameTimestamps[releaseTimeNs] = presentationTimeUs
+                            }
+                        }
                     }
 
                 player = exoPlayer
@@ -400,8 +400,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
      * IMPORTANT: ImageReader dimensions MUST match video resolution,
      * otherwise BufferQueue errors will occur.
      */
-    private fun setupImageReader(width: Int, height: Int) {
-        if (width == videoWidth && height == videoHeight && imageReader != null) {
+    private fun setupImageReader(width: Int, height: Int, force: Boolean = false) {
+        if (!force && width == videoWidth && height == videoHeight && imageReader != null) {
             return
         }
 
@@ -416,7 +416,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             val newReader = ImageReader.newInstance(
                 width,
                 height,
-                ImageFormat.PRIVATE,
+                if (cpuFallback) ImageFormat.YUV_420_888 else ImageFormat.PRIVATE,
                 MAX_IMAGES
             ).apply {
                 setOnImageAvailableListener(
@@ -436,6 +436,27 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             Log.i(TAG, "ImageReader created and attached to player")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create ImageReader: ${e.message}")
+            if (!cpuFallback) {
+                // Preserve the requested dimensions for the one safe fallback.
+                videoWidth = width
+                videoHeight = height
+                enableCpuFallback()
+            } else if (nativeHandle != 0L) {
+                nativeOnError(nativeHandle, "Video output unavailable: ${e.message}")
+            }
+        }
+    }
+
+    /** Called from the Rust decoder worker after native renderer import failed. */
+    fun enableCpuFallback() {
+        handler?.post {
+            if (!cpuFallback) {
+                cpuFallback = true
+                Log.w(TAG, "Native video import unavailable; selecting system-memory upload")
+                if (videoWidth > 0 && videoHeight > 0) {
+                    setupImageReader(videoWidth, videoHeight, force = true)
+                }
+            }
         }
     }
 
@@ -453,28 +474,51 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             return
         } ?: return
 
+        var retained = false
         var hardwareBuffer: HardwareBuffer? = null
         try {
-            hardwareBuffer = image.hardwareBuffer
-            if (hardwareBuffer != null) {
-                val fenceFd = -1
-
-                nativeSubmitHardwareBuffer(
-                    hardwareBuffer,
-                    image.timestamp,
+            val presentationTimeUs = synchronized(frameTimestamps) {
+                frameTimestamps.remove(image.timestamp)
+            } ?: return // Drop unmatched/stale output instead of publishing a wall-clock PTS.
+            val timestampNs = Math.multiplyExact(presentationTimeUs, 1000L)
+            if (!cpuFallback && Build.VERSION.SDK_INT >= 33) {
+                // No CPU pixels are copied. The bounded acquire wait runs on
+                // this player's handler thread, never on the UI/render thread.
+                image.fence.use { fence ->
+                    check(!fence.isValid || fence.await(java.time.Duration.ofSeconds(2))) {
+                        "Video producer fence timed out"
+                    }
+                }
+                hardwareBuffer = image.hardwareBuffer
+                val buffer = checkNotNull(hardwareBuffer) { "Image has no HardwareBuffer" }
+                retained = nativeSubmitImageFrame(image, buffer, timestampNs,
+                    image.width, image.height, playerId)
+                check(retained) { "Failed to retain native video Image" }
+            } else {
+                // Last-resort snapshot before Image.close permits decoder reuse.
+                val planes = image.planes
+                check(planes.size == 3) { "Expected CPU-readable YUV_420_888 output" }
+                check(nativeSubmitCpuFrame(
+                    planes[0].buffer.slice(), planes[0].rowStride, planes[0].pixelStride,
+                    planes[1].buffer.slice(), planes[1].rowStride, planes[1].pixelStride,
+                    planes[2].buffer.slice(), planes[2].rowStride, planes[2].pixelStride,
+                    timestampNs,
                     image.width,
                     image.height,
-                    playerId,
-                    fenceFd
-                )
-
-                frameCount.incrementAndGet()
+                    playerId
+                )) { "Failed to snapshot video image" }
             }
+            frameCount.incrementAndGet()
         } catch (e: Exception) {
             Log.e(TAG, "Error processing frame: ${e.message}")
+            if (!cpuFallback) {
+                enableCpuFallback()
+            } else if (nativeHandle != 0L) {
+                nativeOnError(nativeHandle, "CPU video frame failed: ${e.message}")
+            }
         } finally {
             hardwareBuffer?.close()
-            image.close()
+            if (!retained) image.close()
         }
     }
 
@@ -538,14 +582,17 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
 
     private external fun nativeReleasePlayer(playerId: Long)
 
-    private external fun nativeSubmitHardwareBuffer(
-        buffer: HardwareBuffer,
-        timestampNs: Long,
-        width: Int,
-        height: Int,
-        playerId: Long,
-        fenceFd: Int
-    )
+    private external fun nativeSubmitImageFrame(
+        image: android.media.Image, buffer: HardwareBuffer,
+        timestampNs: Long, width: Int, height: Int, playerId: Long
+    ): Boolean
+
+    private external fun nativeSubmitCpuFrame(
+        y: java.nio.ByteBuffer, yRow: Int, yPixel: Int,
+        u: java.nio.ByteBuffer, uRow: Int, uPixel: Int,
+        v: java.nio.ByteBuffer, vRow: Int, vPixel: Int,
+        timestampNs: Long, width: Int, height: Int, playerId: Long
+    ): Boolean
 
     private external fun nativeOnVideoSizeChanged(nativeHandle: Long, width: Int, height: Int)
 

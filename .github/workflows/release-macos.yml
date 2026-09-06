@@ -23,10 +23,10 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             arch: arm64
-            runner: macos-latest
+            runner: macos-15
           - target: x86_64-apple-darwin
             arch: x86_64
-            runner: macos-13
+            runner: macos-15-intel
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -56,12 +56,13 @@ jobs:
           key: macos-release-${{ matrix.arch }}
 
       - name: Install FFmpeg via Homebrew
-        run: brew install ffmpeg
+        run: brew install ffmpeg pkg-config
 
       - name: Build release binary
-        env:
-          SDKROOT: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
-        run: cargo build --release --locked --package lumina-video-demo --target ${{ matrix.target }}
+        run: |
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          export PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          cargo build --release --locked --package lumina-video-demo --target ${{ matrix.target }}
 
       - name: Create .app bundle
         env:
@@ -120,33 +121,33 @@ jobs:
 
           # Create Info.plist
           cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleDisplayName</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleIdentifier</key>
-  <string>com.luminavideo.demo</string>
-  <key>CFBundleVersion</key>
-  <string>${VERSION}</string>
-  <key>CFBundleShortVersionString</key>
-  <string>${VERSION}</string>
-  <key>CFBundleExecutable</key>
-  <string>lumina-video-demo</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>CFBundleIconFile</key>
-  <string>AppIcon</string>
-  <key>LSMinimumSystemVersion</key>
-  <string>10.13</string>
-  <key>NSHighResolutionCapable</key>
-  <true/>
-</dict>
-</plist>
-PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundleDisplayName</key>
+            <string>${APP_NAME}</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.luminavideo.demo</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>lumina-video-demo</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.13</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
 
           # Convert PNG icon to .icns for Finder/Dock
           ICON_SRC="crates/lumina-video-demo/assets/lumina-video-icon-ferris-hybrid.png"
@@ -160,6 +161,9 @@ PLIST
             done
             iconutil -c icns "$ICONSET_DIR" -o "${APP_DIR}/Contents/Resources/AppIcon.icns"
           fi
+
+      - name: Sign bundled application
+        run: codesign --force --deep --sign - "Lumina Video Demo.app"
 
       - name: Verify app bundle
         run: |
@@ -213,7 +217,7 @@ PLIST
   build-universal:
     name: Build Universal DMG
     needs: build-dmg
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -287,6 +291,9 @@ PLIST
           # Unmount
           hdiutil detach /tmp/arm64-mount
           hdiutil detach /tmp/x86_64-mount
+
+          # lipo changes invalidate the per-architecture signatures.
+          codesign --force --deep --sign - "${APP_NAME}.app"
 
           # Create universal DMG
           mkdir -p dmg-staging

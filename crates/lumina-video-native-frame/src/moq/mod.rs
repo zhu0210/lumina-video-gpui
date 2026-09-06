@@ -36,6 +36,8 @@
 
 pub mod catalog;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub(crate) mod gst_source;
 pub mod media_source;
 pub mod subscriber;
 pub mod transport;
