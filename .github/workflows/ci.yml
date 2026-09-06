@@ -31,8 +31,10 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
-      - name: Check runtime smoke driver
-        run: python3 scripts/test-smoke-gstreamer-runtime.py
+      - name: Check runtime packaging tools
+        run: |
+          python3 scripts/test-smoke-gstreamer-runtime.py
+          python3 scripts/test-collect-runtime-libraries.py
       - name: Check portable workspace dependencies
         shell: python
         run: |

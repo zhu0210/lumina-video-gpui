@@ -11,6 +11,8 @@ on:
       - scripts/cerbero-ffmpeg.recipe
       - scripts/discover-gstreamer-lock.sh
       - scripts/build-gstreamer-runtime.sh
+      - scripts/collect-runtime-libraries.py
+      - scripts/test-collect-runtime-libraries.py
       - scripts/smoke-gstreamer-runtime.sh
       - crates/lumina-video-native-frame/src/vendored_runtime.rs
       - crates/lumina-video-native-frame/src/linux_video.rs

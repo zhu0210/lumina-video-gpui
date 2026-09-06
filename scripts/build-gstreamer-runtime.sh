@@ -37,7 +37,7 @@ while (($#)); do
     esac
 done
 
-for command_name in curl jq sha256sum tar xz gzip find sort awk grep sed mktemp realpath chmod cmp cp readlink stat; do
+for command_name in curl jq sha256sum tar xz gzip find sort awk grep sed mktemp realpath chmod cmp cp readlink stat readelf; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
@@ -678,9 +678,11 @@ TARGET=linux-x86_64
 GLIBC_FLOOR=$target_glibc
 EOF
 cat >"$bundle/NOTICE" <<'EOF'
-This standalone runtime is the union of upstream Cerbero packages named in
-vendor/gstreamer-1.0.lock.json. It is an upstream meta-package bootstrap for
-Lumina, not the recursive closure/license/source inventory planned for #19.
+This standalone runtime contains the upstream Cerbero packages named in
+vendor/gstreamer-1.0.lock.json and their ELF dependency closure from the same
+Cerbero prefix and locked Ubuntu builder. elf-dependencies.json records added
+libraries and host-owned glibc/driver boundaries. The full license/source
+inventory remains tracked in #19.
 EOF
 
 if $build_demo; then
@@ -701,6 +703,12 @@ exec "$bundle_root/vendor/linux-x86_64/bin/lumina-gstreamer-runtime" \
 APP_LAUNCHER
     chmod 0755 "$bundle/lumina-video-demo"
 fi
+
+python3 "$script_dir/collect-runtime-libraries.py" \
+    --bundle "$bundle" --prefix "$cerbero_dir/build/dist/linux_x86_64" \
+    --libdir "$runtime_root/$archive_runtime_libdir" \
+    --manifest "$runtime_root/elf-dependencies.json"
+assert_symlink_tree "$runtime_root"
 
 # Normalize the generated vendor tree before hashing so the tree digest covers
 # the exact files that will be packed.
