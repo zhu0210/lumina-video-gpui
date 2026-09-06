@@ -177,3 +177,11 @@ Stats (zero-copy vs. CPU-assisted vs. failed frame counts) are co-located with e
 ## License
 
 Same as lumina-video (MIT or Apache 2.0).
+
+### Host destruction
+
+`LifecycleOwner` hosts release players automatically. Plain `NativeActivity` hosts
+must call `LuminaVideo.shutdown()` in `onDestroy()` before `super.onDestroy()`.
+Initialize with `LuminaVideo.init(this)` before `super.onCreate()` so native
+startup can create players. Shutdown also rejects in-flight player creation from
+the previous Activity generation.

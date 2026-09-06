@@ -3,6 +3,7 @@
 //! This module provides the foundational types for hardware-accelerated video
 //! playback across all platforms (macOS, Windows, Linux, Android).
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::time::Duration;
 

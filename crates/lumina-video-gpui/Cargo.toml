@@ -1,4 +1,5 @@
 [package]
+autoexamples = false
 name = "lumina-video-gpui"
 version = { workspace = true }
 edition = "2021"
@@ -9,20 +10,15 @@ keywords = ["gpui", "multimedia", "video"]
 categories = ["gui", "multimedia"]
 
 [dependencies]
+url = "2.5"
 lumina-video-core = { path = "../lumina-video-core" }
-lumina-video-native-frame = { path = "../lumina-video-native-frame" }
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "19babba1440d641099fce58111916e6cf29c4220",
+  rev = "3f6222154558bfb2d4d763ff3500c5b4c815173a",
   features = ["wgpu"]
 }
-gpui_wgpu = {
-  git = "https://github.com/zhu0210/zed.git",
-  rev = "19babba1440d641099fce58111916e6cf29c4220"
-}
-lumina-video-wgpu = { path = "../lumina-video-wgpu" }
+
 tracing = { workspace = true }
-crossbeam-channel = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 lumina-video-gst = { path = "../lumina-video-gst" }
@@ -43,4 +39,55 @@ unexpected_cfgs = {
   check-cfg = [
     "cfg(feature, values(\"android-zero-copy\", \"cargo-clippy\", \"moq\", \"vendored-runtime\", \"windows-native-video\"))"
   ]
+}
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { version = "0.3" }
+wasm-bindgen = { version = "0.2" }
+wasm-bindgen-futures = { version = "0.4" }
+web-sys = {
+  version = "0.3",
+  features = [
+    "CodecState",
+    "CssStyleDeclaration",
+    "Document",
+    "Element",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
+    "Location",
+    "MediaError",
+    "Node",
+    "TimeRanges",
+    # WebCodecs API for MoQ decoder
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoDecoderSupport",
+    "VideoFrame",
+    "Window",
+    "console",
+  ]
+}
+# wgpu for WebGPU zero-copy texture operations (must match GPUI's wgpu)
+wgpu = { workspace = true }
+
+gpui_platform = { git = "https://github.com/zhu0210/zed.git", rev = "3f6222154558bfb2d4d763ff3500c5b4c815173a" }
+
+[[bin]]
+name = "web_hls"
+path = "examples/web_hls.rs"
+
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lumina-video-native-frame = { path = "../lumina-video-native-frame" }
+lumina-video-wgpu = { path = "../lumina-video-wgpu" }
+crossbeam-channel = { workspace = true }
+gpui_wgpu = {
+  git = "https://github.com/zhu0210/zed.git",
+  rev = "3f6222154558bfb2d4d763ff3500c5b4c815173a"
 }

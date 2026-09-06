@@ -1,0 +1,23 @@
+# Project build metadata, using FFmpeg's own configure/Makefile implementation.
+# Version and checksum are substituted from the shared FFmpeg lock by the builder.
+class Recipe(recipe.Recipe):
+    name = 'ffmpeg'
+    version = '@VERSION@'
+    stype = SourceType.TARBALL
+    url = 'https://ffmpeg.org/releases/%(name)s-%(version)s.tar.xz'
+    tarball_checksum = '@SHA256@'
+    licenses = [License.LGPLv2_1Plus]
+    btype = BuildType.MAKEFILE
+    config_sh = './configure'
+    config_sh_needs_shell = False
+    configure_tpl = ['%(config-sh)s', '--prefix=%(prefix)s', '--libdir=%(libdir)s', '%(options)s']
+    configure_options = [
+        '--disable-autodetect', '--disable-gpl', '--disable-nonfree',
+        '--disable-static', '--enable-shared', '--disable-programs', '--disable-doc',
+        '--enable-zlib', '--enable-bzlib',
+    ]
+    deps = ['zlib', 'bzip2']
+    files_libs = ['libavcodec', 'libavformat', 'libavutil', 'libavdevice',
+                  'libswresample', 'libavfilter', 'libswscale']
+    files_devel = ['include/libav*', 'include/libsw*', '%(libdir)s/pkgconfig/libav*.pc',
+                   '%(libdir)s/pkgconfig/libsw*.pc']

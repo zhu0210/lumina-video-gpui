@@ -25,7 +25,7 @@ wgpu-hal = {
 
 # Video/audio dependencies
 cpal = "0.16"
-ffmpeg-next = "8.0"
+ffmpeg-next = "=9.0.0"
 opus = "0.3"
 symphonia-codec-aac = "0.5"
 symphonia-core = "0.5"

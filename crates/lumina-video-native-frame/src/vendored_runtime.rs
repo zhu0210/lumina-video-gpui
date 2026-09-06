@@ -378,7 +378,7 @@ mod tests {
 
         let marker_path = vendor_dir.join("registry/marker");
         fs::write(&marker_path, []).map_err(|error| format!("write registry marker: {error}"))?;
-        symlink(&marker_path, &cache_dir.join("gstreamer-1.0.registry"))
+        symlink(&marker_path, cache_dir.join("gstreamer-1.0.registry"))
             .map_err(|error| format!("create registry symlink: {error}"))?;
         let error = {
             let getenv = |name: &str| values.get(name).cloned();

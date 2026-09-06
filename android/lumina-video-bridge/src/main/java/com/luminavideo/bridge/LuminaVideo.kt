@@ -9,8 +9,8 @@
  * ```kotlin
  * class MyActivity : GameActivity() {
  *     override fun onCreate(savedInstanceState: Bundle?) {
- *         super.onCreate(savedInstanceState)
  *         LuminaVideo.init(this)
+ *         super.onCreate(savedInstanceState)
  *     }
  * }
  * ```
@@ -45,6 +45,7 @@ object LuminaVideo {
     private val initialized = AtomicBoolean(false)
     private var appContext: Context? = null
     private var customBuilder: ExoPlayer.Builder? = null
+    private var generation = 0L
 
     /** All bridges created via [createPlayer], tracked for lifecycle cleanup. */
     private val activeBridges = mutableListOf<ExoPlayerBridge>()
@@ -63,36 +64,50 @@ object LuminaVideo {
     @JvmStatic
     @JvmOverloads
     fun init(activity: Activity, builder: ExoPlayer.Builder? = null) {
-        if (!initialized.compareAndSet(false, true)) {
-            Log.w(TAG, "LuminaVideo.init() already called, ignoring")
-            return
+        val activityGeneration = synchronized(activeBridges) {
+            if (!initialized.compareAndSet(false, true)) {
+                Log.w(TAG, "LuminaVideo.init() already called, ignoring")
+                return
+            }
+            appContext = activity.applicationContext
+            customBuilder = builder
+            generation++
+            generation
         }
-        appContext = activity.applicationContext
-        customBuilder = builder
-        Log.i(TAG, "Initialized with context=${activity.applicationContext}")
 
         // Register lifecycle observer for cleanup on Activity destroy.
         // On destroy, reset initialized so a recreated Activity can re-register.
         if (activity is LifecycleOwner) {
             activity.lifecycle.addObserver(LifecycleEventObserver { _, event ->
                 if (event == Lifecycle.Event.ON_DESTROY) {
-                    Log.i(TAG, "Activity destroying, releasing ${activeBridges.size} bridge(s)")
-                    synchronized(activeBridges) {
-                        for (bridge in activeBridges) {
-                            bridge.release()
-                        }
-                        activeBridges.clear()
-                    }
-                    // Reset so a recreated Activity can call init() again
-                    // and register a fresh lifecycle observer
-                    appContext = null
-                    customBuilder = null
-                    initialized.set(false)
+                    shutdown(activityGeneration)
                 }
             })
         } else {
-            Log.w(TAG, "Activity is not a LifecycleOwner, bridges won't auto-release on destroy")
+            Log.i(TAG, "NativeActivity hosts must call LuminaVideo.shutdown() from onDestroy()")
         }
+    }
+
+    /** NativeActivity hosts call this from onDestroy(); LifecycleOwner hosts call it automatically. */
+    @JvmStatic
+    fun shutdown() = shutdown(null)
+
+    private fun shutdown(expectedGeneration: Long?) {
+        val bridges = synchronized(activeBridges) {
+            if (expectedGeneration != null && generation != expectedGeneration) return
+            val snapshot = activeBridges.toList()
+            activeBridges.clear()
+            appContext = null
+            customBuilder = null
+            initialized.set(false)
+            generation++
+            snapshot
+        }
+        bridges.forEach { it.release() }
+    }
+
+    internal fun onBridgeReleased(bridge: ExoPlayerBridge) {
+        synchronized(activeBridges) { activeBridges.remove(bridge) }
     }
 
     /**
@@ -106,20 +121,24 @@ object LuminaVideo {
      */
     @JvmStatic
     fun createPlayer(nativeHandle: Long): ExoPlayerBridge? {
-        val ctx = appContext
+        val (ctx, builder, playerGeneration) = synchronized(activeBridges) {
+            Triple(appContext, customBuilder, generation)
+        }
         if (ctx == null) {
-            Log.e(TAG, "createPlayer() called before init(). Call LuminaVideo.init(activity) in onCreate().")
+            Log.e(TAG, "createPlayer() called before init()")
             return null
         }
-
         val bridge = ExoPlayerBridge(nativeHandle)
-        if (!bridge.initializeWithPlayer(ctx, customBuilder)) {
-            Log.e(TAG, "createPlayer() failed: ExoPlayer creation timed out or threw")
-            return null
+        if (!bridge.initializeWithPlayer(ctx, builder)) return null
+        val accepted = synchronized(activeBridges) {
+            if (initialized.get() && generation == playerGeneration) {
+                activeBridges.add(bridge)
+                true
+            } else false
         }
-
-        synchronized(activeBridges) {
-            activeBridges.add(bridge)
+        if (!accepted) {
+            bridge.release()
+            return null
         }
 
         Log.i(TAG, "createPlayer() succeeded, nativeHandle=$nativeHandle")

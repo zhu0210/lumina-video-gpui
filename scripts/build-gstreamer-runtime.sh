@@ -248,6 +248,19 @@ tar -xzf "$cerbero_archive" -C "$work_dir"
 cerbero_dir="$work_dir/$cerbero_root"
 [[ -x "$cerbero_dir/cerbero-uninstalled" ]] || { echo "Cerbero entrypoint missing" >&2; exit 1; }
 
+# Cerbero 1.28's FFmpeg recipe carries a 7.1-only Meson port. Replace build
+# metadata with our configure-based recipe; never apply those patches to 9.x.
+python3 - "$lock_file" "$repo_root/vendor/ffmpeg.lock.json" "$script_dir/cerbero-ffmpeg.recipe" "$cerbero_dir/recipes/ffmpeg.recipe" <<'PY_FFMPEG'
+import json, pathlib, re, sys
+runtime, shared, template, target = map(pathlib.Path, sys.argv[1:])
+locked = json.loads(runtime.read_text())["sources"]["ffmpeg"]
+assert locked == json.loads(shared.read_text()), "FFmpeg runtime and macOS locks differ"
+assert re.fullmatch(r"9\.\d+\.\d+", locked["version"])
+assert re.fullmatch(r"[0-9a-f]{64}", locked["sha256"])
+assert locked["url"] == f'https://ffmpeg.org/releases/ffmpeg-{locked["version"]}.tar.xz'
+target.write_text(template.read_text().replace("@VERSION@", locked["version"]).replace("@SHA256@", locked["sha256"]))
+PY_FFMPEG
+
 grep -F "tarball_checksum = '$gstreamer_sha'" "$cerbero_dir/recipes/gstreamer-1.0.recipe" >/dev/null
 grep -F "tarball_checksum = '$libav_sha'" "$cerbero_dir/recipes/gst-libav-1.0.recipe" >/dev/null
 zlib_recipe_version=$(sed -n "s/^[[:space:]]*version = '\([^']*\)'$/\1/p" "$cerbero_dir/recipes/zlib.recipe")

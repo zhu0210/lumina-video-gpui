@@ -12,6 +12,7 @@ import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import androidx.media3.common.MediaItem
@@ -44,7 +45,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         private const val INIT_TIMEOUT_SECONDS = 5L
 
         /** Whether the native library was successfully loaded */
-        private var nativeLibraryLoaded = false
+        @Volatile private var nativeLibraryLoaded = false
 
         init {
             try {
@@ -53,7 +54,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 Log.i(TAG, "Loaded liblumina_video_android.so")
             } catch (e: UnsatisfiedLinkError) {
                 nativeLibraryLoaded = false
-                Log.e(TAG, "Failed to load liblumina_video_android.so: ${e.message}")
+                Log.d(TAG, "Standalone JNI library absent; using the host application library")
             }
         }
     }
@@ -81,6 +82,15 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
 
     // State tracking
     private val isReleased = AtomicBoolean(false)
+    // Rust releases its native handle when release() returns. Serialize only
+    // metadata/error callbacks with that boundary, never per-frame pixel work.
+    private val nativeCallbackLock = Any()
+
+    private inline fun withNativeHandle(callback: (Long) -> Unit) {
+        synchronized(nativeCallbackLock) {
+            if (!isReleased.get() && nativeHandle != 0L) callback(nativeHandle)
+        }
+    }
     private val frameCount = AtomicInteger(0)
 
     // Player listener for cleanup on release
@@ -121,17 +131,17 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             return false
         }
 
-        if (!nativeLibraryLoaded) {
-            Log.e(TAG, "Cannot initialize - native library not loaded")
-            return false
-        }
-
         // Generate unique player ID for per-player frame queue isolation
         playerId = try {
-            nativeGeneratePlayerId()
-        } catch (e: Exception) {
-            Log.e(TAG, "nativeGeneratePlayerId() failed, using legacy queue: ${e.message}")
-            0L
+            // Embedded hosts already load the JNI implementation under their
+            // own library name. Resolve the symbol instead of assuming a name.
+            nativeGeneratePlayerId().also { nativeLibraryLoaded = true }
+        } catch (error: LinkageError) {
+            Log.e(TAG, "Host application has not loaded the Lumina JNI implementation", error)
+            return false
+        } catch (error: Exception) {
+            Log.e(TAG, "Could not allocate a native player queue", error)
+            return false
         }
         Log.i(TAG, "Assigned player_id=$playerId")
 
@@ -199,33 +209,27 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                     if (!ndkMode) {
                         setupImageReader(videoSize.width, videoSize.height)
                     }
-                    if (nativeHandle != 0L) {
-                        nativeOnVideoSizeChanged(nativeHandle, videoSize.width, videoSize.height)
-                    }
+                    withNativeHandle { nativeOnVideoSizeChanged(it, videoSize.width, videoSize.height) }
                 }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 updateCachedValues()
-                if (nativeHandle != 0L) {
-                    nativeOnPlaybackStateChanged(nativeHandle, playbackState)
-                }
+                withNativeHandle { nativeOnPlaybackStateChanged(it, playbackState) }
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 updateCachedValues()
-                if (nativeHandle != 0L) {
+                withNativeHandle { handle ->
                     val dur = exoPlayer.duration
                     val durationMs = if (dur == androidx.media3.common.C.TIME_UNSET) -1L else dur
-                    nativeOnDurationChanged(nativeHandle, durationMs)
+                    nativeOnDurationChanged(handle, durationMs)
                 }
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                 Log.e(TAG, "ExoPlayer error: ${error.message}", error)
-                if (nativeHandle != 0L) {
-                    nativeOnError(nativeHandle, error.message ?: "Unknown ExoPlayer error")
-                }
+                withNativeHandle { nativeOnError(it, error.message ?: "Unknown ExoPlayer error") }
             }
         }
         exoPlayer.addListener(playerListener!!)
@@ -380,18 +384,26 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
      * @param surface The Surface from ANativeWindow_toSurface (backed by NDK AImageReader)
      */
     fun setVideoSurfaceFromNative(surface: Surface) {
-        Log.d(TAG, "setVideoSurfaceFromNative called - switching to NDK ImageReader mode")
-        // Post all mutations to the handler thread to avoid racing with
-        // onImageAvailable and setupImageReader
-        handler?.post {
-            ndkMode = true
-            imageReader?.close()
-            imageReader = null
-            this.surface?.release()
-            this.surface = surface
-            player?.setVideoSurface(surface)
-            Log.i(TAG, "Video surface set from native (NDK ImageReader mode active)")
-        } ?: Log.w(TAG, "setVideoSurfaceFromNative called before handler initialized")
+        val posted = handler?.post {
+            if (isReleased.get()) {
+                surface.release()
+                return@post
+            }
+            val previousReader = imageReader
+            val previousSurface = this.surface
+            try {
+                player?.setVideoSurface(surface)
+                ndkMode = true
+                imageReader = null
+                this.surface = surface
+                previousSurface?.release()
+                previousReader?.close()
+            } catch (error: Exception) {
+                surface.release()
+                withNativeHandle { nativeOnError(it, "Native surface handoff failed: ${error.message}") }
+            }
+        } == true
+        if (!posted) surface.release()
     }
 
     /**
@@ -405,10 +417,13 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             return
         }
 
-        imageReader?.close()
-        imageReader = null
-        surface?.release()
-        surface = null
+        if (isReleased.get()) return
+        // setVideoSurface waits for the codec surface handoff. Keep the old
+        // BufferQueue alive until it has stopped being the producer target.
+        val previousReader = imageReader
+        val previousSurface = surface
+        var pendingReader: ImageReader? = null
+        var pendingSurface: Surface? = null
 
         Log.i(TAG, "Setting up ImageReader: ${width}x${height}")
 
@@ -418,7 +433,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 height,
                 if (cpuFallback) ImageFormat.YUV_420_888 else ImageFormat.PRIVATE,
                 MAX_IMAGES
-            ).apply {
+            ).also { pendingReader = it }.apply {
                 setOnImageAvailableListener(
                     { reader -> onImageAvailable(reader) },
                     handler
@@ -426,23 +441,30 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             }
 
             val newSurface = newReader.surface
+            pendingSurface = newSurface
             player?.setVideoSurface(newSurface)
 
             imageReader = newReader
             surface = newSurface
             videoWidth = width
             videoHeight = height
+            pendingReader = null
+            pendingSurface = null
+            previousSurface?.release()
+            previousReader?.close()
 
             Log.i(TAG, "ImageReader created and attached to player")
         } catch (e: Exception) {
+            pendingSurface?.release()
+            pendingReader?.close()
             Log.e(TAG, "Failed to create ImageReader: ${e.message}")
             if (!cpuFallback) {
                 // Preserve the requested dimensions for the one safe fallback.
                 videoWidth = width
                 videoHeight = height
                 enableCpuFallback()
-            } else if (nativeHandle != 0L) {
-                nativeOnError(nativeHandle, "Video output unavailable: ${e.message}")
+            } else {
+                withNativeHandle { nativeOnError(it, "Video output unavailable: ${e.message}") }
             }
         }
     }
@@ -450,7 +472,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     /** Called from the Rust decoder worker after native renderer import failed. */
     fun enableCpuFallback() {
         handler?.post {
-            if (!cpuFallback) {
+            if (!isReleased.get() && !cpuFallback) {
                 cpuFallback = true
                 Log.w(TAG, "Native video import unavailable; selecting system-memory upload")
                 if (videoWidth > 0 && videoHeight > 0) {
@@ -513,8 +535,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             Log.e(TAG, "Error processing frame: ${e.message}")
             if (!cpuFallback) {
                 enableCpuFallback()
-            } else if (nativeHandle != 0L) {
-                nativeOnError(nativeHandle, "CPU video frame failed: ${e.message}")
+            } else {
+                withNativeHandle { nativeOnError(it, "CPU video frame failed: ${e.message}") }
             }
         } finally {
             hardwareBuffer?.close()
@@ -533,44 +555,50 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
      * Safe to call multiple times (idempotent).
      */
     fun release() {
-        if (isReleased.getAndSet(true)) {
-            return
+        synchronized(nativeCallbackLock) {
+            if (!isReleased.compareAndSet(false, true)) return
         }
-
-        Log.i(TAG, "Releasing bridge (submitted ${frameCount.get()} frames, player_id=$playerId)")
-
-        // Post cleanup to the player's thread
-        handler?.post {
-            playerListener?.let { listener ->
-                player?.removeListener(listener)
-            }
-            playerListener = null
-
-            player?.setVideoSurface(null)
-            player?.release()
-            player = null
-
-            surface?.release()
-            surface = null
-
-            imageReader?.close()
-            imageReader = null
-        }
-
-        // Wait for cleanup to complete before nulling references.
-        // quitSafely() processes pending messages then terminates.
+        LuminaVideo.onBridgeReleased(this)
+        val playerHandler = handler
         val thread = handlerThread
-        thread?.quitSafely()
-        try {
-            thread?.join(2000) // 2s timeout to avoid blocking indefinitely
-        } catch (_: InterruptedException) {
-            Log.w(TAG, "Interrupted while waiting for HandlerThread to finish")
+        val cleanupComplete = CountDownLatch(1)
+        val cleanup = Runnable {
+            try {
+                playerListener?.let { player?.removeListener(it) }
+                playerListener = null
+                player?.release()
+            } catch (error: Exception) {
+                Log.e(TAG, "Player release failed", error)
+            } finally {
+                player = null
+                surface?.release()
+                surface = null
+                imageReader?.close()
+                imageReader = null
+                if (nativeLibraryLoaded && playerId != 0L) nativeReleasePlayer(playerId)
+                handler = null
+                handlerThread = null
+                cleanupComplete.countDown()
+                // Allow Media3's already-dispatched tail notifications to drain.
+                if (playerHandler?.postDelayed({ thread?.quitSafely() }, 1_500L) != true) {
+                    thread?.quitSafely()
+                }
+            }
         }
-        handlerThread = null
-        handler = null
-
-        if (nativeLibraryLoaded && playerId != 0L) {
-            nativeReleasePlayer(playerId)
+        if (playerHandler == null || Looper.myLooper() === playerHandler.looper) {
+            cleanup.run()
+        } else if (!playerHandler.post(cleanup)) {
+            cleanup.run()
+        } else if (Looper.myLooper() !== Looper.getMainLooper()) {
+            // Source switches on the decode worker wait for codec release;
+            // Activity destruction never blocks the UI or joins its own Looper.
+            try {
+                if (!cleanupComplete.await(INIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "Timed out waiting for old codec release")
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
         }
     }
 

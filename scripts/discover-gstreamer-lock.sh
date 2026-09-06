@@ -138,6 +138,7 @@ required_elements='[
 ]'
 
 jq -n \
+    --slurpfile ffmpeg "$repo_root/vendor/ffmpeg.lock.json" \
     --arg version "$gstreamer_version" \
     --arg gstreamer_url "$gstreamer_url" \
     --arg gstreamer_sha "$gstreamer_sha" \
@@ -160,6 +161,7 @@ jq -n \
       schema_version: 1,
       gstreamer: {version: $version, source: {url: $gstreamer_url, sha256: $gstreamer_sha}},
       sources: {
+        ffmpeg: $ffmpeg[0],
         gst_libav: {package: "gst-libav-1.0", filename: ("gst-libav-" + $version + ".tar.xz"), url: $libav_url, sha256: $libav_sha},
         zlib: {version: $zlib_version, filename: $zlib_filename, url: $zlib_url, sha256: $zlib_sha}
       },

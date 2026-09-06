@@ -55,13 +55,15 @@ jobs:
         with:
           key: macos-release-${{ matrix.arch }}
 
-      - name: Install FFmpeg via Homebrew
-        run: brew install ffmpeg pkg-config
+      - name: Install FFmpeg build tools
+        run: brew install nasm pkg-config
+
+      - name: Build bundled FFmpeg 9 from lock
+        run: bash scripts/build-ffmpeg-runtime.sh "$RUNNER_TEMP/lumina-ffmpeg"
 
       - name: Build release binary
         run: |
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-          export PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           cargo build --release --locked --package lumina-video-demo --target ${{ matrix.target }}
 
       - name: Create .app bundle
@@ -85,7 +87,7 @@ jobs:
           LIBS_DIR="${APP_DIR}/Contents/Frameworks"
           mkdir -p "$LIBS_DIR"
           for lib in $(otool -L "${APP_DIR}/Contents/MacOS/lumina-video-demo" \
-                       | grep '/opt/homebrew\|/usr/local' \
+                       | grep "$FFMPEG_PREFIX\\|/opt/homebrew\\|/usr/local" \
                        | awk '{print $1}'); do
             cp "$lib" "$LIBS_DIR/"
             LIB_NAME=$(basename "$lib")
@@ -99,7 +101,7 @@ jobs:
             CHANGED=false
             for fw in "$LIBS_DIR"/*.dylib; do
               [ -f "$fw" ] || continue
-              for dep in $(otool -L "$fw" | grep '/opt/homebrew\|/usr/local' | awk '{print $1}'); do
+              for dep in $(otool -L "$fw" | grep "$FFMPEG_PREFIX\\|/opt/homebrew\\|/usr/local" | awk '{print $1}'); do
                 DEP_NAME=$(basename "$dep")
                 if [ ! -f "$LIBS_DIR/$DEP_NAME" ]; then
                   cp "$dep" "$LIBS_DIR/"
@@ -113,11 +115,13 @@ jobs:
           for fw in "$LIBS_DIR"/*.dylib; do
             [ -f "$fw" ] || continue
             install_name_tool -id "@executable_path/../Frameworks/$(basename "$fw")" "$fw"
-            for dep in $(otool -L "$fw" | grep '/opt/homebrew\|/usr/local' | awk '{print $1}'); do
+            for dep in $(otool -L "$fw" | grep "$FFMPEG_PREFIX\\|/opt/homebrew\\|/usr/local" | awk '{print $1}'); do
               DEP_NAME=$(basename "$dep")
               install_name_tool -change "$dep" "@executable_path/../Frameworks/$DEP_NAME" "$fw"
             done
           done
+
+          cp -R "$FFMPEG_PREFIX/share/lumina-ffmpeg" "${APP_DIR}/Contents/Resources/"
 
           # Create Info.plist
           cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
@@ -170,16 +174,16 @@ jobs:
           set -euo pipefail
           APP_NAME="Lumina Video Demo"
           echo "=== Checking for leftover Homebrew paths ==="
-          if otool -L "${APP_NAME}.app/Contents/MacOS/lumina-video-demo" | grep -q '/opt/homebrew\|/usr/local'; then
+          if otool -L "${APP_NAME}.app/Contents/MacOS/lumina-video-demo" | grep -q "$FFMPEG_PREFIX\\|/opt/homebrew\\|/usr/local"; then
             echo "ERROR: Binary still references Homebrew paths:"
-            otool -L "${APP_NAME}.app/Contents/MacOS/lumina-video-demo" | grep '/opt/homebrew\|/usr/local'
+            otool -L "${APP_NAME}.app/Contents/MacOS/lumina-video-demo" | grep "$FFMPEG_PREFIX\\|/opt/homebrew\\|/usr/local"
             exit 1
           fi
           for fw in "${APP_NAME}.app/Contents/Frameworks/"*.dylib; do
             [ -f "$fw" ] || continue
-            if otool -L "$fw" | grep -q '/opt/homebrew\|/usr/local'; then
+            if otool -L "$fw" | grep -q "$FFMPEG_PREFIX\\|/opt/homebrew\\|/usr/local"; then
               echo "ERROR: $(basename "$fw") still references Homebrew paths:"
-              otool -L "$fw" | grep '/opt/homebrew\|/usr/local'
+              otool -L "$fw" | grep "$FFMPEG_PREFIX\\|/opt/homebrew\\|/usr/local"
               exit 1
             fi
           done

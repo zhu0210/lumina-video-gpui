@@ -6,6 +6,8 @@ on:
     paths:
       - .github/workflows/package-gstreamer.yml
       - vendor/gstreamer-1.0.lock.json
+      - vendor/ffmpeg.lock.json
+      - scripts/cerbero-ffmpeg.recipe
       - scripts/discover-gstreamer-lock.sh
       - scripts/build-gstreamer-runtime.sh
       - scripts/smoke-gstreamer-runtime.sh
