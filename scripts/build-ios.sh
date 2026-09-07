@@ -85,6 +85,7 @@ EXPECTED_SYMBOLS=(
     "_lumina_player_poll_frame"
     "_lumina_frame_width"
     "_lumina_frame_height"
+    "_lumina_frame_presentation_time"
     "_lumina_frame_iosurface"
     "_lumina_frame_release"
     "_lumina_diagnostics_snapshot"

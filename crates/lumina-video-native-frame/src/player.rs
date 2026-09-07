@@ -667,6 +667,15 @@ impl CorePlayer {
                 VideoState::Ended | VideoState::Error(_) => {}
             }
         }
+        // The scheduler can return its cached frame after the queue drains.
+        // EOS therefore depends on the producer and queue, not a None frame.
+        if matches!(self.state, VideoState::Playing { .. })
+            && self.frame_queue.is_eos()
+            && self.frame_queue.is_empty()
+        {
+            self.scheduler.pause();
+            self.state = VideoState::Ended;
+        }
         frame
     }
 
@@ -834,10 +843,49 @@ impl Drop for CorePlayer {
     }
 }
 
-#[cfg(all(test, feature = "moq"))]
+#[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::video::{CpuFrame, DecodedFrame, PixelFormat, Plane};
+
+    #[test]
+    fn eos_waits_for_the_last_frame_and_preserves_paused_state() {
+        let mut player = CorePlayer::new("test://eos");
+        let pts = Duration::from_millis(33);
+        let frame = VideoFrame::new(
+            pts,
+            DecodedFrame::Cpu(CpuFrame::new(
+                PixelFormat::Rgba,
+                1,
+                1,
+                vec![Plane {
+                    data: vec![0; 4],
+                    stride: 4,
+                }],
+            )),
+        );
+        player.state = VideoState::Playing {
+            position: Duration::ZERO,
+        };
+        assert!(player.poll_frame().is_none());
+        assert!(matches!(player.state, VideoState::Playing { .. }));
+        assert!(player.frame_queue.push(frame));
+        player.frame_queue.set_eos();
+        player.scheduler.start();
+        assert_eq!(player.poll_frame().unwrap().pts, pts);
+        assert!(matches!(player.state, VideoState::Ended));
+        player.poll_frame();
+        assert!(matches!(player.state, VideoState::Ended));
+
+        player.state = VideoState::Paused { position: pts };
+        player.poll_frame();
+        assert!(matches!(player.state, VideoState::Paused { .. }));
+    }
+
+    #[cfg(feature = "moq")]
     use super::source_uses_moq;
 
+    #[cfg(feature = "moq")]
     #[test]
     fn moq_source_routing_only_matches_moq_schemes() {
         assert!(source_uses_moq("moq://localhost/live/stream"));

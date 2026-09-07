@@ -18,6 +18,9 @@ public final class LuminaVideoFrame: @unchecked Sendable {
     /// Frame height in pixels.
     public let height: Int
 
+    /// Presentation time of this decoded frame, in seconds.
+    public let presentationTime: TimeInterval
+
     /// IOSurface for zero-copy Metal rendering.
     /// ARC retains the storage, but consumers must retain this complete frame until
     /// GPU completion to keep the decoder from recycling its buffer-pool lease.
@@ -27,6 +30,7 @@ public final class LuminaVideoFrame: @unchecked Sendable {
         self.framePtr = framePtr
         self.width = Int(lumina_frame_width(framePtr))
         self.height = Int(lumina_frame_height(framePtr))
+        self.presentationTime = lumina_frame_presentation_time(framePtr)
 
         // lumina_frame_iosurface returns IOSurfaceRef with no CF ownership
         // annotation → Swift imports as Unmanaged<IOSurface>?.

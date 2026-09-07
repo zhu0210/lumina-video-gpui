@@ -30,6 +30,7 @@ and simplifies Swift integration.
 | `lumina_frame_release` | Any | Frees frame memory |
 | `lumina_frame_width` | Any | Read-only accessor |
 | `lumina_frame_height` | Any | Read-only accessor |
+| `lumina_frame_presentation_time` | Any | Frame PTS in seconds; -1.0 for NULL |
 | `lumina_frame_iosurface` | Any | Read-only accessor |
 
 ## Opaque Handle Types
@@ -144,6 +145,7 @@ LuminaFrame *lumina_player_poll_frame(LuminaPlayer *player);
 ```c
 uint32_t         lumina_frame_width(const LuminaFrame *frame);
 uint32_t         lumina_frame_height(const LuminaFrame *frame);
+double           lumina_frame_presentation_time(const LuminaFrame *frame);
 IOSurfaceRef     lumina_frame_iosurface(const LuminaFrame *frame);
 void             lumina_frame_release(LuminaFrame *frame);
 ```

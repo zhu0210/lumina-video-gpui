@@ -222,6 +222,9 @@ uint32_t lumina_frame_width(const LuminaFrame *_Nullable frame);
  */
 uint32_t lumina_frame_height(const LuminaFrame *_Nullable frame);
 
+/** Returns the decoded frame presentation time in seconds, or -1.0 for NULL. */
+double lumina_frame_presentation_time(const LuminaFrame *_Nullable frame);
+
 #ifdef __APPLE__
 /**
  * Returns the IOSurface for zero-copy Metal rendering.

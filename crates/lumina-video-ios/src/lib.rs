@@ -400,6 +400,22 @@ pub extern "C" fn lumina_frame_height(frame: *const LuminaFrame) -> u32 {
     })
 }
 
+/// Returns the frame presentation time in seconds, or -1.0 for NULL.
+///
+/// # Safety
+/// `frame` must be a valid `LuminaFrame` pointer (or NULL).
+#[no_mangle]
+pub extern "C" fn lumina_frame_presentation_time(frame: *const LuminaFrame) -> f64 {
+    ffi_boundary_or(-1.0, || {
+        if frame.is_null() {
+            return -1.0;
+        }
+        // SAFETY: The caller keeps the immutable frame alive for this call;
+        // reading its timestamp neither transfers ownership nor touches GPU memory.
+        unsafe { &*frame }.frame.pts.as_secs_f64()
+    })
+}
+
 /// Returns the IOSurface for zero-copy Metal rendering.
 ///
 /// Returns NULL if the frame is CPU-only or if on a non-Apple platform.

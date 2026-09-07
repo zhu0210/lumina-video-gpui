@@ -41,8 +41,10 @@ final class PlaybackTests: XCTestCase {
         var completed = 0
         var failedGPU = false
         var missingSurface = false
+        var frameTime: TimeInterval = -1
         receiver.receive = { frame in
             received += 1
+            frameTime = frame.presentationTime
             missingSurface = missingSurface || frame.ioSurface == nil
             XCTAssertGreaterThan(frame.width, 0)
             XCTAssertGreaterThan(frame.height, 0)
@@ -66,7 +68,7 @@ final class PlaybackTests: XCTestCase {
         let beforeSeek = received
         player?.seek(to: 1.0)
         try await eventually("paused seek produces a frame") {
-            received > beforeSeek && abs((player?.current_time ?? 0) - 1.0) < 0.25
+            received > beforeSeek && abs(frameTime - 1.0) < 0.25
         }
         XCTAssertEqual(player?.state, .paused)
 
@@ -75,7 +77,7 @@ final class PlaybackTests: XCTestCase {
         let beforeEOSSeek = received
         player?.seek(to: 0.25)
         try await eventually("seek after EOS resumes frame polling without play") {
-            received > beforeEOSSeek && (player?.current_time ?? 2) < 0.75
+            received > beforeEOSSeek && abs(frameTime - 0.25) < 0.25
         }
         XCTAssertFalse(missingSurface)
         XCTAssertFalse(failedGPU)

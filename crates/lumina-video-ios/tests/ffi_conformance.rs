@@ -34,6 +34,7 @@ extern "C" {
     fn lumina_player_poll_frame(player: *mut LuminaPlayer) -> *mut LuminaFrame;
     fn lumina_frame_width(frame: *const LuminaFrame) -> u32;
     fn lumina_frame_height(frame: *const LuminaFrame) -> u32;
+    fn lumina_frame_presentation_time(frame: *const LuminaFrame) -> f64;
     fn lumina_frame_iosurface(frame: *const LuminaFrame) -> *mut std::ffi::c_void;
     fn lumina_frame_release(frame: *mut LuminaFrame);
     fn lumina_player_set_muted(player: *mut LuminaPlayer, muted: bool) -> i32;
@@ -241,6 +242,14 @@ fn frame_width_null() {
 fn frame_height_null() {
     unsafe {
         assert_eq!(lumina_frame_height(ptr::null()), 0);
+    }
+}
+
+#[test]
+fn frame_presentation_time_null() {
+    // SAFETY: NULL is explicitly supported; no frame storage is accessed.
+    unsafe {
+        assert_eq!(lumina_frame_presentation_time(ptr::null()), -1.0);
     }
 }
 

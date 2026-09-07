@@ -2339,32 +2339,11 @@ impl GpuiVideoPlayer {
             }
         };
 
-        // Drain every available frame from the decode queue to prevent
-        // back-pressure ("QUEUE FULL branch, sleeping 5ms").  Upload only
-        // the *last* frame's textures to the GPU — intermediate frames are
-        // just popped and dropped so the decoder thread never stalls.
-        let queue_len_before = self
-            .core
-            .as_ref()
-            .map_or(0, |core| core.frame_queue().len());
-        let mut last_frame = None;
-        let mut drained = 0u32;
-        if let Some(core) = self.core.as_mut() {
-            while let Some(video_frame) = core.poll_frame() {
-                drained += 1;
-                self.loop_seek_pending = false;
-                last_frame = Some(video_frame);
-            }
-        }
-        if drained > 0 {
-            tracing::debug!(
-                "poll_and_upload: drained {drained} frames, queue was {queue_len_before}"
-            );
-        } else if queue_len_before > 0 {
-            tracing::warn!(
-                "poll_and_upload: drained 0 frames but queue has {queue_len_before} — \
-                 scheduler is holding frames back (audio not started?)"
-            );
+        // The scheduler owns frame timing and can return the current frame again.
+        // Poll once per refresh; draining until None can spin forever on that frame.
+        let last_frame = self.core.as_mut().and_then(CorePlayer::poll_frame);
+        if last_frame.is_some() {
+            self.loop_seek_pending = false;
         }
 
         if let Some(video_frame) = last_frame {
