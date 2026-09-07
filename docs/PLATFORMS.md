@@ -1,138 +1,67 @@
-# Platform Support
+# Platform support and validation
 
-Detailed platform requirements, supported codecs, and hardware specifications.
+The target-specific Cargo manifests and implementations define current support.
+A successful build does not establish hardware playback coverage. Container parsing,
+codec availability, hardware decoding and native-memory import are separate capabilities.
 
-## Support Matrix
+## Implemented paths
 
-| Platform | Decoder | HW Decode | Rendering | Status |
-|----------|---------|-----------|-----------|--------|
-| macOS | VideoToolbox | Yes | Zero-copy (MP4); CPU for MKV | **Tested** |
-| Linux | GStreamer + VA-API | Yes | Zero-copy (DMABuf → Vulkan) | **Tested** |
-| Android | ExoPlayer + MediaCodec | Yes | 1 GPU hop* | **Tested** |
-| Web | HTMLVideoElement + hls.js | Yes (browser) | GPU-to-GPU (WebGPU) | **Tested** |
-| Windows | Media Foundation | Yes | Pending testing | **WIP/Untested** |
+| Platform | Media path | Frame delivery | Validation boundary |
+|---|---|---|---|
+| Linux | GStreamer media session; bundled GStreamer 1.28.6 and FFmpeg 9 runtime available | DMA-BUF import into Vulkan/wgpu; explicit fallback if import is unavailable | Local Intel GPU playback, session regressions, and standalone package tests in a clean Ubuntu container |
+| macOS | AVFoundation/VideoToolbox; FFmpeg fallback for containers AVFoundation cannot open | IOSurface native import; FFmpeg fallback may deliver CPU frames | Intel and Apple Silicon CI builds/tests; bundled application builds |
+| iOS | AVFoundation/VideoToolbox with native audio | IOSurface retained through Metal GPU completion | Device and simulator builds; simulator playback, pause, seek, EOS and lifetime tests through the Swift/Metal harness |
+| Android | ExoPlayer/MediaCodec; native MoQ decoder where enabled | AHardwareBuffer with producer fence and GPU YUV conversion; explicit fallback on unsupported devices | Native cross-checks, bridge unit tests and APK builds; physical-device playback remains a separate check |
+| Windows | Media Foundation plus the maintained audio output | Native D3D11/DX12 import into wgpu | Windows compilation and regression tests; actual MF/WASAPI sound output and GPU playback still require device validation |
+| Web | HTMLVideoElement, native HLS or hls.js; browser MoQ bridge | Browser GPU copy into WebGPU | Wasm builds, bridge regressions and browser checks; codec support depends on the browser |
 
-\* Android uses `VkSamplerYcbcrConversion` for GPU-side YUV→RGBA conversion with zero CPU copies. See [#22](https://github.com/lumina-video/lumina-video/pull/22).
+Native-memory delivery is the normal path. CPU pixel upload is the final fallback,
+with its cause reported; it is never counted as zero-copy. Hardware decoding alone
+does not prove that frame delivery avoids CPU copies.
 
-## macOS
+The iOS harness tests the Swift bridge and Metal renderer, not the complete GPUI
+renderer. GPUI is checked for both iOS targets, but physical iOS/Android playback and
+GPUI rendering need device validation. No device model compatibility list is claimed.
 
-- **OS**: macOS 10.13 (High Sierra) or later
-- **Hardware**: Any Mac with Metal support
-  - Apple Silicon (M1, M2, M3, M4) — native hardware decode
-  - Intel Macs with QuickSync (2012 and later)
-- **Codecs**: H.264, HEVC, VP9, AV1 (M3+ for AV1)
-- **Containers**: MP4, MOV, HLS native; MKV/WebM use the automatic FFmpeg fallback
+## Formats and runtime requirements
 
-## Windows
+- **Linux:** the packaged runtime includes its selected demuxers and decoders. Plugin
+  availability, driver capabilities, pixel format and DRM modifier support determine
+  the usable route. See [runtime packaging](GSTREAMER-RUNTIME.md) for the lock file,
+  contents and deployment baseline. The current standalone Linux build targets
+  Ubuntu 24.04/glibc 2.39; it is not an Ubuntu 22.04 binary.
+- **macOS:** AVFoundation handles supported native containers. MKV/WebM fallback uses
+  the bundled FFmpeg build. Ship the packaged application, including its FFmpeg
+  libraries, rather than copying the executable alone.
+- **iOS:** the current AVFoundation path does not provide general MKV support. A
+  GStreamer migration is still a proposal, not an implemented feature. See the
+  [iOS integration guide](IOS.md) for the generated XCFramework and Swift package.
+- **Android:** the maintained bridge has `minSdk = 26`. Its ExoPlayer native-memory
+  route currently requires API 33 producer fences; older versions use the explicitly
+  reported final fallback. Format support depends on ExoPlayer and the installed
+  MediaCodec implementations. See [Android integration](ANDROID.md).
+- **Windows:** available Media Foundation decoders and OS components determine
+  format coverage. Bundling FFmpeg for Linux/macOS does not add a Windows FFmpeg
+  fallback. Do not assume a codec extension is installed or that all MKV streams work.
+- **Web:** browser codecs and media APIs determine playback coverage. The GPU copy
+  path is distinct from native texture aliasing.
 
-- **OS**: Windows 10 version 1803 or later (Windows 11 recommended)
-- **Hardware**: Any GPU with DirectX 11 support
-  - NVIDIA: Kepler (GTX 600) or newer
-  - AMD: GCN 1.0 (HD 7000) or newer
-  - Intel: Haswell (4th gen) or newer
-- **Codecs**: H.264, HEVC (may require HEVC Video Extensions on Windows 10; included in Windows 11), AV1 (with AV1 Extensions)
+An MKV demuxer does not imply hardware support for every codec that MKV can contain.
+Use actual media fixtures and frame-delivery diagnostics to establish coverage.
 
-## Linux
+## Audio and packaging
 
-- **OS**: Ubuntu 22.04+, Fedora 38+, or any distro with GStreamer 1.24+
-- **Hardware**: VA-API compatible GPU with appropriate drivers
-  - Intel: Haswell (4th gen) or newer with `intel-media-va-driver`
-  - AMD: GCN 1.0 or newer with Mesa VA-API
-  - NVIDIA: With proprietary drivers and NVDEC via `nvcodec` plugin
-- **Runtime packages**: `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-libav`
-- **GStreamer requirement**: 1.24+ required for zero-copy (explicit DRM modifier support via `drm-format` caps field)
+The current Linux session uses GStreamer audio-sink selection (`autoaudiosink` by
+default). Legacy environment switches for forcing ALSA/PulseAudio/PipeWire are not
+part of this session's contract. Headless fixture tests explicitly select a fake sink;
+that does not validate audible output.
 
-> **Note**: The modern `va` plugin (in `gstreamer1.0-plugins-bad`) replaces the deprecated `gstreamer-vaapi` plugin. The `va` decoders have higher rank and support explicit DRM modifiers for zero-copy.
+Linux releases can bundle the runtime using the `vendored-runtime` feature. macOS
+release packaging includes the pinned FFmpeg libraries. Android bundles the Java
+bridge, while iOS packages the Rust static libraries and headers as an XCFramework.
+The Windows backend still relies on platform media and audio services.
 
-### Linux Audio Configuration
-
-By default, lumina-video uses **alsasink** for audio output on Linux. This bypasses PulseAudio to avoid a known bug where video freezes after 2-4 seeks on HTTP streams.
-
-**Trade-offs:**
-- ✅ Reliable video seeking on HTTP streams
-- ✅ Audio sharing works via ALSA's dmix plugin
-- ⚠️ No per-app volume control in system tray
-- ⚠️ No automatic audio device switching (Bluetooth, headphones)
-
-**Environment variables to override:**
-
-| Variable | Audio Sink | Notes |
-|----------|------------|-------|
-| *(default)* | alsasink | Reliable seeking |
-| `LUMINA_VIDEO_PULSE_AUDIO=1` | pulsesink | May freeze after seek on HTTP |
-| `LUMINA_VIDEO_PIPEWIRE_AUDIO=1` | pipewiresink | May glitch on backward seek |
-| `LUMINA_VIDEO_FAKE_AUDIO=1` | fakesink | No audio output |
-| `LUMINA_VIDEO_NO_AUDIO=1` | *(disabled)* | Video only |
-
-## Android
-
-- **OS**: Android 5.0 (API 21) or later
-- **Tested devices**: Pixel 4a/6/7/8, Samsung Galaxy S10+/S21/S23, OnePlus 8T/9 Pro
-- **Hardware**: Any device with hardware MediaCodec support (virtually all Android 5.0+ devices)
-- **Codecs**: H.264, HEVC, VP8, VP9, AV1 (Pixel 8+, recent Samsung flagships)
-
-> **Note**: Hardware acceleration availability varies by device manufacturer and Android version. H.264 is universally supported; HEVC/VP9 support is widespread on 2018+ devices.
-
-## Web
-
-- **Browsers**:
-  - Chrome 113+ / Edge 113+ (WebGPU stable)
-  - Firefox 141+ (WebGPU stable, WebGL2 51+)
-  - Safari 26.0+ (WebGPU stable, WebGL2 15+)
-- **HLS Streaming**: Native support in Safari; hls.js for Chrome/Firefox/Edge
-- **Codecs**: H.264 (universal), VP9 (Chrome/Firefox/Edge), HEVC (Safari), AV1 (Chrome 94+, Firefox 98+)
-- **Requirements**:
-  - Modern browser with WebAssembly support
-  - `requestVideoFrameCallback` for frame-accurate sync (Chrome 83+, Safari 15.4+, Firefox 132+)
-
-## Supported Formats
-
-| Format | macOS | Linux | Windows | Android |
-|--------|-------|-------|---------|---------|
-| **Video** |||||
-| H.264/AVC | Yes | Yes | Yes | Yes |
-| H.265/HEVC | Yes | Yes | Yes* | Yes |
-| VP8 | Yes | Yes | No | Yes |
-| VP9 | Yes | Yes | No | Yes |
-| AV1 | Yes (M3+) | Yes** | Yes** | Yes (newer) |
-| **Audio** |||||
-| AAC | Yes | Yes | Yes | Yes |
-| MP3 | Yes | Yes | Yes | Yes |
-| Opus | Yes | Yes | Yes | Yes |
-| **Containers** |||||
-| MP4/M4V | Yes | Yes | Yes | Yes |
-| WebM | FFmpeg | Yes | No | Yes |
-| MKV | FFmpeg | Yes | Partial | Yes |
-| HLS (m3u8) | Yes | Yes | Yes | Yes |
-
-\* Windows HEVC requires HEVC Video Extensions from Microsoft Store (included in Windows 11)
-\*\* AV1 requires appropriate system codecs/plugins
-
-> **Tip**: H.264 + AAC in MP4 container has the broadest compatibility across all platforms.
-
-## Why Native Decoders Over FFmpeg?
-
-| Aspect | Native Decoder | FFmpeg |
-|--------|---------------|--------|
-| **HW Integration** | Direct API access | Abstraction layer overhead |
-| **Memory Efficiency** | Optimal memory locations | Extra copy through libav buffers |
-| **Power Consumption** | OS-optimized for battery | Higher power draw |
-| **Binary Size** | Uses system libraries (0 MB) | +15-30 MB for FFmpeg libs |
-| **Codec Updates** | Automatic via OS updates | Must rebuild/redeploy |
-
-## Platform Fallbacks
-
-On macOS, FFmpeg support is included automatically for MKV/WebM fallback
-through native-frame. Linux playback uses GStreamer; applications that need a
-bundled GStreamer runtime can enable `vendored-runtime` on `lumina-video-gpui`.
-
-## Packaging Recommendations
-
-**End users should never need to install separate video dependencies.**
-
-| Platform | Recommendation |
-|----------|---------------|
-| **macOS** | VideoToolbox is a system framework — ship your `.app` as-is |
-| **Windows** | Media Foundation is built-in. Document HEVC Extensions if needed |
-| **Linux** | Declare GStreamer plugins as package dependencies in `.deb`/`.rpm` |
-| **Android** | MediaCodec is part of Android. ExoPlayer is bundled in your APK |
+See the [cross-platform CI](../.github/workflows/ci.yml),
+[iOS application tests](../.github/workflows/ios.yml), and
+[standalone runtime tests](../.github/workflows/package-gstreamer.yml) for the checks
+that are actually run. Passing them does not replace physical-device acceptance.
