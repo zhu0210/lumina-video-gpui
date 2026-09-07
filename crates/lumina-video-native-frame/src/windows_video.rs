@@ -395,8 +395,20 @@ impl WindowsVideoDecoder {
                     (Some(format), true)
                 }
                 Err(e) => {
+                    // Missing audio is a valid video-only source. A real audio
+                    // track whose output cannot be negotiated must report failure,
+                    // rather than masquerading as a successfully silent video.
+                    // SAFETY: The live reader returns an owned native media type.
+                    if unsafe {
+                        source_reader
+                            .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
+                    }
+                    .is_ok()
+                    {
+                        return Err(e);
+                    }
                     if debug_logging {
-                        info!("No audio stream or audio configuration failed: {}", e);
+                        info!("No audio stream: {e}");
                     }
                     (None, false)
                 }
@@ -767,12 +779,23 @@ impl WindowsVideoDecoder {
         // Get duration from presentation descriptor
         let duration = Self::get_duration(reader);
 
+        // CurrentMediaType describes decoded NV12/RGB32; only the native type
+        // identifies the source codec after output conversion is configured.
+        // SAFETY: The reader is live and the returned owned COM type stays in scope.
+        let codec = unsafe {
+            reader
+                .GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)
+                .and_then(|native| native.GetGUID(&MF_MT_SUBTYPE))
+                .map(codec_name)
+                .unwrap_or_else(|_| "unknown".into())
+        };
+
         let metadata = VideoMetadata {
             width,
             height,
             duration,
             frame_rate,
-            codec: "h264".to_string(), // TODO: Extract actual codec
+            codec,
             pixel_aspect_ratio,
             start_time: None,
         };
@@ -1693,6 +1716,13 @@ impl WindowsVideoDecoder {
                 })?;
         }
 
+        Self::read_audio_format(reader, debug_logging)
+    }
+
+    fn read_audio_format(
+        reader: &IMFSourceReader,
+        debug_logging: bool,
+    ) -> Result<AudioFormatInfo, VideoError> {
         // Get the resolved media type to read actual format attributes
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
         let resolved_type: IMFMediaType = unsafe {
@@ -1717,7 +1747,7 @@ impl WindowsVideoDecoder {
                 .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get channel count: {}", e))
-                })? as u16
+                })?
         };
 
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
@@ -1726,7 +1756,7 @@ impl WindowsVideoDecoder {
                 .GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get bits per sample: {}", e))
-                })? as u16
+                })?
         };
 
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
@@ -1735,7 +1765,7 @@ impl WindowsVideoDecoder {
                 .GetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT)
                 .map_err(|e| {
                     VideoError::DecoderInit(format!("Failed to get block alignment: {}", e))
-                })? as u16
+                })?
         };
 
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
@@ -1747,16 +1777,24 @@ impl WindowsVideoDecoder {
                 })?
         };
 
+        let channels = u16::try_from(channels)
+            .map_err(|_| VideoError::DecoderInit("PCM channel count exceeds u16".into()))?;
+        let bits_per_sample = u16::try_from(bits_per_sample)
+            .map_err(|_| VideoError::DecoderInit("PCM bit depth exceeds u16".into()))?;
+        let block_align = u16::try_from(block_align)
+            .map_err(|_| VideoError::DecoderInit("PCM alignment exceeds u16".into()))?;
+
         // Check if the resolved format is float (MFAudioFormat_Float) vs integer PCM.
         // We request PCM, but check the resolved type to be defensive.
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
-        let is_float = unsafe {
-            if let Ok(subtype) = resolved_type.GetGUID(&MF_MT_SUBTYPE) {
-                subtype == MFAudioFormat_Float
-            } else {
-                false
-            }
-        };
+        let subtype = unsafe { resolved_type.GetGUID(&MF_MT_SUBTYPE) }
+            .map_err(|e| VideoError::DecoderInit(format!("Missing PCM subtype: {e}")))?;
+        if subtype != MFAudioFormat_PCM && subtype != MFAudioFormat_Float {
+            return Err(VideoError::DecoderInit(format!(
+                "Unexpected compressed audio output: {subtype:?}"
+            )));
+        }
+        let is_float = subtype == MFAudioFormat_Float;
 
         let format = AudioFormatInfo {
             sample_rate,
@@ -1767,6 +1805,7 @@ impl WindowsVideoDecoder {
             is_float,
         };
 
+        format.validate().map_err(VideoError::DecoderInit)?;
         if debug_logging {
             info!(
                 "Audio stream configured: {}Hz, {} channels, {}-bit, block_align={}, avg_bps={}",
@@ -1789,18 +1828,13 @@ impl WindowsVideoDecoder {
     /// # MF Reader Flags Handled
     /// - `MF_SOURCE_READERF_ENDOFSTREAM`: Sets audio_eof and returns None
     /// - `MF_SOURCE_READERF_STREAMTICK`: Returns None (gap in stream)
-    /// - `MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED`: Logs warning, continues
+    /// - `MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED`: Reconfigures PCM output at the new PTS
     /// - `MF_SOURCE_READERF_NEWSTREAM`: Logs info, continues
     #[profiling::function]
     pub fn read_audio_sample(&mut self) -> Result<Option<AudioFrame>, VideoError> {
         if !self.audio_enabled {
             return Ok(None);
         }
-
-        let audio_format = match &self.audio_format {
-            Some(f) => f.clone(),
-            None => return Ok(None),
-        };
 
         let mut flags: u32 = 0;
         let mut timestamp: i64 = 0;
@@ -1820,6 +1854,26 @@ impl WindowsVideoDecoder {
                 .map_err(|e| VideoError::DecodeFailed(format!("Audio ReadSample failed: {}", e)))?;
         }
 
+        if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
+            let format = Self::read_audio_format(&self.source_reader, self.debug_logging)?;
+            if self.audio_format.as_ref() != Some(&format) {
+                let position =
+                    if sample.is_some() || flags & (MF_SOURCE_READERF_STREAMTICK.0 as u32) != 0 {
+                        Duration::from_nanos((timestamp.max(0) as u64).saturating_mul(100))
+                    } else {
+                        self.audio_buffered_until
+                    };
+                if let Some(playback) = &mut self.audio_playback {
+                    playback
+                        .reconfigure(format.clone(), position)
+                        .map_err(VideoError::DecodeFailed)?;
+                }
+                self.audio_format = Some(format);
+                self.audio_buffered_until = position;
+                self.audio_tail = None;
+            }
+        }
+
         // Handle MF reader flags
         if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
             self.audio_eof.store(true, Ordering::SeqCst);
@@ -1836,15 +1890,13 @@ impl WindowsVideoDecoder {
             return Ok(None);
         }
 
-        if flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32) != 0 {
-            warn!("Audio media type changed mid-stream");
-            // Could re-read format here, but for now just log
-        }
-
         if flags & (MF_SOURCE_READERF_NEWSTREAM.0 as u32) != 0 && self.debug_logging {
             info!("New audio stream detected");
         }
 
+        let Some(audio_format) = self.audio_format.as_ref() else {
+            return Ok(None);
+        };
         let sample = match sample {
             Some(s) => s,
             None => return Ok(None),
@@ -1975,23 +2027,33 @@ impl WindowsVideoDecoder {
         let Some(playback) = &self.audio_playback else {
             return Ok(());
         };
-        let queue = playback.audio_queue();
         let target = video_position
             .max(playback.clock_position())
             .saturating_add(Duration::from_millis(250));
         for _ in 0..16 {
             if self.audio_eof.load(Ordering::Relaxed)
                 || self.audio_buffered_until >= target
-                || queue.len() >= 50
+                || self
+                    .audio_playback
+                    .as_ref()
+                    .is_some_and(|p| p.audio_queue().len() >= 50)
             {
                 break;
             }
             if let Some(frame) = self.read_audio_sample()? {
                 self.audio_buffered_until = frame.pts.saturating_add(frame.duration());
-                queue.push(frame);
+                // A format change may have replaced the queue during ReadSample.
+                if let Some(playback) = &self.audio_playback {
+                    playback.audio_queue().push(frame);
+                }
             }
         }
-        if self.audio_eof.load(Ordering::Relaxed) && self.audio_tail.is_none() && queue.is_drained()
+        if self.audio_eof.load(Ordering::Relaxed)
+            && self.audio_tail.is_none()
+            && self
+                .audio_playback
+                .as_ref()
+                .is_some_and(|p| p.audio_queue().is_drained())
         {
             // The sample clock counts submitted media. Allow the estimated WASAPI
             // latency to drain before declaring EOS and dropping the output stream.
@@ -2141,6 +2203,24 @@ impl WindowsVideoDecoder {
         }
 
         Ok(DecodedFrame::Cpu(frame))
+    }
+}
+
+fn codec_name(subtype: windows::core::GUID) -> String {
+    use windows::Win32::Media::MediaFoundation as mf;
+    match subtype {
+        mf::MFVideoFormat_H264 | mf::MFVideoFormat_H264_ES | mf::MFVideoFormat_H264_HDCP => {
+            "h264".into()
+        }
+        mf::MFVideoFormat_HEVC | mf::MFVideoFormat_HEVC_ES | mf::MFVideoFormat_HEVC_HDCP => {
+            "hevc".into()
+        }
+        mf::MFVideoFormat_VP90 => "vp9".into(),
+        mf::MFVideoFormat_AV1 => "av1".into(),
+        mf::MFVideoFormat_MP4V => "mpeg4".into(),
+        mf::MFVideoFormat_WMV3 => "wmv3".into(),
+        mf::MFVideoFormat_MJPG => "mjpeg".into(),
+        _ => format!("{subtype:?}"),
     }
 }
 
@@ -2343,6 +2423,17 @@ impl Drop for WindowsVideoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_codec_names_do_not_mislabel_non_h264() {
+        use windows::Win32::Media::MediaFoundation::*;
+        assert_eq!(codec_name(MFVideoFormat_H264), "h264");
+        assert_eq!(codec_name(MFVideoFormat_HEVC), "hevc");
+        assert_eq!(codec_name(MFVideoFormat_VP90), "vp9");
+        assert_eq!(codec_name(MFVideoFormat_AV1), "av1");
+        let custom = windows::core::GUID::from_u128(123);
+        assert_eq!(codec_name(custom), format!("{custom:?}"));
+    }
 
     #[test]
     fn test_hw_accel_type() {

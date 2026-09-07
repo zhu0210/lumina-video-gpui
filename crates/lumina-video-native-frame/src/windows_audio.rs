@@ -74,7 +74,7 @@ impl AudioFrame {
 // ============================================================================
 
 /// Audio format information resolved from Media Foundation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioFormatInfo {
     /// Sample rate in Hz (e.g., 48000)
     pub sample_rate: u32,
@@ -88,6 +88,26 @@ pub struct AudioFormatInfo {
     pub avg_bytes_per_sec: u32,
     /// Whether the audio data is 32-bit float (f32) vs integer PCM.
     pub is_float: bool,
+}
+
+impl AudioFormatInfo {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let valid_depth = if self.is_float {
+            self.bits_per_sample == 32
+        } else {
+            matches!(self.bits_per_sample, 16 | 24 | 32)
+        };
+        if self.channels == 0 || self.sample_rate == 0 || !valid_depth {
+            return Err(format!("Unsupported PCM format: {self:?}"));
+        }
+        let alignment = u32::from(self.channels) * u32::from(self.bits_per_sample / 8);
+        if alignment != u32::from(self.block_align)
+            || self.sample_rate.checked_mul(alignment) != Some(self.avg_bytes_per_sec)
+        {
+            return Err(format!("Invalid PCM alignment/rate: {self:?}"));
+        }
+        Ok(())
+    }
 }
 
 impl Default for AudioFormatInfo {
@@ -524,9 +544,7 @@ impl WindowsAudioPlayback {
         queue: Arc<AudioQueue>,
         clock: Arc<AudioClock>,
     ) -> Result<Self, String> {
-        if format.channels == 0 || format.sample_rate == 0 {
-            return Err("Audio channel count and sample rate must be nonzero".into());
-        }
+        format.validate()?;
         let stream = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| format!("Failed to open audio output: {}", e))?;
 
@@ -609,6 +627,18 @@ impl WindowsAudioPlayback {
         if self.playing {
             self.sink.play();
         }
+    }
+
+    /// Replace negotiated sample geometry without losing playback/volume controls.
+    pub(crate) fn reconfigure(
+        &mut self,
+        format: AudioFormatInfo,
+        position: Duration,
+    ) -> Result<(), String> {
+        format.validate()?;
+        self.format = format;
+        self.seek(position);
+        Ok(())
     }
 
     /// Returns the current audio playback position (accounting for latency).
@@ -742,6 +772,23 @@ mod tests {
             tail.elapsed(start + Duration::from_millis(10050)),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn negotiated_pcm_geometry_is_validated_before_consumption() {
+        let stereo = AudioFormatInfo::default();
+        assert!(stereo.validate().is_ok());
+        let mut changed = stereo.clone();
+        changed.channels = 1;
+        assert!(changed.validate().is_err()); // old stereo alignment is invalid
+        changed.block_align = 2;
+        changed.avg_bytes_per_sec = changed.sample_rate * 2;
+        assert!(changed.validate().is_ok());
+        assert_ne!(stereo, changed);
+        changed.is_float = true;
+        assert!(changed.validate().is_err()); // float is 32-bit, never 16-bit
+        changed.channels = 0;
+        assert!(changed.validate().is_err());
     }
 
     #[test]
