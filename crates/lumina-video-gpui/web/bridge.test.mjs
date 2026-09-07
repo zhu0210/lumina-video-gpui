@@ -84,3 +84,55 @@ test("MoQ bridge reads current structured catalog frames and cleans failed conne
   assert.equal(window.__moqTransportBridge.activeSessions.size, 0);
   producer.close();
 });
+
+test("video exposes failed play and media errors, but ignores a play cancelled by pause", async () => {
+  const { playVideo, pauseVideo, getVideoError } = await import("./video-bridge.js");
+  let reject;
+  const video = { play: () => new Promise((_, fail) => { reject = fail; }), pause() {} };
+  playVideo(video);
+  reject(new Error("NotAllowedError"));
+  await Promise.resolve();
+  assert.match(getVideoError(video), /NotAllowedError/);
+  playVideo(video);
+  assert.equal(getVideoError(video), null);
+  pauseVideo(video);
+  reject(new Error("AbortError"));
+  await Promise.resolve();
+  assert.equal(getVideoError(video), null);
+  video.error = { code: 4, message: "Unsupported codec" };
+  assert.match(getVideoError(video), /Unsupported codec/);
+});
+
+test("HLS manifest preserves pause and exhausted recovery becomes a player error", async () => {
+  const { initHls, getVideoError } = await import("./video-bridge.js");
+  const previous = globalThis.Hls;
+  class FakeHls {
+    static Events = { MANIFEST_PARSED: "manifest", LEVEL_SWITCHED: "level", ERROR: "error", FRAG_LOADED: "fragment" };
+    static ErrorTypes = { NETWORK_ERROR: "network", MEDIA_ERROR: "media" };
+    static isSupported() { return true; }
+    handlers = new Map();
+    retries = 0;
+    destroyed = false;
+    on(event, handler) { this.handlers.set(event, handler); }
+    loadSource() {}
+    attachMedia() {}
+    startLoad() { this.retries++; }
+    recoverMediaError() { this.retries++; }
+    destroy() { this.destroyed = true; }
+  }
+  globalThis.Hls = FakeHls;
+  try {
+    const video = { play() { assert.fail("manifest must not initiate playback"); } };
+    const hls = initHls(video, "https://example.test/video.m3u8");
+    hls.handlers.get("manifest")(null, { levels: [] });
+    const error = { fatal: true, type: "network", details: "manifestLoadError" };
+    for (let i = 0; i < 3; i++) hls.handlers.get("error")(null, error);
+    assert.equal(getVideoError(video), null);
+    hls.handlers.get("error")(null, error);
+    assert.equal(hls.retries, 3);
+    assert.equal(hls.destroyed, true);
+    assert.match(getVideoError(video), /manifestLoadError/);
+  } finally {
+    globalThis.Hls = previous;
+  }
+});

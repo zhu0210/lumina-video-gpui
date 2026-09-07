@@ -9,6 +9,48 @@
  * This file is imported by Rust/WASM via wasm-bindgen.
  */
 
+// Per-element errors and playback request identity must not outlive the element.
+const playbackState = new WeakMap();
+function stateFor(video) {
+  let state = playbackState.get(video);
+  if (!state) {
+    state = { generation: 0, playError: null, fatalError: null };
+    playbackState.set(video, state);
+  }
+  return state;
+}
+
+export function playVideo(video) {
+  const state = stateFor(video);
+  const generation = ++state.generation;
+  state.playError = null;
+  const failed = error => {
+    if (state.generation === generation) {
+      state.playError = `Play failed: ${error?.message || String(error)}`;
+    }
+  };
+  try {
+    Promise.resolve(video.play()).catch(failed);
+  } catch (error) {
+    failed(error);
+    throw error;
+  }
+}
+
+export function pauseVideo(video) {
+  const state = stateFor(video);
+  ++state.generation;
+  state.playError = null;
+  video.pause();
+}
+
+export function getVideoError(video) {
+  const state = playbackState.get(video);
+  if (state?.fatalError) return state.fatalError;
+  if (video.error) return `Media error ${video.error.code}: ${video.error.message || "Playback failed"}`;
+  return state?.playError ?? null;
+}
+
 // HLS.js configuration for best-in-class streaming performance
 const HLS_CONFIG = {
   // Buffer configuration for optimal playback
@@ -79,11 +121,6 @@ export function initHls(video, url) {
     // Reset recovery counters on successful manifest parse
     networkRecoveryAttempts = 0;
     mediaRecoveryAttempts = 0;
-    // Auto-play after manifest is ready (if allowed)
-    video.play().catch(() => {
-      // Autoplay blocked - user interaction required
-      console.debug('[lumina-video] Autoplay blocked, waiting for user interaction');
-    });
   });
 
   hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
@@ -102,6 +139,7 @@ export function initHls(video, url) {
             hls.startLoad();
           } else {
             console.error('[lumina-video] Max network recovery attempts reached, destroying HLS instance');
+            stateFor(video).fatalError = `HLS ${data.type}: ${data.details}`;
             hls.destroy();
           }
           break;
@@ -112,11 +150,13 @@ export function initHls(video, url) {
             hls.recoverMediaError();
           } else {
             console.error('[lumina-video] Max media recovery attempts reached, destroying HLS instance');
+            stateFor(video).fatalError = `HLS ${data.type}: ${data.details}`;
             hls.destroy();
           }
           break;
         default:
           console.error('[lumina-video] Unrecoverable error, destroying HLS instance');
+          stateFor(video).fatalError = `HLS ${data.type}: ${data.details}`;
           hls.destroy();
           break;
       }

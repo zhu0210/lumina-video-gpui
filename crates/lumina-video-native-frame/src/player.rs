@@ -136,12 +136,17 @@ impl CorePlayer {
         url: impl Into<String>,
         decoder: Box<dyn VideoDecoderBackend + Send>,
     ) -> Self {
-        let audio_handle = AudioHandle::new();
+        let audio_handle = decoder.audio_handle().unwrap_or_default();
         let scheduler = FrameScheduler::with_audio_handle(audio_handle.clone());
         let metadata = decoder.metadata().clone();
         let frame_queue = Arc::new(FrameQueue::with_default_capacity());
 
-        let decode_thread = DecodeThread::new(decoder, Arc::clone(&frame_queue));
+        let native_audio = decoder.handles_audio_internally();
+        let decode_thread = DecodeThread::with_audio_handle(
+            decoder,
+            Arc::clone(&frame_queue),
+            native_audio.then(|| audio_handle.clone()),
+        );
 
         Self {
             state: VideoState::Ready,
@@ -403,7 +408,6 @@ impl CorePlayer {
 
                 let frame_queue = Arc::clone(&self.frame_queue);
 
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 let decode_thread = if uses_native_audio {
                     DecodeThread::with_audio_handle(
                         decoder,
@@ -413,9 +417,6 @@ impl CorePlayer {
                 } else {
                     DecodeThread::new(decoder, frame_queue)
                 };
-
-                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-                let decode_thread = DecodeThread::new(decoder, frame_queue);
 
                 self.decode_thread = Some(decode_thread);
 
@@ -464,13 +465,10 @@ impl CorePlayer {
     /// Preserves the current mute state. Use [`play_with_muted`] to set an
     /// explicit mute state at the same time.
     pub fn play(&mut self) {
+        if self.sync_decode_error() {
+            return;
+        }
         if let Some(ref thread) = self.decode_thread {
-            #[cfg(any(
-                target_os = "android",
-                target_os = "ios",
-                target_os = "linux",
-                target_os = "macos"
-            ))]
             thread.set_muted(self.audio_handle.is_muted());
             thread.play();
             self.scheduler.start();
@@ -486,6 +484,9 @@ impl CorePlayer {
 
     /// Starts playback with a specific mute state.
     pub fn play_with_muted(&mut self, muted: bool) {
+        if self.sync_decode_error() {
+            return;
+        }
         self.set_muted(muted);
         if let Some(ref thread) = self.decode_thread {
             thread.play();
@@ -502,6 +503,9 @@ impl CorePlayer {
 
     /// Pauses playback.
     pub fn pause(&mut self) {
+        if self.sync_decode_error() {
+            return;
+        }
         if let Some(ref thread) = self.decode_thread {
             thread.pause();
             self.scheduler.pause();
@@ -517,6 +521,9 @@ impl CorePlayer {
 
     /// Seeks to a specific position.
     pub fn seek(&mut self, position: Duration) {
+        if self.sync_decode_error() {
+            return;
+        }
         if position == Duration::ZERO {
             tracing::debug!("Seek to ZERO requested from state={:?}", self.state,);
         }
@@ -651,6 +658,9 @@ impl CorePlayer {
     ///
     /// Returns `None` if no frame is ready. Updates internal position tracking.
     pub fn poll_frame(&mut self) -> Option<VideoFrame> {
+        if self.sync_decode_error() {
+            return None;
+        }
         let frame = self.scheduler.get_next_frame(&self.frame_queue);
         if let Some(ref f) = frame {
             match self.state {
@@ -698,8 +708,27 @@ impl CorePlayer {
     // Metadata sync
     // =========================================================================
 
+    /// Propagates a terminal worker failure without waiting on the decode thread.
+    fn sync_decode_error(&mut self) -> bool {
+        if let Some(error) = self
+            .decode_thread
+            .as_ref()
+            .and_then(DecodeThread::take_error)
+        {
+            self.scheduler.pause();
+            self.frame_queue.flush();
+            #[cfg(target_os = "macos")]
+            if let Some(audio_thread) = &self.audio_thread {
+                audio_thread.pause();
+            }
+            self.state = VideoState::Error(error);
+        }
+        matches!(self.state, VideoState::Error(_))
+    }
+
     /// Syncs metadata from the decode thread (dynamic values like lazy macOS AVPlayer metadata).
     pub fn sync_metadata_from_decode_thread(&mut self) {
+        self.sync_decode_error();
         let Some(ref thread) = self.decode_thread else {
             return;
         };
@@ -798,12 +827,6 @@ impl CorePlayer {
     /// Sets volume and syncs to the decode thread.
     pub fn set_volume(&mut self, volume: u32) {
         self.audio_handle.set_volume(volume);
-        #[cfg(any(
-            target_os = "android",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos"
-        ))]
         if let Some(ref decode_thread) = self.decode_thread {
             decode_thread.set_volume(volume as f32 / 100.0);
         }

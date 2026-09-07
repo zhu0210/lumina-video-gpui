@@ -201,19 +201,14 @@ impl WebVideoPlayer {
 
     /// Starts or resumes video playback.
     pub fn play(&self) -> Result<(), VideoError> {
-        let promise = self
-            .video
-            .play()
-            .map_err(|e| VideoError::Generic(format!("Play failed: {:?}", e)))?;
-
-        // Fire and forget - we handle state via events
-        let _ = promise;
+        js_play_video(&self.video)
+            .map_err(|error| VideoError::Generic(format!("Play failed: {error:?}")))?;
         Ok(())
     }
 
     /// Pauses video playback.
     pub fn pause(&self) {
-        self.video.pause().ok();
+        js_pause_video(&self.video);
     }
 
     /// Seeks to a specific position.
@@ -346,7 +341,9 @@ impl WebVideoPlayer {
 
     /// Updates the playback state based on video element state.
     pub fn update_state(&mut self) {
-        self.state = if self.video.ended() {
+        self.state = if let Some(error) = js_get_video_error(&self.video) {
+            VideoState::Error(VideoError::Generic(error))
+        } else if self.video.ended() {
             VideoState::Ended
         } else if self.video.paused() {
             VideoState::Paused {
@@ -412,6 +409,15 @@ fn request_video_frame_callback(
 
 #[wasm_bindgen(module = "/web/video-bridge.js")]
 extern "C" {
+    #[wasm_bindgen(catch, js_name = "playVideo")]
+    fn js_play_video(video: &HtmlVideoElement) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(js_name = "pauseVideo")]
+    fn js_pause_video(video: &HtmlVideoElement);
+
+    #[wasm_bindgen(js_name = "getVideoError")]
+    fn js_get_video_error(video: &HtmlVideoElement) -> Option<String>;
+
     /// Initializes HLS.js and attaches it to the video element.
     /// Returns the Hls instance handle.
     #[wasm_bindgen(catch, js_name = "initHls")]

@@ -38,19 +38,20 @@
 //! uses DXVA2/D3D11VA for hardware decoding when available. The decoder falls
 //! back to software decode if hardware acceleration fails.
 
+use crate::audio::AudioHandle;
 #[cfg(feature = "zero-copy")]
 use crate::video::WindowsGpuSurface;
 use crate::video::{
     CpuFrame, DecodedFrame, HwAccelType, PixelFormat, Plane, VideoDecoderBackend, VideoError,
     VideoFrame, VideoMetadata,
 };
-use crate::windows_audio::{AudioFormatInfo, AudioFrame};
+use crate::windows_audio::{AudioDrainClock, AudioFormatInfo, AudioFrame, WindowsAudioPlayback};
 use parking_lot::Mutex;
 #[cfg(feature = "zero-copy")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "zero-copy")]
@@ -327,6 +328,12 @@ pub struct WindowsVideoDecoder {
 
     /// Whether audio end-of-stream has been reached.
     audio_eof: AtomicBool,
+    audio_playback: Option<WindowsAudioPlayback>,
+    audio_handle: AudioHandle,
+    audio_buffered_until: Duration,
+    audio_tail: Option<AudioDrainClock>,
+    muted: bool,
+    volume: f32,
 
     /// COM lifecycle guard. MUST be LAST field so it's dropped last.
     /// Rust drops struct fields in declaration order, so this ensures COM
@@ -395,6 +402,13 @@ impl WindowsVideoDecoder {
                 }
             };
 
+        let audio_playback = audio_format
+            .clone()
+            .map(WindowsAudioPlayback::new)
+            .transpose()
+            .map_err(VideoError::DecoderInit)?;
+        let audio_handle = AudioHandle::new();
+        audio_handle.set_available(audio_playback.is_some());
         let hw_accel = HwAccelType::D3d11va;
 
         if debug_logging {
@@ -430,6 +444,12 @@ impl WindowsVideoDecoder {
             audio_format,
             audio_enabled,
             audio_eof: AtomicBool::new(false),
+            audio_playback,
+            audio_handle,
+            audio_buffered_until: Duration::ZERO,
+            audio_tail: None,
+            muted: false,
+            volume: 1.0,
             // _com_guard must be last so it's dropped last (after all COM objects)
             _com_guard: com_guard,
         })
@@ -1832,7 +1852,7 @@ impl WindowsVideoDecoder {
 
         // Convert timestamp to Duration (100ns units)
         // Clamp negative timestamps to 0 to avoid u64 wrap
-        let pts = Duration::from_nanos(timestamp.max(0) as u64 * 100);
+        let pts = Duration::from_nanos((timestamp.max(0) as u64).saturating_mul(100));
 
         // Get the buffer from the sample
         // SAFETY: The live Windows COM/D3D interface and its output pointers are valid for this operation.
@@ -1853,6 +1873,19 @@ impl WindowsVideoDecoder {
                 .map_err(|e| {
                     VideoError::DecodeFailed(format!("Audio buffer Lock failed: {}", e))
                 })?;
+        }
+
+        if data_ptr.is_null() || current_length == 0 {
+            // SAFETY: Balance the successful Lock before leaving; no slice was formed.
+            unsafe {
+                buffer.Unlock().ok();
+            }
+            if current_length == 0 {
+                return Ok(None);
+            }
+            return Err(VideoError::DecodeFailed(
+                "Audio buffer returned a null data pointer".into(),
+            ));
         }
 
         // Convert raw bytes to i16 samples
@@ -1934,6 +1967,42 @@ impl WindowsVideoDecoder {
             audio_format.channels,
             audio_format.sample_rate,
         )))
+    }
+
+    /// Decode a bounded amount ahead of presentation on the same MF reader.
+    /// Called on the decode worker, never on the render/audio callback threads.
+    fn fill_audio(&mut self, video_position: Duration) -> Result<(), VideoError> {
+        let Some(playback) = &self.audio_playback else {
+            return Ok(());
+        };
+        let queue = playback.audio_queue();
+        let target = video_position
+            .max(playback.clock_position())
+            .saturating_add(Duration::from_millis(250));
+        for _ in 0..16 {
+            if self.audio_eof.load(Ordering::Relaxed)
+                || self.audio_buffered_until >= target
+                || queue.len() >= 50
+            {
+                break;
+            }
+            if let Some(frame) = self.read_audio_sample()? {
+                self.audio_buffered_until = frame.pts.saturating_add(frame.duration());
+                queue.push(frame);
+            }
+        }
+        if self.audio_eof.load(Ordering::Relaxed) && self.audio_tail.is_none() && queue.is_drained()
+        {
+            // The sample clock counts submitted media. Allow the estimated WASAPI
+            // latency to drain before declaring EOS and dropping the output stream.
+            self.audio_tail = Some(AudioDrainClock::new(
+                Instant::now(),
+                self.audio_playback
+                    .as_ref()
+                    .is_some_and(|playback| playback.is_playing()),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns whether audio is enabled and configured.
@@ -2092,7 +2161,13 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
 
     #[profiling::function]
     fn decode_next(&mut self) -> Result<Option<VideoFrame>, VideoError> {
-        self.read_sample()
+        let frame = if self.eof.load(Ordering::Relaxed) {
+            None
+        } else {
+            self.read_sample()?
+        };
+        self.fill_audio(self.position)?;
+        Ok(frame)
     }
 
     #[profiling::function]
@@ -2123,6 +2198,12 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
                 .map_err(|e| VideoError::SeekFailed(format!("SetCurrentPosition failed: {}", e)))?;
         }
 
+        if let Some(playback) = &mut self.audio_playback {
+            playback.seek(position);
+        }
+        self.audio_buffered_until = position;
+        self.audio_tail = None;
+        self.audio_handle.set_native_position(position);
         self.position = position;
         self.eof.store(false, Ordering::SeqCst);
         // Reset audio EOF flag on seek
@@ -2141,9 +2222,74 @@ impl VideoDecoderBackend for WindowsVideoDecoder {
 
     fn is_eof(&self) -> bool {
         self.eof.load(Ordering::SeqCst)
+            && (self.audio_playback.is_none()
+                || self
+                    .audio_tail
+                    .as_ref()
+                    .is_some_and(|tail| tail.elapsed(Instant::now()).is_some()))
     }
 
-    /// Windows Media Foundation handles audio internally - no separate audio thread needed.
+    fn pause(&mut self) -> Result<(), VideoError> {
+        if let Some(tail) = &mut self.audio_tail {
+            tail.pause(Instant::now());
+        }
+        if let Some(playback) = &mut self.audio_playback {
+            playback.pause();
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), VideoError> {
+        if let Some(tail) = &mut self.audio_tail {
+            tail.resume(Instant::now());
+        }
+        if let Some(playback) = &mut self.audio_playback {
+            playback.play();
+        }
+        Ok(())
+    }
+
+    fn set_muted(&mut self, muted: bool) -> Result<(), VideoError> {
+        self.muted = muted;
+        if let Some(playback) = &self.audio_playback {
+            playback.set_volume(if muted { 0.0 } else { self.volume });
+        }
+        Ok(())
+    }
+
+    fn set_volume(&mut self, volume: f32) -> Result<(), VideoError> {
+        self.volume = if volume.is_finite() {
+            volume.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if let Some(playback) = &self.audio_playback {
+            playback.set_volume(if self.muted { 0.0 } else { self.volume });
+        }
+        Ok(())
+    }
+
+    fn audio_handle(&self) -> Option<AudioHandle> {
+        self.audio_playback
+            .as_ref()
+            .map(|_| self.audio_handle.clone())
+    }
+
+    fn current_time(&self) -> Option<Duration> {
+        self.audio_playback.as_ref().map(|playback| {
+            if let Some(tail) = &self.audio_tail {
+                // Audio can end before video (including an empty audio track).
+                // Continue the media timeline after its hardware tail drains so
+                // the remaining video is not frozen against an exhausted clock.
+                if let Some(elapsed) = tail.elapsed(Instant::now()) {
+                    return self.audio_buffered_until.saturating_add(elapsed);
+                }
+            }
+            playback.clock_position()
+        })
+    }
+
+    /// This decoder owns both MF audio decoding and the WASAPI output.
     fn handles_audio_internally(&self) -> bool {
         true
     }

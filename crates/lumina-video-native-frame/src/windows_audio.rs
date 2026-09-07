@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // Audio Frame
@@ -123,6 +123,8 @@ pub struct AudioQueue {
     total_pushed: AtomicU64,
     /// Total samples dropped due to full queue
     total_dropped: AtomicU64,
+    /// Samples still queued or held by the output source.
+    pending_samples: AtomicU64,
 }
 
 impl AudioQueue {
@@ -133,6 +135,7 @@ impl AudioQueue {
             queue: Mutex::new(VecDeque::with_capacity(max_frames)),
             total_pushed: AtomicU64::new(0),
             total_dropped: AtomicU64::new(0),
+            pending_samples: AtomicU64::new(0),
         })
     }
 
@@ -150,6 +153,7 @@ impl AudioQueue {
             return false;
         }
 
+        self.pending_samples.fetch_add(samples, Ordering::Relaxed);
         queue.push_back(frame);
         self.total_pushed.fetch_add(samples, Ordering::Relaxed);
         true
@@ -157,7 +161,7 @@ impl AudioQueue {
 
     /// Pops a frame from the queue. Returns `None` if empty.
     pub fn pop(&self) -> Option<AudioFrame> {
-        let mut queue = self.queue.lock();
+        let mut queue = self.queue.try_lock()?;
         queue.pop_front()
     }
 
@@ -174,7 +178,14 @@ impl AudioQueue {
     /// Clears all frames from the queue (used on seek).
     pub fn clear(&self) {
         let mut queue = self.queue.lock();
+        let discarded: u64 = queue.iter().map(|frame| frame.data.len() as u64).sum();
         queue.clear();
+        self.pending_samples.fetch_sub(discarded, Ordering::Relaxed);
+    }
+
+    /// True only after the output source has consumed every queued sample.
+    pub fn is_drained(&self) -> bool {
+        self.pending_samples.load(Ordering::Relaxed) == 0
     }
 
     /// Returns the total number of samples pushed.
@@ -210,6 +221,8 @@ pub struct AudioClock {
     samples_sent: AtomicU64,
     /// Sample rate in Hz
     sample_rate: u32,
+    /// Media timeline origin, preserved across a seek.
+    origin: Duration,
     /// Estimated output latency
     output_latency: Duration,
 }
@@ -222,8 +235,17 @@ impl AudioClock {
     pub fn new(sample_rate: u32) -> Self {
         Self {
             samples_sent: AtomicU64::new(0),
-            sample_rate,
+            sample_rate: sample_rate.max(1),
+            origin: Duration::ZERO,
             output_latency: Self::DEFAULT_OUTPUT_LATENCY,
+        }
+    }
+
+    /// Starts a fresh media timeline at a seek target.
+    pub fn with_origin(sample_rate: u32, origin: Duration) -> Self {
+        Self {
+            origin,
+            ..Self::new(sample_rate)
         }
     }
 
@@ -231,7 +253,8 @@ impl AudioClock {
     pub fn with_latency(sample_rate: u32, output_latency: Duration) -> Self {
         Self {
             samples_sent: AtomicU64::new(0),
-            sample_rate,
+            sample_rate: sample_rate.max(1),
+            origin: Duration::ZERO,
             output_latency,
         }
     }
@@ -247,13 +270,13 @@ impl AudioClock {
         let raw_position = Duration::from_secs_f64(samples as f64 / self.sample_rate as f64);
 
         // Subtract output latency, but don't go negative
-        raw_position.saturating_sub(self.output_latency)
+        self.origin + raw_position.saturating_sub(self.output_latency)
     }
 
     /// Returns the raw position without latency adjustment.
     pub fn raw_position(&self) -> Duration {
         let samples = self.samples_sent.load(Ordering::Relaxed);
-        Duration::from_secs_f64(samples as f64 / self.sample_rate as f64)
+        self.origin + Duration::from_secs_f64(samples as f64 / self.sample_rate as f64)
     }
 
     /// Resets the clock (called on seek).
@@ -264,6 +287,37 @@ impl AudioClock {
     /// Returns the total samples sent.
     pub fn samples_sent(&self) -> u64 {
         self.samples_sent.load(Ordering::Relaxed)
+    }
+}
+
+/// Tail timing after the last sample, frozen by the same playback controls.
+pub(crate) struct AudioDrainClock {
+    deadline: Instant,
+    paused_at: Option<Instant>,
+}
+
+impl AudioDrainClock {
+    pub(crate) fn new(now: Instant, playing: bool) -> Self {
+        Self {
+            deadline: now + AudioClock::DEFAULT_OUTPUT_LATENCY,
+            paused_at: (!playing).then_some(now),
+        }
+    }
+
+    pub(crate) fn pause(&mut self, now: Instant) {
+        self.paused_at.get_or_insert(now);
+    }
+
+    pub(crate) fn resume(&mut self, now: Instant) {
+        if let Some(paused_at) = self.paused_at.take() {
+            self.deadline += now.saturating_duration_since(paused_at);
+        }
+    }
+
+    pub(crate) fn elapsed(&self, now: Instant) -> Option<Duration> {
+        self.paused_at
+            .unwrap_or(now)
+            .checked_duration_since(self.deadline)
     }
 }
 
@@ -293,6 +347,8 @@ pub struct QueueAudioSource {
     sample_rate: u32,
     /// Silence samples remaining to insert for PTS gap
     silence_samples: u64,
+    /// Interleaved samples consumed within one channel frame.
+    channel_phase: u16,
 }
 
 impl QueueAudioSource {
@@ -308,9 +364,18 @@ impl QueueAudioSource {
             clock,
             current_frame: None,
             frame_pos: 0,
-            channels,
-            sample_rate,
+            channels: channels.max(1),
+            sample_rate: sample_rate.max(1),
             silence_samples: 0,
+            channel_phase: 0,
+        }
+    }
+
+    fn advance_clock(&mut self) {
+        self.channel_phase += 1;
+        if self.channel_phase == self.channels {
+            self.channel_phase = 0;
+            self.clock.add_samples(1);
         }
     }
 
@@ -338,7 +403,7 @@ impl Iterator for QueueAudioSource {
         // First, emit any pending silence samples for PTS gap
         if self.silence_samples > 0 {
             self.silence_samples -= 1;
-            self.clock.add_samples(1);
+            self.advance_clock();
             return Some(0.0);
         }
 
@@ -347,7 +412,8 @@ impl Iterator for QueueAudioSource {
             if self.frame_pos < frame.data.len() {
                 let sample = frame.data[self.frame_pos] as f32 / 32768.0;
                 self.frame_pos += 1;
-                self.clock.add_samples(1);
+                self.queue.pending_samples.fetch_sub(1, Ordering::Relaxed);
+                self.advance_clock();
                 return Some(sample);
             }
         }
@@ -363,22 +429,23 @@ impl Iterator for QueueAudioSource {
             // If we need to insert silence, do it before the frame's samples
             if self.silence_samples > 0 {
                 self.silence_samples -= 1;
-                self.clock.add_samples(1);
+                self.advance_clock();
                 return Some(0.0);
             }
 
             if !frame.data.is_empty() {
                 let sample = frame.data[0] as f32 / 32768.0;
                 self.frame_pos = 1;
-                self.clock.add_samples(1);
+                self.queue.pending_samples.fetch_sub(1, Ordering::Relaxed);
+                self.advance_clock();
                 return Some(sample);
             }
         }
 
         // No more samples available - return silence to keep stream alive
         // This prevents rodio from ending the stream during buffer underruns
-        // Advance the clock even for silence so playback time keeps moving
-        self.clock.add_samples(1);
+        // An underrun is not consumed media: keep the media clock frozen until
+        // decoding catches up rather than silently running ahead of the video.
         Some(0.0)
     }
 }
@@ -464,6 +531,7 @@ impl WindowsAudioPlayback {
             .map_err(|e| format!("Failed to open audio output: {}", e))?;
 
         let sink = rodio::Player::connect_new(stream.mixer());
+        sink.pause();
 
         let source = QueueAudioSource::new(
             Arc::clone(&queue),
@@ -487,9 +555,8 @@ impl WindowsAudioPlayback {
 
     /// Creates a new Windows audio playback manager (creates its own queue/clock).
     ///
-    /// **Warning**: This creates a disconnected queue. Use `new_with_queue` instead
-    /// when you need to share the queue with a decode thread.
-    #[allow(dead_code)]
+    /// The decode worker obtains the current queue with `audio_queue()`.
+    /// A seek replaces the queue, so callers must not cache it across seeks.
     pub fn new(format: AudioFormatInfo) -> Result<Self, String> {
         let queue = AudioQueue::new(Self::MAX_AUDIO_FRAMES);
         let clock = Arc::new(AudioClock::new(format.sample_rate));
@@ -522,9 +589,26 @@ impl WindowsAudioPlayback {
     ///
     /// The decode thread should call this before seeking the decoder,
     /// then start pushing new frames at the seek position.
-    pub fn seek(&mut self) {
-        self.queue.clear();
-        self.clock.reset();
+    pub fn seek(&mut self, position: Duration) {
+        // Replace the complete source, queue and clock: clearing only queued frames
+        // leaves the old source's current frame and inserted silence alive. Using
+        // a new clock also prevents an in-flight callback from changing this epoch.
+        self.sink.stop();
+        self.queue = AudioQueue::new(Self::MAX_AUDIO_FRAMES);
+        self.clock = Arc::new(AudioClock::with_origin(self.format.sample_rate, position));
+        let volume = self.sink.volume();
+        self.sink = rodio::Player::connect_new(self._stream.mixer());
+        self.sink.pause();
+        self.sink.set_volume(volume);
+        self.sink.append(QueueAudioSource::new(
+            Arc::clone(&self.queue),
+            Arc::clone(&self.clock),
+            self.format.channels,
+            self.format.sample_rate,
+        ));
+        if self.playing {
+            self.sink.play();
+        }
     }
 
     /// Returns the current audio playback position (accounting for latency).
@@ -562,6 +646,103 @@ impl WindowsAudioPlayback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stereo_clock_counts_channel_frames_and_stalls_on_underrun() {
+        let queue = AudioQueue::new(2);
+        let clock = Arc::new(AudioClock::with_latency(48000, Duration::ZERO));
+        let mut source = QueueAudioSource::new(queue.clone(), clock.clone(), 2, 48000);
+        for _ in 0..100 {
+            assert_eq!(source.next(), Some(0.0));
+        }
+        assert_eq!(clock.raw_position(), Duration::ZERO);
+        queue.push(AudioFrame::new(Duration::ZERO, vec![16384; 960], 2, 48000));
+        for _ in 0..960 {
+            assert_eq!(source.next(), Some(0.5));
+        }
+        assert_eq!(clock.raw_position(), Duration::from_millis(10));
+        for _ in 0..100 {
+            assert_eq!(source.next(), Some(0.0));
+        }
+        assert_eq!(clock.raw_position(), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn seek_epoch_has_target_pts_without_inserting_elapsed_media_as_silence() {
+        let target = Duration::from_secs(30);
+        let queue = AudioQueue::new(2);
+        let clock = Arc::new(AudioClock::with_origin(48000, target));
+        queue.push(AudioFrame::new(target, vec![16384; 960], 2, 48000));
+        let mut source = QueueAudioSource::new(queue, clock.clone(), 2, 48000);
+        assert_eq!(source.next(), Some(0.5));
+        assert_eq!(clock.raw_position(), target);
+        assert_eq!(source.next(), Some(0.5));
+        assert!(clock.raw_position() > target);
+        assert_eq!(clock.position(), target);
+    }
+
+    #[test]
+    fn pts_gap_inserts_silence_in_channel_frames() {
+        let queue = AudioQueue::new(2);
+        let clock = Arc::new(AudioClock::with_latency(48000, Duration::ZERO));
+        queue.push(AudioFrame::new(
+            Duration::from_millis(20),
+            vec![16384; 2],
+            2,
+            48000,
+        ));
+        let mut source = QueueAudioSource::new(queue, clock.clone(), 2, 48000);
+        for _ in 0..1920 {
+            assert_eq!(source.next(), Some(0.0));
+        }
+        assert_eq!(clock.raw_position(), Duration::from_millis(20));
+        assert_eq!(source.next(), Some(0.5));
+    }
+
+    #[test]
+    fn drain_waits_for_samples_already_popped_by_the_source() {
+        let queue = AudioQueue::new(2);
+        queue.push(AudioFrame::new(Duration::ZERO, vec![1, 2], 2, 48000));
+        let mut source =
+            QueueAudioSource::new(queue.clone(), Arc::new(AudioClock::new(48000)), 2, 48000);
+        source.next();
+        assert!(queue.is_empty());
+        assert!(!queue.is_drained());
+        source.next();
+        assert!(queue.is_drained());
+    }
+
+    #[test]
+    fn drained_audio_tail_does_not_advance_during_pause() {
+        let start = Instant::now();
+        let mut tail = AudioDrainClock::new(start, true);
+        tail.pause(start + Duration::from_millis(100));
+        assert_eq!(
+            tail.elapsed(start + Duration::from_secs(10)),
+            Some(Duration::from_millis(50))
+        );
+        tail.resume(start + Duration::from_secs(10));
+        assert_eq!(
+            tail.elapsed(start + Duration::from_secs(10)),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            tail.elapsed(start + Duration::from_millis(10100)),
+            Some(Duration::from_millis(150))
+        );
+    }
+
+    #[test]
+    fn paused_empty_audio_tail_waits_for_resume() {
+        let start = Instant::now();
+        let mut tail = AudioDrainClock::new(start, false);
+        assert_eq!(tail.elapsed(start + Duration::from_secs(10)), None);
+        tail.resume(start + Duration::from_secs(10));
+        assert_eq!(
+            tail.elapsed(start + Duration::from_millis(10050)),
+            Some(Duration::ZERO)
+        );
+    }
 
     #[test]
     fn test_audio_frame_duration() {

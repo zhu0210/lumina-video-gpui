@@ -15,7 +15,7 @@ use crate::audio::AudioHandle;
 #[cfg(target_os = "macos")]
 use crate::audio_decoder::AudioDecoder;
 use crate::sync_metrics::{StallType, SyncMetrics};
-use crate::video::{VideoDecoderBackend, VideoFrame};
+use crate::video::{VideoDecoderBackend, VideoError, VideoFrame};
 
 /// Default number of frames to buffer ahead.
 const DEFAULT_BUFFER_SIZE: usize = 5;
@@ -273,6 +273,8 @@ pub struct DecodeThread {
     handle: Option<JoinHandle<()>>,
     /// Channel to send commands to the decode thread
     command_tx: crossbeam_channel::Sender<DecodeCommand>,
+    /// At most one terminal worker error, consumed without blocking the UI.
+    error_rx: crossbeam_channel::Receiver<VideoError>,
     /// The frame queue being filled
     frame_queue: Arc<FrameQueue>,
     /// Flag to signal the thread should stop
@@ -312,6 +314,7 @@ impl DecodeThread {
         use std::sync::atomic::AtomicI32;
 
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        let (error_tx, error_rx) = crossbeam_channel::bounded(1);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let duration = Arc::new(Mutex::new(None));
         let dimensions = Arc::new(Mutex::new(None));
@@ -327,12 +330,17 @@ impl DecodeThread {
         let audio = audio_handle.clone();
 
         let handle = thread::spawn(move || {
-            decode_loop(decoder, queue, command_rx, stop, dur, dims, fps, buf, audio);
+            if let Err(error) =
+                decode_loop(decoder, queue, command_rx, stop, dur, dims, fps, buf, audio)
+            {
+                let _ = error_tx.try_send(error);
+            }
         });
 
         Self {
             handle: Some(handle),
             command_tx,
+            error_rx,
             frame_queue,
             stop_flag,
             duration,
@@ -340,6 +348,11 @@ impl DecodeThread {
             frame_rate,
             buffering_percent,
         }
+    }
+
+    /// Takes the terminal worker error, if any, without waiting.
+    pub fn take_error(&self) -> Option<VideoError> {
+        self.error_rx.try_recv().ok()
     }
 
     /// Starts or resumes decoding.
@@ -435,45 +448,27 @@ fn process_decode_command<D: VideoDecoderBackend>(
     cmd: DecodeCommand,
     decoder: &mut D,
     frame_queue: &FrameQueue,
-) -> CommandResult {
+) -> Result<CommandResult, VideoError> {
     match cmd {
-        DecodeCommand::Stop => return CommandResult::Stop,
+        DecodeCommand::Stop => return Ok(CommandResult::Stop),
         DecodeCommand::Play => {
+            decoder.resume()?;
             frame_queue.clear_eos();
-            if let Err(e) = decoder.resume() {
-                tracing::error!("Failed to resume decoder: {}", e);
-            }
-            return CommandResult::Continue(Some(true));
+            return Ok(CommandResult::Continue(Some(true)));
         }
         DecodeCommand::Pause => {
-            if let Err(e) = decoder.pause() {
-                tracing::error!("Failed to pause decoder: {}", e);
-            }
-            return CommandResult::Continue(Some(false));
+            decoder.pause()?;
+            return Ok(CommandResult::Continue(Some(false)));
         }
         DecodeCommand::Seek(position) => {
             frame_queue.flush();
-            if let Err(e) = decoder.seek(position) {
-                tracing::error!("Seek failed: {}", e);
-                // Don't clear EOS if seek failed — prevents infinite loop
-                // when loop_playback tries to seek on live streams
-            } else {
-                frame_queue.clear_eos();
-                return CommandResult::Seeking;
-            }
+            decoder.seek(position)?;
+            return Ok(CommandResult::Seeking);
         }
-        DecodeCommand::SetMuted(muted) => {
-            if let Err(e) = decoder.set_muted(muted) {
-                tracing::error!("Failed to set muted: {}", e);
-            }
-        }
-        DecodeCommand::SetVolume(volume) => {
-            if let Err(e) = decoder.set_volume(volume) {
-                tracing::error!("Failed to set volume: {}", e);
-            }
-        }
+        DecodeCommand::SetMuted(muted) => decoder.set_muted(muted)?,
+        DecodeCommand::SetVolume(volume) => decoder.set_volume(volume)?,
     }
-    CommandResult::Continue(None)
+    Ok(CommandResult::Continue(None))
 }
 
 /// The main decode loop running on the decode thread.
@@ -488,7 +483,7 @@ fn decode_loop<D: VideoDecoderBackend>(
     shared_frame_rate: Arc<Mutex<Option<f32>>>,
     shared_buffering: Arc<std::sync::atomic::AtomicI32>,
     audio_handle: Option<AudioHandle>,
-) {
+) -> Result<(), VideoError> {
     let mut playing = false;
     let mut seek_preview_deadline = None;
     const SEEK_PREVIEW_TIMEOUT: Duration = Duration::from_secs(3);
@@ -506,7 +501,7 @@ fn decode_loop<D: VideoDecoderBackend>(
         // Check for early termination (user closed video)
         if stop_flag.load(Ordering::Acquire) {
             tracing::debug!("Preview loop interrupted by stop signal");
-            return;
+            return Ok(());
         }
 
         match decoder.decode_next() {
@@ -543,8 +538,7 @@ fn decode_loop<D: VideoDecoderBackend>(
                 thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                tracing::warn!("Failed to decode preview frame: {}", e);
-                break;
+                return Err(e);
             }
         }
     }
@@ -575,7 +569,7 @@ fn decode_loop<D: VideoDecoderBackend>(
             // Check for early termination (user closed video)
             if stop_flag.load(Ordering::Acquire) {
                 tracing::debug!("Metadata loop interrupted by stop signal");
-                return;
+                return Ok(());
             }
 
             let duration_opt = decoder.duration();
@@ -614,9 +608,7 @@ fn decode_loop<D: VideoDecoderBackend>(
     }
 
     // Pause the decoder after getting preview frame (for decoders like ExoPlayer that auto-play)
-    if let Err(e) = decoder.pause() {
-        tracing::debug!("Failed to pause after preview: {}", e);
-    }
+    decoder.pause()?;
 
     // Note: We no longer count consecutive Nones for EOS detection.
     // Instead, we rely on decoder.is_eof() which checks actual decoder state.
@@ -639,8 +631,8 @@ fn decode_loop<D: VideoDecoderBackend>(
                 // A failed or superseding seek must cancel any older preview request.
                 seek_preview_deadline = None;
             }
-            match process_decode_command(cmd, &mut decoder, &frame_queue) {
-                CommandResult::Stop => return,
+            match process_decode_command(cmd, &mut decoder, &frame_queue)? {
+                CommandResult::Stop => return Ok(()),
                 CommandResult::Continue(Some(new_playing)) => {
                     playing = new_playing;
                     seek_preview_deadline = None;
@@ -655,8 +647,9 @@ fn decode_loop<D: VideoDecoderBackend>(
             }
         }
         if seek_preview_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            tracing::warn!("Timed out waiting for paused seek preview");
-            seek_preview_deadline = None;
+            return Err(VideoError::SeekFailed(
+                "Timed out waiting for paused seek preview".into(),
+            ));
         }
 
         // Update buffering percentage immediately (important for UI feedback)
@@ -720,10 +713,7 @@ fn decode_loop<D: VideoDecoderBackend>(
                 continue;
             }
             Err(e) => {
-                tracing::error!("Decode error: {}", e);
-                seek_preview_deadline = None;
-                thread::sleep(Duration::from_millis(10));
-                continue;
+                return Err(e);
             }
         };
 
@@ -734,6 +724,7 @@ fn decode_loop<D: VideoDecoderBackend>(
             tracing::debug!("Frame rejected by queue (flushing)");
         }
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -2875,13 +2866,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn paused_and_eos_seek_deliver_one_new_preview() {
-        use std::sync::atomic::AtomicUsize;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let resumes = Arc::new(AtomicUsize::new(0));
-        let queue = Arc::new(FrameQueue::new(3));
-        let decoder = SeekDecoder {
+    fn seek_decoder(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        resumes: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> SeekDecoder {
+        SeekDecoder {
             metadata: crate::video::VideoMetadata {
                 width: 10,
                 height: 10,
@@ -2893,9 +2882,46 @@ mod tests {
             },
             pending: Some(Duration::ZERO),
             empty_polls: 0,
-            calls: calls.clone(),
-            resumes: resumes.clone(),
-        };
+            calls,
+            resumes,
+        }
+    }
+
+    #[test]
+    fn failed_seek_reaches_core_player_and_remains_terminal() {
+        use crate::player::CorePlayer;
+        use crate::video::VideoState;
+        let decoder = seek_decoder(Arc::new(0.into()), Arc::new(0.into()));
+        let mut player = CorePlayer::with_decoder("test://seek-error", Box::new(decoder));
+        player.seek(Duration::MAX);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !matches!(player.state(), VideoState::Error(_))
+            && std::time::Instant::now() < deadline
+        {
+            player.poll_frame();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            player.state(),
+            VideoState::Error(VideoError::SeekFailed(_))
+        ));
+        player.play();
+        player.pause();
+        player.seek(Duration::ZERO);
+        assert!(player.poll_frame().is_none());
+        assert!(matches!(
+            player.state(),
+            VideoState::Error(VideoError::SeekFailed(_))
+        ));
+    }
+
+    #[test]
+    fn paused_and_eos_seek_deliver_one_new_preview() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resumes = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(FrameQueue::new(3));
+        let decoder = seek_decoder(calls.clone(), resumes.clone());
         let worker = DecodeThread::new(decoder, queue.clone());
         assert_eq!(
             queue.pop_blocking(Duration::from_secs(1)).unwrap().pts,
@@ -2925,13 +2951,6 @@ mod tests {
         assert!(!queue.is_eos());
         assert_eq!(resumes.load(Ordering::Relaxed), 1);
 
-        // A stalled seek must stop polling at its deadline without resuming playback.
-        worker.seek(Duration::from_secs(9));
-        thread::sleep(Duration::from_millis(3200));
-        let count = calls.load(Ordering::Relaxed);
-        thread::sleep(Duration::from_millis(30));
-        assert_eq!(calls.load(Ordering::Relaxed), count);
-        assert!(count < 800, "empty decoder results must not busy-spin");
         // A newer seek replaces the pending target; stopping must interrupt polling.
         worker.seek(Duration::from_secs(9));
         worker.seek(Duration::from_secs(3));
@@ -2939,6 +2958,18 @@ mod tests {
             queue.pop_blocking(Duration::from_secs(1)).unwrap().pts,
             Duration::from_secs(3)
         );
+        // A stalled seek must stop polling at its deadline without resuming playback.
+        worker.seek(Duration::from_secs(9));
+        thread::sleep(Duration::from_millis(3200));
+        let count = calls.load(Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(calls.load(Ordering::Relaxed), count);
+        assert!(count < 800, "empty decoder results must not busy-spin");
+        assert!(matches!(
+            worker.take_error(),
+            Some(VideoError::SeekFailed(_))
+        ));
+        assert!(worker.take_error().is_none());
         worker.seek(Duration::from_secs(9));
         let start = std::time::Instant::now();
         drop(worker);
