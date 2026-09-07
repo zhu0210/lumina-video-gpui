@@ -71,7 +71,7 @@ jobs:
             -scheme LuminaTestHarness -configuration Debug \
             -destination "platform=iOS Simulator,id=$simulator_udid" \
             -derivedDataPath target/ios-harness \
-            -resultBundlePath target/ios-playback.xcresult \
+            -resultBundlePath "$RUNNER_TEMP/ios-playback.xcresult" \
             CODE_SIGNING_ALLOWED=NO test
       - name: Build unsigned iPhone application
         run: |
@@ -85,6 +85,6 @@ jobs:
           name: ios-application-and-playback
           path: |
             ios/lumina-video-bridge/Artifacts/CLuminaVideo.xcframework
-            target/ios-playback.xcresult
+            ${{ runner.temp }}/ios-playback.xcresult
             target/ios-device/Build/Products/Release-iphoneos/LuminaTestHarness.app
           if-no-files-found: warn
