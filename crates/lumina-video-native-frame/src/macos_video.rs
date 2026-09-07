@@ -1638,6 +1638,10 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         HwAccelType::VideoToolbox
     }
 
+    fn is_eof(&self) -> bool {
+        self.eof_reached.load(Ordering::Relaxed)
+    }
+
     /// Returns the current playback position reported by AVPlayer.
     ///
     /// This queries AVPlayer's `currentTime()` and converts it to a Duration.
