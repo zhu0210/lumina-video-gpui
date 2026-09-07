@@ -1307,10 +1307,18 @@ impl FrameScheduler {
     /// This prevents burst consumption of group-boundary deliveries.
     /// Updates pacing if fps changes (e.g., provisional → accurate metadata).
     pub fn set_frame_rate_pacing(&mut self, fps: f32) {
-        if fps <= 0.0 {
+        if !fps.is_finite() || fps <= 0.0 {
             return;
         }
-        let new_interval = Duration::from_secs_f64(1.0 / fps as f64);
+        let Ok(new_interval) = Duration::try_from_secs_f64(1.0 / fps as f64) else {
+            return;
+        };
+        if std::time::Instant::now()
+            .checked_add(new_interval)
+            .is_none()
+        {
+            return;
+        }
         if self.frame_pacing_interval == new_interval {
             return; // No change
         }
@@ -1350,18 +1358,16 @@ impl FrameScheduler {
             return;
         }
         let now = std::time::Instant::now();
-        self.next_frame_due = Some(match self.next_frame_due {
-            Some(due) => {
-                let next = due + self.frame_pacing_interval;
-                // Snap forward if we fell behind by more than one interval
-                if next + self.frame_pacing_interval < now {
-                    now + self.frame_pacing_interval
-                } else {
-                    next
-                }
+        let next = self
+            .next_frame_due
+            .and_then(|due| due.checked_add(self.frame_pacing_interval));
+        self.next_frame_due = match next {
+            // Snap forward if we fell behind by more than one interval.
+            Some(next) if now.saturating_duration_since(next) <= self.frame_pacing_interval => {
+                Some(next)
             }
-            None => now + self.frame_pacing_interval,
-        });
+            _ => now.checked_add(self.frame_pacing_interval),
+        };
     }
 
     /// Returns the sync metrics tracker.
@@ -1468,11 +1474,11 @@ impl FrameScheduler {
         self.smoothed_drift_us = 0.0;
         if let Some(start) = self.playback_start_time.take() {
             // Calculate wall-clock position
-            let wall_clock_pos = self.playback_start_position + start.elapsed();
+            let wall_clock_pos = self.playback_start_position.saturating_add(start.elapsed());
 
             // Use frame PTS if wall-clock has run away (e.g., after loops)
             if let Some(ref frame) = self.current_frame {
-                let max_pos = frame.pts + Duration::from_secs(1);
+                let max_pos = frame.pts.saturating_add(Duration::from_secs(1));
                 self.current_position = if wall_clock_pos > max_pos {
                     frame.pts
                 } else {
@@ -1541,7 +1547,7 @@ impl FrameScheduler {
         // Use wall-clock for smooth updates, but don't exceed the last frame's PTS
         // This prevents position from running ahead of actual video playback
         let wall_clock_pos = match self.playback_start_time {
-            Some(start) => self.playback_start_position + start.elapsed(),
+            Some(start) => self.playback_start_position.saturating_add(start.elapsed()),
             None => return self.current_position,
         };
 
@@ -1551,7 +1557,7 @@ impl FrameScheduler {
             // Use 3 seconds to handle keyframe gaps after seeking - keyframe-based
             // seeking can create gaps > 1s between the first decoded frame and
             // the next available frame in the stream.
-            let max_pos = frame.pts + Duration::from_secs(3);
+            let max_pos = frame.pts.saturating_add(Duration::from_secs(3));
             if wall_clock_pos > max_pos {
                 return frame.pts;
             }
@@ -2234,8 +2240,8 @@ impl FrameScheduler {
             let gap = next_pts.abs_diff(current_pos);
             let ahead_tolerance = self.compute_ahead_tolerance(audio_started, gap, now);
             let accept_tolerance = ahead_tolerance.saturating_add(LIVE_ACCEPT_JITTER_TOLERANCE);
-            let should_accept =
-                next_pts <= current_pos + accept_tolerance || self.current_frame.is_none();
+            let should_accept = next_pts <= current_pos.saturating_add(accept_tolerance)
+                || self.current_frame.is_none();
 
             if !should_accept {
                 let rejection_start = *self.rejection_start_time.get_or_insert(now);
@@ -2694,7 +2700,9 @@ impl FrameScheduler {
         }
         // Only update position if we have a valid playback start time
         if let Some(start_time) = self.playback_start_time {
-            self.current_position = self.playback_start_position + start_time.elapsed();
+            self.current_position = self
+                .playback_start_position
+                .saturating_add(start_time.elapsed());
         }
         self.stalled = true;
 
@@ -2753,7 +2761,9 @@ impl FrameScheduler {
             return;
         }
         if let Some(start_time) = self.playback_start_time {
-            self.current_position = self.playback_start_position + start_time.elapsed();
+            self.current_position = self
+                .playback_start_position
+                .saturating_add(start_time.elapsed());
         }
         self.playback_start_time = None;
         self.audio_stalled = true;
@@ -2820,6 +2830,64 @@ mod tests {
         };
         let cpu_frame = CpuFrame::new(PixelFormat::Yuv420p, 10, 10, vec![plane]);
         VideoFrame::new(pts, DecodedFrame::Cpu(cpu_frame))
+    }
+
+    #[test]
+    fn max_seek_can_poll_a_frame_before_decoder_reports_failure() {
+        // Reproduce the scheduling side of failed_seek_reaches_core_player without
+        // racing the decode worker: a frame is still queued when the seek is polled.
+        let queue = FrameQueue::new(1);
+        let mut scheduler = FrameScheduler::new();
+        scheduler.seek(Duration::MAX);
+        assert!(queue.try_push(make_test_frame(Duration::ZERO)));
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn maximum_timestamps_saturate_in_position_pause_and_stall_clocks() {
+        let make_scheduler = || {
+            let mut scheduler = FrameScheduler::new();
+            scheduler.playback_requested = true;
+            scheduler.playback_start_position = Duration::MAX;
+            scheduler.current_position = Duration::MAX;
+            scheduler.current_frame = Some(make_test_frame(Duration::MAX));
+            scheduler.playback_start_time = Some(
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap(),
+            );
+            scheduler
+        };
+        let mut scheduler = make_scheduler();
+        assert_eq!(scheduler.position(), Duration::MAX);
+        scheduler.pause();
+        assert_eq!(scheduler.position(), Duration::MAX);
+        let mut scheduler = make_scheduler();
+        scheduler.handle_stall();
+        assert_eq!(scheduler.position(), Duration::MAX);
+        let mut scheduler = make_scheduler();
+        scheduler.enter_audio_stall();
+        assert_eq!(scheduler.position(), Duration::MAX);
+    }
+
+    #[test]
+    fn invalid_frame_rates_preserve_pacing_without_overflow() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.set_frame_rate_pacing(30.0);
+        let interval = scheduler.frame_pacing_interval;
+        for fps in [f32::NAN, f32::INFINITY, 0.0, -1.0, f32::MIN_POSITIVE] {
+            scheduler.set_frame_rate_pacing(fps);
+            assert_eq!(scheduler.frame_pacing_interval, interval);
+        }
+        scheduler.advance_frame_pacing();
+        assert!(scheduler.next_frame_due.is_some());
+        // Even an interval beyond the platform Instant range cannot panic.
+        scheduler.frame_pacing_interval = Duration::MAX;
+        scheduler.advance_frame_pacing();
+        assert!(scheduler.next_frame_due.is_none());
     }
 
     struct SeekDecoder {

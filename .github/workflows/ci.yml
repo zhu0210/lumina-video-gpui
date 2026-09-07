@@ -146,6 +146,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
       - name: Test opt-in Media Foundation and GPU import
         run: cargo test --locked --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --features windows-native-video --all-targets
+      - name: Build Windows player application
+        run: cargo build --locked --package lumina-video-demo --features windows-native-video
   check-android:
     name: Check (Android)
     runs-on: ubuntu-latest
@@ -168,8 +170,8 @@ jobs:
         run: rustup target add aarch64-linux-android
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
-      - name: Check Android native-frame build
-        run: cargo ndk -t arm64-v8a check --locked --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --features android-zero-copy,moq
+      - name: Check Android native-frame and GPUI integration
+        run: cargo ndk -t arm64-v8a check --locked --package lumina-video-core --package lumina-video-native-frame --package lumina-video-wgpu --package lumina-video-gpui --features android-zero-copy,moq
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6.3.0
         with:

@@ -87,6 +87,9 @@ use crate::video::{
 
 use crate::video::MacOSGpuSurface;
 
+#[path = "macos_video_playback.rs"]
+mod playback;
+
 // FFI declarations for IOSurface
 extern "C" {
     /// Returns the IOSurface backing a CVPixelBuffer, or null if not IOSurface-backed.
@@ -409,6 +412,8 @@ pub struct MacOSVideoDecoder {
     /// Whether we're seeking and waiting for completion (triggers buffering UI)
     /// Arc-wrapped for sharing with seek completion handler
     seeking: Arc<AtomicBool>,
+    /// AVFoundation seek completion is distinct from post-seek frame warmup.
+    seek_completed_generation: Arc<AtomicU64>,
     /// Seek generation counter for coalescing seeks
     /// Incremented on each seek, used to identify stale frames/completions
     seek_generation: Arc<AtomicU64>,
@@ -640,6 +645,7 @@ impl MacOSVideoDecoder {
             metadata_ready: AtomicBool::new(false),
             preview_done: AtomicBool::new(false),
             seeking: Arc::new(AtomicBool::new(false)),
+            seek_completed_generation: Arc::new(AtomicU64::new(0)),
             seek_generation: Arc::new(AtomicU64::new(0)),
             seek_target_gen: Arc::new(AtomicU64::new(0)),
             seek_target_pts_micros: Arc::new(AtomicU64::new(0)),
@@ -1103,10 +1109,29 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
                         cmtime_to_duration(current_time)
                     );
                 }
-                // Check for EOF
+                // No new pixel buffer is normal between frames or while paused.
+                // Drain output before marking EOF, and never use the pre-seek clock
+                // while AVFoundation is still completing an asynchronous seek.
                 let duration_secs = *self.duration_secs.lock();
-                let current_secs = cmtime_to_seconds(current_time);
-                if duration_secs > 0.0 && current_secs >= duration_secs - 0.1 {
+                let current_secs = if current_time.flags.contains(CMTimeFlags::Valid)
+                    && !current_time
+                        .flags
+                        .intersects(CMTimeFlags::ImpliedValueFlagsMask)
+                    && current_time.timescale > 0
+                {
+                    cmtime_to_seconds(current_time)
+                } else {
+                    f64::NAN
+                };
+                if playback::output_drained_at_end(
+                    current_secs,
+                    duration_secs,
+                    player_rate,
+                    self.seek_completed_generation.load(Ordering::Acquire)
+                        != self.seek_generation.load(Ordering::Acquire),
+                ) {
+                    self.seeking.store(false, Ordering::Relaxed);
+                    self.seek_target_gen.store(0, Ordering::Release);
                     self.eof_reached.store(true, Ordering::Relaxed);
                 }
                 return Ok(None);
@@ -1316,7 +1341,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         // SAFETY: The retained AVFoundation/CoreVideo object is live for this call; objc2 marks this framework ABI operation unsafe.
         unsafe { self.player_item.cancelPendingSeeks() };
 
-        // Mark as seeking to trigger buffering UI until frames arrive
+        // Mark as seeking to trigger buffering UI until frames arrive.
         self.seeking.store(true, Ordering::Relaxed);
 
         // Mark output as not ready - will be set true by delegate callback
@@ -1352,6 +1377,7 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         let gen = self.seek_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let seek_generation = Arc::clone(&self.seek_generation);
         let seeking = Arc::clone(&self.seeking);
+        let seek_completed_generation = Arc::clone(&self.seek_completed_generation);
         let seek_target_gen = Arc::clone(&self.seek_target_gen);
         let needs_output_reset = Arc::clone(&self.needs_output_reset);
 
@@ -1367,6 +1393,8 @@ impl VideoDecoderBackend for MacOSVideoDecoder {
         // This ensures buffering UI stays visible until frames are truly available.
         let completion = RcBlock::new(move |finished: Bool| {
             let is_latest = seek_generation.load(Ordering::Relaxed) == gen;
+            // A late completion cannot clear a newer seek or overwrite its completion.
+            seek_completed_generation.fetch_max(gen, Ordering::Release);
 
             if !finished.as_bool() {
                 tracing::debug!("MacOSVideoDecoder: seek {} was cancelled", gen);

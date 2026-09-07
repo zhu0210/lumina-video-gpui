@@ -1720,7 +1720,8 @@ impl GpuiVideoPlayer {
 
     #[cfg(target_os = "android")]
     fn update_android_import(&mut self, window: &mut Window) {
-        use gpui_wgpu::{ExternalFrameOutcome, ExternalFrameRequest, ExternalRgbaFrame};
+        use gpui::{ExternalFrameRequest, ExternalRgbaFrame};
+        use gpui_wgpu::ExternalFrameOutcome;
         if self.android_retirement_pending {
             let _ = window.clear_external_frame();
             let _ = window.take_external_frame_outcome();
