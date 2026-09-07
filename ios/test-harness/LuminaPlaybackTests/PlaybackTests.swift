@@ -74,6 +74,12 @@ final class PlaybackTests: XCTestCase {
 
         player?.play()
         try await eventually("end of stream") { player?.state == .ended }
+        let beforeReplay = received
+        player?.play()
+        try await eventually("play after EOS rewinds without an explicit seek") {
+            received > beforeReplay && frameTime < 0.5
+        }
+        try await eventually("replayed stream ends") { player?.state == .ended }
         let beforeEOSSeek = received
         player?.seek(to: 0.25)
         try await eventually("seek after EOS resumes frame polling without play") {

@@ -471,6 +471,17 @@ impl LegacyConsumer {
                 Ok(Ok(None)) | Err(_) => {
                     self.group = None;
                 }
+                Ok(Err(
+                    moq_net::Error::Old
+                    | moq_net::Error::Lagged
+                    | moq_net::Error::Evicted
+                    | moq_net::Error::Dropped
+                    | moq_net::Error::Timeout,
+                )) => {
+                    // A lost/expired group does not close its track. Resume at the
+                    // next group boundary (a keyframe), never at a damaged delta.
+                    self.group = None;
+                }
                 Ok(Err(error)) => return Err(error.into()),
             }
         }
@@ -514,6 +525,58 @@ mod legacy_tests {
         assert_eq!(first.payload, b"key"[..]);
         assert_eq!(second.payload, b"delta"[..]);
         assert_eq!(second.timestamp, Duration::from_micros(20));
+    }
+
+    #[tokio::test]
+    async fn legacy_recovers_after_group_loss_but_preserves_fatal_errors() {
+        for error in [
+            moq_net::Error::Old,
+            moq_net::Error::Lagged,
+            moq_net::Error::Evicted,
+            moq_net::Error::Dropped,
+            moq_net::Error::Timeout,
+            moq_net::Error::Transport("connection lost".into()),
+            moq_net::Error::Unauthorized,
+        ] {
+            let fatal = matches!(
+                error,
+                moq_net::Error::Transport(_) | moq_net::Error::Unauthorized
+            );
+            let mut broadcast = moq_net::broadcast::Producer::new(Default::default());
+            let mut track = broadcast
+                .create_track("video", hang::container::track_info())
+                .unwrap();
+            let mut lost = track.append_group().unwrap();
+            frame(b"old", 10).write_to(&mut lost).unwrap();
+            let mut reader = LegacyConsumer::new(
+                broadcast.consume(),
+                MediaTrack {
+                    name: "video".into(),
+                    priority: 100,
+                },
+                Duration::from_secs(1),
+            );
+            assert_eq!(reader.read().await.unwrap().unwrap().payload, b"old"[..]);
+            lost.abort(error.clone()).unwrap();
+            let mut fresh = track.append_group().unwrap();
+            frame(b"fresh-key", 30).write_to(&mut fresh).unwrap();
+            frame(b"fresh-delta", 40).write_to(&mut fresh).unwrap();
+            fresh.finish().unwrap();
+            let next = tokio::time::timeout(Duration::from_secs(1), reader.read())
+                .await
+                .unwrap();
+            if fatal {
+                assert_eq!(next.err().unwrap().to_string(), error.to_string());
+            } else {
+                let next = next.unwrap().unwrap();
+                assert_eq!(next.payload, b"fresh-key"[..]);
+                assert_eq!(next.timestamp, Duration::from_micros(30));
+                assert!(next.keyframe);
+                let delta = reader.read().await.unwrap().unwrap();
+                assert_eq!(delta.payload, b"fresh-delta"[..]);
+                assert!(!delta.keyframe);
+            }
+        }
     }
 
     #[tokio::test]

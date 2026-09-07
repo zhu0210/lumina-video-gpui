@@ -2888,6 +2888,42 @@ mod tests {
     }
 
     #[test]
+    fn play_after_eos_rewinds_for_both_play_entry_points() {
+        use crate::player::CorePlayer;
+        use crate::video::VideoState;
+        for explicit_mute in [false, true] {
+            let decoder = seek_decoder(Arc::new(0.into()), Arc::new(0.into()));
+            let mut player = CorePlayer::with_decoder("test://replay", Box::new(decoder));
+            player.seek(Duration::from_secs(2));
+            player.play();
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while !matches!(player.state(), VideoState::Ended)
+                && std::time::Instant::now() < deadline
+            {
+                player.poll_frame();
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(player.state(), VideoState::Ended));
+            if explicit_mute {
+                player.play_with_muted(true);
+                assert!(player.audio_handle().is_muted());
+            } else {
+                player.play();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let mut replayed = false;
+            while !replayed && std::time::Instant::now() < deadline {
+                replayed = player.poll_frame().is_some_and(|frame| frame.pts.is_zero());
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                replayed,
+                "replay must deliver a new frame from the beginning"
+            );
+        }
+    }
+
+    #[test]
     fn failed_seek_reaches_core_player_and_remains_terminal() {
         use crate::player::CorePlayer;
         use crate::video::VideoState;

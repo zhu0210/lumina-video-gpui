@@ -460,13 +460,16 @@ impl CorePlayer {
     // Playback control
     // =========================================================================
 
-    /// Starts or resumes playback.
+    /// Starts or resumes playback, rewinding to the beginning after end-of-stream.
     ///
     /// Preserves the current mute state. Use [`play_with_muted`] to set an
     /// explicit mute state at the same time.
     pub fn play(&mut self) {
         if self.sync_decode_error() {
             return;
+        }
+        if matches!(self.state, VideoState::Ended) {
+            self.seek(Duration::ZERO);
         }
         if let Some(ref thread) = self.decode_thread {
             thread.set_muted(self.audio_handle.is_muted());
@@ -487,18 +490,8 @@ impl CorePlayer {
         if self.sync_decode_error() {
             return;
         }
-        self.set_muted(muted);
-        if let Some(ref thread) = self.decode_thread {
-            thread.play();
-            self.scheduler.start();
-            self.state = VideoState::Playing {
-                position: self.scheduler.position(),
-            };
-            #[cfg(target_os = "macos")]
-            if let Some(ref audio_thread) = self.audio_thread {
-                audio_thread.play();
-            }
-        }
+        self.audio_handle.set_muted(muted);
+        self.play();
     }
 
     /// Pauses playback.

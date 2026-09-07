@@ -130,9 +130,9 @@ fn downgrade_budget_expired(active: bool, deadline: Option<Instant>, now: Instan
 
 #[cfg(target_os = "linux")]
 struct DirectImportWorker {
-    input: Sender<lumina_video_native_frame::NativeFrameLease>,
-    input_drop: Receiver<lumina_video_native_frame::NativeFrameLease>,
-    output: Receiver<Result<ImportedNv12Texture, Nv12ImportError>>,
+    input: Sender<(u64, lumina_video_native_frame::NativeFrameLease)>,
+    input_drop: Receiver<(u64, lumina_video_native_frame::NativeFrameLease)>,
+    output: Receiver<(u64, Result<ImportedNv12Texture, Nv12ImportError>)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -159,14 +159,14 @@ impl DirectImportWorker {
         let thread = std::thread::Builder::new()
             .name("lumina-dmabuf-import".into())
             .spawn(move || {
-                while let Ok(lease) = input_receiver.recv() {
+                while let Ok((epoch, lease)) = input_receiver.recv() {
                     // SAFETY: this route enqueues only GStreamer-owned DMABuf leases whose
                     // export supplied a producer-ready SyncFile and truthful NV12 layout;
                     // the producer has handed the image to GENERAL/FOREIGN ownership and
                     // `device` is the matching Vulkan device. The importer only validates
                     // and wraps the image/fence; it never waits or submits GPU work.
                     let imported = unsafe { import_external_dmabuf_nv12(lease, &device) };
-                    let _ = try_send_drop_oldest(&output, &worker_output_drop, imported);
+                    let _ = try_send_drop_oldest(&output, &worker_output_drop, (epoch, imported));
                 }
             })
             .ok()?;
@@ -178,13 +178,21 @@ impl DirectImportWorker {
         })
     }
 
-    fn enqueue(&self, lease: lumina_video_native_frame::NativeFrameLease) -> bool {
-        try_send_drop_oldest(&self.input, &self.input_drop, lease)
+    fn enqueue(&self, epoch: u64, lease: lumina_video_native_frame::NativeFrameLease) -> bool {
+        try_send_drop_oldest(&self.input, &self.input_drop, (epoch, lease))
     }
 
-    fn try_take(&self) -> Option<Result<ImportedNv12Texture, Nv12ImportError>> {
-        self.output.try_recv().ok()
+    fn try_take(&self, epoch: u64) -> Option<Result<ImportedNv12Texture, Nv12ImportError>> {
+        take_import_for_epoch(&self.output, epoch)
     }
+}
+
+// A seek can overtake an import already running on the worker. Filter both
+// successful textures and errors before either can affect the new presentation.
+#[cfg(target_os = "linux")]
+fn take_import_for_epoch<T>(receiver: &Receiver<(u64, T)>, epoch: u64) -> Option<T> {
+    let (import_epoch, result) = receiver.try_recv().ok()?;
+    (import_epoch == epoch).then_some(result)
 }
 
 #[cfg(target_os = "linux")]
@@ -347,6 +355,8 @@ pub struct GpuiVideoPlayer {
     #[cfg(target_os = "linux")]
     direct_import: Option<DirectImportWorker>,
     #[cfg(target_os = "linux")]
+    presentation_epoch: u64,
+    #[cfg(target_os = "linux")]
     direct_alias_supported: Option<bool>,
     #[cfg(target_os = "linux")]
     presentation_transition: PresentationTransition,
@@ -457,6 +467,8 @@ impl GpuiVideoPlayer {
             has_presented_frame: false,
             #[cfg(target_os = "linux")]
             direct_import: None,
+            #[cfg(target_os = "linux")]
+            presentation_epoch: 0,
             #[cfg(target_os = "linux")]
             direct_alias_supported: None,
             #[cfg(target_os = "linux")]
@@ -742,7 +754,14 @@ impl GpuiVideoPlayer {
         }
         #[cfg(target_os = "linux")]
         if let Some(session) = self.session.as_mut() {
-            let _ = session.command(lumina_video_core::session::SessionCommand::Play);
+            let replay = matches!(session.snapshot().state, CoreSessionState::Ended);
+            if session
+                .command(lumina_video_core::session::SessionCommand::Play)
+                .is_ok()
+                && replay
+            {
+                self.invalidate_pending_linux_imports();
+            }
         }
     }
 
@@ -776,8 +795,20 @@ impl GpuiVideoPlayer {
         }
         #[cfg(target_os = "linux")]
         if let Some(session) = self.session.as_mut() {
-            let _ = session.command(lumina_video_core::session::SessionCommand::Seek { position });
+            if session
+                .command(lumina_video_core::session::SessionCommand::Seek { position })
+                .is_ok()
+            {
+                self.invalidate_pending_linux_imports();
+            }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn invalidate_pending_linux_imports(&mut self) {
+        self.presentation_epoch = self.presentation_epoch.wrapping_add(1);
+        self.pending_frame = None;
+        // Already submitted/displayed textures remain the seek placeholder.
     }
 
     /// Discovered source audio tracks. Currently populated by GStreamer on Linux.
@@ -1526,7 +1557,7 @@ impl GpuiVideoPlayer {
         let result = self
             .direct_import
             .as_ref()
-            .and_then(DirectImportWorker::try_take);
+            .and_then(|worker| worker.try_take(self.presentation_epoch));
         match result {
             Some(Ok(imported)) if self.pending_external.is_none() => {
                 self.stage_imported_frame(window, imported);
@@ -1556,7 +1587,7 @@ impl GpuiVideoPlayer {
                 let enqueued = self
                     .direct_import
                     .as_ref()
-                    .is_some_and(|worker| worker.enqueue(frame));
+                    .is_some_and(|worker| worker.enqueue(self.presentation_epoch, frame));
                 if !enqueued {
                     self.disable_direct_import(
                         RendererOutcome::TransientFailure,
@@ -2549,6 +2580,37 @@ mod direct_route_state_tests {
         assert!(try_send_drop_oldest(&sender, &drop_receiver, 1));
         assert!(try_send_drop_oldest(&sender, &drop_receiver, 2));
         assert_eq!(receiver.try_recv(), Ok(2));
+    }
+
+    #[test]
+    fn seek_epoch_rejects_in_flight_success_and_failure_without_restarting_worker() {
+        let (sender, receiver) = bounded(1);
+        let before_seek = 0;
+        let after_seek = 1;
+        // Simulate imports that complete after a seek has been accepted.
+        sender
+            .send((before_seek, Ok::<_, &str>("old texture")))
+            .unwrap();
+        assert_eq!(super::take_import_for_epoch(&receiver, after_seek), None);
+        sender
+            .send((before_seek, Err::<&str, _>("old import failure")))
+            .unwrap();
+        assert_eq!(super::take_import_for_epoch(&receiver, after_seek), None);
+        // The same mailbox still carries current successes and errors.
+        sender
+            .send((after_seek, Ok::<_, &str>("seek texture")))
+            .unwrap();
+        assert_eq!(
+            super::take_import_for_epoch(&receiver, after_seek),
+            Some(Ok("seek texture"))
+        );
+        sender
+            .send((after_seek, Err::<&str, _>("current failure")))
+            .unwrap();
+        assert_eq!(
+            super::take_import_for_epoch(&receiver, after_seek),
+            Some(Err("current failure"))
+        );
     }
 
     #[test]
