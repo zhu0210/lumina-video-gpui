@@ -13,9 +13,11 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.VideoSize
@@ -84,6 +86,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     private val frameTimestamps = FrameTimeline(MAX_IMAGES * 2)
     // Reused only on the player's application looper, including ImageReader callbacks.
     private val framePeriod = Timeline.Period()
+    private val liveWindowRecovery = LiveWindowRecovery()
 
     // Volume before muting (to restore on unmute)
     private var volumeBeforeMute: Float = 1.0f
@@ -231,6 +234,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                if (exoPlayer.playbackState == Player.STATE_READY && liveWindowRecovery.finish()) {
+                    Log.i(TAG, "Live-window recovery reached READY")
+                }
                 updateCachedValues()
                 withNativeHandle {
                     nativeOnPlaybackStateChanged(it, exoPlayer.playbackState, frameTimestamps.generation())
@@ -246,9 +252,26 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 }
             }
 
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+            override fun onPlayerError(error: PlaybackException) {
+                if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW &&
+                    liveWindowRecovery.start(SystemClock.elapsedRealtime())) {
+                    Log.w(TAG, "Behind live window; recovering at the default live position")
+                    frameTimestamps.reset(frameTimestamps.generation())
+                    // Media3's documented recovery. Keep playWhenReady so a
+                    // paused session stays paused while its live window moves.
+                    exoPlayer.seekToDefaultPosition()
+                    exoPlayer.prepare()
+                    updateCachedValues()
+                    return
+                }
+                liveWindowRecovery.finish()
                 Log.e(TAG, "ExoPlayer error: ${error.message}", error)
-                withNativeHandle { nativeOnError(it, error.message ?: "Unknown ExoPlayer error") }
+                val message = if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) {
+                    "Live-window recovery failed or repeated within 30 seconds"
+                } else {
+                    error.message ?: "Unknown ExoPlayer error"
+                }
+                withNativeHandle { nativeOnError(it, message) }
             }
         }
         exoPlayer.addListener(playerListener!!)
@@ -278,6 +301,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 return@post
             }
             Log.d(TAG, "play($url)")
+            liveWindowRecovery.reset()
             val mediaItem = MediaItem.fromUri(url)
             p.setMediaItem(mediaItem)
             p.prepare()
@@ -360,6 +384,12 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
             override fun run() {
                 if (!isReleased.get()) {
                     updateCachedValues()
+                    if (liveWindowRecovery.hasTimedOut(SystemClock.elapsedRealtime())) {
+                        liveWindowRecovery.finish()
+                        player?.stop()
+                        Log.e(TAG, "Live-window recovery timed out after 10 seconds")
+                        withNativeHandle { nativeOnError(it, "Live-window recovery timed out after 10 seconds") }
+                    }
                     handler?.postDelayed(this, 16)
                 }
             }

@@ -2308,6 +2308,8 @@ impl GpuiVideoPlayer {
     pub fn loading_overlay(&self) -> impl IntoElement {
         div()
             .absolute()
+            .top_0()
+            .left_0()
             .size_full()
             .bg(rgb(0x000000))
             .flex()
@@ -2339,6 +2341,8 @@ impl GpuiVideoPlayer {
         };
         div()
             .absolute()
+            .top_0()
+            .left_0()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .flex()
@@ -2375,6 +2379,8 @@ impl GpuiVideoPlayer {
         Some(
             div()
                 .absolute()
+                .top_0()
+                .left_0()
                 .size_full()
                 .bg(rgba(0x00000088))
                 .flex()
