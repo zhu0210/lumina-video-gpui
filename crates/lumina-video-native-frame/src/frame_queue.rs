@@ -2136,7 +2136,9 @@ impl FrameScheduler {
                     next_pts,
                     ahead
                 );
-                if ahead > Duration::from_millis(500) {
+                if ahead > Duration::from_millis(500)
+                    && !(self.use_audio_as_sync_master && self.audio_position() > Duration::ZERO)
+                {
                     let jump_to = next_pts.saturating_sub(Duration::from_millis(42));
                     tracing::info!(
                         "get_next_frame: clock jump after first frame {:?} → {:?} \
@@ -2289,8 +2291,10 @@ impl FrameScheduler {
         // Use AUDIO POSITION as master clock when available.
         // This is the key to A/V sync: video presentation follows audio playback.
         // Wall-clock is only used as fallback when audio is not available.
-        // Keep popping frames until we find one that should be displayed now
-        loop {
+        // Bound all resync/drop paths even if the producer refills concurrently
+        // or the selected external clock does not move during this UI poll.
+        let poll_budget = queue.len().saturating_add(1);
+        for _ in 0..poll_budget {
             let Some(next_pts) = queue.peek_pts() else {
                 // Queue is empty - we're stalled (buffering)
                 self.handle_stall();
@@ -2306,7 +2310,7 @@ impl FrameScheduler {
             let max_bias_us = MAX_VIDEO_PTS_BIAS.as_micros() as i64;
             let clamped_bias_us = total_bias_us.clamp(-max_bias_us, max_bias_us);
             let effective_bias_ms = clamped_bias_us / 1000;
-            let current_pos = if clamped_bias_us >= 0 {
+            let mut current_pos = if clamped_bias_us >= 0 {
                 raw_sync_pos.saturating_add(Duration::from_micros(clamped_bias_us as u64))
             } else {
                 raw_sync_pos.saturating_sub(Duration::from_micros((-clamped_bias_us) as u64))
@@ -2319,7 +2323,9 @@ impl FrameScheduler {
             // seek recovery). Jump the clock forward to prevent indefinite rejection.
             // This handles streams with non-contiguous PTS (common with network buffering).
             let ahead_of_position = next_pts.saturating_sub(current_pos);
-            if ahead_of_position > Duration::from_secs(1) {
+            if ahead_of_position > Duration::from_secs(1)
+                && !(self.use_audio_as_sync_master && self.audio_position() > Duration::ZERO)
+            {
                 let jump_to = next_pts.saturating_sub(Duration::from_millis(42));
                 tracing::info!(
                     "get_next_frame: large PTS gap detected, jumping clock {:?} → {:?} (gap={:?})",
@@ -2331,8 +2337,9 @@ impl FrameScheduler {
                 self.playback_start_position = jump_to;
                 self.playback_start_time = Some(std::time::Instant::now());
                 self.reset_rejection_tracking();
-                // Continue to re-evaluate with the new clock position
-                continue;
+                // Evaluate this frame against the recovered clock directly.
+                // Re-reading position() can clamp back to the old frame PTS.
+                current_pos = jump_to;
             }
 
             // Accept frame if:
@@ -2600,7 +2607,9 @@ impl FrameScheduler {
             // clock catches up — which can take seconds.
             if let Some(next_pts) = queue.peek_pts() {
                 let ahead = next_pts.saturating_sub(self.current_position);
-                if ahead > Duration::from_millis(500) {
+                if ahead > Duration::from_millis(500)
+                    && !(self.use_audio_as_sync_master && self.audio_position() > Duration::ZERO)
+                {
                     let jump_to = next_pts.saturating_sub(Duration::from_millis(42));
                     tracing::info!(
                         "get_next_frame: clock jump {:?} → {:?} \
@@ -2621,6 +2630,7 @@ impl FrameScheduler {
             self.track_recovery_frame();
             return Some(frame);
         }
+        self.current_frame.clone()
     }
 
     /// Records A/V sync metrics for a displayed frame.
@@ -3072,6 +3082,50 @@ mod tests {
             resumes,
             output_transition: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn large_pts_gap_with_frozen_native_clock_returns_without_spinning() {
+        let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            let audio = AudioHandle::default();
+            audio.set_available(true);
+            audio.set_native_position(Duration::from_millis(609));
+            let mut scheduler = FrameScheduler::with_audio_handle(audio.clone());
+            let queue = FrameQueue::new(3);
+            scheduler.start();
+            queue.push(make_test_frame(Duration::from_millis(600)));
+            scheduler.get_next_frame(&queue);
+            queue.push(make_test_frame(Duration::from_millis(12_320)));
+            for _ in 0..3 {
+                assert_eq!(
+                    scheduler.get_next_frame(&queue).unwrap().pts,
+                    Duration::from_millis(600)
+                );
+                assert_eq!(scheduler.position(), Duration::from_millis(609));
+            }
+            // Existing rejection timeout must still drop irreconcilable output.
+            scheduler.rejection_start_time =
+                Some(std::time::Instant::now() - Duration::from_secs(10));
+            scheduler.get_next_frame(&queue);
+            assert!(queue.is_empty());
+            // Wall-clock recovery must also finish even when position() would
+            // clamp a jump beyond the previous frame's three-second allowance.
+            let mut wall_clock = FrameScheduler::new();
+            wall_clock.start();
+            queue.push(make_test_frame(Duration::from_millis(600)));
+            wall_clock.get_next_frame(&queue);
+            queue.push(make_test_frame(Duration::from_millis(12_320)));
+            assert_eq!(
+                wall_clock.get_next_frame(&queue).unwrap().pts,
+                Duration::from_millis(12_320)
+            );
+            finished_tx.send(()).unwrap();
+        });
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("frame polling must be bounded even when native time is frozen");
+        worker.join().unwrap();
     }
 
     #[test]

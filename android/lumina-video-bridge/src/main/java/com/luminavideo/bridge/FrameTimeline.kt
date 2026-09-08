@@ -1,6 +1,6 @@
 package com.luminavideo.bridge
 
-/** Bounded correspondence between codec release times and media PTS across seeks. */
+/** Bounded correspondence between codec release times and period PTS across seeks. */
 internal class FrameTimeline(private val capacity: Int) {
     data class Stamp(val presentationTimeUs: Long, val generation: Long)
 
@@ -29,5 +29,19 @@ internal class FrameTimeline(private val capacity: Int) {
     }
 
     @Synchronized
-    fun take(releaseTimeNs: Long): Stamp? = frames.remove(releaseTimeNs)
+    fun take(releaseTimeNs: Long, periodPositionInWindowUs: Long): Stamp? {
+        val stamp = frames.remove(releaseTimeNs) ?: return null
+        // Media3's frame listener reports period time; currentPosition reports
+        // window time. Resolve at consumption because a live window can move
+        // while an Image is pending, without changing the period or generation.
+        val windowTimeUs = try {
+            Math.addExact(stamp.presentationTimeUs, periodPositionInWindowUs)
+        } catch (_: ArithmeticException) {
+            return null
+        }
+        // Frames before a sliding window, or outside the native nanosecond
+        // timestamp range, cannot be submitted to the presentation queue.
+        if (windowTimeUs < 0 || windowTimeUs > Long.MAX_VALUE / 1000L) return null
+        return stamp.copy(presentationTimeUs = windowTimeUs)
+    }
 }

@@ -17,6 +17,7 @@ import android.util.Log
 import android.view.Surface
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import java.util.concurrent.CountDownLatch
@@ -81,6 +82,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     // MediaCodec surface timestamps are release times, not media PTS. Keep a
     // bounded correspondence until ImageReader returns the associated image.
     private val frameTimestamps = FrameTimeline(MAX_IMAGES * 2)
+    // Reused only on the player's application looper, including ImageReader callbacks.
+    private val framePeriod = Timeline.Period()
 
     // Volume before muting (to restore on unmute)
     private var volumeBeforeMute: Float = 1.0f
@@ -200,6 +203,21 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     private fun setupListenersAndSurface(exoPlayer: ExoPlayer) {
         // Listen for video size changes, playback state, and errors
         playerListener = object : Player.Listener {
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                // Live playlist refreshes move the window origin used by both
+                // currentPosition and the frame timestamp conversion below.
+                updateCachedValues()
+            }
+
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int
+            ) {
+                frameTimestamps.reset(frameTimestamps.generation())
+                updateCachedValues()
+            }
+
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 Log.d(TAG, "onVideoSizeChanged: ${videoSize.width}x${videoSize.height}")
                 if (videoSize.width > 0 && videoSize.height > 0) {
@@ -516,7 +534,17 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         var retained = false
         var hardwareBuffer: HardwareBuffer? = null
         try {
-            val stamp = frameTimestamps.take(image.timestamp)
+            val p = player ?: return
+            val timeline = p.currentTimeline
+            val periodIndex = p.currentPeriodIndex
+            if (periodIndex !in 0 until timeline.periodCount) return
+            // Matches Media3 ExoPlayerImpl.getCurrentPositionUsInternal:
+            // content period time + positionInWindowUs; ads use their own clock.
+            // Do not read Player from the codec-thread metadata callback.
+            val periodOffsetUs = if (p.isPlayingAd) 0L else
+                timeline.getPeriod(periodIndex, framePeriod).positionInWindowUs
+            if (periodOffsetUs == androidx.media3.common.C.TIME_UNSET) return
+            val stamp = frameTimestamps.take(image.timestamp, periodOffsetUs)
                 ?: return // Drop unmatched/stale output instead of publishing a wall-clock PTS.
             val timestampNs = Math.multiplyExact(stamp.presentationTimeUs, 1000L)
             if (!cpuFallback && Build.VERSION.SDK_INT >= 33) {
