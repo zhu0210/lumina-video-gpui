@@ -1831,6 +1831,11 @@ impl GpuiVideoPlayer {
                     self.android_pending = false;
                     self.android_presentation_deadline = None;
                     self.preview.presented();
+                    if !self.android_native_presented {
+                        tracing::info!(
+                            "Android native frame presented via GPU conversion; no CPU pixel upload"
+                        );
+                    }
                     self.android_native_presented = true;
                     self.android_previous_textures = None;
                 }
@@ -1899,7 +1904,9 @@ impl GpuiVideoPlayer {
         // SAFETY: the importer records conversion on this window's exact device.
         // Commands initialize this texture to RESOURCE before sampling; its HAL
         // callback retains every Vulkan resource and the producer Image lease.
-        let frame = match unsafe { ExternalRgbaFrame::new(prepared.texture, prepared.commands) } {
+        let frame = match unsafe {
+            ExternalRgbaFrame::new_with_commands(prepared.texture, prepared.commands)
+        } {
             Ok(frame) => frame,
             Err(error) => {
                 self.downgrade_android_import(&error.to_string());
@@ -2501,7 +2508,7 @@ impl GpuiVideoPlayer {
             match textures {
                 Ok(tex) => {
                     if self.frame_textures.is_none() {
-                        tracing::info!("First video frame uploaded to GPU");
+                        tracing::info!("First video frame prepared for GPU rendering");
                     }
                     #[cfg(target_os = "android")]
                     self.observe_android_cpu_upload();
@@ -2547,7 +2554,7 @@ impl GpuiVideoPlayer {
 
         match textures {
             Ok(tex) => {
-                tracing::debug!("Preview frame uploaded to GPU");
+                tracing::debug!("Preview frame prepared for GPU rendering");
                 #[cfg(target_os = "android")]
                 self.observe_android_cpu_upload();
                 self.preview.presented();

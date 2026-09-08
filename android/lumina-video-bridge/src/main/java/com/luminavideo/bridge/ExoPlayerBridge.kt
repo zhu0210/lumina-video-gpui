@@ -24,6 +24,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
+// Never call Image.planes for opaque/vendor buffers: some Android drivers abort
+// in nativeCreatePlanes instead of throwing a catchable Java exception.
+internal fun isCpuReadableYuvImage(imageFormat: Int, bufferFormat: Int, usage: Long): Boolean =
+    imageFormat == ImageFormat.YUV_420_888 &&
+        bufferFormat == HardwareBuffer.YCBCR_420_888 &&
+        usage and HardwareBuffer.USAGE_CPU_READ_OFTEN != 0L
+
 /**
  * Bridge between ExoPlayer and lumina-video's Rust rendering.
  *
@@ -474,7 +481,16 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 cpuFallback = true
                 Log.w(TAG, "Native video import unavailable; selecting system-memory upload")
                 if (videoWidth > 0 && videoHeight > 0) {
+                    // Surface replacement alone can carry the codec's PRIVATE
+                    // allocations into a YUV reader. Release/reconfigure the
+                    // codec while preserving the existing playback position/state.
+                    val fallbackPlayer = player
+                    val position = fallbackPlayer?.currentPosition
+                    fallbackPlayer?.stop()
+                    frameTimestamps.reset(frameTimestamps.generation())
                     setupImageReader(videoWidth, videoHeight, force = true)
+                    if (position != null) fallbackPlayer.seekTo(position)
+                    fallbackPlayer?.prepare()
                 }
             }
         }
@@ -486,6 +502,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     private fun onImageAvailable(reader: ImageReader) {
         if (isReleased.get()) return
         if (!nativeLibraryLoaded) return
+        // Listener messages from a replaced reader can already be queued.
+        // They must not be interpreted using the new output mode.
+        if (reader !== imageReader) return
 
         val image = try {
             reader.acquireLatestImage()
@@ -514,6 +533,19 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                     image.width, image.height, playerId, stamp.generation)
                 check(retained) { "Failed to retain native video Image" }
             } else {
+                // Validate the actual allocation before touching planes; Image's
+                // logical format alone can conceal an opaque vendor allocation.
+                check(image.format == ImageFormat.YUV_420_888) { "CPU image is not YUV" }
+                if (Build.VERSION.SDK_INT >= 28) {
+                    hardwareBuffer = image.hardwareBuffer
+                    val buffer = checkNotNull(hardwareBuffer) { "CPU image has no HardwareBuffer" }
+                    check(isCpuReadableYuvImage(image.format, buffer.format, buffer.usage)) {
+                        "CPU output is not readable YUV: image=${image.format}, " +
+                            "buffer=${buffer.format}, usage=${buffer.usage}"
+                    }
+                }
+                // API 26/27 start with a YUV-configured codec and never transition
+                // from PRIVATE output; Image.getHardwareBuffer begins at API 28.
                 // Last-resort snapshot before Image.close permits decoder reuse.
                 val planes = image.planes
                 check(planes.size == 3) { "Expected CPU-readable YUV_420_888 output" }

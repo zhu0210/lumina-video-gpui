@@ -47,6 +47,8 @@ pub struct FrameQueue {
     frames: Arc<Mutex<VecDeque<VideoFrame>>>,
     /// Seek requests not yet applied by the decoder; changed under the frames lock.
     pending_seeks: AtomicUsize,
+    /// A decoder-requested single preview, published under the frames lock.
+    preview_ready: AtomicBool,
     /// Maximum number of frames to buffer
     capacity: usize,
     /// Condition variable for signaling when frames are available
@@ -68,6 +70,7 @@ impl FrameQueue {
             frames: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
             capacity,
             pending_seeks: AtomicUsize::new(0),
+            preview_ready: AtomicBool::new(false),
             frame_available: Arc::new(Condvar::new()),
             space_available: Arc::new(Condvar::new()),
             flushing: Arc::new(AtomicBool::new(false)),
@@ -87,6 +90,10 @@ impl FrameQueue {
     /// or stopped. Returns false if the queue is being flushed/stopped and the
     /// frame should be discarded.
     pub fn push(&self, frame: VideoFrame) -> bool {
+        self.push_with_preview(frame, false)
+    }
+
+    fn push_with_preview(&self, frame: VideoFrame, preview: bool) -> bool {
         let mut frames = self.frames.lock();
 
         // Wait for space if queue is full
@@ -110,6 +117,7 @@ impl FrameQueue {
         }
 
         frames.push_back(frame);
+        self.preview_ready.store(preview, Ordering::Release);
         self.frame_available.notify_one();
         true
     }
@@ -144,6 +152,7 @@ impl FrameQueue {
 
         let frame = frames.pop_front();
         if frame.is_some() {
+            self.preview_ready.store(false, Ordering::Release);
             self.space_available.notify_one();
         }
         frame
@@ -170,8 +179,19 @@ impl FrameQueue {
 
         let frame = frames.pop_front();
         if frame.is_some() {
+            self.preview_ready.store(false, Ordering::Release);
             self.space_available.notify_one();
         }
+        frame
+    }
+
+    fn pop_preview(&self) -> Option<VideoFrame> {
+        let mut frames = self.frames.lock();
+        if !self.preview_ready.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let frame = frames.pop_front();
+        self.space_available.notify_one();
         frame
     }
 
@@ -227,6 +247,7 @@ impl FrameQueue {
             let mut frames = self.frames.lock();
             let count = frames.len();
             frames.clear();
+            self.preview_ready.store(false, Ordering::Release);
             count
         };
 
@@ -243,6 +264,7 @@ impl FrameQueue {
         let mut frames = self.frames.lock();
         self.pending_seeks.fetch_add(1, Ordering::Release);
         frames.clear();
+        self.preview_ready.store(false, Ordering::Release);
         self.eos.store(false, Ordering::Release);
         self.space_available.notify_all();
     }
@@ -762,7 +784,7 @@ fn decode_loop<D: VideoDecoderBackend>(
         };
 
         tracing::trace!("Decoded frame at {:?}", frame.pts);
-        if frame_queue.push(frame) {
+        if frame_queue.push_with_preview(frame, seek_preview_deadline.is_some()) {
             seek_preview_deadline = None;
         } else {
             tracing::debug!("Frame rejected by queue (flushing)");
@@ -1503,6 +1525,7 @@ impl FrameScheduler {
 
     /// Pauses playback.
     pub fn pause(&mut self) {
+        let native_position = self.active_native_position();
         self.playback_requested = false;
         self.waiting_for_first_frame = false;
         self.stalled = false;
@@ -1531,6 +1554,9 @@ impl FrameScheduler {
             } else {
                 self.current_position = wall_clock_pos;
             }
+        }
+        if let Some(position) = native_position {
+            self.current_position = position;
         }
     }
 
@@ -1580,8 +1606,24 @@ impl FrameScheduler {
         }
     }
 
+    // Native players pace their output and own the media clock, including
+    // buffering. An empty mailbox between presented frames is normal.
+    fn active_native_position(&self) -> Option<Duration> {
+        if !self.playback_requested || !self.use_audio_as_sync_master {
+            return None;
+        }
+        let audio = self.audio_handle.as_ref()?;
+        (audio.is_available()
+            && audio.is_using_native_position()
+            && audio.playback_epoch().is_some())
+        .then(|| audio.position_for_sync())
+    }
+
     /// Returns the current playback position.
     pub fn position(&self) -> Duration {
+        if let Some(position) = self.active_native_position() {
+            return position;
+        }
         // If stalled (queue empty or audio underrun), return the last known position
         // to prevent the scroll bar / subtitles from advancing during buffering
         if self.stalled || self.audio_stalled {
@@ -2020,6 +2062,23 @@ impl FrameScheduler {
     /// - If video behind audio → skip frames to catch up
     /// - If video ahead of audio → hold current frame (don't advance)
     pub fn get_next_frame(&mut self, queue: &FrameQueue) -> Option<VideoFrame> {
+        if !self.playback_requested {
+            // Ordinary buffered/in-flight frames must not advance a paused view.
+            // A seek clears current_frame; renderer fallback explicitly publishes
+            // one replacement preview without changing the frozen media position.
+            let frame = if self.current_frame.is_none() {
+                queue.pop()
+            } else {
+                queue.pop_preview()
+            };
+            if let Some(frame) = frame {
+                if self.current_frame.is_none() {
+                    self.current_position = frame.pts;
+                }
+                self.current_frame = Some(frame);
+            }
+            return self.current_frame.clone();
+        }
         // If waiting for first frame, accept any frame to start the clock
         if self.waiting_for_first_frame {
             let queue_len = queue.len();
@@ -2738,6 +2797,11 @@ impl FrameScheduler {
 
     /// Handles entering stall state when queue is empty.
     fn handle_stall(&mut self) {
+        // Native output arrives at presentation cadence, not as a decode-ahead
+        // queue. The native buffering state already reports genuine starvation.
+        if self.active_native_position().is_some() {
+            return;
+        }
         // Only mark as stalled during active playback, not during pause/buffering
         if self.stalled || !self.playback_requested {
             return;
@@ -3008,6 +3072,67 @@ mod tests {
             resumes,
             output_transition: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn pause_does_not_present_buffered_frames_but_allows_one_fallback_preview() {
+        let audio = AudioHandle::default();
+        audio.set_available(true);
+        audio.set_native_position(Duration::from_millis(324));
+        let mut scheduler = FrameScheduler::with_audio_handle(audio);
+        let queue = FrameQueue::new(3);
+        scheduler.start();
+        assert!(queue.push(make_test_frame(Duration::from_millis(300))));
+        scheduler.get_next_frame(&queue);
+        scheduler.pause();
+        let paused = scheduler.position();
+        assert!(queue.push(make_test_frame(Duration::from_millis(600))));
+        for _ in 0..10 {
+            assert_eq!(
+                scheduler.get_next_frame(&queue).unwrap().pts,
+                Duration::from_millis(300)
+            );
+            assert_eq!(scheduler.position(), paused);
+        }
+        queue.flush();
+        assert!(queue.push_with_preview(make_test_frame(paused), true));
+        assert_eq!(scheduler.get_next_frame(&queue).unwrap().pts, paused);
+        assert!(queue.push(make_test_frame(Duration::from_millis(700))));
+        assert_eq!(scheduler.get_next_frame(&queue).unwrap().pts, paused);
+        assert_eq!(scheduler.position(), paused);
+        queue.flush();
+        scheduler.seek(Duration::from_secs(1));
+        assert!(queue.push_with_preview(make_test_frame(Duration::from_secs(1)), true));
+        assert_eq!(
+            scheduler.get_next_frame(&queue).unwrap().pts,
+            Duration::from_secs(1)
+        );
+        assert_eq!(scheduler.position(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn paced_native_frames_keep_native_time_between_deliveries_and_freeze_on_pause() {
+        let audio = AudioHandle::default();
+        audio.set_available(true);
+        let mut scheduler = FrameScheduler::with_audio_handle(audio.clone());
+        let queue = FrameQueue::new(1);
+        scheduler.start();
+        for n in 1..=90 {
+            let pts = Duration::from_millis(n * 33);
+            audio.set_native_position(pts);
+            assert!(queue.try_push(make_test_frame(pts)));
+            assert_eq!(scheduler.get_next_frame(&queue).unwrap().pts, pts);
+            // UI polls faster than the native player's frame cadence.
+            scheduler.get_next_frame(&queue);
+            assert!(!scheduler.is_stalled());
+            assert_eq!(scheduler.position(), pts);
+        }
+        let paused_position = scheduler.position();
+        scheduler.pause();
+        audio.set_native_position(Duration::from_secs(4));
+        assert_eq!(scheduler.position(), paused_position);
+        scheduler.seek(Duration::from_secs(8));
+        assert_eq!(scheduler.position(), Duration::from_secs(8));
     }
 
     #[test]

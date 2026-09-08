@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::zero_copy::ZeroCopyError;
 
 pub struct PreparedAndroidFrame {
-    pub commands: wgpu::CommandBuffer,
+    pub commands: Vec<wgpu::CommandBuffer>,
     pub texture: Arc<wgpu::Texture>,
     pub width: u32,
     pub height: u32,
@@ -425,6 +425,12 @@ impl AndroidFrameImporter {
                     state: wgpu::TextureUses::RESOURCE,
                 }),
             );
+            let initialize = encoder.finish();
+            // wgpu 30 does not permit mixing wgpu and raw encoding APIs on one
+            // encoder. Keep initialization first in the same renderer submission.
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Android raw AHB conversion"),
+            });
             // SAFETY: raw commands are recorded exclusively into this wgpu-owned
             // encoder. It is neither ended nor submitted here. Resource lifetimes
             // are transferred to the output texture's GPU-tracked drop callback.
@@ -440,10 +446,16 @@ impl AndroidFrameImporter {
                 Ok::<_, ZeroCopyError>(())
             })?;
 
-            let commands = encoder.finish();
+            let texture = Arc::new(texture);
+            // Raw encoding bypasses wgpu's resource tracker. Retain the texture's
+            // HAL callback (and native Image lease) through this buffer's GPU work,
+            // including when the frame is retired immediately after submission.
+            let retained_texture = Arc::clone(&texture);
+            encoder.on_submitted_work_done(move || drop(retained_texture));
+            let commands = vec![initialize, encoder.finish()];
             Ok(PreparedAndroidFrame {
                 commands,
-                texture: Arc::new(texture),
+                texture,
                 width,
                 height,
             })

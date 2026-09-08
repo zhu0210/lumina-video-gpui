@@ -14,7 +14,7 @@ url = "2.5"
 lumina-video-core = { path = "../lumina-video-core" }
 gpui = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "3644f52e78f5371d503888b2cdcd15187e703874",
+  rev = "f6dfc3025195c1026600fa5a95e14ae3ad64176d",
   features = ["wgpu"]
 }
 
@@ -76,7 +76,7 @@ web-sys = {
 # wgpu for WebGPU zero-copy texture operations (must match GPUI's wgpu)
 wgpu = { workspace = true }
 
-gpui_platform = { git = "https://github.com/zhu0210/zed.git", rev = "3644f52e78f5371d503888b2cdcd15187e703874" }
+gpui_platform = { git = "https://github.com/zhu0210/zed.git", rev = "f6dfc3025195c1026600fa5a95e14ae3ad64176d" }
 
 [[bin]]
 name = "web_hls"
@@ -89,5 +89,5 @@ lumina-video-wgpu = { path = "../lumina-video-wgpu" }
 crossbeam-channel = { workspace = true }
 gpui_wgpu = {
   git = "https://github.com/zhu0210/zed.git",
-  rev = "3644f52e78f5371d503888b2cdcd15187e703874"
+  rev = "f6dfc3025195c1026600fa5a95e14ae3ad64176d"
 }
