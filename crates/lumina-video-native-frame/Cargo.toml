@@ -38,7 +38,6 @@ quinn = { version = "0.11", optional = true }
 
 # Android native decoder + zero-copy
 [target.'cfg(target_os = "android")'.dependencies]
-android-activity = { version = "0.6", features = ["game-activity"] }
 ash = { version = "0.38" }
 jni = { workspace = true }
 libc = { version = "0.2" }

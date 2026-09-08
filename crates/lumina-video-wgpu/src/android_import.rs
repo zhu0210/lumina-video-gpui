@@ -63,7 +63,7 @@ impl Drop for ConversionPipeline {
 struct FrameResources {
     pipeline: Arc<ConversionPipeline>,
     // The Java Image remains acquired, preventing ImageReader/MediaCodec pool reuse.
-    _producer: AndroidVideoFrame,
+    _producer: Arc<AndroidVideoFrame>,
     input: vk::Image,
     input_memory: vk::DeviceMemory,
     input_view: vk::ImageView,
@@ -116,7 +116,7 @@ impl AndroidFrameImporter {
     /// The renderer must submit the returned commands before sampling its texture.
     pub unsafe fn prepare(
         &mut self,
-        frame: AndroidVideoFrame,
+        frame: Arc<AndroidVideoFrame>,
         device: &wgpu::Device,
     ) -> Result<PreparedAndroidFrame, ZeroCopyError> {
         if !frame.owns_producer_image()
@@ -136,7 +136,7 @@ impl AndroidFrameImporter {
 
     unsafe fn prepare_vulkan(
         &mut self,
-        frame: AndroidVideoFrame,
+        frame: Arc<AndroidVideoFrame>,
         device: &wgpu::Device,
     ) -> Result<PreparedAndroidFrame, ZeroCopyError> {
         // SAFETY: this is a live wgpu device, and no raw queue operations occur.

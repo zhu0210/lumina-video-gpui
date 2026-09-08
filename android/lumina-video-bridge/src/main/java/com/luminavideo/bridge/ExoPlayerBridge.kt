@@ -38,8 +38,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         private const val TAG = "ExoPlayerBridge"
 
         /** Maximum number of images to hold in the ImageReader buffer */
-        // Held GPU frames, one pending native frame, and acquireLatestImage headroom.
-        private const val MAX_IMAGES = 8
+        // CorePlayer's five queued frames, GPU/current/import frames, one native
+        // mailbox frame, and acquireLatestImage headroom stay bounded together.
+        private const val MAX_IMAGES = 12
 
         /** Timeout for ExoPlayer creation on the HandlerThread */
         private const val INIT_TIMEOUT_SECONDS = 5L
@@ -72,7 +73,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
     private var cpuFallback = Build.VERSION.SDK_INT < 33
     // MediaCodec surface timestamps are release times, not media PTS. Keep a
     // bounded correspondence until ImageReader returns the associated image.
-    private val frameTimestamps = LinkedHashMap<Long, Long>()
+    private val frameTimestamps = FrameTimeline(MAX_IMAGES * 2)
 
     // Volume before muting (to restore on unmute)
     private var volumeBeforeMute: Float = 1.0f
@@ -160,16 +161,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                     .apply {
                         setVideoScalingMode(androidx.media3.common.C.VIDEO_SCALING_MODE_SCALE_TO_FIT)
                         setVideoFrameMetadataListener { presentationTimeUs, releaseTimeNs, _, _ ->
-                            synchronized(frameTimestamps) {
-                                if (frameTimestamps.size >= MAX_IMAGES * 2) {
-                                    val oldest = frameTimestamps.keys.iterator()
-                                    if (oldest.hasNext()) {
-                                        oldest.next()
-                                        oldest.remove()
-                                    }
-                                }
-                                frameTimestamps[releaseTimeNs] = presentationTimeUs
-                            }
+                            frameTimestamps.record(presentationTimeUs, releaseTimeNs)
                         }
                     }
 
@@ -215,7 +207,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 updateCachedValues()
-                withNativeHandle { nativeOnPlaybackStateChanged(it, playbackState) }
+                withNativeHandle {
+                    nativeOnPlaybackStateChanged(it, exoPlayer.playbackState, frameTimestamps.generation())
+                }
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -285,8 +279,12 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
      *
      * @param positionMs Position in milliseconds
      */
-    fun seek(positionMs: Long) {
-        handler?.post { player?.seekTo(positionMs) }
+    fun seek(positionMs: Long, generation: Long) {
+        handler?.post {
+            frameTimestamps.reset(generation)
+            player?.seekTo(positionMs)
+            updateCachedValues()
+        }
     }
 
     /**
@@ -330,24 +328,24 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
 
     /**
      * Starts a periodic Runnable on the handler thread to update cached position.
-     * Runs every 250ms while the player is alive.
+     * Runs every 16ms while the player is alive.
      */
     private fun startPositionUpdater() {
         val updater = object : Runnable {
             override fun run() {
                 if (!isReleased.get()) {
                     updateCachedValues()
-                    handler?.postDelayed(this, 250)
+                    handler?.postDelayed(this, 16)
                 }
             }
         }
-        handler?.postDelayed(updater, 250)
+        handler?.postDelayed(updater, 16)
     }
 
     /**
      * Gets the current playback position in milliseconds.
      *
-     * Returns a cached value updated every ~250ms on the player thread.
+     * Returns a cached value updated every ~16ms on the player thread.
      * Safe to call from any thread (Rust decode thread, main thread, etc.).
      *
      * @return Current position in ms, or 0 if not playing
@@ -499,10 +497,9 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
         var retained = false
         var hardwareBuffer: HardwareBuffer? = null
         try {
-            val presentationTimeUs = synchronized(frameTimestamps) {
-                frameTimestamps.remove(image.timestamp)
-            } ?: return // Drop unmatched/stale output instead of publishing a wall-clock PTS.
-            val timestampNs = Math.multiplyExact(presentationTimeUs, 1000L)
+            val stamp = frameTimestamps.take(image.timestamp)
+                ?: return // Drop unmatched/stale output instead of publishing a wall-clock PTS.
+            val timestampNs = Math.multiplyExact(stamp.presentationTimeUs, 1000L)
             if (!cpuFallback && Build.VERSION.SDK_INT >= 33) {
                 // No CPU pixels are copied. The bounded acquire wait runs on
                 // this player's handler thread, never on the UI/render thread.
@@ -514,7 +511,7 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                 hardwareBuffer = image.hardwareBuffer
                 val buffer = checkNotNull(hardwareBuffer) { "Image has no HardwareBuffer" }
                 retained = nativeSubmitImageFrame(image, buffer, timestampNs,
-                    image.width, image.height, playerId)
+                    image.width, image.height, playerId, stamp.generation)
                 check(retained) { "Failed to retain native video Image" }
             } else {
                 // Last-resort snapshot before Image.close permits decoder reuse.
@@ -527,7 +524,8 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
                     timestampNs,
                     image.width,
                     image.height,
-                    playerId
+                    playerId,
+                    stamp.generation
                 )) { "Failed to snapshot video image" }
             }
             frameCount.incrementAndGet()
@@ -612,19 +610,19 @@ class ExoPlayerBridge internal constructor(private val nativeHandle: Long = 0L) 
 
     private external fun nativeSubmitImageFrame(
         image: android.media.Image, buffer: HardwareBuffer,
-        timestampNs: Long, width: Int, height: Int, playerId: Long
+        timestampNs: Long, width: Int, height: Int, playerId: Long, generation: Long
     ): Boolean
 
     private external fun nativeSubmitCpuFrame(
         y: java.nio.ByteBuffer, yRow: Int, yPixel: Int,
         u: java.nio.ByteBuffer, uRow: Int, uPixel: Int,
         v: java.nio.ByteBuffer, vRow: Int, vPixel: Int,
-        timestampNs: Long, width: Int, height: Int, playerId: Long
+        timestampNs: Long, width: Int, height: Int, playerId: Long, generation: Long
     ): Boolean
 
     private external fun nativeOnVideoSizeChanged(nativeHandle: Long, width: Int, height: Int)
 
-    private external fun nativeOnPlaybackStateChanged(nativeHandle: Long, stateValue: Int)
+    private external fun nativeOnPlaybackStateChanged(nativeHandle: Long, stateValue: Int, generation: Long)
 
     private external fun nativeOnError(nativeHandle: Long, errorMessage: String)
 

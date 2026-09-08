@@ -4,7 +4,7 @@
 //! enabling smooth playback by decoupling decoding from rendering.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -45,6 +45,8 @@ pub enum DecodeCommand {
 pub struct FrameQueue {
     /// The decoded frames ready for display
     frames: Arc<Mutex<VecDeque<VideoFrame>>>,
+    /// Seek requests not yet applied by the decoder; changed under the frames lock.
+    pending_seeks: AtomicUsize,
     /// Maximum number of frames to buffer
     capacity: usize,
     /// Condition variable for signaling when frames are available
@@ -65,6 +67,7 @@ impl FrameQueue {
         Self {
             frames: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
             capacity,
+            pending_seeks: AtomicUsize::new(0),
             frame_available: Arc::new(Condvar::new()),
             space_available: Arc::new(Condvar::new()),
             flushing: Arc::new(AtomicBool::new(false)),
@@ -89,14 +92,20 @@ impl FrameQueue {
         // Wait for space if queue is full
         while frames.len() >= self.capacity {
             // Check both flushing and stopped to avoid deadlock on shutdown
-            if self.flushing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+            if self.flushing.load(Ordering::Acquire)
+                || self.stopped.load(Ordering::Acquire)
+                || self.pending_seeks.load(Ordering::Acquire) != 0
+            {
                 return false;
             }
             self.space_available.wait(&mut frames);
         }
 
         // Check again after waiting
-        if self.flushing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+        if self.flushing.load(Ordering::Acquire)
+            || self.stopped.load(Ordering::Acquire)
+            || self.pending_seeks.load(Ordering::Acquire) != 0
+        {
             return false;
         }
 
@@ -109,12 +118,15 @@ impl FrameQueue {
     ///
     /// Returns false if the queue is full, being flushed, or stopped.
     pub fn try_push(&self, frame: VideoFrame) -> bool {
-        if self.flushing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+        if self.flushing.load(Ordering::Acquire)
+            || self.stopped.load(Ordering::Acquire)
+            || self.pending_seeks.load(Ordering::Acquire) != 0
+        {
             return false;
         }
 
         let mut frames = self.frames.lock();
-        if frames.len() >= self.capacity {
+        if frames.len() >= self.capacity || self.pending_seeks.load(Ordering::Acquire) != 0 {
             return false;
         }
 
@@ -225,8 +237,27 @@ impl FrameQueue {
         self.flushing.store(false, Ordering::Release);
     }
 
+    // Keep insertion closed until every requested seek has reached the decoder.
+    // The same lock as push/try_push makes invalidation atomic with publication.
+    fn begin_seek(&self) {
+        let mut frames = self.frames.lock();
+        self.pending_seeks.fetch_add(1, Ordering::Release);
+        frames.clear();
+        self.eos.store(false, Ordering::Release);
+        self.space_available.notify_all();
+    }
+
+    fn finish_seek(&self) {
+        let _frames = self.frames.lock();
+        self.pending_seeks.fetch_sub(1, Ordering::Release);
+    }
+
     /// Marks that end-of-stream has been reached.
     pub fn set_eos(&self) {
+        let _frames = self.frames.lock();
+        if self.pending_seeks.load(Ordering::Acquire) != 0 {
+            return;
+        }
         self.eos.store(true, Ordering::Release);
         self.frame_available.notify_all();
     }
@@ -369,7 +400,7 @@ impl DecodeThread {
     ///
     /// This will flush the frame queue and start decoding from the new position.
     pub fn seek(&self, position: Duration) {
-        self.frame_queue.flush();
+        self.frame_queue.begin_seek();
         // Immediately show buffering indicator - HTTP streams need to rebuffer after seek
         self.buffering_percent.store(0, Ordering::Relaxed);
         let _ = self.command_tx.send(DecodeCommand::Seek(position));
@@ -463,6 +494,7 @@ fn process_decode_command<D: VideoDecoderBackend>(
         DecodeCommand::Seek(position) => {
             frame_queue.flush();
             decoder.seek(position)?;
+            frame_queue.finish_seek();
             return Ok(CommandResult::Seeking);
         }
         DecodeCommand::SetMuted(muted) => decoder.set_muted(muted)?,
@@ -646,6 +678,14 @@ fn decode_loop<D: VideoDecoderBackend>(
                 }
             }
         }
+        // Renderer fallback must also run while paused. It uses the same
+        // bounded one-frame preview path as seek, without starting playback.
+        if decoder.poll_output_transition()? {
+            frame_queue.flush();
+            if !playing {
+                seek_preview_deadline = Some(std::time::Instant::now() + SEEK_PREVIEW_TIMEOUT);
+            }
+        }
         if seek_preview_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(VideoError::SeekFailed(
                 "Timed out waiting for paused seek preview".into(),
@@ -698,7 +738,11 @@ fn decode_loop<D: VideoDecoderBackend>(
         }
 
         // Decode the next frame
-        let frame = match decoder.decode_next() {
+        let decoded = decoder.decode_next();
+        if frame_queue.pending_seeks.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        let frame = match decoded {
             Ok(Some(frame)) => frame,
             Ok(None) if decoder.is_eof() => {
                 frame_queue.set_eos();
@@ -2896,6 +2940,7 @@ mod tests {
         empty_polls: usize,
         calls: Arc<std::sync::atomic::AtomicUsize>,
         resumes: Arc<std::sync::atomic::AtomicUsize>,
+        output_transition: Arc<AtomicBool>,
     }
 
     impl VideoDecoderBackend for SeekDecoder {
@@ -2932,6 +2977,15 @@ mod tests {
         fn is_eof(&self) -> bool {
             self.pending.is_none()
         }
+        fn poll_output_transition(&mut self) -> Result<bool, VideoError> {
+            if self.output_transition.swap(false, Ordering::AcqRel) {
+                self.pending = Some(Duration::from_secs(2));
+                self.empty_polls = 3;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     }
 
     fn seek_decoder(
@@ -2952,7 +3006,55 @@ mod tests {
             empty_polls: 0,
             calls,
             resumes,
+            output_transition: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn seek_rejects_in_flight_frames_until_all_requests_are_applied() {
+        let queue = Arc::new(FrameQueue::new(3));
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let producer_queue = Arc::clone(&queue);
+        let producer = thread::spawn(move || {
+            // Model a decode already in flight when the render thread seeks.
+            let old_frame = make_test_frame(Duration::ZERO);
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            producer_queue.push(old_frame)
+        });
+        queue.begin_seek();
+        queue.begin_seek();
+        release_tx.send(()).unwrap();
+        assert!(!producer.join().unwrap());
+        assert!(queue.pop().is_none());
+        // Applying the first seek must not reopen insertion before the second.
+        queue.flush();
+        queue.finish_seek();
+        assert!(!queue.try_push(make_test_frame(Duration::from_secs(1))));
+        queue.set_eos();
+        assert!(!queue.is_eos());
+        queue.finish_seek();
+        assert!(queue.push(make_test_frame(Duration::from_secs(2))));
+        assert_eq!(queue.pop().unwrap().pts, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn paused_output_transition_delivers_preview_without_resuming() {
+        let resumes = Arc::new(0.into());
+        let decoder = seek_decoder(Arc::new(0.into()), Arc::clone(&resumes));
+        let transition = Arc::clone(&decoder.output_transition);
+        let queue = Arc::new(FrameQueue::new(3));
+        let worker = DecodeThread::new(decoder, Arc::clone(&queue));
+        assert_eq!(
+            queue.pop_blocking(Duration::from_secs(1)).unwrap().pts,
+            Duration::ZERO
+        );
+        transition.store(true, Ordering::Release);
+        assert_eq!(
+            queue.pop_blocking(Duration::from_secs(1)).unwrap().pts,
+            Duration::from_secs(2)
+        );
+        assert_eq!(resumes.load(Ordering::Acquire), 0);
+        worker.stop();
     }
 
     #[test]

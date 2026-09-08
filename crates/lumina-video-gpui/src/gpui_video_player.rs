@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::time::Instant;
 
 use gpui::*;
@@ -57,6 +57,37 @@ use lumina_video_wgpu::GpuFrameTextures;
 use lumina_video_wgpu::{import_external_dmabuf_nv12, ImportedNv12Texture, Nv12ImportError};
 #[cfg(target_os = "linux")]
 use lumina_video_wgpu::{native_frame_lease_to_textures, NativeFrameIngestionError};
+
+// Preview selection is independent of the retained display texture: a paused seek
+// or source replacement must refresh it once a new frame becomes available.
+#[cfg(any(not(target_os = "linux"), test))]
+struct PreviewState {
+    refresh_requested: bool,
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+impl PreviewState {
+    fn new() -> Self {
+        Self {
+            refresh_requested: true,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.refresh_requested = true;
+    }
+
+    fn frame(
+        &self,
+        queue: &lumina_video_native_frame::frame_queue::FrameQueue,
+    ) -> Option<lumina_video_native_frame::video::VideoFrame> {
+        self.refresh_requested.then(|| queue.peek()).flatten()
+    }
+
+    fn presented(&mut self) {
+        self.refresh_requested = false;
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
@@ -204,9 +235,12 @@ impl Drop for DirectImportWorker {
 
 #[cfg(target_os = "android")]
 struct AndroidImportWorker {
-    input: Sender<lumina_video_native_frame::android_video::AndroidVideoFrame>,
-    input_drop: Receiver<lumina_video_native_frame::android_video::AndroidVideoFrame>,
-    output: Receiver<Result<lumina_video_wgpu::PreparedAndroidFrame, String>>,
+    input: Sender<Arc<lumina_video_native_frame::android_video::AndroidVideoFrame>>,
+    input_drop: Receiver<Arc<lumina_video_native_frame::android_video::AndroidVideoFrame>>,
+    output: Receiver<(
+        Arc<lumina_video_native_frame::android_video::AndroidVideoFrame>,
+        Result<lumina_video_wgpu::PreparedAndroidFrame, String>,
+    )>,
 }
 
 #[cfg(target_os = "android")]
@@ -225,9 +259,9 @@ impl AndroidImportWorker {
                     // mailbox. The bridge retains Image ownership and completes
                     // producer acquire before delivery; GPUI submits commands
                     // before sampling the returned texture.
-                    let prepared = unsafe { importer.prepare(frame, &device) }
+                    let prepared = unsafe { importer.prepare(Arc::clone(&frame), &device) }
                         .map_err(|error| error.to_string());
-                    let _ = try_send_drop_oldest(&sender, &output_drop, prepared);
+                    let _ = try_send_drop_oldest(&sender, &output_drop, (frame, prepared));
                 }
             })
             .ok()?;
@@ -345,6 +379,8 @@ pub struct GpuiVideoPlayer {
     background_executor: BackgroundExecutor,
     #[cfg(not(target_os = "linux"))]
     core: Option<CorePlayer>,
+    #[cfg(not(target_os = "linux"))]
+    preview: PreviewState,
     #[cfg(target_os = "linux")]
     session: Option<GstMediaSession>,
     url: String,
@@ -376,6 +412,8 @@ pub struct GpuiVideoPlayer {
     #[cfg(target_os = "android")]
     android_import: Option<AndroidImportWorker>,
     #[cfg(target_os = "android")]
+    android_last_frame: Option<Arc<lumina_video_native_frame::android_video::AndroidVideoFrame>>,
+    #[cfg(target_os = "android")]
     android_import_disabled: bool,
     #[cfg(target_os = "android")]
     android_fallback_pending: bool,
@@ -383,6 +421,10 @@ pub struct GpuiVideoPlayer {
     android_previous_textures: Option<GpuFrameTextures>,
     #[cfg(target_os = "android")]
     android_pending: bool,
+    #[cfg(target_os = "android")]
+    android_import_deadline: Option<Instant>,
+    #[cfg(target_os = "android")]
+    android_presentation_deadline: Option<Instant>,
     #[cfg(target_os = "android")]
     android_native_presented: bool,
     #[cfg(target_os = "android")]
@@ -458,6 +500,8 @@ impl GpuiVideoPlayer {
             background_executor,
             #[cfg(not(target_os = "linux"))]
             core,
+            #[cfg(not(target_os = "linux"))]
+            preview: PreviewState::new(),
             #[cfg(target_os = "linux")]
             session,
             url,
@@ -489,6 +533,8 @@ impl GpuiVideoPlayer {
             #[cfg(target_os = "android")]
             android_import: None,
             #[cfg(target_os = "android")]
+            android_last_frame: None,
+            #[cfg(target_os = "android")]
             android_import_disabled: false,
             #[cfg(target_os = "android")]
             android_fallback_pending: false,
@@ -496,6 +542,10 @@ impl GpuiVideoPlayer {
             android_previous_textures: None,
             #[cfg(target_os = "android")]
             android_pending: false,
+            #[cfg(target_os = "android")]
+            android_import_deadline: None,
+            #[cfg(target_os = "android")]
+            android_presentation_deadline: None,
             #[cfg(target_os = "android")]
             android_native_presented: false,
             #[cfg(target_os = "android")]
@@ -539,6 +589,8 @@ impl GpuiVideoPlayer {
     /// uploaded GPU texture until the new session presents a frame.
     pub fn open(&mut self, url: impl Into<String>, _cx: &App) {
         let url = url.into();
+        #[cfg(not(target_os = "linux"))]
+        self.preview.invalidate();
         self.audio_tracks.clear();
         self.selected_audio_track_id = None;
         self.audio_track_selection_error = None;
@@ -750,7 +802,6 @@ impl GpuiVideoPlayer {
         #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.play();
-            return;
         }
         #[cfg(target_os = "linux")]
         if let Some(session) = self.session.as_mut() {
@@ -769,7 +820,6 @@ impl GpuiVideoPlayer {
         #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.pause();
-            return;
         }
         #[cfg(target_os = "linux")]
         if let Some(session) = self.session.as_mut() {
@@ -786,12 +836,13 @@ impl GpuiVideoPlayer {
     }
 
     pub fn seek(&mut self, position: Duration) {
+        #[cfg(not(target_os = "linux"))]
+        self.preview.invalidate();
         #[cfg(target_os = "android")]
         self.reset_android_import();
         #[cfg(not(target_os = "linux"))]
         if let Some(core) = self.core.as_mut() {
             core.seek(position);
-            return;
         }
         #[cfg(target_os = "linux")]
         if let Some(session) = self.session.as_mut() {
@@ -1688,6 +1739,9 @@ impl GpuiVideoPlayer {
         // or on sources/platform versions that cannot provide an owned GPU frame.
         self.android_retirement_pending |= self.android_pending || self.android_native_presented;
         self.android_import = None;
+        self.android_last_frame = None;
+        self.android_import_deadline = None;
+        self.android_presentation_deadline = None;
         self.android_import_disabled = true;
         self.android_fallback_pending = false;
         self.android_pending = false;
@@ -1697,6 +1751,10 @@ impl GpuiVideoPlayer {
 
     #[cfg(target_os = "android")]
     fn reset_android_import(&mut self) {
+        self.preview.invalidate();
+        self.android_import_deadline = None;
+        self.android_presentation_deadline = None;
+        self.android_last_frame = None;
         self.android_import = None;
         if self.android_pending {
             self.frame_textures = self.android_previous_textures.take();
@@ -1719,6 +1777,46 @@ impl GpuiVideoPlayer {
     }
 
     #[cfg(target_os = "android")]
+    fn queue_android_frame(
+        &mut self,
+        surface: &lumina_video_native_frame::video::AndroidGpuSurface,
+    ) {
+        if self.android_import_disabled {
+            return;
+        }
+        let Some(frame) = surface.native_frame() else {
+            self.downgrade_android_import("native frame has no owned ImageReader lease");
+            return;
+        };
+        if self
+            .android_last_frame
+            .as_ref()
+            .is_some_and(|last| Arc::ptr_eq(last, &frame))
+        {
+            return;
+        }
+        if self.android_import.is_none() {
+            let Some(gpu) = self.gpu_context.as_ref() else {
+                return;
+            };
+            self.android_import = AndroidImportWorker::new(Arc::clone(gpu.device()));
+        }
+        let sent = self.android_import.as_ref().is_some_and(|worker| {
+            try_send_drop_oldest(&worker.input, &worker.input_drop, Arc::clone(&frame))
+        });
+        if sent {
+            self.android_last_frame = Some(frame);
+            let now = Instant::now();
+            self.android_import_deadline.get_or_insert(
+                now.checked_add(self.config.lifecycle_timeout)
+                    .unwrap_or(now),
+            );
+        } else {
+            self.downgrade_android_import("import worker unavailable");
+        }
+    }
+
+    #[cfg(target_os = "android")]
     fn update_android_import(&mut self, window: &mut Window) {
         use gpui::{ExternalFrameRequest, ExternalRgbaFrame};
         use gpui_wgpu::ExternalFrameOutcome;
@@ -1731,6 +1829,8 @@ impl GpuiVideoPlayer {
             match window.take_external_frame_outcome() {
                 Some(ExternalFrameOutcome::Accepted) => {
                     self.android_pending = false;
+                    self.android_presentation_deadline = None;
+                    self.preview.presented();
                     self.android_native_presented = true;
                     self.android_previous_textures = None;
                 }
@@ -1751,49 +1851,49 @@ impl GpuiVideoPlayer {
         if self.android_import_disabled {
             return;
         }
-        let player_id = self.core.as_ref().map_or(0, CorePlayer::android_player_id);
-        // MoQ and uninitialized CorePlayer instances do not use the ExoPlayer bridge.
-        if player_id == 0 {
-            return;
-        }
-        if self.android_import.is_none() {
-            let Some(gpu) = self.gpu_context.as_ref() else {
-                return;
-            };
-            self.android_import = AndroidImportWorker::new(Arc::clone(gpu.device()));
-            if self.android_import.is_none() {
-                self.downgrade_android_import("could not start import worker");
-                return;
-            }
-        }
-        if let Some(frame) =
-            lumina_video_native_frame::android_video::try_receive_hardware_buffer_for_player(
-                player_id,
-            )
-        {
-            let sent = self.android_import.as_ref().is_some_and(|worker| {
-                try_send_drop_oldest(&worker.input, &worker.input_drop, frame)
-            });
-            if !sent {
-                self.downgrade_android_import("import worker disconnected");
-                return;
-            }
-        }
         if self.android_pending {
+            if self
+                .android_presentation_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.downgrade_android_import("timed out waiting for renderer acknowledgement");
+            }
             return;
         }
-        let prepared = self
-            .android_import
-            .as_ref()
-            .and_then(|worker| worker.output.try_recv().ok());
-        let prepared = match prepared {
-            Some(Ok(frame)) => frame,
-            Some(Err(error)) => {
+        let Some(worker) = self.android_import.as_ref() else {
+            return;
+        };
+        let (source, prepared) = match worker.output.try_recv() {
+            Ok((source, Ok(frame))) => (source, frame),
+            Ok((_, Err(error))) => {
                 self.downgrade_android_import(&error);
                 return;
             }
-            None => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.downgrade_android_import("import worker disconnected");
+                return;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                if self
+                    .android_import_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    self.downgrade_android_import("timed out waiting for native frame import");
+                }
+                return;
+            }
         };
+        // A newer frame may still be queued/in flight. Bound lack of progress,
+        // without extending the budget merely because new input keeps arriving.
+        let now = Instant::now();
+        self.android_import_deadline = self
+            .android_last_frame
+            .as_ref()
+            .filter(|last| !Arc::ptr_eq(last, &source))
+            .map(|_| {
+                now.checked_add(self.config.lifecycle_timeout)
+                    .unwrap_or(now)
+            });
         let texture = Arc::clone(&prepared.texture);
         let (width, height) = (prepared.width, prepared.height);
         // SAFETY: the importer records conversion on this window's exact device.
@@ -1819,6 +1919,11 @@ impl GpuiVideoPlayer {
             height,
         });
         self.android_pending = true;
+        let now = Instant::now();
+        self.android_presentation_deadline = Some(
+            now.checked_add(self.config.lifecycle_timeout)
+                .unwrap_or(now),
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1862,10 +1967,8 @@ impl GpuiVideoPlayer {
             }
             self.poll_and_upload_frames();
         } else if matches!(self.state, VideoState::Ready | VideoState::Paused { .. }) {
-            // Peek at first frame for preview (don't advance queue)
-            if self.frame_textures.is_none() {
-                self.try_preview_frame();
-            }
+            // A retained display texture must not suppress a paused seek/source preview.
+            self.try_preview_frame();
         } else if self.initialized {
             let qlen = self
                 .core
@@ -2379,6 +2482,13 @@ impl GpuiVideoPlayer {
         }
 
         if let Some(video_frame) = last_frame {
+            #[cfg(target_os = "android")]
+            if let lumina_video_native_frame::video::DecodedFrame::Android(surface) =
+                &video_frame.frame
+            {
+                self.queue_android_frame(surface);
+                return;
+            }
             let textures = decoded_frame_to_textures(
                 &video_frame.frame,
                 gpu.device(),
@@ -2395,6 +2505,7 @@ impl GpuiVideoPlayer {
                     }
                     #[cfg(target_os = "android")]
                     self.observe_android_cpu_upload();
+                    self.preview.presented();
                     self.frame_textures = Some(tex);
                 }
                 Err(error) => {
@@ -2406,18 +2517,24 @@ impl GpuiVideoPlayer {
 
     #[cfg(not(target_os = "linux"))]
     fn try_preview_frame(&mut self) {
-        if self.frame_textures.is_some() {
-            return;
-        }
-
         let gpu = match self.gpu_context.as_ref() {
             Some(g) => g,
             None => return,
         };
 
-        let Some(frame) = self.core.as_ref().and_then(CorePlayer::peek_frame) else {
+        let Some(frame) = self
+            .core
+            .as_ref()
+            .and_then(|core| self.preview.frame(core.frame_queue()))
+        else {
             return;
         };
+
+        #[cfg(target_os = "android")]
+        if let lumina_video_native_frame::video::DecodedFrame::Android(surface) = &frame.frame {
+            self.queue_android_frame(surface);
+            return;
+        }
 
         let textures = decoded_frame_to_textures(
             &frame.frame,
@@ -2433,6 +2550,7 @@ impl GpuiVideoPlayer {
                 tracing::debug!("Preview frame uploaded to GPU");
                 #[cfg(target_os = "android")]
                 self.observe_android_cpu_upload();
+                self.preview.presented();
                 self.frame_textures = Some(tex);
             }
             Err(error) => {
@@ -2620,5 +2738,57 @@ mod direct_route_state_tests {
         drop(receiver);
         let (_drop_sender, drop_receiver) = bounded::<u8>(1);
         assert!(!try_send_drop_oldest(&sender, &drop_receiver, 1));
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::PreviewState;
+    use lumina_video_native_frame::{
+        frame_queue::FrameQueue,
+        video::{CpuFrame, DecodedFrame, PixelFormat, Plane, VideoFrame},
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn paused_preview_refresh_survives_retained_image_and_empty_seek_queue() {
+        let queue = FrameQueue::new(2);
+        let frame = |seconds| {
+            VideoFrame::new(
+                Duration::from_secs(seconds),
+                DecodedFrame::Cpu(CpuFrame::new(
+                    PixelFormat::Rgba,
+                    1,
+                    1,
+                    vec![Plane::new(vec![0, 0, 0, 255], 4)],
+                )),
+            )
+        };
+        let mut preview = PreviewState::new();
+        assert!(queue.try_push(frame(1)));
+        let displayed = preview.frame(&queue).unwrap();
+        preview.presented();
+        assert!(preview.frame(&queue).is_none());
+        // CorePlayer flushes on seek. The display keeps its owned old image,
+        // while the preview request waits across arbitrary empty refreshes.
+        queue.flush();
+        preview.invalidate();
+        assert!(preview.frame(&queue).is_none());
+        assert!(preview.frame(&queue).is_none());
+        assert_eq!(displayed.pts, Duration::from_secs(1));
+        assert!(queue.try_push(frame(10)));
+        let pending = preview.frame(&queue).unwrap();
+        assert_eq!(pending.pts, Duration::from_secs(10));
+        assert_eq!(queue.len(), 1); // preview does not advance the presentation clock
+        assert_eq!(displayed.pts, Duration::from_secs(1));
+        // Only presentation completes the request; a queued native import does not.
+        assert!(preview.frame(&queue).is_some());
+        preview.presented();
+        assert!(preview.frame(&queue).is_none());
+        // Source replacement/fallback uses the same invalidation while paused.
+        queue.flush();
+        preview.invalidate();
+        assert!(queue.try_push(frame(0)));
+        assert_eq!(preview.frame(&queue).unwrap().pts, Duration::ZERO);
     }
 }

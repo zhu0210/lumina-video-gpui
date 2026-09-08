@@ -463,6 +463,13 @@ impl AndroidGpuSurface {
             _owner: owner,
         }
     }
+
+    /// Clone the native producer lease retained by this surface, when available.
+    /// The renderer must keep this Arc through GPU retirement; cloning the handle
+    /// alone would let ImageReader recycle pixels while the GPU still reads them.
+    pub fn native_frame(&self) -> Option<Arc<crate::android_video::AndroidVideoFrame>> {
+        Arc::clone(&self._owner).downcast().ok()
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -1036,6 +1043,13 @@ pub trait VideoDecoderBackend: Send {
         Ok(()) // Default no-op for decoders without playback control
     }
 
+    /// Apply pending renderer-requested output changes on the decode worker.
+    /// Return true to discard old queued frames and request one fresh preview,
+    /// including while paused. The worker bounds that preview wait.
+    fn poll_output_transition(&mut self) -> Result<bool, VideoError> {
+        Ok(false)
+    }
+
     /// Returns the total duration if known.
     fn duration(&self) -> Option<Duration> {
         self.metadata().duration
@@ -1174,6 +1188,10 @@ impl VideoDecoderBackend for Box<dyn VideoDecoderBackend + Send> {
 
     fn set_volume(&mut self, volume: f32) -> Result<(), VideoError> {
         (**self).set_volume(volume)
+    }
+
+    fn poll_output_transition(&mut self) -> Result<bool, VideoError> {
+        (**self).poll_output_transition()
     }
 
     fn duration(&self) -> Option<Duration> {
